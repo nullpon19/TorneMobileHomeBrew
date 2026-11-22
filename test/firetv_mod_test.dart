@@ -16,6 +16,8 @@ import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
+import 'package:tmhb/ui/player_cache_policy.dart';
+import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/titles_screen.dart';
 
@@ -403,6 +405,98 @@ void main() {
 
       expect(await store.hasCredentials, isTrue);
       expect(find.text('インポート済み'), findsOneWidget);
+    });
+  });
+
+  group('PlayerScreen loading indicator & Android cache sizing', () {
+    test('playerLoadingLabel shows loading until first video frame arrives', () {
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: false,
+          playingStarted: false,
+          playingNow: false,
+          buffering: true,
+        ),
+        '読み込み中…',
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: false,
+          playingStarted: true,
+          playingNow: true,
+          buffering: false,
+        ),
+        '読み込み中…',
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: true,
+          buffering: false,
+        ),
+        isNull,
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: true,
+          buffering: true,
+        ),
+        'バッファリング中…',
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+        ),
+        isNull,
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: true,
+          hasVideoFrame: false,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+        ),
+        isNull,
+      );
+    });
+
+    test('effectiveRecordingDemuxerMaxBytes uses compact Android limits', () {
+      expect(
+        effectiveRecordingDemuxerMaxBytes(isAndroid: true),
+        androidRecordingDemuxerMaxBytes,
+      );
+      expect(
+        effectiveRecordingDemuxerMaxBackBytes(isAndroid: true),
+        androidRecordingDemuxerMaxBackBytes,
+      );
+      expect(
+        effectiveRecordingDemuxerMaxBytes(isAndroid: false),
+        recordingDemuxerMaxBytes,
+      );
+      expect(
+        effectiveRecordingDemuxerMaxBackBytes(isAndroid: false),
+        recordingDemuxerMaxBackBytes,
+      );
+      expect(
+        androidRecordingDemuxerMaxBytes,
+        lessThan(recordingDemuxerMaxBytes),
+      );
+      expect(
+        androidProxyWindowCapBytes,
+        lessThan(DtcpProxy.windowCapBytes),
+      );
     });
   });
 }

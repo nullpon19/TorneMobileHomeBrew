@@ -496,6 +496,7 @@ class DtcpProxy {
       );
       final iterator = StreamIterator<List<int>>(timed);
       _iterator = iterator;
+      final yieldWatch = Stopwatch()..start();
       try {
         while (!_stopRequested) {
           if (_queue.bufferedBytes >= prefetchCapBytes) {
@@ -527,6 +528,10 @@ class DtcpProxy {
               'proxy: $packets packets, $plainBytes bytes decrypted '
               'so far',
             );
+          }
+          if (yieldWatch.elapsedMilliseconds >= 4) {
+            await Future<void>.delayed(Duration.zero);
+            yieldWatch.reset();
           }
         }
       } finally {
@@ -887,6 +892,7 @@ class DtcpProxy {
     var skip = skipPlaintext;
     var produced = 0;
     var firstPlainLogged = false;
+    final yieldWatch = Stopwatch()..start();
     try {
       while (!producer.cancelled && !_stopRequested) {
         if (_window.producerShouldPause) {
@@ -924,6 +930,10 @@ class DtcpProxy {
           }
           produced += piece.length;
           _window.append(piece);
+        }
+        if (yieldWatch.elapsedMilliseconds >= 4) {
+          await Future<void>.delayed(Duration.zero);
+          yieldWatch.reset();
         }
       }
     } finally {

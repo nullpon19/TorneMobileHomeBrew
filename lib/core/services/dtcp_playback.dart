@@ -6,6 +6,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import '../diagnostics.dart';
@@ -104,6 +105,10 @@ class PlaybackKeySource {
     }
   }
 }
+
+/// Plaintext proxy window cap used on Android / Fire TV (reduced from 32 MiB
+/// to 8 MiB to curb initial LAN burst pressure on 1 GB RAM Fire TV sticks).
+const int androidProxyWindowCapBytes = 8 * 1024 * 1024;
 
 class DtcpPlaybackEngine implements PlaybackEngine {
   DtcpPlaybackEngine({
@@ -240,6 +245,9 @@ class DtcpPlaybackEngine implements PlaybackEngine {
         diag: diag,
         totalBytes: seekTotalBytes,
         totalDuration: seekTotalDuration,
+        windowCapBytesOverride: Platform.isAndroid
+            ? androidProxyWindowCapBytes
+            : null,
       );
       diag(
         DiagCategory.playback,

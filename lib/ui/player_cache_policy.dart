@@ -32,3 +32,20 @@ const int recordingDemuxerMaxBytes = 32 * 1024 * 1024;
 /// demuxer's backward scans and a small step back stay
 /// local instead of re-entering the proxy.
 const int recordingDemuxerMaxBackBytes = 16 * 1024 * 1024;
+
+/// Tighter demuxer forward cache on memory-constrained Android / Fire TV
+/// sticks (still ~30s+ at mobile bitrate without filling 1 GB RAM).
+const int androidRecordingDemuxerMaxBytes = 8 * 1024 * 1024;
+
+/// Tighter demuxer backward cache on Android / Fire TV devices.
+const int androidRecordingDemuxerMaxBackBytes = 4 * 1024 * 1024;
+
+/// Effective `demuxer-max-bytes` for recorded playback on [isAndroid].
+int effectiveRecordingDemuxerMaxBytes({required bool isAndroid}) =>
+    isAndroid ? androidRecordingDemuxerMaxBytes : recordingDemuxerMaxBytes;
+
+/// Effective `demuxer-max-back-bytes` for recorded playback on [isAndroid].
+int effectiveRecordingDemuxerMaxBackBytes({required bool isAndroid}) =>
+    isAndroid
+    ? androidRecordingDemuxerMaxBackBytes
+    : recordingDemuxerMaxBackBytes;

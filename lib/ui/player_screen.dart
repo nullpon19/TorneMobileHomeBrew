@@ -171,6 +171,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -189,6 +190,21 @@ import 'player_seek_policy.dart';
 import 'player_speed_policy.dart';
 import 'player_teardown_policy.dart';
 import 'player_track_policy.dart';
+
+/// Returns the overlay spinner caption while waiting for initial video frames
+/// or recovering from mid-stream buffering, or `null` once ready/paused.
+String? playerLoadingLabel({
+  required bool interrupted,
+  required bool hasVideoFrame,
+  required bool playingStarted,
+  required bool playingNow,
+  required bool buffering,
+}) {
+  if (interrupted) return null;
+  if (!hasVideoFrame || !playingStarted) return '読み込み中…';
+  if (buffering && playingNow) return 'バッファリング中…';
+  return null;
+}
 
 class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({
@@ -265,6 +281,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _watchdog;
   bool _playing = false;
+  bool _buffering = true;
+  bool _hasVideoFrame = false;
   String? _error;
 
   /// Interruption state (plan 80): playback that had started
@@ -379,6 +397,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   static const Duration _rewindStep = Duration(seconds: -10);
   static const Duration _forwardStep = Duration(seconds: 30);
 
+  void _onVideoRectChanged() {
+    final r = _videoController.rect.value;
+    if (!_hasVideoFrame &&
+        r != null &&
+        r.width > 0 &&
+        r.height > 0 &&
+        mounted) {
+      setState(() => _hasVideoFrame = true);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -391,6 +420,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _player = Player();
     unawaited(_player.setVolume(100.0));
     _videoController = VideoController(_player);
+    _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
     _subscriptions.add(
@@ -398,21 +428,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         _diag(DiagCategory.playback, 'player: playing=$playing');
         _wakelockSession.setPlaying(playing);
         final wasPlaying = _playingNow;
-        _playingNow = playing;
+        if (mounted) {
+          setState(() {
+            _playingNow = playing;
+            if (playing) {
+              _playing = true;
+              _interrupted = false;
+              _interruptDetail = null;
+            }
+          });
+        } else {
+          _playingNow = playing;
+          if (playing) _playing = true;
+        }
         if (playing) {
-          _playing = true;
           _watchdog?.cancel();
           // A (re)start clears any interruption state
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
           _stallTimer?.cancel();
           _bufferingSincePlaying = false;
-          if (_interrupted && mounted) {
-            setState(() {
-              _interrupted = false;
-              _interruptDetail = null;
-            });
-          }
         } else if (wasPlaying) {
           _onPlaybackStopped();
         }
@@ -427,6 +462,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           // mpv stopped (plan 80); buffering clearing again
           // while playing is a recovery and clears it.
           _bufferingSincePlaying = buffering;
+        }
+        if (mounted && _buffering != buffering) {
+          setState(() => _buffering = buffering);
+        } else {
+          _buffering = buffering;
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.width.listen((width) {
+        if (!_hasVideoFrame && width != null && width > 0 && mounted) {
+          setState(() => _hasVideoFrame = true);
         }
       }),
     );
@@ -592,6 +639,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     setState(() {
       _interrupted = false;
       _interruptDetail = null;
+      _buffering = true;
     });
     try {
       await _player.setVolume(100.0);
@@ -802,11 +850,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         if (!widget.live) {
           await platform.setProperty(
             'demuxer-max-bytes',
-            '$recordingDemuxerMaxBytes',
+            '${effectiveRecordingDemuxerMaxBytes(isAndroid: Platform.isAndroid)}',
           );
           await platform.setProperty(
             'demuxer-max-back-bytes',
-            '$recordingDemuxerMaxBackBytes',
+            '${effectiveRecordingDemuxerMaxBackBytes(isAndroid: Platform.isAndroid)}',
           );
         }
         _diag(
@@ -968,6 +1016,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               subscription.cancel();
             }
           },
+        ),
+        (
+          name: 'video rect listener',
+          run: () => _videoController.rect.removeListener(_onVideoRectChanged),
         ),
         (name: 'player', run: () => unawaited(_stopAndDisposePlayer())),
         (name: 'session', run: () => unawaited(_stopSession())),
@@ -1192,6 +1244,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final loadingLabel = playerLoadingLabel(
+      interrupted: _interrupted,
+      hasVideoFrame: _hasVideoFrame,
+      playingStarted: _playing,
+      playingNow: _playingNow,
+      buffering: _buffering,
+    );
     return PopScope(
       canPop: !_osdOpen,
       onPopInvokedWithResult: (didPop, _) {
@@ -1270,37 +1329,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         controller: _videoController,
                         controls: NoVideoControls,
                       ),
-                      if (!_playing)
-                        const Center(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: Colors.black54,
-                              borderRadius: BorderRadius.all(
-                                Radius.circular(12),
+                      if (loadingLabel != null)
+                        IgnorePointer(
+                          child: Center(
+                            child: DecoratedBox(
+                              decoration: const BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius: BorderRadius.all(
+                                  Radius.circular(12),
+                                ),
                               ),
-                            ),
-                            child: Padding(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 20,
-                                vertical: 14,
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  SizedBox(
-                                    width: 20,
-                                    height: 20,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 20,
+                                  vertical: 14,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
                                     ),
-                                  ),
-                                  SizedBox(width: 12),
-                                  Text(
-                                    '読み込み中…',
-                                    style: TextStyle(color: Colors.white),
-                                  ),
-                                ],
+                                    const SizedBox(width: 12),
+                                    Text(
+                                      loadingLabel,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ),
