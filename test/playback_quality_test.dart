@@ -1,8 +1,4 @@
-/// Saved playback quality (Discord request, 2026-11-21): one
-/// value in the key-value store is both the settings screen's
-/// default and the starting choice of the live / title detail
-/// screens, and a change on any of them writes back to it.
-/// Unset means the original quality (DR).
+/// Fire TV provisional build: playback quality is fixed to mobile (true).
 library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -27,7 +23,7 @@ const _reg = RegisteredNasne(
 );
 
 void main() {
-  group('PlaybackQualityNotifier persistence', () {
+  group('PlaybackQualityNotifier Fire TV mobile-fixed', () {
     late InMemoryKeyValueStore keyValues;
 
     setUp(() {
@@ -42,47 +38,29 @@ void main() {
       return container;
     }
 
-    test('nothing stored means the original quality', () async {
+    test('nothing stored defaults to mobile (true)', () async {
       final container = makeContainer();
-      container.read(playbackQualityProvider);
-      await flush();
-      expect(container.read(playbackQualityProvider), isFalse);
-    });
-
-    test('a stored mobile choice is restored', () async {
-      await keyValues.write('playback_use_mobile', 'true');
-      final container = makeContainer();
-      container.read(playbackQualityProvider);
+      expect(container.read(playbackQualityProvider), isTrue);
       await flush();
       expect(container.read(playbackQualityProvider), isTrue);
+      expect(await keyValues.read('playback_use_mobile'), 'true');
     });
 
-    test('a stored original choice is restored', () async {
+    test('a stored false is overridden to mobile (true)', () async {
       await keyValues.write('playback_use_mobile', 'false');
       final container = makeContainer();
       container.read(playbackQualityProvider);
       await flush();
-      expect(container.read(playbackQualityProvider), isFalse);
-    });
-
-    test('an unparsable stored value falls back to the original', () async {
-      await keyValues.write('playback_use_mobile', 'yes');
-      final container = makeContainer();
-      container.read(playbackQualityProvider);
-      await flush();
-      expect(container.read(playbackQualityProvider), isFalse);
-    });
-
-    test('set writes the value through to the store', () async {
-      final container = makeContainer();
-      final notifier = container.read(playbackQualityProvider.notifier);
-      await notifier.set(true);
       expect(container.read(playbackQualityProvider), isTrue);
       expect(await keyValues.read('playback_use_mobile'), 'true');
+    });
 
+    test('set keeps quality fixed to mobile (true)', () async {
+      final container = makeContainer();
+      final notifier = container.read(playbackQualityProvider.notifier);
       await notifier.set(false);
-      expect(container.read(playbackQualityProvider), isFalse);
-      expect(await keyValues.read('playback_use_mobile'), 'false');
+      expect(container.read(playbackQualityProvider), isTrue);
+      expect(await keyValues.read('playback_use_mobile'), 'true');
     });
   });
 
@@ -107,46 +85,17 @@ void main() {
       );
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
-      await tester.ensureVisible(find.text('再生画質'));
+      await tester.ensureVisible(find.text('再生画質: モバイル固定'));
       await tester.pump();
     }
 
-    Set<bool> selectedOf(WidgetTester tester) => tester
-        .widget<SegmentedButton<bool>>(find.byType(SegmentedButton<bool>))
-        .selected;
-
-    testWidgets('DR (the original quality) is the default shown', (
+    testWidgets('settings shows mobile-fixed indicator without selector', (
       tester,
     ) async {
       final keyValues = InMemoryKeyValueStore();
       await pumpSettings(tester, keyValues);
-      expect(find.text('元画質 (DR)'), findsOneWidget);
-      expect(find.text('モバイル'), findsOneWidget);
-      expect(selectedOf(tester), {false});
-    });
-
-    testWidgets('choosing mobile persists as the saved quality', (
-      tester,
-    ) async {
-      final keyValues = InMemoryKeyValueStore();
-      await pumpSettings(tester, keyValues);
-      final container = ProviderScope.containerOf(
-        tester.element(find.text('再生画質')),
-      );
-
-      await tester.tap(find.text('モバイル'));
-      await tester.pump();
-      expect(selectedOf(tester), {true});
-      expect(container.read(playbackQualityProvider), isTrue);
-      expect(await keyValues.read('playback_use_mobile'), 'true');
-    });
-
-    testWidgets('a saved mobile choice is the one shown', (tester) async {
-      final keyValues = InMemoryKeyValueStore();
-      await keyValues.write('playback_use_mobile', 'true');
-      await pumpSettings(tester, keyValues);
-      await tester.pump();
-      expect(selectedOf(tester), {true});
+      expect(find.text('再生画質: モバイル固定'), findsOneWidget);
+      expect(find.byType(SegmentedButton<bool>), findsNothing);
     });
   });
 
@@ -194,29 +143,12 @@ void main() {
       await tester.pump();
     }
 
-    Set<bool> selectedOf(WidgetTester tester) => tester
-        .widget<SegmentedButton<bool>>(find.byType(SegmentedButton<bool>))
-        .selected;
-
-    testWidgets('starts on the original quality when nothing is saved', (
+    testWidgets('shows mobile-fixed text and no quality segmented button', (
       tester,
     ) async {
       await pumpDetail(tester, InMemoryKeyValueStore());
-      expect(selectedOf(tester), {false});
-    });
-
-    testWidgets('starts from the saved quality and writes changes back', (
-      tester,
-    ) async {
-      final keyValues = InMemoryKeyValueStore();
-      await keyValues.write('playback_use_mobile', 'true');
-      await pumpDetail(tester, keyValues);
-      expect(selectedOf(tester), {true});
-
-      await tester.tap(find.text('元画質 (DR)'));
-      await tester.pump();
-      expect(selectedOf(tester), {false});
-      expect(await keyValues.read('playback_use_mobile'), 'false');
+      expect(find.text('画質: モバイル固定'), findsOneWidget);
+      expect(find.byType(SegmentedButton<bool>), findsNothing);
     });
   });
 }

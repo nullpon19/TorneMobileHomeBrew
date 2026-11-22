@@ -1,10 +1,17 @@
 package com.markun.tmhb
 
+import android.Manifest
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.view.WindowManager
@@ -12,6 +19,8 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.system.StructPollfd
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -30,6 +39,7 @@ class MainActivity : FlutterActivity() {
     private val akeConnections = mutableMapOf<Int, AkeSocketConnection>()
     private val akeExecutor = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingStoragePermissionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -117,6 +127,37 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FIRETV_HELPER_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "setMediaVolumeMax" -> result.success(setMediaVolumeMax())
+                    "isVpnActive" -> result.success(isVpnActive())
+                    "isTailscaleInstalled" -> result.success(isTailscaleInstalled())
+                    "tryConnectTailscale" -> result.success(tryConnectTailscale())
+                    "launchTailscale" -> result.success(launchTailscale())
+                    "hasStoragePermission" -> result.success(hasStoragePermission())
+                    "requestStoragePermission" -> requestStoragePermission(result)
+                    "getAppFilesDirPath" -> result.success(getExternalFilesDir(null)?.absolutePath)
+                    "listCredentialCandidateFiles" -> {
+                        akeExecutor.execute {
+                            val list = listCredentialCandidateFiles()
+                            mainHandler.post { result.success(list) }
+                        }
+                    }
+                    "readFileBytes" -> {
+                        val path = call.argument<String>("path")
+                        if (path == null) {
+                            result.success(null)
+                        } else {
+                            akeExecutor.execute {
+                                val bytes = readCandidateFileBytes(path)
+                                mainHandler.post { result.success(bytes) }
+                            }
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, AKE_SOCKET_EVENTS_CHANNEL)
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -188,12 +229,204 @@ class MainActivity : FlutterActivity() {
         startActivity(Intent.createChooser(intent, "デバッグログを共有"))
     }
 
+    private fun setMediaVolumeMax(): Boolean =
+        try {
+            val audio = applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: return false
+            val maxVolume = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, maxVolume, 0)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+    @Suppress("DEPRECATION")
+    private fun isVpnActive(): Boolean =
+        try {
+            val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+            val activeCaps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+                return true
+            }
+            cm.allNetworks.any { network ->
+                cm.getNetworkCapabilities(network)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            }
+        } catch (_: Exception) {
+            false
+        }
+
+    private fun tailscaleLaunchIntent(): Intent? =
+        packageManager.getLeanbackLaunchIntentForPackage(TAILSCALE_PACKAGE)
+            ?: packageManager.getLaunchIntentForPackage(TAILSCALE_PACKAGE)
+
+    private fun isTailscaleInstalled(): Boolean =
+        try {
+            tailscaleLaunchIntent() != null
+        } catch (_: Exception) {
+            false
+        }
+
+    private fun tryConnectTailscale(): Boolean =
+        try {
+            val intent = Intent("com.tailscale.ipn.CONNECT_VPN").apply {
+                setPackage(TAILSCALE_PACKAGE)
+            }
+            sendBroadcast(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+    private fun launchTailscale(): Boolean =
+        try {
+            val intent = tailscaleLaunchIntent() ?: return false
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+    private fun hasStoragePermission(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return true
+        }
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestStoragePermission(result: MethodChannel.Result) {
+        if (hasStoragePermission()) {
+            result.success(true)
+            return
+        }
+        pendingStoragePermissionResult?.success(false)
+        pendingStoragePermissionResult = result
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
+            STORAGE_PERMISSION_REQUEST_CODE,
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == STORAGE_PERMISSION_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val pending = pendingStoragePermissionResult
+            pendingStoragePermissionResult = null
+            pending?.success(granted)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun listCredentialCandidateFiles(): List<Map<String, Any>> {
+        val roots = listOf(
+            Triple(getExternalFilesDir(null), "アプリ専用フォルダ", 2),
+            Triple(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "Download",
+                2,
+            ),
+            Triple(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                "Documents",
+                2,
+            ),
+            Triple(Environment.getExternalStorageDirectory(), "内部ストレージ", 1),
+        )
+        val allowedExts = setOf("env", "txt", "cert", "key", "pem", "bin")
+        val seenPaths = HashSet<String>()
+        val results = ArrayList<Map<String, Any>>()
+
+        fun scanDir(dir: File, folderLabel: String, depthRemaining: Int) {
+            val children = try {
+                dir.listFiles()
+            } catch (_: Exception) {
+                null
+            } ?: return
+            for (child in children) {
+                if (results.size >= MAX_CREDENTIAL_CANDIDATES) return
+                val name = child.name
+                if (name.startsWith(".")) continue
+                if (child.isDirectory) {
+                    if (depthRemaining > 1) {
+                        scanDir(child, "$folderLabel/$name", depthRemaining - 1)
+                    }
+                    continue
+                }
+                if (!child.isFile || !child.canRead()) continue
+                val size = child.length()
+                if (size !in 1L..MAX_CREDENTIAL_FILE_BYTES) continue
+                val ext = child.extension.lowercase()
+                val lowerName = name.lowercase()
+                if (ext !in allowedExts && !lowerName.contains("credential")) continue
+                val canonical = try {
+                    child.canonicalPath
+                } catch (_: Exception) {
+                    child.absolutePath
+                }
+                if (!seenPaths.add(canonical)) continue
+                results.add(
+                    mapOf(
+                        "path" to child.absolutePath,
+                        "name" to name,
+                        "folder" to folderLabel,
+                        "size" to size,
+                    ),
+                )
+            }
+        }
+
+        for ((root, label, depth) in roots) {
+            if (root != null && root.exists() && root.isDirectory) {
+                scanDir(root, label, depth)
+            }
+        }
+
+        results.sortWith(
+            compareByDescending<Map<String, Any>> {
+                val name = (it["name"] as String).lowercase()
+                name.endsWith(".env") || name.contains("credential")
+            }.thenBy { it["folder"] as String }
+                .thenBy { (it["name"] as String).lowercase() },
+        )
+        return results
+    }
+
+    private fun readCandidateFileBytes(path: String): ByteArray? =
+        try {
+            val file = File(path)
+            if (!file.exists() || !file.isFile || !file.canRead()) {
+                null
+            } else {
+                val size = file.length()
+                if (size !in 1L..MAX_CREDENTIAL_FILE_BYTES) null else file.readBytes()
+            }
+        } catch (_: Exception) {
+            null
+        }
+
     companion object {
         private const val MULTICAST_LOCK_CHANNEL = "com.markun.tmhb/multicast_lock"
         private const val WAKELOCK_CHANNEL = "com.markun.tmhb/wakelock"
         private const val SHARE_FILES_CHANNEL = "com.markun.tmhb/share_files"
         private const val AKE_SOCKET_CHANNEL = "com.markun.tmhb/ake_socket"
         private const val AKE_SOCKET_EVENTS_CHANNEL = "com.markun.tmhb/ake_socket_events"
+        private const val FIRETV_HELPER_CHANNEL = "com.markun.tmhb/firetv_helper"
+        private const val TAILSCALE_PACKAGE = "com.tailscale.ipn"
+        private const val STORAGE_PERMISSION_REQUEST_CODE = 1001
+        private const val MAX_CREDENTIAL_FILE_BYTES = 1_048_576L
+        private const val MAX_CREDENTIAL_CANDIDATES = 100
     }
 }
 

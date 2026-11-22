@@ -8,12 +8,14 @@ library;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/providers.dart';
 import '../app/state.dart';
 import 'epg_screen.dart';
 import 'home_screen.dart';
 import 'live_screen.dart';
 import 'schedules_screen.dart';
 import 'settings_screen.dart';
+import 'tailscale_guard.dart';
 import 'titles_screen.dart';
 
 /// Width at or above which the shell uses a navigation rail.
@@ -71,55 +73,76 @@ class AppShell extends ConsumerWidget {
     ];
     void select(int index) => ref.read(tabIndexProvider.notifier).select(index);
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final body = IndexedStack(index: tab, children: screens);
-        if (constraints.maxWidth >= railBreakpoint) {
-          final reportedTopInset = MediaQuery.paddingOf(context).top;
-          final extraTop = wideLayoutMinTopInset > reportedTopInset
-              ? wideLayoutMinTopInset - reportedTopInset
-              : 0.0;
-          return Scaffold(
-            body: Padding(
-              padding: EdgeInsets.only(top: extraTop),
-              child: Row(
-                children: [
-                  NavigationRail(
-                    selectedIndex: tab,
-                    onDestinationSelected: select,
-                    labelType: NavigationRailLabelType.all,
-                    destinations: [
-                      for (final d in _destinations)
-                        NavigationRailDestination(
-                          icon: Icon(d.icon),
-                          selectedIcon: Icon(d.selectedIcon),
-                          label: Text(d.label),
+    return TailscaleGuard(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final body = IndexedStack(index: tab, children: screens);
+          if (constraints.maxWidth >= railBreakpoint) {
+            final reportedTopInset = MediaQuery.paddingOf(context).top;
+            final extraTop = wideLayoutMinTopInset > reportedTopInset
+                ? wideLayoutMinTopInset - reportedTopInset
+                : 0.0;
+            return Scaffold(
+              body: Padding(
+                padding: EdgeInsets.only(top: extraTop),
+                child: Row(
+                  children: [
+                    NavigationRail(
+                      selectedIndex: tab,
+                      onDestinationSelected: select,
+                      labelType: NavigationRailLabelType.all,
+                      destinations: [
+                        for (final d in _destinations)
+                          NavigationRailDestination(
+                            icon: Icon(d.icon),
+                            selectedIcon: Icon(d.selectedIcon),
+                            label: Text(d.label),
+                          ),
+                      ],
+                      trailing: Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: IconButton(
+                          tooltip: 'Tailscale を開く',
+                          icon: const Icon(Icons.vpn_lock),
+                          onPressed: () async {
+                            final ok = await ref
+                                .read(fireTvHelperProvider)
+                                .launchTailscale();
+                            if (!ok && context.mounted) {
+                              ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+                                const SnackBar(
+                                  content: Text('Tailscale アプリが見つかりませんでした'),
+                                ),
+                              );
+                            }
+                          },
                         ),
-                    ],
-                  ),
-                  const VerticalDivider(thickness: 1, width: 1),
-                  Expanded(child: body),
-                ],
+                      ),
+                    ),
+                    const VerticalDivider(thickness: 1, width: 1),
+                    Expanded(child: body),
+                  ],
+                ),
               ),
+            );
+          }
+          return Scaffold(
+            body: body,
+            bottomNavigationBar: NavigationBar(
+              selectedIndex: tab,
+              onDestinationSelected: select,
+              destinations: [
+                for (final d in _destinations)
+                  NavigationDestination(
+                    icon: Icon(d.icon),
+                    selectedIcon: Icon(d.selectedIcon),
+                    label: d.label,
+                  ),
+              ],
             ),
           );
-        }
-        return Scaffold(
-          body: body,
-          bottomNavigationBar: NavigationBar(
-            selectedIndex: tab,
-            onDestinationSelected: select,
-            destinations: [
-              for (final d in _destinations)
-                NavigationDestination(
-                  icon: Icon(d.icon),
-                  selectedIcon: Icon(d.selectedIcon),
-                  label: d.label,
-                ),
-            ],
-          ),
-        );
-      },
+        },
+      ),
     );
   }
 }

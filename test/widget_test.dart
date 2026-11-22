@@ -18,7 +18,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
-    expect(app.title, 'torne mobile HB');
+    expect(app.title, 'torne HB FireTV');
     expect(find.text('torne mobile HB'), findsWidgets);
     expect(find.text('nasne が登録されていません'), findsOneWidget);
     expect(find.text('設定で登録する'), findsOneWidget);

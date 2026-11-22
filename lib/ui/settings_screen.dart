@@ -211,22 +211,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('再生画質', style: Theme.of(context).textTheme.titleSmall),
-                const SizedBox(height: 8),
-                SegmentedButton<bool>(
-                  segments: const [
-                    ButtonSegment(value: false, label: Text('元画質 (DR)')),
-                    ButtonSegment(value: true, label: Text('モバイル')),
-                  ],
-                  selected: {ref.watch(playbackQualityProvider)},
-                  onSelectionChanged: (selection) => ref
-                      .read(playbackQualityProvider.notifier)
-                      .set(selection.first),
-                ),
-                const SizedBox(height: 8),
                 Text(
-                  'TV 視聴と録画再生を開始するときの画質です。'
-                  '各視聴画面で画質を変更すると、この値も更新されます。',
+                  '再生画質: モバイル固定',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Fire TV 版では安定再生のため、TV 視聴・録画再生ともに常にモバイル画質を使用します'
+                  '（モバイル画質が存在しない番組のみ元画質にフォールバックします）。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],

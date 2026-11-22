@@ -38,10 +38,17 @@ class LiveScreen extends ConsumerStatefulWidget {
 
 class _LiveScreenState extends ConsumerState<LiveScreen> {
   String? _selectedId;
+  final FocusNode _detailWatchFocusNode = FocusNode(debugLabel: 'liveWatch');
 
   /// Container id of the band whose tab is selected; null
   /// means the first band with channels.
   String? _selectedBandId;
+
+  @override
+  void dispose() {
+    _detailWatchFocusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -67,11 +74,17 @@ class _LiveScreenState extends ConsumerState<LiveScreen> {
               reg: reg,
               selectedId: _selectedId,
               selectedBandId: _selectedBandId,
+              detailWatchFocusNode: _detailWatchFocusNode,
               onSelectBand: (bandId) =>
                   setState(() => _selectedBandId = bandId),
               onSelect: (channel, twoPane) {
                 if (twoPane) {
                   setState(() => _selectedId = channel.id);
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted && _detailWatchFocusNode.canRequestFocus) {
+                      _detailWatchFocusNode.requestFocus();
+                    }
+                  });
                 } else {
                   Navigator.of(context).push(
                     MaterialPageRoute(
@@ -103,6 +116,7 @@ class _LiveList extends ConsumerWidget {
     required this.reg,
     required this.selectedId,
     required this.selectedBandId,
+    required this.detailWatchFocusNode,
     required this.onSelectBand,
     required this.onSelect,
   });
@@ -110,6 +124,7 @@ class _LiveList extends ConsumerWidget {
   final RegisteredNasne reg;
   final String? selectedId;
   final String? selectedBandId;
+  final FocusNode detailWatchFocusNode;
   final ValueChanged<String> onSelectBand;
   final void Function(LiveChannel channel, bool twoPane) onSelect;
 
@@ -206,7 +221,11 @@ class _LiveList extends ConsumerWidget {
                 flex: 6,
                 child: selected == null
                     ? const Center(child: Text('チャンネルを選択してください'))
-                    : LiveChannelDetailView(reg: reg, channel: selected),
+                    : LiveChannelDetailView(
+                        reg: reg,
+                        channel: selected,
+                        watchFocusNode: detailWatchFocusNode,
+                      ),
               ),
             ],
           );
@@ -309,7 +328,11 @@ class LiveChannelDetailPage extends ConsumerWidget {
         for (final band in list) {
           for (final channel in band.channels) {
             if (channel.id == channelId) {
-              return LiveChannelDetailView(reg: reg, channel: channel);
+              return LiveChannelDetailView(
+                reg: reg,
+                channel: channel,
+                autofocusWatch: true,
+              );
             }
           }
         }
@@ -319,20 +342,23 @@ class LiveChannelDetailPage extends ConsumerWidget {
   }
 }
 
-/// The channel detail: the current programme's information and
-/// the viewing action, with the plan-33 quality choice when the
-/// channel offers a mobile resource. The choice starts from the
-/// saved playback quality — the original quality until one is
-/// saved — and writes changes back to it.
+/// The channel detail optimized for Fire TV D-pad navigation:
+/// programme title, channel/broadcast time, and the watch button
+/// placed immediately above truncated descriptions, with playback
+/// quality fixed to mobile (falling back when unavailable).
 class LiveChannelDetailView extends ConsumerStatefulWidget {
   const LiveChannelDetailView({
     super.key,
     required this.reg,
     required this.channel,
+    this.watchFocusNode,
+    this.autofocusWatch = false,
   });
 
   final RegisteredNasne reg;
   final LiveChannel channel;
+  final FocusNode? watchFocusNode;
+  final bool autofocusWatch;
 
   @override
   ConsumerState<LiveChannelDetailView> createState() =>
@@ -340,19 +366,6 @@ class LiveChannelDetailView extends ConsumerStatefulWidget {
 }
 
 class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
-  /// Playback quality choice (plan 33, shared with recordings).
-  /// The visit starts from the saved quality
-  /// (playbackQualityProvider) and a change here writes back
-  /// to it, so the choice carries to the next viewing. Null
-  /// until the viewer touches the choice on this visit — the
-  /// saved value, including its asynchronous restore, shows
-  /// through meanwhile.
-  bool? _useMobileChoice;
-
-  /// The quality in effect on this visit: this screen's own
-  /// choice once made, the saved quality otherwise.
-  bool get _useMobile => _useMobileChoice ?? ref.read(playbackQualityProvider);
-
   /// A viewing start is in flight (plan 35 guard, shared with
   /// recordings): while set, the button is disabled and _watch
   /// is re-entrancy-guarded.
@@ -364,24 +377,19 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
   @override
   Widget build(BuildContext context) {
     final ch = channel;
-    // The quality choice in effect: this visit's own choice
-    // once made, the saved quality otherwise. Watching the
-    // saved quality rebuilds this view when its asynchronous
-    // restore lands.
-    final bool useMobile =
-        _useMobileChoice ?? ref.watch(playbackQualityProvider);
-    final originalRes = ch.originalRes;
     final mobileRes = ch.mobileRes;
-    final originalLabel = originalRes?.quality == null
-        ? '元画質'
-        : '元画質 (${resQualityLabel(originalRes!.quality)})';
     final start = ch.programStart;
     final end = ch.programEnd;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Text(ch.programTitle, style: Theme.of(context).textTheme.titleLarge),
-        const SizedBox(height: 12),
+        Text(
+          ch.programTitle,
+          style: Theme.of(context).textTheme.titleLarge,
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+        ),
+        const SizedBox(height: 8),
         if (ch.channelName != null)
           FieldRow(label: 'チャンネル', value: ch.channelName!),
         if (start != null && end != null)
@@ -391,42 +399,44 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
                 '${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}',
           ),
         if (ch.genre != null) FieldRow(label: 'ジャンル', value: ch.genre!),
+        const SizedBox(height: 16),
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            FilledButton.icon(
+              focusNode: widget.watchFocusNode,
+              autofocus: widget.autofocusWatch,
+              onPressed: _starting ? null : () => _watch(context, ref),
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('視聴'),
+            ),
+            if (mobileRes != null)
+              Text(
+                '画質: モバイル固定',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+          ],
+        ),
         if (ch.description != null && ch.description!.isNotEmpty) ...[
           const SizedBox(height: 12),
-          Text('概要', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 4),
-          Text(ch.description!),
+          Text(
+            ch.description!,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
         ],
         if (ch.longDescription != null && ch.longDescription!.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Text('詳細', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 4),
-          Text(ch.longDescription!),
-        ],
-        const SizedBox(height: 24),
-        if (mobileRes != null) ...[
-          Text('再生画質', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 8),
-          SegmentedButton<bool>(
-            segments: [
-              ButtonSegment(value: false, label: Text(originalLabel)),
-              const ButtonSegment(value: true, label: Text('モバイル')),
-            ],
-            selected: {useMobile},
-            onSelectionChanged: (selection) {
-              setState(() => _useMobileChoice = selection.first);
-              ref.read(playbackQualityProvider.notifier).set(selection.first);
-            },
+          const SizedBox(height: 6),
+          Text(
+            ch.longDescription!,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
           ),
-          const SizedBox(height: 16),
         ],
-        FilledButton.icon(
-          onPressed: _starting ? null : () => _watch(context, ref),
-          icon: const Icon(Icons.play_arrow),
-          label: const Text('視聴'),
-        ),
-        const SizedBox(height: 8),
-        const Text('視聴には DTCP-IP の資格情報が必要です (設定画面からインポートできます)。'),
       ],
     );
   }
@@ -442,9 +452,7 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
       showSnack(context, '視聴可能なコンテンツがありません');
       return;
     }
-    final res =
-        (_useMobile ? channel.mobileRes : channel.originalRes) ??
-        channel.res.first;
+    final res = channel.mobileRes ?? channel.originalRes ?? channel.res.first;
     setState(() => _starting = true);
     try {
       await startPlaybackAndShowPlayer(

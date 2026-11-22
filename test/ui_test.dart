@@ -1347,8 +1347,8 @@ void main() {
     expect(fixture.titlesService.deletedIds, isEmpty);
   });
 
-  testWidgets('title detail with a mobile res offers the quality choice; '
-      'the original is the default (plan 33)', (tester) async {
+  testWidgets('title detail with a mobile res always uses mobile quality '
+      '(Fire TV fixed)', (tester) async {
     usePhoneSize(tester);
     final engine = RecordingPlaybackEngine();
     final fixture = Fixture(
@@ -1387,64 +1387,52 @@ void main() {
     await tester.tap(find.text('モバイル付きタイトル'));
     await tester.pumpAndSettle();
 
-    expect(find.text('再生画質'), findsOneWidget);
-    expect(find.text('元画質 (DR)'), findsOneWidget);
-    expect(find.text('モバイル'), findsOneWidget);
+    expect(find.text('画質: モバイル固定'), findsOneWidget);
+    expect(find.byType(SegmentedButton<bool>), findsNothing);
 
-    // No selection change: the engine receives the original res.
-    await tester.tap(find.text('再生'));
-    await tester.pumpAndSettle();
-    expect(engine.lastRes?.quality, 'dr');
-    expect(find.text('資格情報が必要です'), findsOneWidget);
-    await tester.tap(find.text('閉じる'));
-    await tester.pumpAndSettle();
-
-    // Selecting mobile switches the res the engine receives.
-    await tester.tap(find.text('モバイル'));
-    await tester.pumpAndSettle();
+    // Fire TV build always selects mobile when available.
     await tester.tap(find.text('再生'));
     await tester.pumpAndSettle();
     expect(engine.lastRes?.quality, 'mobile');
+    expect(find.text('資格情報が必要です'), findsOneWidget);
     await tester.tap(find.text('閉じる'));
     await tester.pumpAndSettle();
   });
 
-  RecordedTitle mobileTitle() => RecordedTitle(
-    id: '301',
-    title: 'モバイル付きタイトル',
-    scheduledStart: DateTime.parse('2026-11-15T13:00:00+09:00'),
-    scheduledDurationSeconds: 1800,
-    channelName: 'テスト放送',
-    copyCountRemaining: 10,
-    res: const [
-      TitleRes(
-        url: 'http://192.0.2.10:58890/web/video/pvr?id=301&quality=dr',
-        protocolInfo: 'http-get:*:application/x-dtcp1:*',
-        cleartextSize: 200000000,
-        quality: 'dr',
-      ),
-      TitleRes(
-        url: 'http://192.0.2.10:58890/web/video/pvr?id=301&quality=mobile',
-        protocolInfo: 'http-get:*:application/x-dtcp1:*',
-        cleartextSize: 20000000,
-        quality: 'mobile',
-      ),
-    ],
-  );
-
-  Finder qualityButton() => find.descendant(
-    of: find.byType(TitleDetailView),
-    matching: find.byType(SegmentedButton<bool>),
-  );
-
   testWidgets(
-    'title detail quality choice starts from the saved quality and '
-    'writes changes back (playback quality memory)',
+    'title detail picks mobile even if stored quality was false',
     (tester) async {
       usePhoneSize(tester);
       final engine = RecordingPlaybackEngine();
-      final fixture = Fixture(titles: [mobileTitle()], playback: engine);
-      await fixture.keyValues.write('playback_use_mobile', 'true');
+      final fixture = Fixture(
+        titles: [
+          RecordedTitle(
+            id: '301',
+            title: 'モバイル付きタイトル',
+            scheduledStart: DateTime.parse('2026-11-15T13:00:00+09:00'),
+            scheduledDurationSeconds: 1800,
+            channelName: 'テスト放送',
+            copyCountRemaining: 10,
+            res: const [
+              TitleRes(
+                url: 'http://192.0.2.10:58890/web/video/pvr?id=301&quality=dr',
+                protocolInfo: 'http-get:*:application/x-dtcp1:*',
+                cleartextSize: 200000000,
+                quality: 'dr',
+              ),
+              TitleRes(
+                url:
+                    'http://192.0.2.10:58890/web/video/pvr?id=301&quality=mobile',
+                protocolInfo: 'http-get:*:application/x-dtcp1:*',
+                cleartextSize: 20000000,
+                quality: 'mobile',
+              ),
+            ],
+          ),
+        ],
+        playback: engine,
+      );
+      await fixture.keyValues.write('playback_use_mobile', 'false');
       await tester.pumpWidget(fixture.app());
       await tester.pumpAndSettle();
 
@@ -1453,60 +1441,11 @@ void main() {
       await tester.tap(find.text('モバイル付きタイトル'));
       await tester.pumpAndSettle();
 
-      // The saved mobile choice is the starting selection, and
-      // playback uses it without the choice being touched.
-      expect(tester.widget<SegmentedButton<bool>>(qualityButton()).selected, {
-        true,
-      });
       await tester.tap(find.text('再生'));
       await tester.pumpAndSettle();
       expect(engine.lastRes?.quality, 'mobile');
       await tester.tap(find.text('閉じる'));
       await tester.pumpAndSettle();
-
-      // Changing the choice writes back to the saved value.
-      await tester.tap(find.text('元画質 (DR)'));
-      await tester.pumpAndSettle();
-      expect(await fixture.keyValues.read('playback_use_mobile'), 'false');
-      await tester.tap(find.text('再生'));
-      await tester.pumpAndSettle();
-      expect(engine.lastRes?.quality, 'dr');
-      await tester.tap(find.text('閉じる'));
-      await tester.pumpAndSettle();
-    },
-  );
-
-  testWidgets(
-    'a quality choice made on the title detail persists to the '
-    'next visit (playback quality memory)',
-    (tester) async {
-      usePhoneSize(tester);
-      final engine = RecordingPlaybackEngine();
-      final fixture = Fixture(titles: [mobileTitle()], playback: engine);
-      await tester.pumpWidget(fixture.app());
-      await tester.pumpAndSettle();
-
-      await tester.tap(find.text('録画済み'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('モバイル付きタイトル'));
-      await tester.pumpAndSettle();
-
-      // Nothing saved: the original quality is the start.
-      expect(tester.widget<SegmentedButton<bool>>(qualityButton()).selected, {
-        false,
-      });
-
-      await tester.tap(find.text('モバイル'));
-      await tester.pumpAndSettle();
-      expect(await fixture.keyValues.read('playback_use_mobile'), 'true');
-
-      await tester.pageBack();
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('モバイル付きタイトル'));
-      await tester.pumpAndSettle();
-      expect(tester.widget<SegmentedButton<bool>>(qualityButton()).selected, {
-        true,
-      });
     },
   );
 
@@ -1628,8 +1567,8 @@ void main() {
     expect(find.textContaining('14:05–14:50'), findsOneWidget);
   });
 
-  testWidgets('live detail offers the quality choice and viewing '
-      'passes the chosen res to the engine (plan 39)', (tester) async {
+  testWidgets('live detail always uses mobile quality when available '
+      '(Fire TV fixed)', (tester) async {
     usePhoneSize(tester);
     final engine = RecordingPlaybackEngine();
     final fixture = Fixture(playback: engine);
@@ -1642,27 +1581,15 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('ライブ番組A'), findsWidgets);
-    expect(find.text('再生画質'), findsOneWidget);
-    expect(find.text('元画質 (DR)'), findsOneWidget);
-    expect(find.text('モバイル'), findsOneWidget);
+    expect(find.text('画質: モバイル固定'), findsOneWidget);
+    expect(find.byType(SegmentedButton<bool>), findsNothing);
 
-    // No selection change: the engine receives the original res.
     await tester.tap(find.text('視聴'));
     await tester.pumpAndSettle();
     expect(engine.liveStartCalls, 1);
     expect(engine.lastLiveChannel?.serviceId, 0xde00);
-    expect(engine.lastLiveRes?.quality, 'dr');
-    expect(find.text('資格情報が必要です'), findsOneWidget);
-    await tester.tap(find.text('閉じる'));
-    await tester.pumpAndSettle();
-
-    // Selecting mobile switches the res the engine receives.
-    await tester.tap(find.text('モバイル'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('視聴'));
-    await tester.pumpAndSettle();
-    expect(engine.liveStartCalls, 2);
     expect(engine.lastLiveRes?.quality, 'mobile');
+    expect(find.text('資格情報が必要です'), findsOneWidget);
     await tester.tap(find.text('閉じる'));
     await tester.pumpAndSettle();
   });

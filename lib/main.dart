@@ -42,17 +42,63 @@ Future<void> main() async {
 class TmhbApp extends StatelessWidget {
   const TmhbApp({super.key});
 
+  static ThemeData _buildTheme() {
+    final scheme = ColorScheme.fromSeed(seedColor: Colors.indigo);
+    const focusBorder = BorderSide(color: Colors.amber, width: 3);
+    return ThemeData(
+      colorScheme: scheme,
+      focusColor: Colors.amber.withValues(alpha: 0.28),
+      listTileTheme: ListTileThemeData(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: ButtonStyle(
+          side: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused)
+                ? focusBorder
+                : BorderSide.none,
+          ),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: ButtonStyle(
+          side: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused)
+                ? focusBorder
+                : BorderSide(color: scheme.outline),
+          ),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: ButtonStyle(
+          side: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused)
+                ? focusBorder
+                : BorderSide.none,
+          ),
+        ),
+      ),
+      iconButtonTheme: IconButtonThemeData(
+        style: ButtonStyle(
+          side: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused)
+                ? focusBorder
+                : BorderSide.none,
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'torne mobile HB',
+      title: 'torne HB FireTV',
       // A tap outside a text field dismisses the keyboard
       // anywhere in the app (plan 54).
       builder: (context, child) =>
           KeyboardDismissOnTap(child: child ?? const SizedBox.shrink()),
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-      ),
+      theme: _buildTheme(),
       home: const AppShell(),
     );
   }

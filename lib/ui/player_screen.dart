@@ -172,19 +172,19 @@ library;
 
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
 import 'player_error_policy.dart';
 import 'player_resume_policy.dart';
-import 'player_safe_area_policy.dart';
 import 'player_seek_policy.dart';
 import 'player_speed_policy.dart';
 import 'player_teardown_policy.dart';
@@ -354,40 +354,42 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// first byte even with the streaming proxy.
   static const int mpvNetworkTimeoutSeconds = 30;
 
-  /// Seek bar dimensions in the video controls (player UI
-  /// follow-up). The stock Material theme's visible bar is
-  /// 2.4 px inside a 36 px container with a 12.8 px thumb;
-  /// the container is the touch target, so it grows to
-  /// 48 px, the thumb to 16 px and the visible bar to 4 px.
-  /// The desktop theme takes the same three values.
-  static const double seekBarThickness = 4.0;
-  static const double seekBarTouchHeight = 48.0;
-  static const double seekBarThumbDiameter = 16.0;
-
-  /// How far the non-fullscreen seek bar is lifted off the
-  /// video's bottom edge (player UI follow-up). Outside
-  /// fullscreen the stock theme gives the bar a zero margin
-  /// and the controls no safe-area padding, leaving it
-  /// under the iPhone home indicator; the fullscreen theme
-  /// already carries a 42 px margin over the safe-area
-  /// padding and keeps it. This lift is only the gap kept
-  /// above the gesture area: the theme adds the device's
-  /// bottom view padding under it (plan 105, see
-  /// player_safe_area_policy).
-  static const double seekBarBottomLift = 12.0;
-
-  /// The diagnostics log, captured in [initState] (plan
-  /// 104): dispose and the teardown it drives read no
+  /// The diagnostics log and Fire TV helper, captured in [initState]
+  /// (plan 104): dispose and the teardown it drives read no
   /// provider through ref — Riverpod 3 throws once the
   /// widget is deactivating, and a throw there aborts the
   /// teardown (see player_teardown_policy).
   late final DiagLog _diag;
+  late final FireTvHelper _fireTvHelper;
+
+  final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
+  final FocusNode _osdFirstFocusNode = FocusNode(debugLabel: 'playerOsdFirst');
+
+  bool _osdOpen = false;
+  Timer? _osdTimer;
+
+  IconData? _hudIcon;
+  String? _hudText;
+  Timer? _hudTimer;
+
+  Timer? _seekDebounceTimer;
+  Duration _pendingSeekOffset = Duration.zero;
+  Duration? _seekBasePosition;
+
+  static const Duration _rewindStep = Duration(seconds: -10);
+  static const Duration _forwardStep = Duration(seconds: 30);
 
   @override
   void initState() {
     super.initState();
     _diag = ref.read(diagLogProvider);
+    _fireTvHelper = ref.read(fireTvHelperProvider);
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
+    unawaited(_fireTvHelper.setMediaVolumeMax());
     _player = Player();
+    unawaited(_player.setVolume(100.0));
     _videoController = VideoController(_player);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
@@ -592,6 +594,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _interruptDetail = null;
     });
     try {
+      await _player.setVolume(100.0);
       await _player.open(
         Media(
           widget.session.mediaUri.toString(),
@@ -600,6 +603,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               : null,
         ),
       );
+      await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
       _diag(DiagCategory.playback, 'player: resume failed: $e');
@@ -704,31 +708,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       });
     } catch (e) {
       _diag(DiagCategory.playback, 'player: seekable observation failed: $e');
-    }
-  }
-
-  /// Seeks by [offset] (±[skipSeekStep]) from the current
-  /// position (player UI follow-up). Reached only through
-  /// the skip buttons, which stay disabled while [_seekable]
-  /// is false; a refusal that still comes back lands on the
-  /// error stream and is classified there (see
-  /// player_error_policy), so it cannot fail a playback
-  /// already under way.
-  Future<void> _skipSeek(Duration offset) async {
-    final target = skipSeekTarget(
-      position: _player.state.position,
-      offset: offset,
-      duration: _player.state.duration,
-    );
-    _diag(
-      DiagCategory.playback,
-      'player: skip seek by ${offset.inSeconds}s '
-      'to ${target.inSeconds}s',
-    );
-    try {
-      await _player.seek(target);
-    } catch (e) {
-      _diag(DiagCategory.playback, 'player: skip seek failed: $e');
     }
   }
 
@@ -848,9 +827,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           '(plan 86)',
         );
       }
+      await _player.setVolume(100.0);
       await _player.open(
         Media(widget.session.mediaUri.toString(), start: start),
       );
+      await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: open completed');
       await _applySubtitleSelection();
     } catch (e) {
@@ -867,179 +848,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _watchdog?.cancel();
       if (mounted) setState(() => _error = '$e');
     }
-  }
-
-  /// The Material (Android / iOS) controls theme with this
-  /// screen's seek bar dimensions (player UI follow-up)
-  /// and, for recordings, the ±10 s skip buttons in the
-  /// transport row. Built from media_kit's defaults via
-  /// copyWith so the gestures and the rest of the stock
-  /// behaviour carry over unchanged.
-  ///
-  /// Outside fullscreen the bottom margins also clear the
-  /// system gesture area (plan 105): the seek bar's margin
-  /// and the bottom button bar's margin grow by
-  /// [bottomViewPadding], the device's bottom view
-  /// padding, and the button bar's right margin moves the
-  /// fullscreen button in from the corner (see
-  /// player_safe_area_policy). Fullscreen needs none of
-  /// this: media_kit pads the fullscreen controls by the
-  /// safe area itself, under the stock 42 px margins.
-  MaterialVideoControlsThemeData _materialControlsTheme({
-    required bool fullscreen,
-    double bottomViewPadding = 0,
-  }) {
-    final base = fullscreen
-        ? kDefaultMaterialVideoControlsThemeDataFullscreen
-        : kDefaultMaterialVideoControlsThemeData;
-    var data = base.copyWith(
-      seekBarHeight: seekBarThickness,
-      seekBarContainerHeight: seekBarTouchHeight,
-      seekBarThumbSize: seekBarThumbDiameter,
-    );
-    if (!fullscreen) {
-      data = data.copyWith(
-        seekBarMargin: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: seekBarBottomMargin(
-            lift: seekBarBottomLift,
-            viewPaddingBottom: bottomViewPadding,
-          ),
-        ),
-        bottomButtonBarMargin: EdgeInsets.only(
-          left: 16,
-          right: bottomButtonBarRightMargin,
-          bottom: bottomButtonBarBottomMargin(bottomViewPadding),
-        ),
-      );
-    }
-    if (!widget.live) {
-      data = data.copyWith(
-        primaryButtonBar: _recordedPrimaryButtonBar(
-          playIconSize: fullscreen ? 56.0 : 48.0,
-        ),
-      );
-    }
-    return data;
-  }
-
-  /// The desktop controls theme with the same seek bar
-  /// dimensions (player UI follow-up); the desktop defaults
-  /// are one data set for both normal and fullscreen. The
-  /// skip buttons join the bottom transport row, which is
-  /// where the desktop controls keep theirs.
-  MaterialDesktopVideoControlsThemeData _desktopControlsTheme() {
-    var data = kDefaultMaterialDesktopVideoControlsThemeData.copyWith(
-      seekBarHeight: seekBarThickness,
-      seekBarContainerHeight: seekBarTouchHeight,
-      seekBarThumbSize: seekBarThumbDiameter,
-    );
-    if (!widget.live) {
-      data = data.copyWith(bottomButtonBar: _recordedDesktopButtonBar());
-    }
-    return data;
-  }
-
-  /// The Material transport row for recordings: media_kit's
-  /// stock row with a ±10 s skip button flanking the
-  /// play/pause button on each side (player UI follow-up),
-  /// and — when the title has chapter points — a chapter
-  /// button outside each skip button (plan 112).
-  List<Widget> _recordedPrimaryButtonBar({required double playIconSize}) => [
-    const Spacer(flex: 2),
-    const MaterialSkipPreviousButton(),
-    const Spacer(),
-    if (_chapters.isNotEmpty) ...[
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: false,
-        onSeek: () => _seekToChapter(forward: false),
-      ),
-      const Spacer(),
-    ],
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: -skipSeekStep,
-      onSkip: _skipSeek,
-    ),
-    const Spacer(),
-    MaterialPlayOrPauseButton(iconSize: playIconSize),
-    const Spacer(),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: skipSeekStep,
-      onSkip: _skipSeek,
-    ),
-    if (_chapters.isNotEmpty) ...[
-      const Spacer(),
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: true,
-        onSeek: () => _seekToChapter(forward: true),
-      ),
-    ],
-    const Spacer(),
-    const MaterialSkipNextButton(),
-    const Spacer(flex: 2),
-  ];
-
-  /// The desktop bottom row for recordings: the stock row
-  /// with the ±10 s skip buttons after the skip-next button
-  /// (player UI follow-up) and, when the title has chapter
-  /// points, the chapter buttons after them (plan 112).
-  List<Widget> _recordedDesktopButtonBar() => [
-    const MaterialDesktopSkipPreviousButton(),
-    const MaterialDesktopPlayOrPauseButton(),
-    const MaterialDesktopSkipNextButton(),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: -skipSeekStep,
-      onSkip: _skipSeek,
-      iconSize: 28,
-    ),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: skipSeekStep,
-      onSkip: _skipSeek,
-      iconSize: 28,
-    ),
-    if (_chapters.isNotEmpty) ...[
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: false,
-        onSeek: () => _seekToChapter(forward: false),
-        iconSize: 28,
-      ),
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: true,
-        onSeek: () => _seekToChapter(forward: true),
-        iconSize: 28,
-      ),
-    ],
-    const MaterialDesktopVolumeButton(),
-    const MaterialDesktopPositionIndicator(),
-    const Spacer(),
-    const MaterialDesktopFullscreenButton(),
-  ];
-
-  /// The video controls with the chapter ticks overlaid
-  /// on the seek bar (plan 112): the stock adaptive
-  /// controls, plus the ticks layer aligned to their
-  /// seek bar. Only built while the title has chapter
-  /// points — the plain adaptive controls serve live
-  /// viewing and chapterless recordings, exactly as
-  /// before.
-  Widget _controlsWithChapterTicks(VideoState state) {
-    return Stack(
-      children: [
-        AdaptiveVideoControls(state),
-        Positioned.fill(
-          child: _ChapterTicksOverlay(player: _player, chapters: _chapters),
-        ),
-      ],
-    );
   }
 
   /// The position leaving this screen reports to the unit,
@@ -1136,6 +944,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
+        (name: 'osd timer', run: () => _osdTimer?.cancel()),
+        (name: 'hud timer', run: () => _hudTimer?.cancel()),
+        (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
+        (
+          name: 'focus nodes',
+          run: () {
+            _rootFocusNode.dispose();
+            _osdFirstFocusNode.dispose();
+          },
+        ),
+        (
+          name: 'system ui restore',
+          run: () => unawaited(
+            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+          ),
+        ),
         (name: 'wakelock', run: () => _wakelockSession.release()),
         (
           name: 'subscriptions',
@@ -1163,136 +987,588 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     super.dispose();
   }
 
+  String _formatClock(Duration d) {
+    final total = d.isNegative ? 0 : d.inSeconds;
+    final hours = total ~/ 3600;
+    final minutes = (total % 3600) ~/ 60;
+    final seconds = total % 60;
+    final mm = minutes.toString().padLeft(2, '0');
+    final ss = seconds.toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:$mm:$ss' : '$mm:$ss';
+  }
+
+  void _showHudMessage(IconData icon, String text) {
+    _hudTimer?.cancel();
+    setState(() {
+      _hudIcon = icon;
+      _hudText = text;
+    });
+    _hudTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _hudIcon = null;
+          _hudText = null;
+        });
+      }
+    });
+  }
+
+  void _openOsd() {
+    setState(() => _osdOpen = true);
+    _resetOsdTimer();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _osdFirstFocusNode.canRequestFocus) {
+        _osdFirstFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _closeOsd() {
+    _osdTimer?.cancel();
+    if (!_osdOpen) return;
+    setState(() => _osdOpen = false);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _rootFocusNode.canRequestFocus) {
+        _rootFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _toggleOsd() {
+    if (_osdOpen) {
+      _closeOsd();
+    } else {
+      _openOsd();
+    }
+  }
+
+  void _resetOsdTimer() {
+    _osdTimer?.cancel();
+    _osdTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && _osdOpen) _closeOsd();
+    });
+  }
+
+  void _togglePlayPauseWithHud() {
+    final willPlay = !_playingNow;
+    unawaited(_player.playOrPause());
+    _showHudMessage(
+      willPlay ? Icons.play_arrow : Icons.pause,
+      willPlay ? '再生' : '一時停止',
+    );
+  }
+
+  void _queueRelativeSeek(Duration delta) {
+    if (widget.live) return;
+    _seekBasePosition ??= _player.state.position;
+    _pendingSeekOffset += delta;
+    final duration = _player.state.duration;
+    final preview = skipSeekTarget(
+      position: _seekBasePosition!,
+      offset: _pendingSeekOffset,
+      duration: duration,
+    );
+    final totalSec = _pendingSeekOffset.inSeconds;
+    final sign = totalSec >= 0 ? '+' : '';
+    final timeInfo = duration > Duration.zero
+        ? '${_formatClock(preview)} / ${_formatClock(duration)}'
+        : _formatClock(preview);
+    _showHudMessage(
+      totalSec < 0 ? Icons.replay_10 : Icons.forward_30,
+      '$sign$totalSec秒 ($timeInfo)',
+    );
+    _seekDebounceTimer?.cancel();
+    _seekDebounceTimer = Timer(const Duration(milliseconds: 250), () {
+      unawaited(_commitPendingSeek());
+    });
+  }
+
+  Future<void> _commitPendingSeek() async {
+    final base = _seekBasePosition;
+    final offset = _pendingSeekOffset;
+    _seekBasePosition = null;
+    _pendingSeekOffset = Duration.zero;
+    if (base == null || offset == Duration.zero) return;
+    final target = skipSeekTarget(
+      position: base,
+      offset: offset,
+      duration: _player.state.duration,
+    );
+    _diag(
+      DiagCategory.playback,
+      'player: dpad seek by ${offset.inSeconds}s to ${target.inSeconds}s',
+    );
+    try {
+      await _player.seek(target);
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: dpad seek failed: $e');
+    }
+  }
+
+  void _cyclePlaybackRate() {
+    if (!canChangePlaybackSpeed(live: widget.live)) return;
+    final idx = playbackSpeeds.indexOf(_playbackRate);
+    final next = playbackSpeeds[(idx + 1) % playbackSpeeds.length];
+    unawaited(_selectPlaybackRate(next));
+    _resetOsdTimer();
+  }
+
+  void _cycleAudioTrack() {
+    if (!canSwitchAudio(_realAudioTracks.length)) return;
+    final next = (_selectedAudioIndex + 1) % _realAudioTracks.length;
+    unawaited(_selectAudioTrack(next));
+    _resetOsdTimer();
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (_interrupted) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (_osdOpen) {
+      if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
+        _closeOsd();
+        return KeyEventResult.handled;
+      }
+      _resetOsdTimer();
+      return KeyEventResult.ignored;
+    }
+    final isRepeat = event is KeyRepeatEvent;
+    if (key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.mediaRewind) {
+      if (widget.live) {
+        if (!isRepeat) {
+          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+        }
+      } else {
+        _queueRelativeSeek(_rewindStep);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.mediaFastForward) {
+      if (widget.live) {
+        if (!isRepeat) {
+          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+        }
+      } else {
+        _queueRelativeSeek(_forwardStep);
+      }
+      return KeyEventResult.handled;
+    }
+    if (isRepeat) return KeyEventResult.ignored;
+
+    if (key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter ||
+        key == LogicalKeyboardKey.space ||
+        key == LogicalKeyboardKey.gameButtonA ||
+        key == LogicalKeyboardKey.mediaPlayPause) {
+      _togglePlayPauseWithHud();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.mediaPlay) {
+      unawaited(_player.play());
+      _showHudMessage(Icons.play_arrow, '再生');
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.mediaPause) {
+      unawaited(_player.pause());
+      _showHudMessage(Icons.pause, '一時停止');
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown ||
+        key == LogicalKeyboardKey.contextMenu ||
+        key == LogicalKeyboardKey.info) {
+      _openOsd();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
   Widget build(BuildContext context) {
-    // The device's bottom view padding — the home
-    // indicator's area on iPhone / iPad, the gesture
-    // bar's on Android, zero where the system keeps the
-    // window clear. The non-fullscreen controls' bottom
-    // margins grow by it (plan 105, see
-    // player_safe_area_policy). viewPadding, not
-    // padding: it reports the raw inset whether or not
-    // an ancestor has consumed the padding form.
-    final bottomViewPadding = MediaQuery.viewPaddingOf(context).bottom;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.title),
-        actions: [
-          if (canChangePlaybackSpeed(live: widget.live))
-            PopupMenuButton<double>(
-              tooltip: '再生速度',
-              initialValue: _playbackRate,
-              onSelected: _selectPlaybackRate,
-              itemBuilder: (context) => [
-                for (final rate in playbackSpeeds)
-                  CheckedPopupMenuItem<double>(
-                    value: rate,
-                    checked: rate == _playbackRate,
-                    child: Text(playbackSpeedLabel(rate)),
-                  ),
-              ],
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.speed),
-                    if (_playbackRate != 1.0) ...[
-                      const SizedBox(width: 4),
-                      Text(playbackSpeedLabel(_playbackRate)),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-          if (canSwitchAudio(_realAudioTracks.length))
-            PopupMenuButton<int>(
-              tooltip: '音声',
-              icon: const Icon(Icons.audiotrack),
-              initialValue: _selectedAudioIndex,
-              onSelected: _selectAudioTrack,
-              itemBuilder: (context) => [
-                for (var i = 0; i < _realAudioTracks.length; i++)
-                  CheckedPopupMenuItem<int>(
-                    value: i,
-                    checked: i == _selectedAudioIndex,
-                    child: Text(audioTrackLabel(i)),
-                  ),
-              ],
-            ),
-          if (canToggleSubtitles(_realSubtitleTracks.length))
-            IconButton(
-              tooltip: '字幕',
-              icon: Icon(
-                _subtitlesOn ? Icons.closed_caption : Icons.closed_caption_off,
-              ),
-              onPressed: _toggleSubtitles,
-            ),
-        ],
-      ),
-      body: _error != null
-          ? Center(
-              child: SingleChildScrollView(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const Text('再生を開始できませんでした。', textAlign: TextAlign.center),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'nasne との接続やネットワークの状態を確認して、'
-                        'もう一度お試しください。',
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 8),
-                      // The raw player error (an mpv message, or
-                      // this screen's own timeout wording) is
-                      // diagnostic text, not something a viewer
-                      // can act on: it sits behind the detail
-                      // expander (plan 86, plan 85 item 9), and
-                      // is in the diagnostic log as well.
-                      ExpansionTile(
-                        title: const Text('詳細'),
-                        children: [
-                          Text(
-                            _error!,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            )
-          : Stack(
-              children: [
-                MaterialVideoControlsTheme(
-                  normal: _materialControlsTheme(
-                    fullscreen: false,
-                    bottomViewPadding: bottomViewPadding,
-                  ),
-                  fullscreen: _materialControlsTheme(fullscreen: true),
-                  child: MaterialDesktopVideoControlsTheme(
-                    normal: _desktopControlsTheme(),
-                    fullscreen: _desktopControlsTheme(),
-                    child: Video(
-                      controller: _videoController,
-                      // The stock adaptive controls, with
-                      // the chapter ticks overlaid while
-                      // the title has points (plan 112).
-                      controls: _chapters.isEmpty
-                          ? AdaptiveVideoControls
-                          : _controlsWithChapterTicks,
+    return PopScope(
+      canPop: !_osdOpen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _osdOpen) {
+          _closeOsd();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: _error != null
+            ? Center(
+                child: SingleChildScrollView(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.error_outline,
+                          size: 48,
+                          color: Colors.redAccent,
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          '再生を開始できませんでした。',
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(color: Colors.white),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'nasne との接続やネットワークの状態を確認して、'
+                          'もう一度お試しください。',
+                          style: TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          autofocus: true,
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.arrow_back),
+                          label: const Text('戻る'),
+                        ),
+                        const SizedBox(height: 16),
+                        ExpansionTile(
+                          collapsedTextColor: Colors.white70,
+                          textColor: Colors.white,
+                          iconColor: Colors.white70,
+                          collapsedIconColor: Colors.white70,
+                          title: const Text('詳細'),
+                          children: [
+                            Text(
+                              _error!,
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                if (_interrupted) _buildInterruptionBanner(),
+              )
+            : Focus(
+                focusNode: _rootFocusNode,
+                autofocus: true,
+                onKeyEvent: _handleKeyEvent,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _toggleOsd,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Video(
+                        controller: _videoController,
+                        controls: NoVideoControls,
+                      ),
+                      if (!_playing)
+                        const Center(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.all(
+                                Radius.circular(12),
+                              ),
+                            ),
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 14,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  SizedBox(width: 12),
+                                  Text(
+                                    '読み込み中…',
+                                    style: TextStyle(color: Colors.white),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                      if (_osdOpen) _buildRemoteOsd(),
+                      if (_interrupted) _buildInterruptionBanner(),
+                    ],
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  Widget _buildStatusHud() {
+    return Positioned(
+      top: 24,
+      left: 24,
+      right: 24,
+      child: IgnorePointer(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.black87,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_hudIcon != null) ...[
+                  Icon(_hudIcon, color: Colors.white, size: 28),
+                  const SizedBox(width: 12),
+                ],
+                Flexible(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _hudText ?? '',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteOsd() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.transparent, Colors.black87, Colors.black],
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                if (widget.live)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.redAccent,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      'LIVE',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                else
+                  StreamBuilder<Duration>(
+                    stream: _player.stream.position,
+                    initialData: _player.state.position,
+                    builder: (context, snapshot) {
+                      final pos = snapshot.data ?? Duration.zero;
+                      final dur = _player.state.duration;
+                      return Text(
+                        dur > Duration.zero
+                            ? '${_formatClock(pos)} / ${_formatClock(dur)}'
+                            : _formatClock(pos),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ),
+            if (!widget.live) ...[
+              const SizedBox(height: 8),
+              StreamBuilder<Duration>(
+                stream: _player.stream.position,
+                initialData: _player.state.position,
+                builder: (context, snapshot) {
+                  final pos = snapshot.data ?? Duration.zero;
+                  final dur = _player.state.duration;
+                  final value = dur > Duration.zero
+                      ? (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
+                      : 0.0;
+                  return LinearProgressIndicator(
+                    value: value,
+                    backgroundColor: Colors.white24,
+                    color: Colors.lightBlueAccent,
+                    minHeight: 6,
+                  );
+                },
+              ),
+            ],
+            const SizedBox(height: 12),
+            FocusTraversalGroup(
+              child: Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  _osdButton(
+                    focusNode: _osdFirstFocusNode,
+                    autofocus: true,
+                    icon: _playingNow ? Icons.pause : Icons.play_arrow,
+                    label: _playingNow ? '一時停止' : '再生',
+                    onPressed: () {
+                      _togglePlayPauseWithHud();
+                      _resetOsdTimer();
+                    },
+                  ),
+                  if (!widget.live) ...[
+                    _osdButton(
+                      icon: Icons.replay_10,
+                      label: '-10秒',
+                      onPressed: () {
+                        _queueRelativeSeek(_rewindStep);
+                        _resetOsdTimer();
+                      },
+                    ),
+                    _osdButton(
+                      icon: Icons.forward_30,
+                      label: '+30秒',
+                      onPressed: () {
+                        _queueRelativeSeek(_forwardStep);
+                        _resetOsdTimer();
+                      },
+                    ),
+                    if (_chapters.isNotEmpty) ...[
+                      _osdButton(
+                        icon: Icons.fast_rewind,
+                        label: '前チャプター',
+                        onPressed: () {
+                          unawaited(_seekToChapter(forward: false));
+                          _resetOsdTimer();
+                        },
+                      ),
+                      _osdButton(
+                        icon: Icons.fast_forward,
+                        label: '次チャプター',
+                        onPressed: () {
+                          unawaited(_seekToChapter(forward: true));
+                          _resetOsdTimer();
+                        },
+                      ),
+                    ],
+                  ],
+                  if (canChangePlaybackSpeed(live: widget.live))
+                    _osdButton(
+                      icon: Icons.speed,
+                      label: '速度 ${playbackSpeedLabel(_playbackRate)}',
+                      onPressed: _cyclePlaybackRate,
+                    ),
+                  if (canSwitchAudio(_realAudioTracks.length))
+                    _osdButton(
+                      icon: Icons.audiotrack,
+                      label: audioTrackLabel(_selectedAudioIndex),
+                      onPressed: _cycleAudioTrack,
+                    ),
+                  if (canToggleSubtitles(_realSubtitleTracks.length))
+                    _osdButton(
+                      icon: _subtitlesOn
+                          ? Icons.closed_caption
+                          : Icons.closed_caption_off,
+                      label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
+                      onPressed: () {
+                        _toggleSubtitles();
+                        _resetOsdTimer();
+                      },
+                    ),
+                  _osdButton(
+                    icon: Icons.close,
+                    label: '閉じる',
+                    onPressed: _closeOsd,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _osdButton({
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required IconData icon,
+    required String label,
+    required VoidCallback onPressed,
+  }) {
+    return OutlinedButton.icon(
+      focusNode: focusNode,
+      autofocus: autofocus,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: Colors.white,
+        backgroundColor: Colors.white12,
+        side: const BorderSide(color: Colors.white38),
+      ),
+      onPressed: onPressed,
+      icon: Icon(icon, size: 20),
+      label: Text(label),
     );
   }
 
@@ -1308,16 +1584,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       bottom: 0,
       child: Container(
         color: Colors.black87,
-        // The banner's buttons sit at the screen's bottom
-        // edge like the controls do, so its bottom padding
-        // clears the gesture area the same way (plan 105,
-        // see player_safe_area_policy).
-        padding: EdgeInsets.fromLTRB(
-          16,
-          10,
-          16,
-          10 + bottomGestureInset(MediaQuery.viewPaddingOf(context).bottom),
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         child: Row(
           children: [
             const Icon(Icons.error_outline, color: Colors.white),
@@ -1348,7 +1615,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               ),
             ),
             const SizedBox(width: 12),
-            FilledButton(onPressed: _resume, child: const Text('再開')),
+            FilledButton(
+              autofocus: true,
+              onPressed: _resume,
+              child: const Text('再開'),
+            ),
             IconButton(
               tooltip: '閉じる',
               icon: const Icon(Icons.close, color: Colors.white),
@@ -1359,318 +1630,4 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       ),
     );
   }
-}
-
-/// A ±10-second skip button for the video controls' button
-/// bars (player UI follow-up). Follows the seekable signal
-/// the player screen observes from mpv: enabled — and white,
-/// like the neighbouring transport buttons — while the
-/// stream is seekable, and a disabled, dimmed button while
-/// it is not, so an unseekable stream shows its state
-/// instead of inviting a seek that would be refused.
-class _SkipSeekButton extends StatelessWidget {
-  const _SkipSeekButton({
-    required this.seekable,
-    required this.offset,
-    required this.onSkip,
-    this.iconSize = 36,
-  });
-
-  /// The observed seekable signal (see _PlayerScreenState).
-  final ValueListenable<bool> seekable;
-
-  /// How far this button seeks: −[skipSeekStep] or
-  /// +[skipSeekStep]; the sign also picks the icon.
-  final Duration offset;
-
-  /// Invoked with [offset] when the button is tapped.
-  final void Function(Duration offset) onSkip;
-
-  /// Icon size: 36 in the Material transport row, matching
-  /// its larger centre buttons; the desktop row passes its
-  /// own 28.
-  final double iconSize;
-
-  @override
-  Widget build(BuildContext context) {
-    final forward = offset > Duration.zero;
-    return ValueListenableBuilder<bool>(
-      valueListenable: seekable,
-      builder: (context, canSeek, _) => IconButton(
-        tooltip: forward ? '10秒スキップ' : '10秒戻し',
-        iconSize: iconSize,
-        color: Colors.white,
-        onPressed: canSeek ? () => onSkip(offset) : null,
-        icon: Icon(forward ? Icons.forward_10 : Icons.replay_10),
-      ),
-    );
-  }
-}
-
-/// A chapter skip button for the video controls' button
-/// bars (plan 112): seeks to the adjacent chapter point
-/// (see player_chapter_policy for which point that is).
-/// Like the ±10 s skip buttons it follows the seekable
-/// signal — enabled and white while the stream is
-/// seekable, disabled and dimmed while it is not — and
-/// the bars only include it when the title has chapter
-/// points at all.
-class _ChapterSkipButton extends StatelessWidget {
-  const _ChapterSkipButton({
-    required this.seekable,
-    required this.forward,
-    required this.onSeek,
-    this.iconSize = 36,
-  });
-
-  /// The observed seekable signal (see _PlayerScreenState).
-  final ValueListenable<bool> seekable;
-
-  /// True for the next-chapter button, false for the
-  /// previous-chapter one; also picks the icon.
-  final bool forward;
-
-  /// Invoked when the button is tapped.
-  final VoidCallback onSeek;
-
-  /// Icon size, matching the neighbouring transport
-  /// buttons (see _SkipSeekButton).
-  final double iconSize;
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<bool>(
-      valueListenable: seekable,
-      builder: (context, canSeek, _) => IconButton(
-        tooltip: forward ? '次のチャプター' : '前のチャプター',
-        iconSize: iconSize,
-        color: Colors.white,
-        onPressed: canSeek ? onSeek : null,
-        icon: Icon(forward ? Icons.fast_forward : Icons.fast_rewind),
-      ),
-    );
-  }
-}
-
-/// The chapter ticks on the seek bar (plan 112): one
-/// mark per chapter point, drawn over the stock seek
-/// bar's line.
-///
-/// media_kit's controls expose neither a slot in their
-/// seek bar nor their own visibility, so two alignments
-/// are maintained here, both best-effort:
-///
-/// - Geometry: the line's extent and centre are
-///   computed from the effective controls theme — the
-///   same values the controls lay the bar out with —
-///   via player_chapter_policy, so the ticks follow
-///   the app's theming (including the safe-area lift
-///   of plan 105, which reaches the ticks through the
-///   theme's seek bar margin, and the fullscreen
-///   safe-area padding the controls substitute).
-/// - Visibility: the stock controls show on
-///   interaction and fade after their hover duration.
-///   This overlay mirrors that from the pointer
-///   activity it can observe through a translucent
-///   listener, fading on the same duration. The one
-///   divergence the mirror cannot see is a tap meant
-///   to hide the controls: the ticks then stay for
-///   the remainder of the hover duration.
-class _ChapterTicksOverlay extends StatefulWidget {
-  const _ChapterTicksOverlay({required this.player, required this.chapters});
-
-  final Player player;
-
-  /// The title's chapter points (see
-  /// _PlayerScreenState._chapters).
-  final List<Duration> chapters;
-
-  @override
-  State<_ChapterTicksOverlay> createState() => _ChapterTicksOverlayState();
-}
-
-class _ChapterTicksOverlayState extends State<_ChapterTicksOverlay> {
-  bool _visible = false;
-  Timer? _hideTimer;
-  StreamSubscription<Duration>? _durationSubscription;
-  Duration _duration = Duration.zero;
-
-  /// The hover duration of the controls theme resolved
-  /// by the latest build; the hide timer mirrors it.
-  Duration _hoverDuration = const Duration(seconds: 3);
-
-  @override
-  void initState() {
-    super.initState();
-    _duration = widget.player.state.duration;
-    _durationSubscription = widget.player.stream.duration.listen((duration) {
-      if (mounted && duration != _duration) {
-        setState(() => _duration = duration);
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _hideTimer?.cancel();
-    _durationSubscription?.cancel();
-    super.dispose();
-  }
-
-  /// Notes an interaction: the ticks show, and the
-  /// hide timer restarts — the mirror of the stock
-  /// controls' show-and-fade (see the class comment).
-  void _poke() {
-    if (!_visible) setState(() => _visible = true);
-    _hideTimer?.cancel();
-    _hideTimer = Timer(_hoverDuration, () {
-      if (mounted) setState(() => _visible = false);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final fractions = chapterTickFractions(
-      chapters: widget.chapters,
-      duration: _duration,
-    );
-    if (fractions.isEmpty) return const SizedBox.expand();
-    final platform = Theme.of(context).platform;
-    final fullscreen = isFullscreen(context);
-    final themePadding = fullscreen
-        ? MediaQuery.of(context).padding
-        : EdgeInsets.zero;
-    // The line's geometry depends on the video area's
-    // size, which the layout constraints give (the
-    // overlay fills the controls' stack).
-    ({double left, double right, double centerY}) lineFor(Size area) {
-      if (platform == TargetPlatform.android ||
-          platform == TargetPlatform.iOS) {
-        final themeWidget = MaterialVideoControlsTheme.maybeOf(context);
-        final data = fullscreen
-            ? (themeWidget?.fullscreen ??
-                  kDefaultMaterialVideoControlsThemeDataFullscreen)
-            : (themeWidget?.normal ?? kDefaultMaterialVideoControlsThemeData);
-        _hoverDuration = data.controlsHoverDuration;
-        return materialChapterSeekBarLine(
-          areaWidth: area.width,
-          areaHeight: area.height,
-          columnPadding: data.padding ?? themePadding,
-          seekBarMargin: data.seekBarMargin,
-          seekBarHeight: data.seekBarHeight,
-        );
-      }
-      final themeWidget = MaterialDesktopVideoControlsTheme.maybeOf(context);
-      final data = fullscreen
-          ? (themeWidget?.fullscreen ??
-                kDefaultMaterialDesktopVideoControlsThemeDataFullscreen)
-          : (themeWidget?.normal ??
-                kDefaultMaterialDesktopVideoControlsThemeData);
-      _hoverDuration = data.controlsHoverDuration;
-      return desktopChapterSeekBarLine(
-        areaWidth: area.width,
-        areaHeight: area.height,
-        columnPadding: data.padding ?? themePadding,
-        seekBarMargin: data.seekBarMargin,
-        seekBarContainerHeight: data.seekBarContainerHeight,
-        buttonBarExtent:
-            data.buttonBarHeight +
-            data.bottomButtonBarMargin.top +
-            data.bottomButtonBarMargin.bottom,
-        seekBarTranslate: data.bottomButtonBar.isNotEmpty
-            ? desktopSeekBarTranslateWithButtonBar
-            : 0,
-      );
-    }
-
-    if (platform != TargetPlatform.android &&
-        platform != TargetPlatform.iOS &&
-        platform != TargetPlatform.macOS &&
-        platform != TargetPlatform.windows &&
-        platform != TargetPlatform.linux) {
-      // No stock seek bar on this platform (the
-      // adaptive controls show none), so no ticks.
-      return const SizedBox.expand();
-    }
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final line = lineFor(Size(constraints.maxWidth, constraints.maxHeight));
-        return Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) => _poke(),
-          onPointerMove: (_) => _poke(),
-          onPointerHover: (_) => _poke(),
-          child: IgnorePointer(
-            child: AnimatedOpacity(
-              opacity: _visible ? 1.0 : 0.0,
-              duration: const Duration(milliseconds: 300),
-              child: CustomPaint(
-                painter: _ChapterTicksPainter(
-                  fractions: fractions,
-                  left: line.left,
-                  right: line.right,
-                  centerY: line.centerY,
-                ),
-                size: Size.infinite,
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// Paints the chapter ticks: a short vertical mark at
-/// each chapter fraction, centred on the seek bar's
-/// line (see _ChapterTicksOverlay for how the line is
-/// located).
-class _ChapterTicksPainter extends CustomPainter {
-  const _ChapterTicksPainter({
-    required this.fractions,
-    required this.left,
-    required this.right,
-    required this.centerY,
-  });
-
-  /// Chapter positions as fractions of the duration.
-  final List<double> fractions;
-
-  /// The seek bar line's horizontal extent and
-  /// vertical centre, in the overlay's coordinates.
-  final double left;
-  final double right;
-  final double centerY;
-
-  /// Tick dimensions: taller than the 4 px line so
-  /// the marks read as its divisions, narrow enough
-  /// not to be mistaken for the thumb.
-  static const double tickHeight = 12;
-  static const double tickWidth = 2;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final width = right - left;
-    if (width <= 0) return;
-    final paint = Paint()..color = const Color(0xE6FFFFFF);
-    for (final fraction in fractions) {
-      final x = left + width * fraction;
-      canvas.drawRect(
-        Rect.fromLTWH(
-          x - tickWidth / 2,
-          centerY - tickHeight / 2,
-          tickWidth,
-          tickHeight,
-        ),
-        paint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(_ChapterTicksPainter oldDelegate) =>
-      !listEquals(oldDelegate.fractions, fractions) ||
-      oldDelegate.left != left ||
-      oldDelegate.right != right ||
-      oldDelegate.centerY != centerY;
 }

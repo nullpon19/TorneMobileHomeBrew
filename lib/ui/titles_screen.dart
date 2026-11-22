@@ -131,6 +131,7 @@ Future<bool?> showResumeChoiceDialog(
           child: const Text('最初から再生'),
         ),
         FilledButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(true),
           child: const Text('続きから再生'),
         ),
@@ -291,6 +292,13 @@ class TitlesScreen extends ConsumerStatefulWidget {
 
 class _TitlesScreenState extends ConsumerState<TitlesScreen> {
   String? _selectedId;
+  final FocusNode _detailPlayFocusNode = FocusNode(debugLabel: 'titlePlay');
+
+  @override
+  void dispose() {
+    _detailPlayFocusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -318,9 +326,15 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
           : _TitleList(
               reg: reg,
               selectedId: _selectedId,
+              detailPlayFocusNode: _detailPlayFocusNode,
               onSelect: (title, twoPane) {
                 if (twoPane) {
                   setState(() => _selectedId = title.id);
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted && _detailPlayFocusNode.canRequestFocus) {
+                      _detailPlayFocusNode.requestFocus();
+                    }
+                  });
                 } else {
                   Navigator.of(context).push(
                     MaterialPageRoute(
@@ -339,11 +353,13 @@ class _TitleList extends ConsumerStatefulWidget {
   const _TitleList({
     required this.reg,
     required this.selectedId,
+    required this.detailPlayFocusNode,
     required this.onSelect,
   });
 
   final RegisteredNasne reg;
   final String? selectedId;
+  final FocusNode detailPlayFocusNode;
   final void Function(RecordedTitle title, bool twoPane) onSelect;
 
   @override
@@ -640,7 +656,11 @@ class _TitleListState extends ConsumerState<_TitleList> {
               flex: 6,
               child: selected == null
                   ? const Center(child: Text('タイトルを選択してください'))
-                  : TitleDetailView(reg: reg, title: selected),
+                  : TitleDetailView(
+                      reg: reg,
+                      title: selected,
+                      playFocusNode: widget.detailPlayFocusNode,
+                    ),
             ),
           ],
         );
@@ -683,32 +703,61 @@ class _TitleLeading extends ConsumerWidget {
   }
 }
 
-/// The detail view's thumbnail banner (plan 86.6): a 16:9
-/// picture above the title when the unit provides one, and
-/// nothing at all when it does not (no empty box).
-class _TitleThumbnailBanner extends ConsumerWidget {
-  const _TitleThumbnailBanner({required this.reg, required this.titleId});
+/// Compact 16:9 thumbnail (or fallback visual) for the 1/4-width left
+/// column in the Fire TV detail header.
+class _TitleCompactThumbnail extends ConsumerWidget {
+  const _TitleCompactThumbnail({required this.reg, required this.title});
 
   final RegisteredNasne reg;
-  final String titleId;
+  final RecordedTitle title;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final bytes = ref
-        .watch(titleThumbnailProvider((reg: reg, titleId: titleId)))
-        .value;
-    if (bytes == null) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: AspectRatio(
-          aspectRatio: 16 / 9,
-          child: Image.memory(
-            bytes,
-            fit: BoxFit.cover,
-            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+    final theme = Theme.of(context);
+    if (title.recordingFlag) {
+      return AspectRatio(
+        aspectRatio: 16 / 9,
+        child: Container(
+          decoration: BoxDecoration(
+            color: theme.colorScheme.errorContainer,
+            borderRadius: BorderRadius.circular(8),
           ),
+          alignment: Alignment.center,
+          child: Icon(
+            Icons.fiber_manual_record,
+            size: 36,
+            color: theme.colorScheme.error,
+          ),
+        ),
+      );
+    }
+    final bytes = ref
+        .watch(titleThumbnailProvider((reg: reg, titleId: title.id)))
+        .value;
+    final placeholder = AspectRatio(
+      aspectRatio: 16 / 9,
+      child: Container(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        alignment: Alignment.center,
+        child: Icon(
+          Icons.movie_outlined,
+          size: 36,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
+    );
+    if (bytes == null) return placeholder;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: AspectRatio(
+        aspectRatio: 16 / 9,
+        child: Image.memory(
+          bytes,
+          fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => placeholder,
         ),
       ),
     );
@@ -767,6 +816,7 @@ class TitleDetailPage extends ConsumerWidget {
             return TitleDetailView(
               reg: reg,
               title: t,
+              autofocusPlay: true,
               onDeleted: () => Navigator.of(context).pop(),
             );
           }
@@ -777,17 +827,19 @@ class TitleDetailPage extends ConsumerWidget {
   }
 }
 
-/// The title detail: merged XSRS + DIDL information and the playback
-/// action. When the title carries a mobile resource alongside the
-/// original, a playback quality choice is offered (plan 33); the
-/// choice starts from the saved playback quality — the original
-/// quality until one is saved — and writes changes back to it.
+/// The title detail optimized for Fire TV D-pad navigation:
+/// 1/4-width thumbnail + 3/4-width title & key metadata on top,
+/// action buttons immediately underneath, and long programme text
+/// truncated so buttons never scroll off-screen. Playback quality is
+/// fixed to mobile (falling back when a title has no mobile res).
 class TitleDetailView extends ConsumerStatefulWidget {
   const TitleDetailView({
     super.key,
     required this.reg,
     required this.title,
     this.onDeleted,
+    this.playFocusNode,
+    this.autofocusPlay = false,
   });
 
   final RegisteredNasne reg;
@@ -798,26 +850,14 @@ class TitleDetailView extends ConsumerStatefulWidget {
   /// Null in the two-pane layout, where the refreshed list
   /// simply stops resolving the selection.
   final VoidCallback? onDeleted;
+  final FocusNode? playFocusNode;
+  final bool autofocusPlay;
 
   @override
   ConsumerState<TitleDetailView> createState() => _TitleDetailViewState();
 }
 
 class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
-  /// Playback quality choice (plan 33): false = the title's
-  /// original resource (DR / 3倍), true = the mobile transcode.
-  /// The visit starts from the saved quality
-  /// (playbackQualityProvider) and a change here writes back
-  /// to it, so the choice carries to the next viewing. Null
-  /// until the viewer touches the choice on this visit — the
-  /// saved value, including its asynchronous restore, shows
-  /// through meanwhile.
-  bool? _useMobileChoice;
-
-  /// The quality in effect on this visit: this screen's own
-  /// choice once made, the saved quality otherwise.
-  bool get _useMobile => _useMobileChoice ?? ref.read(playbackQualityProvider);
-
   /// A playback start is in flight (plan 35). Starting takes a
   /// second or more (credentials -> HEAD -> AKE -> proxy); the
   /// build-13 field log showed a second tap in that window
@@ -854,145 +894,125 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
   @override
   Widget build(BuildContext context) {
     final t = title;
-    // The quality choice in effect: this visit's own choice
-    // once made, the saved quality otherwise. Watching the
-    // saved quality rebuilds this view when its asynchronous
-    // restore lands.
-    final bool useMobile =
-        _useMobileChoice ?? ref.watch(playbackQualityProvider);
-    // The protection state this view shows is the loaded
-    // list's: a successful toggle rewrites it there (plan 103),
-    // and this view is rebuilt with the updated title.
     final protectValue = t.protectFlag;
     final channels = ref.watch(channelsProvider(reg)).value;
     final credentialSummary = ref.watch(credentialSummaryProvider);
     final credentialsMissing =
         credentialSummary.hasValue && credentialSummary.value == null;
-    final sizeBytes = t.res
-        .map((r) => r.cleartextSize)
-        .whereType<int>()
-        .firstOrNull;
-    final qualities = [
-      for (final r in t.res)
-        if (r.quality != null) r.quality!,
-    ];
-    final originalRes = t.originalRes;
     final mobileRes = t.mobileRes;
-    final originalLabel = originalRes?.quality == null
-        ? '元画質'
-        : '元画質 (${resQualityLabel(originalRes!.quality)})';
+    final channelText = t.channelName ?? channelDisplayName(channels, t.channel);
+    final metaParts = <String>[
+      if (t.scheduledStart != null)
+        formatDateTimeWithWeekdayJst(t.scheduledStart!),
+      if (t.scheduledDurationSeconds != null)
+        formatDurationSeconds(t.scheduledDurationSeconds!),
+      channelText,
+      if (t.recordingFlag) '録画中',
+    ];
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        if (!t.recordingFlag) _TitleThumbnailBanner(reg: reg, titleId: t.id),
-        Text(t.title, style: Theme.of(context).textTheme.titleLarge),
-        const SizedBox(height: 12),
-        if (t.scheduledStart != null)
-          FieldRow(
-            label: '録画日時',
-            value: formatDateTimeWithWeekdayJst(t.scheduledStart!),
-          ),
-        if (t.scheduledDurationSeconds != null)
-          FieldRow(
-            label: '長さ',
-            value: formatDurationSeconds(t.scheduledDurationSeconds!),
-          ),
-        FieldRow(
-          label: 'チャンネル',
-          value: t.channelName ?? channelDisplayName(channels, t.channel),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              flex: 1,
+              child: _TitleCompactThumbnail(reg: reg, title: t),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 3,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    t.title,
+                    style: Theme.of(context).textTheme.titleLarge,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    metaParts.join(' ・ '),
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  if (t.resumePointSeconds != null &&
+                      t.resumePointSeconds! > 0) ...[
+                    const SizedBox(height: 4),
+                    FieldRow(
+                      label: '再開位置',
+                      value: formatDurationSeconds(t.resumePointSeconds!),
+                    ),
+                  ],
+                  if (t.recordingFlag)
+                    FieldRow(
+                      label: '保護',
+                      value: t.protectFlag ? '保護あり' : 'なし',
+                    )
+                  else
+                    _ProtectionRow(
+                      protect: protectValue,
+                      onChanged: _protectBusy ? null : _toggleProtection,
+                    ),
+                ],
+              ),
+            ),
+          ],
         ),
-        if (t.genre != null && t.genre!.isNotEmpty)
-          FieldRow(label: 'ジャンル', value: t.genre!),
-        if (t.desiredQualityMode != null)
-          FieldRow(
-            label: '画質モード',
-            value: qualityModeLabel(t.desiredQualityMode!),
-          ),
-        if (t.copyCountRemaining != null)
-          FieldRow(label: '残コピー回数', value: '${t.copyCountRemaining} 回'),
-        // The protection row (plan 98): a switch for finished
-        // titles. A title still being recorded keeps the static
-        // display — the verified update shape covers finished
-        // titles, and a recording's listed item is still
-        // changing under the unit.
-        if (t.recordingFlag)
-          FieldRow(label: '保護', value: t.protectFlag ? '保護あり' : 'なし')
-        else
-          _ProtectionRow(
-            protect: protectValue,
-            onChanged: _protectBusy ? null : _toggleProtection,
-          ),
-        if (t.recordingFlag) const FieldRow(label: '状態', value: '録画中'),
-        if (sizeBytes != null)
-          FieldRow(label: 'サイズ', value: formatBytes(sizeBytes)),
-        if (t.resumePointSeconds != null && t.resumePointSeconds! > 0)
-          FieldRow(
-            label: '再開位置',
-            value: formatDurationSeconds(t.resumePointSeconds!),
-          ),
-        if (qualities.isNotEmpty)
-          FieldRow(label: 'res 品質', value: qualities.join(', ')),
-        if (t.description != null && t.description!.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Text('概要', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 4),
-          Text(t.description!),
-        ],
-        if (t.longDescription != null && t.longDescription!.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Text('詳細', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 4),
-          Text(t.longDescription!),
-        ],
-        const SizedBox(height: 24),
-        if (mobileRes != null) ...[
-          Text('再生画質', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 8),
-          SegmentedButton<bool>(
-            segments: [
-              ButtonSegment(value: false, label: Text(originalLabel)),
-              const ButtonSegment(value: true, label: Text('モバイル')),
-            ],
-            selected: {useMobile},
-            onSelectionChanged: (selection) {
-              setState(() => _useMobileChoice = selection.first);
-              ref.read(playbackQualityProvider.notifier).set(selection.first);
-            },
-          ),
-          const SizedBox(height: 16),
-        ],
-        FilledButton.icon(
-          onPressed: _starting ? null : () => _play(context, ref),
-          icon: const Icon(Icons.play_arrow),
-          label: const Text('再生'),
+        const SizedBox(height: 16),
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            FilledButton.icon(
+              focusNode: widget.playFocusNode,
+              autofocus: widget.autofocusPlay,
+              onPressed: _starting ? null : () => _play(context, ref),
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('再生'),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => deleteRecordedTitle(
+                context: context,
+                ref: ref,
+                reg: reg,
+                title: title,
+                onDeleted: widget.onDeleted,
+              ),
+              icon: Icon(
+                Icons.delete_outline,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              label: Text(
+                'このタイトルを削除',
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+            if (mobileRes != null)
+              Text(
+                '画質: モバイル固定',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+          ],
         ),
-        // The credential note shows only while no pair is
-        // imported (plan 86.2): as a permanent fixture it told
-        // people who had already imported that they still had
-        // something to do. While the state is loading nothing
-        // is shown, so the text never flickers in and out.
         if (credentialsMissing) ...[
           const SizedBox(height: 8),
           const Text('録画の再生には資格情報のインポートが必要です。'),
         ],
-        const SizedBox(height: 24),
-        OutlinedButton.icon(
-          onPressed: () => deleteRecordedTitle(
-            context: context,
-            ref: ref,
-            reg: reg,
-            title: title,
-            onDeleted: widget.onDeleted,
+        if (t.description != null && t.description!.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(
+            t.description!,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
           ),
-          icon: Icon(
-            Icons.delete_outline,
-            color: Theme.of(context).colorScheme.error,
-          ),
-          label: Text(
-            'このタイトルを削除',
-            style: TextStyle(color: Theme.of(context).colorScheme.error),
-          ),
-        ),
+        ],
       ],
     );
   }
@@ -1008,8 +1028,8 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
       showSnack(context, '再生可能なコンテンツがありません');
       return;
     }
-    final res =
-        (_useMobile ? title.mobileRes : title.originalRes) ?? title.res.first;
+    // Always prefer mobile quality on Fire TV.
+    final res = title.mobileRes ?? title.originalRes ?? title.res.first;
     // Resume (plan 86): a title the viewer stopped midway offers
     // its recorded position. Ask before starting — beginning a
     // session is the expensive step, and the choice belongs

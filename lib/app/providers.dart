@@ -14,6 +14,7 @@ import '../core/core.dart';
 import 'ake_socket.dart';
 import 'debug_log.dart';
 import 'file_pick.dart';
+import 'firetv_helper.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
@@ -197,16 +198,9 @@ final hiddenEpgGenresProvider =
       HiddenEpgGenresNotifier.new,
     );
 
-/// The playback quality every viewing starts with (Discord
-/// request, 2026-11-21): false = the content's original quality
-/// (DR / 3倍 as recorded), true = the mobile transcode. One
-/// value serves live viewing and recordings alike — the plan-33
-/// choice is the same original/mobile pair on both detail
-/// screens. The value is the single one the settings screen's
-/// default and the detail screens' choices both read and
-/// write: changing the quality on a detail screen updates it,
-/// so the next viewing starts where the last one left off.
-/// Nothing stored means the original quality.
+/// Fire TV provisional build fixes playback quality to mobile
+/// (true = mobile transcode) to avoid 32-bit Fire TV hardware
+/// decode stalls on DR streams.
 class PlaybackQualityNotifier extends Notifier<bool> {
   static const _key = 'playback_use_mobile';
 
@@ -215,14 +209,16 @@ class PlaybackQualityNotifier extends Notifier<bool> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
-      if (value == 'true' && !state) state = true;
+      if (value != 'true') {
+        await store.write(_key, 'true');
+      }
     });
-    return false;
+    return true;
   }
 
   Future<void> set(bool useMobile) async {
-    state = useMobile;
-    await ref.read(keyValueStoreProvider).write(_key, '$useMobile');
+    state = true;
+    await ref.read(keyValueStoreProvider).write(_key, 'true');
   }
 }
 
@@ -322,6 +318,9 @@ final debugLogFolderOpenerProvider = Provider<DebugLogFolderOpener?>((ref) {
 final fileBytesPickerProvider = Provider<FileBytesPicker>(
   (ref) => FileBytesPicker(),
 );
+
+/// Platform helper for Fire TV (volume max, Tailscale, local file scan).
+final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
 
 final playbackEngineProvider = Provider<PlaybackEngine>(
   (ref) => DtcpPlaybackEngine(

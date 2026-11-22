@@ -29,6 +29,7 @@ import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 
@@ -74,15 +75,28 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
     }
   }
 
-  /// Picks a file through [FileBytesPicker]. A cancelled pick
-  /// returns null and stays silent (a normal outcome); a failed
-  /// pick also returns null, but first leaves a diagnostics
-  /// record and a visible error — the plan 69.5 leftover, where
-  /// a picker exception escaped unhandled and the button looked
-  /// dead. The failure presentation follows plan 71: never
-  /// swallow, log the detail, tell the user. The shown text is
-  /// plain (plan 86.2); the exception itself stays in the log.
+  /// Picks a file. On Android / Fire TV, opens an in-app file chooser that
+  /// lists candidate files in Download / Documents / app-private storage so
+  /// Fire OS 8 devices without DocumentsUI can select credentials with a
+  /// D-pad remote. On other platforms (or if the user chooses the system
+  /// picker fallback), falls back to [FileBytesPicker].
   Future<Uint8List?> _pickFile() async {
+    final helper = ref.read(fireTvHelperProvider);
+    if (helper.isAndroid) {
+      final result = await showDialog<_FireTvPickResult>(
+        context: context,
+        builder: (_) => _FireTvFilePickerDialog(helper: helper),
+      );
+      if (result == null) return null;
+      if (result.useSystemPicker) {
+        return _pickWithSystemPicker();
+      }
+      return result.bytes;
+    }
+    return _pickWithSystemPicker();
+  }
+
+  Future<Uint8List?> _pickWithSystemPicker() async {
     try {
       return await ref.read(fileBytesPickerProvider).pick();
     } catch (e) {
@@ -222,100 +236,119 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
   @override
   Widget build(BuildContext context) {
     final summary = ref.watch(credentialSummaryProvider);
+    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('DTCP-IP 資格情報')),
       body: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
-          const Text(
-            '録画を再生するには、お持ちの対応機器から取り出した'
-            '「証明書」と「秘密鍵」のペアが必要です。',
-          ),
-          const SizedBox(height: 16),
-          Text('用意のしかた', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 6),
-          const Text(
-            '1. 対応機器から証明書と秘密鍵を取り出します'
-            ' (このアプリ自体に取り出す機能はありません)。\n'
-            '2. ファイル (credentials.env) で用意できた場合は、'
-            '下の「ファイルから読み込む」から選ぶだけで完了します。\n'
-            '3. テキストで用意した場合は、その下の欄に貼り付けます。\n\n'
-            '取り込んだ内容はこの端末の中にだけ保存され、'
-            '外部に送られることはありません。',
-          ),
-          const SizedBox(height: 16),
           summary.when(
             data: (value) => value == null
                 ? const ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     leading: Icon(Icons.info_outline),
                     title: Text('未インポート'),
+                    subtitle: Text(
+                      '再生には対応機器から取り出した証明書と秘密鍵のペアが必要です（端末内にのみ保存）。',
+                    ),
                   )
                 : const ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     leading: Icon(Icons.verified_user),
                     title: Text('インポート済み'),
+                    subtitle: Text('端末内の安全な保管庫に保存されています。'),
                   ),
-            loading: () => const ListTile(title: Text('確認中…')),
-            error: (e, _) => const ListTile(title: Text('状態を確認できませんでした')),
-          ),
-          const Divider(),
-          Text(
-            'ファイルから読み込む',
-            style: Theme.of(context).textTheme.titleSmall,
-          ),
-          const SizedBox(height: 6),
-          const Text(
-            '資格情報ファイル (credentials.env) を選ぶと、'
-            'そのまま確認して保存します。',
-          ),
-          const SizedBox(height: 6),
-          OutlinedButton.icon(
-            onPressed: _busy ? null : _importFromEnvFile,
-            icon: const Icon(Icons.folder_open),
-            label: const Text('ファイルを選択'),
-          ),
-          const SizedBox(height: 16),
-          Text('テキストで入力する', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 6),
-          _pairFields(
-            label: '証明書',
-            controller: _certText,
-            fileBytes: _certFileBytes,
-            onPick: () async {
-              final bytes = await _pickFile();
-              if (bytes != null) setState(() => _certFileBytes = bytes);
-            },
-            onClearFile: () => setState(() => _certFileBytes = null),
-          ),
-          const SizedBox(height: 16),
-          _pairFields(
-            label: '秘密鍵',
-            controller: _keyText,
-            fileBytes: _keyFileBytes,
-            onPick: () async {
-              final bytes = await _pickFile();
-              if (bytes != null) setState(() => _keyFileBytes = bytes);
-            },
-            onClearFile: () => setState(() => _keyFileBytes = null),
+            loading: () => const ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text('確認中…'),
+            ),
+            error: (e, _) => const ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text('状態を確認できませんでした'),
+            ),
           ),
           if (_error != null) ...[
-            const SizedBox(height: 12),
-            Text(
-              _error!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.errorContainer,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _error!,
+                style: TextStyle(color: theme.colorScheme.onErrorContainer),
+              ),
             ),
           ],
-          const SizedBox(height: 20),
-          FilledButton.icon(
-            onPressed: _busy ? null : () => _import(),
-            icon: const Icon(Icons.download_done),
-            label: const Text('検証して保存'),
+          const SizedBox(height: 12),
+          // Action buttons placed ABOVE the text inputs so Fire TV D-pad users
+          // never get trapped inside FireTVIME before reaching the buttons.
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              FilledButton.icon(
+                autofocus: true,
+                onPressed: _busy ? null : _importFromEnvFile,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('ファイルから読み込む (credentials.env)'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _busy ? null : () => _import(),
+                icon: const Icon(Icons.download_done),
+                label: const Text('検証して保存'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _delete,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('保存済みの資格情報を削除'),
+              ),
+            ],
           ),
-          const SizedBox(height: 8),
-          OutlinedButton.icon(
-            onPressed: _busy ? null : _delete,
-            icon: const Icon(Icons.delete_outline),
-            label: const Text('保存済みの資格情報を削除'),
+          const SizedBox(height: 12),
+          Text('用意のしかた', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 4),
+          Text(
+            'ファイル (credentials.env) は Download フォルダまたはアプリ専用フォルダに置いて上のボタンから選べます。'
+            '直接入力する場合は下の左右2欄に入力し、上の「検証して保存」を押してください。',
+            style: theme.textTheme.bodySmall,
+          ),
+          const Divider(height: 24),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: _pairFields(
+                  label: '証明書',
+                  controller: _certText,
+                  fileBytes: _certFileBytes,
+                  onPick: () async {
+                    final bytes = await _pickFile();
+                    if (bytes != null) setState(() => _certFileBytes = bytes);
+                  },
+                  onClearFile: () => setState(() => _certFileBytes = null),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _pairFields(
+                  label: '秘密鍵',
+                  controller: _keyText,
+                  fileBytes: _keyFileBytes,
+                  onPick: () async {
+                    final bytes = await _pickFile();
+                    if (bytes != null) setState(() => _keyFileBytes = bytes);
+                  },
+                  onClearFile: () => setState(() => _keyFileBytes = null),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -332,10 +365,23 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: Theme.of(context).textTheme.titleSmall),
+        Row(
+          children: [
+            Expanded(
+              child: Text(label, style: Theme.of(context).textTheme.titleSmall),
+            ),
+            if (fileBytes == null)
+              OutlinedButton.icon(
+                onPressed: _busy ? null : onPick,
+                icon: const Icon(Icons.folder_open, size: 18),
+                label: const Text('ファイル選択'),
+              ),
+          ],
+        ),
         const SizedBox(height: 6),
         if (fileBytes != null)
           ListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 8),
             leading: const Icon(Icons.insert_drive_file),
             title: const Text('ファイルから読み込み済み'),
             trailing: IconButton(
@@ -343,7 +389,7 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
               onPressed: onClearFile,
             ),
           )
-        else ...[
+        else
           TextField(
             controller: controller,
             decoration: const InputDecoration(
@@ -351,17 +397,166 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
               hintText: '内容をそのまま貼り付け',
             ),
             minLines: 2,
-            maxLines: 4,
+            maxLines: 3,
             autocorrect: false,
             enableSuggestions: false,
           ),
-          const SizedBox(height: 6),
-          OutlinedButton.icon(
-            onPressed: onPick,
-            icon: const Icon(Icons.folder_open),
-            label: const Text('ファイルから読み込む'),
+      ],
+    );
+  }
+}
+
+class _FireTvPickResult {
+  const _FireTvPickResult.bytes(this.bytes) : useSystemPicker = false;
+  const _FireTvPickResult.systemPicker()
+    : bytes = null,
+      useSystemPicker = true;
+
+  final Uint8List? bytes;
+  final bool useSystemPicker;
+}
+
+class _FireTvFilePickerDialog extends StatefulWidget {
+  const _FireTvFilePickerDialog({required this.helper});
+
+  final FireTvHelper helper;
+
+  @override
+  State<_FireTvFilePickerDialog> createState() =>
+      _FireTvFilePickerDialogState();
+}
+
+class _FireTvFilePickerDialogState extends State<_FireTvFilePickerDialog> {
+  bool _loading = true;
+  bool _hasPermission = true;
+  String? _appFilesDir;
+  String? _error;
+  List<CredentialCandidateFile> _files = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final hasPerm = await widget.helper.hasStoragePermission();
+    final appDir = await widget.helper.getAppFilesDirPath();
+    final files = await widget.helper.listCredentialCandidateFiles();
+    if (!mounted) return;
+    setState(() {
+      _hasPermission = hasPerm;
+      _appFilesDir = appDir;
+      _files = files;
+      _loading = false;
+    });
+  }
+
+  Future<void> _requestPermission() async {
+    final granted = await widget.helper.requestStoragePermission();
+    if (!mounted) return;
+    if (!granted) {
+      setState(() {
+        _error = 'ストレージ読み取り権限が許可されませんでした。アプリ専用フォルダを使用してください。';
+      });
+    }
+    await _refresh();
+  }
+
+  Future<void> _selectFile(CredentialCandidateFile file) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final bytes = await widget.helper.readFileBytes(file.path);
+    if (!mounted) return;
+    if (bytes == null) {
+      setState(() {
+        _loading = false;
+        _error = '${file.name} を読み込めませんでした。権限またはファイル配置を確認してください。';
+      });
+      return;
+    }
+    Navigator.of(context).pop(_FireTvPickResult.bytes(bytes));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AlertDialog(
+      title: const Text('資格情報ファイルを選択'),
+      content: SizedBox(
+        width: 520,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (_error != null) ...[
+              Text(_error!, style: TextStyle(color: theme.colorScheme.error)),
+              const SizedBox(height: 8),
+            ],
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (_files.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Text(
+                  '候補ファイルが見つかりませんでした。\n'
+                  'Download フォルダ または アプリ専用フォルダにファイルを配置してください。'
+                  '${_appFilesDir != null ? '\nアプリ専用フォルダ: $_appFilesDir' : ''}',
+                  style: theme.textTheme.bodySmall,
+                ),
+              )
+            else
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 280),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: _files.length,
+                  itemBuilder: (context, index) {
+                    final f = _files[index];
+                    return ListTile(
+                      autofocus: index == 0,
+                      leading: const Icon(Icons.description_outlined),
+                      title: Text(f.name),
+                      subtitle: Text('${f.folder} (${f.size} B)'),
+                      onTap: () => _selectFile(f),
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        if (!_hasPermission)
+          FilledButton.tonal(
+            onPressed: _loading ? null : _requestPermission,
+            child: const Text('Download フォルダの権限を許可'),
           ),
-        ],
+        TextButton(
+          onPressed: _loading ? null : _refresh,
+          child: const Text('再読み込み'),
+        ),
+        TextButton(
+          onPressed: _loading
+              ? null
+              : () => Navigator.of(
+                  context,
+                ).pop(const _FireTvPickResult.systemPicker()),
+          child: const Text('標準ピッカーを試す'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('キャンセル'),
+        ),
       ],
     );
   }
