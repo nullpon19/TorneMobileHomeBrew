@@ -11,6 +11,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/app/firetv_helper.dart';
+import 'package:tmhb/app/firetv_preset.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
@@ -301,6 +302,107 @@ void main() {
       expect(helper.volumeMaxCalls, greaterThanOrEqualTo(1));
       expect(helper.tryConnectCalls, 0);
       expect(find.text('Tailscale が起動していません'), findsNothing);
+    });
+  });
+
+  group('FireTvPreset seeding', () {
+    const samplePreset = FireTvPreset(
+      certHex: katSinkCert,
+      keyHex: katSinkPriv,
+      nasneHost: '192.168.10.171',
+      nasneUdn: 'uuid:test-nasne',
+      nasneName: 'nasne',
+      nasneMac: '00:25:dc:5a:4d:e5',
+    );
+
+    test('seeds credentials and nasne once and respects later deletion', () async {
+      final kv = InMemoryKeyValueStore();
+      final credStore = InMemoryCredentialStore(
+        authorityKeys: [hexToBytes(katAuthPub)],
+      );
+      final regStore = InMemoryRegistrationStore();
+
+      // First launch applies both presets.
+      await applyFireTvPresetsIfNeeded(
+        keyValues: kv,
+        credentialStore: credStore,
+        registrationStore: regStore,
+        preset: samplePreset,
+      );
+      expect(await credStore.hasCredentials, isTrue);
+      final regs1 = await regStore.loadAll();
+      expect(regs1.map((r) => r.host), ['192.168.10.171']);
+      expect(await kv.read(presetCredAppliedKey), 'true');
+      expect(await kv.read(presetNasneAppliedKey), 'true');
+
+      // User deletes both on a later launch; presets must not re-apply.
+      await credStore.delete();
+      await regStore.remove('192.168.10.171');
+      await applyFireTvPresetsIfNeeded(
+        keyValues: kv,
+        credentialStore: credStore,
+        registrationStore: regStore,
+        preset: samplePreset,
+      );
+      expect(await credStore.hasCredentials, isFalse);
+      expect(await regStore.loadAll(), isEmpty);
+    });
+
+    test('does not overwrite already-configured stores', () async {
+      final kv = InMemoryKeyValueStore();
+      final credStore = InMemoryCredentialStore(
+        authorityKeys: [hexToBytes(katAuthPub)],
+      );
+      await credStore.save(
+        certificate: hexToBytes(katSinkCert),
+        privateKey: hexToBytes(katSinkPriv),
+      );
+      const existingReg = RegisteredNasne(
+        host: '10.0.0.5',
+        udn: 'uuid:custom',
+        friendlyName: 'custom-nasne',
+        macAddr: '00:11:22:33:44:55',
+      );
+      final regStore = InMemoryRegistrationStore([existingReg]);
+
+      await applyFireTvPresetsIfNeeded(
+        keyValues: kv,
+        credentialStore: credStore,
+        registrationStore: regStore,
+        preset: samplePreset,
+      );
+      final regs = await regStore.loadAll();
+      expect(regs.map((r) => r.host), ['10.0.0.5']);
+    });
+
+    testWidgets('preset restore button appears and saves credentials', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final store = InMemoryCredentialStore(
+        authorityKeys: [hexToBytes(katAuthPub)],
+      );
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            credentialStoreProvider.overrideWithValue(store),
+            fireTvHelperProvider.overrideWithValue(_FakeFireTvHelper()),
+            fireTvPresetProvider.overrideWithValue(samplePreset),
+          ],
+          child: const MaterialApp(home: DtcpCredentialScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('内蔵プリセットを読み込む'), findsOneWidget);
+      await tester.tap(find.text('内蔵プリセットを読み込む'));
+      await tester.pumpAndSettle();
+
+      expect(await store.hasCredentials, isTrue);
+      expect(find.text('インポート済み'), findsOneWidget);
     });
   });
 }

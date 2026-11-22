@@ -15,6 +15,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'app/bootstrap.dart';
+import 'app/firetv_preset.dart';
 import 'ui/widgets.dart';
 import 'app/lifecycle_log.dart';
 import 'app/providers.dart';
@@ -29,6 +30,13 @@ Future<void> main() async {
   // files before anything reads the stores (plan 96).
   await migrateLegacyKeyValueFiles(storeDirectory);
   final container = fileStoreContainer(storeDirectory);
+  await applyFireTvPresetsIfNeeded(
+    keyValues: container.read(keyValueStoreProvider),
+    credentialStore: container.read(credentialStoreProvider),
+    registrationStore: container.read(registrationStoreProvider),
+    preset: container.read(fireTvPresetProvider),
+    diag: container.read(diagLogProvider),
+  );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed
   // around a playback session (the wakelock sleep investigation).
