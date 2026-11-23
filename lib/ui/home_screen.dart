@@ -53,25 +53,104 @@ class HomeScreen extends ConsumerWidget {
   }
 }
 
-class _StatusList extends ConsumerWidget {
+/// Width of the home body at or above which paired sections render side-by-side
+/// in equal-height two-column rows (Fire TV / tablet). Narrow screens stack.
+const double homeTwoColumnBreakpoint = 600;
+
+class _StatusList extends ConsumerStatefulWidget {
   const _StatusList({required this.reg});
 
   final RegisteredNasne reg;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_StatusList> createState() => _StatusListState();
+}
+
+class _StatusListState extends ConsumerState<_StatusList> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reg = widget.reg;
     return RefreshIndicator(
       onRefresh: () async => invalidateDeviceData(ref, reg),
-      child: ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final twoColumn = constraints.maxWidth >= homeTwoColumnBreakpoint;
+          const leftMargin = EdgeInsets.fromLTRB(12, 6, 6, 6);
+          const rightMargin = EdgeInsets.fromLTRB(6, 6, 12, 6);
+          return ListView(
+            controller: _scrollController,
+            // Keep all six cards built so D-pad traversal can reach off-screen
+            // bottom sections without skipping unbuilt rows.
+            scrollCacheExtent: const ScrollCacheExtent.pixels(2000),
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: [
+              if (twoColumn)
+                _PairedSectionRow(
+                  left: _DeviceSection(
+                    reg: reg,
+                    margin: leftMargin,
+                    scrollController: _scrollController,
+                  ),
+                  right: _HddSection(
+                    reg: reg,
+                    margin: rightMargin,
+                    scrollController: _scrollController,
+                  ),
+                )
+              else ...[
+                _DeviceSection(reg: reg, scrollController: _scrollController),
+                _HddSection(reg: reg, scrollController: _scrollController),
+              ],
+              _LiveSection(reg: reg, scrollController: _scrollController),
+              _RecNgSection(reg: reg, scrollController: _scrollController),
+              if (twoColumn)
+                _PairedSectionRow(
+                  left: _NetworkSection(
+                    reg: reg,
+                    margin: leftMargin,
+                    scrollController: _scrollController,
+                  ),
+                  right: _BcasSection(
+                    reg: reg,
+                    margin: rightMargin,
+                    scrollController: _scrollController,
+                  ),
+                )
+              else ...[
+                _NetworkSection(reg: reg, scrollController: _scrollController),
+                _BcasSection(reg: reg, scrollController: _scrollController),
+              ],
+              const SizedBox(height: 12),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _PairedSectionRow extends StatelessWidget {
+  const _PairedSectionRow({required this.left, required this.right});
+
+  final Widget left;
+  final Widget right;
+
+  @override
+  Widget build(BuildContext context) {
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _DeviceSection(reg: reg),
-          _HddSection(reg: reg),
-          _LiveSection(reg: reg),
-          _RecNgSection(reg: reg),
-          _NetworkSection(reg: reg),
-          _BcasSection(reg: reg),
-          const SizedBox(height: 12),
+          Expanded(child: left),
+          Expanded(child: right),
         ],
       ),
     );
@@ -79,9 +158,15 @@ class _StatusList extends ConsumerWidget {
 }
 
 class _DeviceSection extends ConsumerWidget {
-  const _DeviceSection({required this.reg});
+  const _DeviceSection({
+    required this.reg,
+    this.margin,
+    this.scrollController,
+  });
 
   final RegisteredNasne reg;
+  final EdgeInsetsGeometry? margin;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -89,6 +174,9 @@ class _DeviceSection extends ConsumerWidget {
     return SectionCard(
       title: '本体情報',
       icon: Icons.router_outlined,
+      margin: margin ?? SectionCard.defaultMargin,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(
         info,
         (d) => Column(
@@ -117,9 +205,11 @@ class _DeviceSection extends ConsumerWidget {
 }
 
 class _HddSection extends ConsumerWidget {
-  const _HddSection({required this.reg});
+  const _HddSection({required this.reg, this.margin, this.scrollController});
 
   final RegisteredNasne reg;
+  final EdgeInsetsGeometry? margin;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -127,6 +217,9 @@ class _HddSection extends ConsumerWidget {
     return SectionCard(
       title: 'HDD',
       icon: Icons.storage_outlined,
+      margin: margin ?? SectionCard.defaultMargin,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(
         hdds,
         (list) => Column(
@@ -194,9 +287,10 @@ class _HddTile extends StatelessWidget {
 }
 
 class _LiveSection extends ConsumerWidget {
-  const _LiveSection({required this.reg});
+  const _LiveSection({required this.reg, this.scrollController});
 
   final RegisteredNasne reg;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -204,6 +298,8 @@ class _LiveSection extends ConsumerWidget {
     return SectionCard(
       title: 'ライブ状態',
       icon: Icons.live_tv_outlined,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(live, (status) {
         final eit = status.eitPf;
         final messages = [...status.caMessages, ...status.emmMessages];
@@ -247,9 +343,10 @@ class _LiveSection extends ConsumerWidget {
 }
 
 class _RecNgSection extends ConsumerWidget {
-  const _RecNgSection({required this.reg});
+  const _RecNgSection({required this.reg, this.scrollController});
 
   final RegisteredNasne reg;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -257,6 +354,8 @@ class _RecNgSection extends ConsumerWidget {
     return SectionCard(
       title: '録画失敗',
       icon: Icons.videocam_off_outlined,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(
         recNg,
         (items) => items.isEmpty
@@ -281,9 +380,15 @@ class _RecNgSection extends ConsumerWidget {
 }
 
 class _NetworkSection extends ConsumerWidget {
-  const _NetworkSection({required this.reg});
+  const _NetworkSection({
+    required this.reg,
+    this.margin,
+    this.scrollController,
+  });
 
   final RegisteredNasne reg;
+  final EdgeInsetsGeometry? margin;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -291,6 +396,9 @@ class _NetworkSection extends ConsumerWidget {
     return SectionCard(
       title: 'ネットワーク',
       icon: Icons.lan_outlined,
+      margin: margin ?? SectionCard.defaultMargin,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(
         network,
         (n) => Column(
@@ -309,9 +417,11 @@ class _NetworkSection extends ConsumerWidget {
 }
 
 class _BcasSection extends ConsumerWidget {
-  const _BcasSection({required this.reg});
+  const _BcasSection({required this.reg, this.margin, this.scrollController});
 
   final RegisteredNasne reg;
+  final EdgeInsetsGeometry? margin;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -319,6 +429,9 @@ class _BcasSection extends ConsumerWidget {
     return SectionCard(
       title: 'B-CAS',
       icon: Icons.badge_outlined,
+      margin: margin ?? SectionCard.defaultMargin,
+      focusable: true,
+      scrollController: scrollController,
       child: asyncSection(
         bcas,
         (b) => Column(

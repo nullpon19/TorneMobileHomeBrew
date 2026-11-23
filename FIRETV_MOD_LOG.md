@@ -101,7 +101,7 @@
 2. **録画・TV視聴詳細画面からのメタデータ引き渡し (`lib/ui/titles_screen.dart`, `lib/ui/live_screen.dart`)**:
    - 録画済み詳細画面・Live 視聴詳細画面の双方で、番組タイトル・放送日時／チャンネル／ジャンル・詳細文（詳細画面上で 2 行省略または省略していた内容）を `PlayerScreen` へ渡すように拡張。
 
-### 第9弾: OSD 循環フォーカストラップ＆高視認性強調・EPG 黒フォーカス枠＆予約済み赤枠／編集導線（本コミット）
+### 第9弾: OSD 循環フォーカストラップ＆高視認性強調・EPG 黒フォーカス枠＆予約済み赤枠／編集導線 (`b5f6be3`)
 1. **再生中 OSD ボタンバーの循環フォーカストラップ＆強調スタイル (`lib/ui/player_screen.dart`)**:
    - OSD 操作ボタン列を専用 `FocusScopeNode` ベースの `PlayerOsdButtonBar` に変更し、右端から右で左端・左端から左へループし、上下矢印（複数行時は行間移動、単一行時は同ボタン維持）でもフォーカスが OSD 外へ逃げないように制御（万一ルートへ外れても矢印キーで先頭ボタンへ復帰）。
    - `osdButtonStyle()` によりフォーカス中ボタンを明るい金色背景・黒文字／黒アイコン・白 2.5px 枠線に反転強調。
@@ -109,6 +109,14 @@
    - ライトモード時の EPG タイルフォーカス枠色を `#D32F2F` から黒枠 (`Colors.black`, 3px) へ変更（ナイトモード時は `Colors.amberAccent` 維持）。
    - `schedulesProvider` と照合 (`parseScheduleEventId` / `findMatchingSchedule`) し、予約済み番組タイルを 2.5px の赤枠（ライト `#D32F2F` / ナイト `redAccent`）＋時刻横の赤ドットで囲い表示（予約済み＋フォーカス時は外側黒/金枠＋内側赤枠を併用描画）。
    - 予約済み番組の詳細ダイアログ（EPG・番組検索双方）では「録画予約」の代わりに **`'予約を編集'`** ボタンを表示し、押下で `ScheduleDetailPage`（編集／時刻変更／削除）を開くように変更。
+
+### 第10弾: ホーム画面 2 カラム並列・高さ揃え＆リモコン下端スクロール対応（本コミット）
+1. **ホーム画面のペアカード 2 カラム化＆高さ揃え (`lib/ui/home_screen.dart`, `lib/ui/widgets.dart`)**:
+   - 横幅 `homeTwoColumnBreakpoint` (`600dp`) 以上（Fire TV／タブレット等）で、「本体情報」＋「HDD」および「ネットワーク」＋「B-CAS」をそれぞれ `_PairedSectionRow` (`IntrinsicHeight` + `Row(crossAxisAlignment: CrossAxisAlignment.stretch)`) により 2 カラム並列・同高さで配置。
+   - 外側・中央マージンを上下カードと統一 (`12dp`) し、狭幅画面（スマホサイズ）では従来の縦 1 カラム表示を維持。
+2. **ホーム画面のリモコン D-pad フォーカス＆最下部スクロール対応 (`lib/ui/widgets.dart`, `lib/ui/home_screen.dart`)**:
+   - `SectionCard` に `margin`・`focusable`・`scrollController` 対応を追加し、ホーム画面の全 6 セクションカードをフォーカス可能化（ライト時黒枠 3px / ダーク時 `amberAccent` 3px、レイアウトズレなし、エラー時「再試行」ボタンへのフォーカス移動も両立）。
+   - `_StatusList` の `ListView` に `ScrollController` と `scrollCacheExtent: ScrollCacheExtent.pixels(2000)` を設定し、全カード常時探索可能にしたうえでフォーカス追従 (`Scrollable.ensureVisible`)、画面縦幅超えカードの段階スクロール、および最下段到達時の最下部スクロールを実装。
 
 ---
 
@@ -137,6 +145,7 @@
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー・プリセット復元ボタン |
 | `lib/ui/epg_screen.dart` | `_EventTile` の `focusColor` 無効化＋3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、`schedulesProvider` 照合による予約済み赤枠・赤ドット表示・詳細 `'予約を編集'` (`ScheduleDetailPage`) 切替 |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力）、検索結果の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
+| `lib/ui/home_screen.dart` | 横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
 | `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、OSD「番組詳細」データ引き渡し |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
 | `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
@@ -146,10 +155,10 @@
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
 | `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、`knownDuration` 引き渡し、OSD「番組詳細」データ引き渡し、検索欄 `FireTvTextInputField` 化、`'番組まとめ'` `FilterChip`・シリーズ折りたたみフォルダ `_TitleGroupTile`・展開インデント表示を追加 |
-| `lib/ui/widgets.dart` | 決定キーでダイアログ入力を開く共通 `FireTvTextInputField` / `_FireTvTextInputDialog` 追加 |
+| `lib/ui/widgets.dart` | 決定キーでダイアログ入力を開く共通 `FireTvTextInputField` / `_FireTvTextInputDialog` 追加、`SectionCard` の `margin`・D-pad `focusable` 枠強調＆`ScrollController` 連動スクロール対応 |
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・終了確認・終端ガード・OSD詳細パネル＆循環フォーカス）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・終了確認・終端ガード・OSD詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |
@@ -183,7 +192,7 @@
 アップストリーム更新後に `firetv-mod` をリベース／チェリーピックする際は、主に以下の競合ポイントを確認してください。
 - `lib/ui/player_screen.dart` / `lib/ui/player_error_policy.dart`（フルスクリーン OSD / ±10秒シーク / シークバー HUD / 事前バッファ / 自動再開・フォーカス / 録画終了時自動復帰）
 - `lib/ui/title_list_filter.dart` / `lib/ui/titles_screen.dart` / `lib/ui/live_screen.dart`（番組自動まとめ・折りたたみフォルダ・1/4 サムネレイアウト・画質都度切替・`knownDuration`・検索入力ダイアログ）
-- `lib/ui/dtcp_credential_screen.dart` / `lib/ui/settings_screen.dart` / `lib/ui/epg_screen.dart` / `lib/ui/epg_search_screen.dart` / `lib/ui/schedule_form.dart` / `lib/ui/widgets.dart` / `lib/ui/app_shell.dart`（各入力ダイアログ・EPG赤/金枠・戻る終了確認）
+- `lib/ui/dtcp_credential_screen.dart` / `lib/ui/settings_screen.dart` / `lib/ui/home_screen.dart` / `lib/ui/epg_screen.dart` / `lib/ui/epg_search_screen.dart` / `lib/ui/schedule_form.dart` / `lib/ui/widgets.dart` / `lib/ui/app_shell.dart`（各入力ダイアログ・Home 2カラム/D-padスクロール・EPG黒/金枠・戻る終了確認）
 - `lib/core/dtcp/dtcp_proxy.dart` / `dtcp_crypto.dart` / `lib/core/services/dtcp_playback.dart`
 - `lib/app/providers.dart` / `lib/main.dart` / `android/app/build.gradle.kts` / `MainActivity.kt`
 

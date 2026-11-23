@@ -3,6 +3,9 @@
 /// error presentation stay uniform.
 library;
 
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -53,24 +56,177 @@ class ErrorView extends StatelessWidget {
 }
 
 /// A titled card used to group one home-screen section.
-class SectionCard extends StatelessWidget {
+class SectionCard extends StatefulWidget {
   const SectionCard({
     super.key,
     required this.title,
     required this.child,
     this.icon,
     this.trailing,
+    this.margin = defaultMargin,
+    this.focusable = false,
+    this.scrollController,
   });
+
+  static const EdgeInsets defaultMargin = EdgeInsets.fromLTRB(12, 6, 12, 6);
 
   final String title;
   final IconData? icon;
   final Widget? trailing;
   final Widget child;
+  final EdgeInsetsGeometry margin;
+  final bool focusable;
+  final ScrollController? scrollController;
+
+  @override
+  State<SectionCard> createState() => _SectionCardState();
+}
+
+class _SectionCardState extends State<SectionCard> {
+  late final FocusNode _focusNode = FocusNode(
+    debugLabel: 'section:${widget.title}',
+  )..addListener(_handleFocusNodeChanged);
+  bool _hasPrimaryFocus = false;
+
+  @override
+  void dispose() {
+    _focusNode
+      ..removeListener(_handleFocusNodeChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleFocusNodeChanged() {
+    final primary = _focusNode.hasPrimaryFocus;
+    if (_hasPrimaryFocus != primary && mounted) {
+      setState(() => _hasPrimaryFocus = primary);
+    }
+  }
+
+  void _onFocusChange(bool hasFocus) {
+    _handleFocusNodeChanged();
+    if (!hasFocus) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          alignment: 0.15,
+        ),
+      );
+    });
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (!_focusNode.hasPrimaryFocus) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key != LogicalKeyboardKey.arrowDown &&
+        key != LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.ignored;
+    }
+
+    final scrollable = Scrollable.maybeOf(context);
+    final pos =
+        (widget.scrollController != null && widget.scrollController!.hasClients)
+        ? widget.scrollController!.position
+        : scrollable?.position;
+    final cardBox = context.findRenderObject() as RenderBox?;
+    final viewportBox = scrollable?.context.findRenderObject() as RenderBox?;
+
+    if (cardBox != null &&
+        cardBox.attached &&
+        cardBox.hasSize &&
+        viewportBox != null &&
+        viewportBox.attached &&
+        viewportBox.hasSize) {
+      final cardTop = cardBox
+          .localToGlobal(Offset.zero, ancestor: viewportBox)
+          .dy;
+      final cardHeight = cardBox.size.height;
+      final cardBottom = cardTop + cardHeight;
+      final viewportHeight = viewportBox.size.height;
+
+      if (key == LogicalKeyboardKey.arrowDown) {
+        final overflowingBottom =
+            cardBottom > viewportHeight + 4 &&
+            (cardTop <= 24 || cardHeight > viewportHeight - 16);
+        if (overflowingBottom &&
+            pos != null &&
+            pos.pixels < pos.maxScrollExtent) {
+          final step = (cardBottom - viewportHeight + 16).clamp(80.0, 180.0);
+          final target = (pos.pixels + step).clamp(
+            pos.minScrollExtent,
+            pos.maxScrollExtent,
+          );
+          unawaited(
+            pos.animateTo(
+              target,
+              duration: const Duration(milliseconds: 140),
+              curve: Curves.easeOut,
+            ),
+          );
+          return KeyEventResult.handled;
+        }
+      } else {
+        final overflowingTop =
+            cardTop < -4 &&
+            (cardBottom >= viewportHeight - 24 ||
+                cardHeight > viewportHeight - 16);
+        if (overflowingTop && pos != null && pos.pixels > pos.minScrollExtent) {
+          final step = (-cardTop + 16).clamp(80.0, 180.0);
+          final target = (pos.pixels - step).clamp(
+            pos.minScrollExtent,
+            pos.maxScrollExtent,
+          );
+          unawaited(
+            pos.animateTo(
+              target,
+              duration: const Duration(milliseconds: 140),
+              curve: Curves.easeOut,
+            ),
+          );
+          return KeyEventResult.handled;
+        }
+      }
+    }
+
+    if (key == LogicalKeyboardKey.arrowDown) {
+      final moved = _focusNode.focusInDirection(TraversalDirection.down);
+      if (moved) return KeyEventResult.handled;
+      if (pos != null && pos.pixels < pos.maxScrollExtent) {
+        unawaited(
+          pos.animateTo(
+            pos.maxScrollExtent,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+          ),
+        );
+      }
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
+    final card = Card(
+      margin: widget.margin,
+      shape: widget.focusable && _hasPrimaryFocus
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: focusBorderColor, width: 3),
+            )
+          : null,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
         child: Column(
@@ -78,24 +234,31 @@ class SectionCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                if (icon != null) ...[
-                  Icon(icon, size: 20),
+                if (widget.icon != null) ...[
+                  Icon(widget.icon, size: 20),
                   const SizedBox(width: 8),
                 ],
                 Expanded(
                   child: Text(
-                    title,
+                    widget.title,
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                 ),
-                ?trailing,
+                ?widget.trailing,
               ],
             ),
             const SizedBox(height: 8),
-            child,
+            widget.child,
           ],
         ),
       ),
+    );
+    if (!widget.focusable) return card;
+    return Focus(
+      focusNode: _focusNode,
+      onFocusChange: _onFocusChange,
+      onKeyEvent: _handleKeyEvent,
+      child: card,
     );
   }
 }

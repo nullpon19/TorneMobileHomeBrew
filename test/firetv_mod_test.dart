@@ -19,6 +19,7 @@ import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
+import 'package:tmhb/ui/home_screen.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
 import 'package:tmhb/ui/player_error_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
@@ -1623,6 +1624,212 @@ void main() {
         expect(f2.hasPrimaryFocus, isTrue);
       },
     );
+  });
+
+  group('HomeScreen 2-column layout and Fire TV D-pad scrolling', () {
+    Widget buildHomeTestApp({
+      Brightness brightness = Brightness.light,
+      List<RecNgItem> recNgItems = const [],
+    }) {
+      const reg = RegisteredNasne(
+        host: '192.0.2.10',
+        udn: 'uuid:home-test',
+        friendlyName: 'テストnasne',
+        macAddr: '00:11:22:33:44:55',
+      );
+      return ProviderScope(
+        overrides: [
+          registrationStoreProvider.overrideWithValue(
+            InMemoryRegistrationStore(const [reg]),
+          ),
+          deviceInfoProvider.overrideWith(
+            (ref, r) async => const DeviceInfo(
+              name: 'テストnasne',
+              softwareVersion: '0260',
+              currDate: '2026-11-23T14:00:00+09:00',
+              pref: '東京都',
+              updateExists: true,
+            ),
+          ),
+          hddDetailsProvider.overrideWith(
+            (ref, r) async => const [
+              HddDetail(
+                HddEntry(
+                  id: 0,
+                  internal: true,
+                  mounted: true,
+                  registered: true,
+                ),
+                HddInfo(
+                  id: 0,
+                  internal: true,
+                  format: 'xfs',
+                  name: 'hdd0',
+                  usedBytes: 300000000000,
+                  freeBytes: 200000000000,
+                  totalBytes: 500000000000,
+                ),
+              ),
+            ],
+          ),
+          liveStatusProvider.overrideWith(
+            (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+          ),
+          recNgProvider.overrideWith((ref, r) async => recNgItems),
+          networkInfoProvider.overrideWith(
+            (ref, r) async => const NetworkInfo(
+              macAddr: '00:11:22:33:44:55',
+              ipv4Addr: '192.0.2.10',
+              gateway: '192.0.2.1',
+              dhcpEnabled: true,
+            ),
+          ),
+          bcasInfoProvider.overrideWith(
+            (ref, r) async =>
+                const BcasInfo(cardId: '0000123456789999', status: 'OK'),
+          ),
+        ],
+        child: MaterialApp(
+          theme: ThemeData(brightness: brightness),
+          home: const HomeScreen(),
+        ),
+      );
+    }
+
+    Finder cardForSection(String title, {bool skipOffstage = false}) =>
+        find.ancestor(
+          of: find.text(title, skipOffstage: skipOffstage),
+          matching: find.byType(Card, skipOffstage: skipOffstage),
+        );
+
+    testWidgets(
+      'wide screen lays out paired cards side-by-side with equal heights',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        await tester.pumpWidget(buildHomeTestApp());
+        await tester.pumpAndSettle();
+
+        final deviceRect = tester.getRect(cardForSection('本体情報'));
+        final hddRect = tester.getRect(cardForSection('HDD'));
+        final networkRect = tester.getRect(cardForSection('ネットワーク'));
+        final bcasRect = tester.getRect(cardForSection('B-CAS'));
+
+        expect(hddRect.left, greaterThan(deviceRect.left));
+        expect(deviceRect.top, hddRect.top);
+        expect((deviceRect.height - hddRect.height).abs(), lessThan(0.01));
+        expect((deviceRect.width - hddRect.width).abs(), lessThan(1.0));
+
+        expect(bcasRect.left, greaterThan(networkRect.left));
+        expect(networkRect.top, bcasRect.top);
+        expect((networkRect.height - bcasRect.height).abs(), lessThan(0.01));
+        expect((networkRect.width - bcasRect.width).abs(), lessThan(1.0));
+      },
+    );
+
+    testWidgets(
+      'Fire TV D-pad scrolls all the way down to B-CAS and shows focus border',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final recNgItems = List<RecNgItem>.generate(
+          6,
+          (i) => RecNgItem(id: 'ng-$i', title: '録画失敗テスト $i', raw: const {}),
+        );
+
+        await tester.pumpWidget(buildHomeTestApp(recNgItems: recNgItems));
+        await tester.pumpAndSettle();
+
+        final listView = tester.widget<ListView>(find.byType(ListView));
+        final controller = listView.controller!;
+        expect(controller.position.maxScrollExtent, greaterThan(0));
+        expect(controller.offset, 0);
+
+        final deviceCard = cardForSection('本体情報');
+        final hddCard = cardForSection('HDD');
+        final networkCard = cardForSection('ネットワーク');
+        final bcasCard = cardForSection('B-CAS');
+
+        expect(tester.getRect(networkCard).bottom, greaterThan(540));
+        expect(tester.getRect(bcasCard).bottom, greaterThan(540));
+
+        // Focus top-left card ('本体情報') and check light-mode black border.
+        final deviceFocus = tester.widget<Focus>(
+          find.ancestor(of: deviceCard, matching: find.byType(Focus)).first,
+        );
+        deviceFocus.focusNode!.requestFocus();
+        await tester.pumpAndSettle();
+
+        final focusedDeviceShape =
+            tester.widget<Card>(deviceCard).shape as RoundedRectangleBorder?;
+        expect(focusedDeviceShape?.side.color, Colors.black);
+        expect(focusedDeviceShape?.side.width, 3);
+
+        // Right moves focus to paired 'HDD' card; Left moves back.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pumpAndSettle();
+        final focusedHddShape =
+            tester.widget<Card>(hddCard).shape as RoundedRectangleBorder?;
+        expect(focusedHddShape?.side.color, Colors.black);
+        expect(focusedHddShape?.side.width, 3);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pumpAndSettle();
+
+        // Down across cards scrolls all the way down to the bottom row.
+        for (var i = 0; i < 6; i++) {
+          await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+          await tester.pumpAndSettle();
+        }
+
+        expect(controller.offset, greaterThan(0));
+        expect(FocusManager.instance.primaryFocus, isNotNull);
+        final onstageNetworkCard = cardForSection('ネットワーク', skipOffstage: true);
+        final onstageBcasCard = cardForSection('B-CAS', skipOffstage: true);
+        expect(onstageNetworkCard, findsOneWidget);
+        expect(onstageBcasCard, findsOneWidget);
+        expect(tester.getRect(onstageNetworkCard).bottom, lessThanOrEqualTo(540.5));
+        expect(tester.getRect(onstageBcasCard).bottom, lessThanOrEqualTo(540.5));
+        expect(tester.getRect(onstageNetworkCard).top, greaterThanOrEqualTo(0));
+        expect(tester.getRect(onstageBcasCard).top, greaterThanOrEqualTo(0));
+
+        // Dark mode uses amberAccent focus border on Home cards.
+        await tester.pumpWidget(buildHomeTestApp(brightness: Brightness.dark));
+        await tester.pumpAndSettle();
+        final darkDeviceFocus = tester.widget<Focus>(
+          find.ancestor(of: deviceCard, matching: find.byType(Focus)).first,
+        );
+        darkDeviceFocus.focusNode!.requestFocus();
+        await tester.pumpAndSettle();
+        final darkDeviceShape =
+            tester.widget<Card>(deviceCard).shape as RoundedRectangleBorder?;
+        expect(darkDeviceShape?.side.color, Colors.amberAccent);
+        expect(darkDeviceShape?.side.width, 3);
+      },
+    );
+
+    testWidgets('narrow phone width stacks paired cards vertically', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(buildHomeTestApp());
+      await tester.pumpAndSettle();
+
+      final deviceRect = tester.getRect(cardForSection('本体情報'));
+      final hddRect = tester.getRect(cardForSection('HDD'));
+      final networkRect = tester.getRect(cardForSection('ネットワーク'));
+      final bcasRect = tester.getRect(cardForSection('B-CAS'));
+
+      expect(hddRect.top, greaterThanOrEqualTo(deviceRect.bottom));
+      expect(bcasRect.top, greaterThanOrEqualTo(networkRect.bottom));
+    });
   });
 }
 
