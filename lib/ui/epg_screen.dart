@@ -27,6 +27,7 @@ import 'error_messages.dart';
 import 'format.dart';
 import 'live_screen.dart';
 import 'schedule_form.dart';
+import 'schedules_screen.dart';
 import 'epg_subchannel_visibility.dart';
 import 'widgets.dart';
 
@@ -395,6 +396,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
               onPressed: () {
+                ref.invalidate(schedulesProvider(reg));
                 if (_selectedBand == terrestrialBroadcastingType) {
                   ref.invalidate(epgGuideProvider(reg));
                   ref.invalidate(channelLogosProvider(reg));
@@ -424,6 +426,8 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
     final guideAsync = isBs
         ? ref.watch(bsEpgGuideProvider(reg))
         : ref.watch(epgGuideProvider(reg));
+    final schedules =
+        ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
     final logos = isBs
         ? (ref.watch(bsChannelLogosProvider(reg)).value ??
               const <int, List<int>>{})
@@ -469,6 +473,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
                 guide,
                 ref.watch(showSubchannelsProvider),
               ),
+              schedules: schedules,
               hiddenGenres: ref.watch(hiddenEpgGenresProvider),
               onWatchEvent: (channel) => openLiveChannelForEpg(
                 context,
@@ -499,6 +504,7 @@ class _GuideView extends StatelessWidget {
   const _GuideView({
     required this.reg,
     required this.guide,
+    required this.schedules,
     required this.hiddenGenres,
     required this.onWatchEvent,
     required this.logos,
@@ -513,6 +519,7 @@ class _GuideView extends StatelessWidget {
 
   final RegisteredNasne reg;
   final EpgGuide guide;
+  final List<RecordSchedule> schedules;
 
   /// Genres the viewer marked as not watched (plan 95):
   /// their tiles paint blank.
@@ -606,6 +613,7 @@ class _GuideView extends StatelessWidget {
                           child: _DayGrid(
                             reg: reg,
                             services: guide.services,
+                            schedules: schedules,
                             hiddenGenres: hiddenGenres,
                             onWatchEvent: onWatchEvent,
                             dayStart: dayStart,
@@ -748,6 +756,7 @@ class _DayGrid extends StatelessWidget {
   const _DayGrid({
     required this.reg,
     required this.services,
+    required this.schedules,
     required this.hiddenGenres,
     required this.onWatchEvent,
     required this.dayStart,
@@ -757,6 +766,7 @@ class _DayGrid extends StatelessWidget {
 
   final RegisteredNasne reg;
   final List<EpgServiceGuide> services;
+  final List<RecordSchedule> schedules;
   final Set<int> hiddenGenres;
   final void Function(Channel channel) onWatchEvent;
   final DateTime dayStart;
@@ -813,6 +823,11 @@ class _DayGrid extends StatelessWidget {
                               event.genreLevel1,
                               hiddenGenres,
                             ),
+                            matchedSchedule: findMatchingSchedule(
+                              schedules,
+                              services[i].channel,
+                              event,
+                            ),
                             onWatch: () =>
                                 onWatchEvent(services[i].channel),
                           ),
@@ -844,6 +859,7 @@ class _EventTile extends StatefulWidget {
     required this.reg,
     required this.dayStart,
     required this.suppressed,
+    this.matchedSchedule,
     required this.onWatch,
   });
 
@@ -858,6 +874,9 @@ class _EventTile extends StatefulWidget {
   /// surface colour — no tint, no text — so it does not draw
   /// the eye. The slot and the tap (the detail dialog) stay.
   final bool suppressed;
+
+  /// Existing scheduled recording matching this broadcast event, if any.
+  final RecordSchedule? matchedSchedule;
 
   /// Opens live viewing for this tile's channel (plan 95);
   /// the detail dialog offers it only while the event is on
@@ -876,6 +895,7 @@ class _EventTileState extends State<_EventTile> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     final event = widget.event;
+    final isReserved = widget.matchedSchedule != null;
     final startMin = math.max(
       0,
       event.start.difference(widget.dayStart).inMinutes,
@@ -896,9 +916,86 @@ class _EventTileState extends State<_EventTile> {
     // about 16px at the labelSmall size and a title line about
     // 17px, with 2px of vertical padding at each edge.
     final maxTitleLines = ((height - 4 - 16) / 17).floor();
-    final focusBorderColor = isDark
-        ? Colors.amberAccent
+    final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
+    final reservedBorderColor = isDark
+        ? Colors.redAccent
         : const Color(0xFFD32F2F);
+    final Widget content = widget.suppressed
+        ? const SizedBox.expand()
+        : maxTitleLines >= 1
+        ? Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    if (isReserved) ...[
+                      Icon(
+                        Icons.fiber_manual_record,
+                        size: 10,
+                        color: reservedBorderColor,
+                      ),
+                      const SizedBox(width: 2),
+                    ],
+                    Expanded(
+                      child: Text(
+                        timeText,
+                        style: timeStyle,
+                        maxLines: 1,
+                        overflow: TextOverflow.clip,
+                      ),
+                    ),
+                  ],
+                ),
+                if (title != null)
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: theme.textTheme.bodySmall,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: maxTitleLines.clamp(1, 4),
+                    ),
+                  ),
+              ],
+            ),
+          )
+        : Padding(
+            // Compact form for tiles too short for two lines:
+            // time and title share one small line.
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                if (isReserved) ...[
+                  Icon(
+                    Icons.fiber_manual_record,
+                    size: 9,
+                    color: reservedBorderColor,
+                  ),
+                  const SizedBox(width: 2),
+                ],
+                Text(
+                  timeText,
+                  style: timeStyle?.copyWith(fontSize: 10, height: 1.1),
+                ),
+                if (title != null) ...[
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontSize: 10,
+                        height: 1.1,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
     return Positioned(
       top: top,
       left: 1,
@@ -910,6 +1007,11 @@ class _EventTileState extends State<_EventTile> {
             ? BoxDecoration(
                 borderRadius: BorderRadius.circular(3),
                 border: Border.all(color: focusBorderColor, width: 3),
+              )
+            : isReserved
+            ? BoxDecoration(
+                borderRadius: BorderRadius.circular(3),
+                border: Border.all(color: reservedBorderColor, width: 2.5),
               )
             : const BoxDecoration(),
         child: Material(
@@ -942,60 +1044,32 @@ class _EventTileState extends State<_EventTile> {
               channel: widget.channel,
               channelName: widget.channelName,
               event: event,
+              existingSchedule: widget.matchedSchedule,
               onWatch: widget.onWatch,
             ),
-            child: widget.suppressed
-                ? const SizedBox.expand()
-                : maxTitleLines >= 1
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 4,
-                      vertical: 2,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(timeText, style: timeStyle),
-                        if (title != null)
-                          Expanded(
-                            child: Text(
-                              title,
-                              style: theme.textTheme.bodySmall,
-                              overflow: TextOverflow.ellipsis,
-                              maxLines: maxTitleLines.clamp(1, 4),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                content,
+                if (_focused && isReserved)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: Padding(
+                        padding: const EdgeInsets.all(3),
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(1),
+                            border: Border.all(
+                              color: reservedBorderColor,
+                              width: 2,
                             ),
                           ),
-                      ],
-                    ),
-                  )
-                : Padding(
-                    // Compact form for tiles too short for two lines:
-                    // time and title share one small line.
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Text(
-                          timeText,
-                          style: timeStyle?.copyWith(fontSize: 10, height: 1.1),
                         ),
-                        if (title != null) ...[
-                          const SizedBox(width: 4),
-                          Expanded(
-                            child: Text(
-                              title,
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontSize: 10,
-                                height: 1.1,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ],
+                      ),
                     ),
                   ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1021,12 +1095,62 @@ class _EventTileState extends State<_EventTile> {
 /// start and after the end there is nothing of this event to
 /// watch (the live stream carries whatever is on air then),
 /// so the action is not shown at all.
+/// Parses the 4th comma-separated element (EIT `event_id`) from an XSRS
+/// `desiredMatchingID` string (e.g. `,,0x7880,0x12ab`). Returns `null` when
+/// absent, malformed, or `<= 0` (manual time-based reservations use `0`).
+int? parseScheduleEventId(String desiredMatchingId) {
+  final parts = desiredMatchingId.split(',');
+  if (parts.length < 4) return null;
+  final raw = parts[3].trim();
+  if (raw.isEmpty) return null;
+  final parsed = (raw.startsWith('0x') || raw.startsWith('0X'))
+      ? int.tryParse(raw.substring(2), radix: 16)
+      : int.tryParse(raw);
+  if (parsed == null || parsed <= 0) return null;
+  return parsed;
+}
+
+/// Finds an active reservation matching [event] on [channel], matching on EIT
+/// `eventId` first and falling back to an exact start/end time match for
+/// manual reservations (`eventId == 0`).
+RecordSchedule? findMatchingSchedule(
+  List<RecordSchedule> schedules,
+  Channel channel,
+  EpgEvent event,
+) {
+  for (final s in schedules) {
+    if (s.channel.broadcastingType != channel.broadcastingType ||
+        s.channel.serviceId != channel.serviceId) {
+      continue;
+    }
+    final eid = parseScheduleEventId(s.desiredMatchingId);
+    if (eid != null &&
+        eid == event.eventId &&
+        s.start.difference(event.start).abs() <= const Duration(hours: 6)) {
+      return s;
+    }
+  }
+  for (final s in schedules) {
+    if (s.channel.broadcastingType != channel.broadcastingType ||
+        s.channel.serviceId != channel.serviceId) {
+      continue;
+    }
+    if (parseScheduleEventId(s.desiredMatchingId) != null) continue;
+    if (s.start.difference(event.start).abs() <= const Duration(minutes: 2) &&
+        s.end.difference(event.end).abs() <= const Duration(minutes: 2)) {
+      return s;
+    }
+  }
+  return null;
+}
+
 void showEpgEventDetail(
   BuildContext context, {
   required RegisteredNasne reg,
   required Channel channel,
   required String channelName,
   required EpgEvent event,
+  RecordSchedule? existingSchedule,
   VoidCallback? onWatch,
 }) {
   final now = DateTime.now();
@@ -1037,7 +1161,20 @@ void showEpgEventDetail(
     builder: (dialogContext) => EpgEventDetailDialog(
       event: event,
       channelName: channelName,
-      onReserve: event.end.isAfter(now)
+      onEditSchedule: existingSchedule != null
+          ? () {
+              Navigator.of(dialogContext).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => ScheduleDetailPage(
+                    reg: reg,
+                    scheduleId: existingSchedule.id,
+                  ),
+                ),
+              );
+            }
+          : null,
+      onReserve: existingSchedule == null && event.end.isAfter(now)
           ? () {
               Navigator.of(dialogContext).pop();
               Navigator.of(context).push(
@@ -1067,6 +1204,7 @@ class EpgEventDetailDialog extends StatelessWidget {
     required this.event,
     required this.channelName,
     this.onReserve,
+    this.onEditSchedule,
     this.onWatch,
   });
 
@@ -1074,8 +1212,11 @@ class EpgEventDetailDialog extends StatelessWidget {
   final String channelName;
 
   /// Opens the prefilled reservation form (plan 28); null when
-  /// the event has already ended.
+  /// the event has already ended or is already scheduled.
   final VoidCallback? onReserve;
+
+  /// Opens [ScheduleDetailPage] for an already-reserved programme.
+  final VoidCallback? onEditSchedule;
 
   /// Opens the channel's live viewing (plan 95); null unless
   /// the event is on air now.
@@ -1085,6 +1226,9 @@ class EpgEventDetailDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final genreLabel = epgGenreLabel(event.genreLevel1);
+    final reservedColor = theme.brightness == Brightness.dark
+        ? Colors.redAccent
+        : const Color(0xFFD32F2F);
     return AlertDialog(
       title: Text(event.title ?? '番組情報なし'),
       content: SingleChildScrollView(
@@ -1101,6 +1245,23 @@ class EpgEventDetailDialog extends StatelessWidget {
               '（${event.duration.inMinutes}分）',
               style: theme.textTheme.bodyMedium,
             ),
+            if (onEditSchedule != null) ...[
+              const SizedBox(height: 6),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.fiber_manual_record, size: 12, color: reservedColor),
+                  const SizedBox(width: 4),
+                  Text(
+                    '録画予約済み',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: reservedColor,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ],
             if (event.shortText != null && event.shortText!.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(event.shortText!),
@@ -1142,7 +1303,13 @@ class EpgEventDetailDialog extends StatelessWidget {
             icon: const Icon(Icons.live_tv, size: 18),
             label: const Text('試聴'),
           ),
-        if (onReserve != null)
+        if (onEditSchedule != null)
+          FilledButton.icon(
+            onPressed: onEditSchedule,
+            icon: const Icon(Icons.edit_outlined, size: 18),
+            label: const Text('予約を編集'),
+          )
+        else if (onReserve != null)
           FilledButton.icon(
             onPressed: onReserve,
             icon: const Icon(Icons.fiber_manual_record, size: 18),

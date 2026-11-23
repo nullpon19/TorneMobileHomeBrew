@@ -182,11 +182,18 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
     if (hits.isEmpty) {
       return const Center(child: Text('見つかりませんでした。'));
     }
+    final schedules =
+        ref.watch(schedulesProvider(widget.reg)).value ??
+        const <RecordSchedule>[];
+    final reservedColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.redAccent
+        : const Color(0xFFD32F2F);
     return ListView.builder(
       itemCount: hits.length,
       itemBuilder: (context, index) {
         final hit = hits[index];
         final event = hit.event;
+        final matched = findMatchingSchedule(schedules, hit.channel, event);
         return ListTile(
           title: Text(event.title ?? '番組情報なし'),
           subtitle: Text(
@@ -195,12 +202,16 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
             '${formatTimeJst(event.end)}',
           ),
           isThreeLine: true,
+          trailing: matched != null
+              ? Icon(Icons.fiber_manual_record, size: 12, color: reservedColor)
+              : null,
           onTap: () => showEpgEventDetail(
             context,
             reg: widget.reg,
             channel: hit.channel,
             channelName: hit.channelName,
             event: event,
+            existingSchedule: matched,
             onWatch: () => openLiveChannelForEpg(
               context,
               ref,

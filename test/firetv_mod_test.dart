@@ -752,6 +752,9 @@ void main() {
                 InMemoryRegistrationStore(const [reg]),
               ),
               epgGuideProvider.overrideWith((ref, r) async => guide),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
               channelLogosProvider.overrideWith(
                 (ref, r) async => const <int, List<int>>{},
               ),
@@ -784,7 +787,7 @@ void main() {
         final box = decorated.decoration as BoxDecoration;
         expect(box.border, isNotNull);
         expect(box.border!.top.width, 3);
-        expect(box.border!.top.color, const Color(0xFFD32F2F));
+        expect(box.border!.top.color, Colors.black);
       },
     );
   });
@@ -1275,6 +1278,349 @@ void main() {
         await tester.tap(find.text('閉じる'));
         await tester.pumpAndSettle();
         expect(closeCount, 3);
+      },
+    );
+  });
+
+  group('EPG reservation matching, red border & edit button', () {
+    test('parseScheduleEventId & findMatchingSchedule match eventId or manual time window', () {
+      expect(parseScheduleEventId(',,0x1111,0x002a'), 42);
+      expect(parseScheduleEventId('0x7880,0x7880,0xDE00,0x0000'), isNull);
+      expect(parseScheduleEventId(''), isNull);
+
+      const channel = Channel(
+        broadcastingType: 2,
+        networkId: 0x1111,
+        transportStreamId: 0x2222,
+        serviceId: 0x3333,
+        serviceType: 1,
+        channelNumber: 1,
+        serviceName: 'テスト放送',
+      );
+      const otherChannel = Channel(
+        broadcastingType: 2,
+        networkId: 0x1111,
+        transportStreamId: 0x2222,
+        serviceId: 0x4444,
+        serviceType: 1,
+        channelNumber: 2,
+        serviceName: '別チャンネル',
+      );
+      final baseStart = DateTime.parse('2026-11-23T14:00:00+09:00');
+      final event = EpgEvent(
+        eventId: 42,
+        start: baseStart,
+        duration: const Duration(minutes: 30),
+        title: 'アニメ番組',
+      );
+      final manualEvent = EpgEvent(
+        eventId: 99,
+        start: baseStart.add(const Duration(hours: 2)),
+        duration: const Duration(minutes: 30),
+        title: '手動予約番組',
+      );
+      final epgSched = RecordSchedule(
+        id: 's1',
+        start: baseStart,
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x3333,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x1111,0x002a',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      final wrongDaySched = RecordSchedule(
+        id: 's_day',
+        start: baseStart.add(const Duration(days: 7)),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x3333,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x1111,0x002a',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      final manualSched = RecordSchedule(
+        id: 's_manual',
+        start: manualEvent.start,
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x3333,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: '0x1111,0x2222,0x3333,0x0000',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+
+      expect(
+        findMatchingSchedule([wrongDaySched, epgSched], channel, event)?.id,
+        's1',
+      );
+      expect(
+        findMatchingSchedule([wrongDaySched], channel, event),
+        isNull,
+      );
+      expect(
+        findMatchingSchedule([epgSched], otherChannel, event),
+        isNull,
+      );
+      expect(
+        findMatchingSchedule([manualSched], channel, manualEvent)?.id,
+        's_manual',
+      );
+    });
+
+    testWidgets(
+      'EpgScreen renders red border on reserved tile and opens edit button instead of reserve',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 800);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.1',
+          udn: 'uuid:epg-reserved-test',
+          friendlyName: 'nasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const channel = Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2222,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト放送',
+        );
+        final reservedStart = DateTime.now().toUtc();
+        final openStart = reservedStart.add(const Duration(minutes: 25));
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            EpgServiceGuide(
+              channel: channel,
+              events: [
+                EpgEvent(
+                  eventId: 42,
+                  start: reservedStart,
+                  duration: const Duration(minutes: 20),
+                  title: '予約済み番組テスト',
+                  genreLevel1: 3,
+                ),
+                EpgEvent(
+                  eventId: 43,
+                  start: openStart,
+                  duration: const Duration(minutes: 20),
+                  title: '未予約番組テスト',
+                  genreLevel1: 3,
+                ),
+              ],
+            ),
+          ],
+        );
+        final sched = RecordSchedule(
+          id: 'sched-42',
+          start: reservedStart,
+          durationSeconds: 1200,
+          conditionId: '1',
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x3333,
+          ),
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x1111,0x002a',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '予約済み番組テスト',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              schedulesProvider.overrideWith((ref, r) async => [sched]),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: EpgScreen()),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+
+        final reservedInkWell = find.ancestor(
+          of: find.text('予約済み番組テスト'),
+          matching: find.byType(InkWell),
+        );
+        final outerDecoratedFinder = find.ancestor(
+          of: reservedInkWell,
+          matching: find.byType(DecoratedBox),
+        );
+        final unfocusedDecorated = tester.widget<DecoratedBox>(
+          outerDecoratedFinder.first,
+        );
+        final unfocusedBox = unfocusedDecorated.decoration as BoxDecoration;
+        expect(unfocusedBox.border, isNotNull);
+        expect(unfocusedBox.border!.top.color, const Color(0xFFD32F2F));
+        expect(unfocusedBox.border!.top.width, 2.5);
+
+        // Focusing the reserved tile puts black focus border outside + inner red frame.
+        tester.widget<InkWell>(reservedInkWell).onFocusChange?.call(true);
+        await tester.pump();
+        final focusedDecorated = tester.widget<DecoratedBox>(
+          outerDecoratedFinder.first,
+        );
+        final focusedBox = focusedDecorated.decoration as BoxDecoration;
+        expect(focusedBox.border!.top.color, Colors.black);
+        expect(focusedBox.border!.top.width, 3);
+        expect(
+          find.descendant(
+            of: reservedInkWell,
+            matching: find.byIcon(Icons.fiber_manual_record),
+          ),
+          findsOneWidget,
+        );
+
+        // Tapping reserved programme offers '予約を編集' instead of '録画予約'.
+        await tester.tap(find.text('予約済み番組テスト'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画予約済み'), findsOneWidget);
+        expect(find.text('予約を編集'), findsOneWidget);
+        expect(find.text('録画予約'), findsNothing);
+
+        await tester.tap(find.text('閉じる'));
+        await tester.pumpAndSettle();
+
+        // Tapping unreserved future programme still offers '録画予約'.
+        await tester.tap(find.text('未予約番組テスト'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画予約'), findsOneWidget);
+        expect(find.text('予約を編集'), findsNothing);
+      },
+    );
+  });
+
+  group('PlayerOsdButtonBar cyclic focus & highlight style', () {
+    test('osdButtonStyle uses high-contrast amber/black when focused', () {
+      final style = osdButtonStyle();
+      expect(
+        style.backgroundColor?.resolve({WidgetState.focused}),
+        Colors.amberAccent,
+      );
+      expect(
+        style.foregroundColor?.resolve({WidgetState.focused}),
+        Colors.black,
+      );
+      expect(
+        style.side?.resolve({WidgetState.focused})?.color,
+        Colors.white,
+      );
+      expect(style.backgroundColor?.resolve(const {}), Colors.white12);
+      expect(style.foregroundColor?.resolve(const {}), Colors.white);
+    });
+
+    testWidgets(
+      'arrow keys cycle between ends and keep focus inside OSD button bar',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final scope = FocusScopeNode(debugLabel: 'testOsdScope');
+        final f0 = FocusNode(debugLabel: 'b0');
+        final f1 = FocusNode(debugLabel: 'b1');
+        final f2 = FocusNode(debugLabel: 'b2');
+        addTearDown(scope.dispose);
+        addTearDown(f0.dispose);
+        addTearDown(f1.dispose);
+        addTearDown(f2.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: PlayerOsdButtonBar(
+                focusScopeNode: scope,
+                onClose: () {},
+                children: [
+                  OutlinedButton.icon(
+                    focusNode: f0,
+                    autofocus: true,
+                    style: osdButtonStyle(),
+                    onPressed: () {},
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('再生'),
+                  ),
+                  OutlinedButton.icon(
+                    focusNode: f1,
+                    style: osdButtonStyle(),
+                    onPressed: () {},
+                    icon: const Icon(Icons.info_outline),
+                    label: const Text('番組詳細'),
+                  ),
+                  OutlinedButton.icon(
+                    focusNode: f2,
+                    style: osdButtonStyle(),
+                    onPressed: () {},
+                    icon: const Icon(Icons.close),
+                    label: const Text('閉じる'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(f0.hasPrimaryFocus, isTrue);
+
+        // Right across all buttons loops back from rightmost (f2) -> leftmost (f0).
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(f1.hasPrimaryFocus, isTrue);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(f2.hasPrimaryFocus, isTrue);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(f0.hasPrimaryFocus, isTrue);
+
+        // Left from leftmost (f0) loops back to rightmost (f2).
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(f2.hasPrimaryFocus, isTrue);
+
+        // Up/Down stay trapped inside the OSD bar.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+        expect(f2.hasPrimaryFocus, isTrue);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        expect(f2.hasPrimaryFocus, isTrue);
       },
     );
   });

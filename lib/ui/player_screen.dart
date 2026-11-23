@@ -223,6 +223,144 @@ String? formatProgramDetailBody({
   return '$short\n\n$long';
 }
 
+/// High-contrast button style for [PlayerOsdButtonBar] items so D-pad focus is
+/// immediately visible over video playback.
+ButtonStyle osdButtonStyle() {
+  return ButtonStyle(
+    backgroundColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.amberAccent;
+      }
+      return Colors.white12;
+    }),
+    foregroundColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.black;
+      }
+      return Colors.white;
+    }),
+    iconColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.black;
+      }
+      return Colors.white;
+    }),
+    side: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return const BorderSide(color: Colors.white, width: 2.5);
+      }
+      return const BorderSide(color: Colors.white38);
+    }),
+    elevation: WidgetStateProperty.resolveWith(
+      (states) => states.contains(WidgetState.focused) ? 4 : 0,
+    ),
+    overlayColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.pressed)) return Colors.white24;
+      return Colors.transparent;
+    }),
+  );
+}
+
+/// Traps D-pad directional focus within the OSD action bar and loops
+/// horizontally between the first and last buttons so focus never escapes.
+class PlayerOsdButtonBar extends StatelessWidget {
+  const PlayerOsdButtonBar({
+    super.key,
+    required this.focusScopeNode,
+    required this.children,
+    required this.onClose,
+    this.onInteraction,
+  });
+
+  final FocusScopeNode focusScopeNode;
+  final List<Widget> children;
+  final VoidCallback onClose;
+  final VoidCallback? onInteraction;
+
+  List<FocusNode> _buttons() => focusScopeNode.traversalDescendants
+      .where((n) => n.canRequestFocus && !n.skipTraversal)
+      .toList();
+
+  FocusNode? _adjacentRowButton(
+    List<FocusNode> buttons,
+    FocusNode current, {
+    required bool down,
+  }) {
+    final cur = current.rect.center;
+    final candidates = buttons.where((b) {
+      final cy = b.rect.center.dy;
+      return down ? cy > cur.dy + 12 : cy < cur.dy - 12;
+    }).toList();
+    if (candidates.isEmpty) return null;
+    final targetY = candidates
+        .map((b) => b.rect.center.dy)
+        .reduce(down ? math.min : math.max);
+    final rowButtons = candidates
+        .where((b) => (b.rect.center.dy - targetY).abs() <= 12)
+        .toList();
+    rowButtons.sort(
+      (a, b) => (a.rect.center.dx - cur.dx).abs().compareTo(
+        (b.rect.center.dx - cur.dx).abs(),
+      ),
+    );
+    return rowButtons.first;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusScope(
+      node: focusScopeNode,
+      autofocus: true,
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+          return KeyEventResult.ignored;
+        }
+        final key = event.logicalKey;
+        onInteraction?.call();
+        if (event is KeyDownEvent &&
+            (key == LogicalKeyboardKey.escape ||
+                key == LogicalKeyboardKey.goBack)) {
+          onClose();
+          return KeyEventResult.handled;
+        }
+        final buttons = _buttons();
+        if (buttons.isEmpty) return KeyEventResult.handled;
+        final currentIdx = buttons.indexWhere(
+          (n) => n.hasPrimaryFocus || n.hasFocus,
+        );
+        if (key == LogicalKeyboardKey.arrowRight) {
+          final next = currentIdx < 0 ? 0 : (currentIdx + 1) % buttons.length;
+          buttons[next].requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowLeft) {
+          final prev = currentIdx < 0
+              ? buttons.length - 1
+              : (currentIdx - 1 + buttons.length) % buttons.length;
+          buttons[prev].requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowDown ||
+            key == LogicalKeyboardKey.arrowUp) {
+          if (currentIdx < 0) {
+            buttons.first.requestFocus();
+            return KeyEventResult.handled;
+          }
+          final target = _adjacentRowButton(
+            buttons,
+            buttons[currentIdx],
+            down: key == LogicalKeyboardKey.arrowDown,
+          );
+          (target ?? buttons[currentIdx]).requestFocus();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: Wrap(spacing: 10, runSpacing: 8, children: children),
+    );
+  }
+}
+
 /// Translucent upper-half overlay panel displaying full programme metadata and
 /// descriptions during playback, with Fire TV D-pad scroll and close support.
 class ProgramDetailOverlayPanel extends StatelessWidget {
@@ -579,6 +717,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   late final FireTvHelper _fireTvHelper;
 
   final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
+  final FocusScopeNode _osdFocusScopeNode = FocusScopeNode(
+    debugLabel: 'playerOsdScope',
+  );
   final FocusNode _osdFirstFocusNode = FocusNode(debugLabel: 'playerOsdFirst');
   final FocusNode _osdDetailButtonFocusNode = FocusNode(
     debugLabel: 'playerOsdDetailButton',
@@ -1443,6 +1584,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           name: 'focus nodes',
           run: () {
             _rootFocusNode.dispose();
+            _osdFocusScopeNode.dispose();
             _osdFirstFocusNode.dispose();
             _osdDetailButtonFocusNode.dispose();
             _detailFocusNode.dispose();
@@ -1758,6 +1900,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         return KeyEventResult.handled;
       }
       _resetOsdTimer();
+      if (key == LogicalKeyboardKey.arrowLeft ||
+          key == LogicalKeyboardKey.arrowRight ||
+          key == LogicalKeyboardKey.arrowUp ||
+          key == LogicalKeyboardKey.arrowDown) {
+        if (_osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+        return KeyEventResult.handled;
+      }
       return KeyEventResult.ignored;
     }
     final isRepeat = event is KeyRepeatEvent;
@@ -2356,11 +2507,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               _buildSeekBarSection(isSeekingPreview: false),
             ],
             const SizedBox(height: 12),
-            FocusTraversalGroup(
-              child: Wrap(
-                spacing: 10,
-                runSpacing: 8,
-                children: [
+            PlayerOsdButtonBar(
+              focusScopeNode: _osdFocusScopeNode,
+              onClose: _closeOsd,
+              onInteraction: _resetOsdTimer,
+              children: [
                   _osdButton(
                     focusNode: _osdFirstFocusNode,
                     autofocus: true,
@@ -2443,8 +2594,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     label: '閉じる',
                     onPressed: _closeOsd,
                   ),
-                ],
-              ),
+              ],
             ),
           ],
         ),
@@ -2462,11 +2612,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     return OutlinedButton.icon(
       focusNode: focusNode,
       autofocus: autofocus,
-      style: OutlinedButton.styleFrom(
-        foregroundColor: Colors.white,
-        backgroundColor: Colors.white12,
-        side: const BorderSide(color: Colors.white38),
-      ),
+      style: osdButtonStyle(),
       onPressed: onPressed,
       icon: Icon(icon, size: 20),
       label: Text(label),
