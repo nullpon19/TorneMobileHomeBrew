@@ -19,6 +19,7 @@ import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'player_cache_policy.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -49,6 +50,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final selected = ref.watch(selectedRegistrationProvider);
     final debugSettings = ref.watch(debugSettingsProvider);
     final storeDir = ref.watch(storeDirectoryProvider);
+    final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
+    final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(
@@ -81,24 +84,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     title: Text(reg.friendlyName),
                     subtitle: Text('${reg.host}\nMAC ${maskMac(reg.macAddr)}'),
                     isThreeLine: true,
-                    trailing: PopupMenuButton<String>(
-                      onSelected: (action) =>
-                          _onRegistrationAction(action, reg),
-                      itemBuilder: (context) => [
-                        if (selected?.host != reg.host)
-                          const PopupMenuItem(
-                            value: 'select',
-                            child: Text('この nasne を使う'),
-                          ),
-                        const PopupMenuItem(
-                          value: 'verify',
-                          child: Text('登録を検証'),
-                        ),
-                        const PopupMenuItem(
-                          value: 'remove',
-                          child: Text('登録を解除'),
-                        ),
-                      ],
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _showRegistrationActions(
+                      reg,
+                      isSelected: selected?.host == reg.host,
                     ),
                   ),
               ],
@@ -165,15 +154,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                TextField(
+                FireTvTextInputField(
                   controller: _manualHost,
-                  decoration: const InputDecoration(
-                    labelText: 'IP アドレス / ホスト名',
-                    hintText: '192.168.11.129',
-                  ),
+                  labelText: 'IP アドレス / ホスト名',
+                  hintText: '192.168.11.129',
+                  dialogTitle: 'IP アドレス / ホスト名',
                   keyboardType: TextInputType.url,
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => FocusScope.of(context).unfocus(),
                 ),
                 const SizedBox(height: 8),
                 FilledButton.icon(
@@ -183,6 +169,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
               ],
             ),
+          ),
+          const Divider(),
+          _sectionTitle(context, '表示'),
+          SwitchListTile(
+            title: const Text('ナイトモード'),
+            subtitle: const Text('暗い背景のダークテーマに切り替えます'),
+            value: ref.watch(nightModeProvider),
+            onChanged: (value) =>
+                ref.read(nightModeProvider.notifier).set(value),
           ),
           const Divider(),
           _sectionTitle(context, '番組表'),
@@ -204,6 +199,40 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '録画予約済みの表示',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<EpgReservedStyle>(
+                  segments: const [
+                    ButtonSegment(
+                      value: EpgReservedStyle.fill,
+                      label: Text('赤塗りつぶし'),
+                    ),
+                    ButtonSegment(
+                      value: EpgReservedStyle.border,
+                      label: Text('赤枠'),
+                    ),
+                  ],
+                  selected: {ref.watch(epgReservedStyleProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(epgReservedStyleProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '番組表で録画予約が入っている番組を目立たせる表示スタイルを選びます。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
           const Divider(),
           _sectionTitle(context, '再生'),
           Padding(
@@ -211,7 +240,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('再生画質', style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'デフォルト再生画質',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const SizedBox(height: 8),
                 SegmentedButton<bool>(
                   segments: const [
@@ -223,13 +255,69 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                       .read(playbackQualityProvider.notifier)
                       .set(selection.first),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 6),
                 Text(
-                  'TV 視聴と録画再生を開始するときの画質です。'
-                  '各視聴画面で画質を変更すると、この値も更新されます。',
+                  'TV 視聴・録画再生で個別に画質を選ばなかったときに使われる既定の画質です'
+                  '（モバイル画質がない番組は元画質で再生します）。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            title: const Text('Live のバッファ時間（遅延再生）'),
+            subtitle: Text(
+              '設定: ${formatBufferDurationLabel(liveBufferSeconds)} '
+              '（開始前に設定秒数分を蓄積して途切れを防ぎます。'
+              '15秒以上では副音声切替が効きにくくなる場合があります）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  formatBufferDurationLabel(liveBufferSeconds),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickBufferDuration(
+              title: 'Live のバッファ時間（遅延再生）',
+              description:
+                  '再生開始前に指定時間分を貯めてから流し、トンネルや短い圏外での途切れを防ぎます。',
+              options: liveBufferOptionsSeconds,
+              current: liveBufferSeconds,
+              onSelected: (value) =>
+                  ref.read(liveBufferSecondsProvider.notifier).set(value),
+            ),
+          ),
+          ListTile(
+            title: const Text('録画のバッファ時間（先読み）'),
+            subtitle: Text(
+              '設定: ${formatBufferDurationLabel(recordedBufferSeconds)} '
+              '（1分以上は内蔵ストレージ一時キャッシュを使用・最大60分）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  formatBufferDurationLabel(recordedBufferSeconds),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickBufferDuration(
+              title: '録画のバッファ時間（先読み）',
+              description:
+                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低512MB空き残存）。',
+              options: recordedBufferOptionsSeconds,
+              current: recordedBufferSeconds,
+              onSelected: (value) =>
+                  ref.read(recordedBufferSecondsProvider.notifier).set(value),
             ),
           ),
           const Divider(),
@@ -317,7 +405,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Text(
               '発見にはローカルネットワークへのアクセス許可が必要です (iOS では許可ダイアログが'
               '表示される場合があります)。発見できない環境では手動登録を使ってください。\n\n'
-              'torne mobile HB $appVersionLabel',
+              'torne HB FireTV $appVersionLabel',
             ),
           ),
         ],
@@ -464,6 +552,88 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     await _registerDevice(device);
   }
 
+  Future<void> _pickBufferDuration({
+    required String title,
+    required String description,
+    required List<int> options,
+    required int current,
+    required Future<void> Function(int value) onSelected,
+  }) async {
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text(title),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              description,
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final opt in options)
+            _BufferOptionTile(
+              label: formatBufferDurationLabel(opt),
+              selected: opt == current,
+              autofocus: opt == current,
+              onTap: () => Navigator.of(dialogContext).pop(opt),
+            ),
+        ],
+      ),
+    );
+    if (chosen != null) {
+      await onSelected(chosen);
+    }
+  }
+
+  Future<void> _showRegistrationActions(
+    RegisteredNasne reg, {
+    required bool isSelected,
+  }) async {
+    final title = reg.friendlyName.trim().isNotEmpty
+        ? reg.friendlyName.trim()
+        : reg.host;
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        contentPadding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!isSelected)
+              ListTile(
+                autofocus: true,
+                leading: const Icon(Icons.check_circle_outline),
+                title: const Text('この nasne を使う'),
+                onTap: () => Navigator.of(dialogContext).pop('select'),
+              ),
+            ListTile(
+              autofocus: isSelected,
+              leading: const Icon(Icons.verified_outlined),
+              title: const Text('登録を検証'),
+              onTap: () => Navigator.of(dialogContext).pop('verify'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('登録を解除'),
+              onTap: () => Navigator.of(dialogContext).pop('remove'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('閉じる'),
+          ),
+        ],
+      ),
+    );
+    if (action != null && mounted) {
+      await _onRegistrationAction(action, reg);
+    }
+  }
+
   Future<void> _onRegistrationAction(String action, RegisteredNasne reg) async {
     switch (action) {
       case 'select':
@@ -495,5 +665,65 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         if (!mounted) return;
         showSnack(context, '登録を解除しました');
     }
+  }
+}
+
+class _BufferOptionTile extends StatefulWidget {
+  const _BufferOptionTile({
+    required this.label,
+    required this.selected,
+    required this.autofocus,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final bool autofocus;
+  final VoidCallback onTap;
+
+  @override
+  State<_BufferOptionTile> createState() => _BufferOptionTileState();
+}
+
+class _BufferOptionTileState extends State<_BufferOptionTile> {
+  bool _focused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final focusColor = isDark ? Colors.amberAccent : Colors.amber;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+      child: InkWell(
+        autofocus: widget.autofocus,
+        borderRadius: BorderRadius.circular(8),
+        onFocusChange: (focused) {
+          if (_focused != focused) setState(() => _focused = focused);
+        },
+        onTap: widget.onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: _focused ? focusColor : Colors.transparent,
+              width: 2.5,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                widget.selected
+                    ? Icons.check_circle
+                    : Icons.radio_button_unchecked,
+                size: 20,
+              ),
+              const SizedBox(width: 12),
+              Expanded(child: Text(widget.label)),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

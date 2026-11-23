@@ -3,6 +3,9 @@
 /// error presentation stay uniform.
 library;
 
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -53,24 +56,177 @@ class ErrorView extends StatelessWidget {
 }
 
 /// A titled card used to group one home-screen section.
-class SectionCard extends StatelessWidget {
+class SectionCard extends StatefulWidget {
   const SectionCard({
     super.key,
     required this.title,
     required this.child,
     this.icon,
     this.trailing,
+    this.margin = defaultMargin,
+    this.focusable = false,
+    this.scrollController,
   });
+
+  static const EdgeInsets defaultMargin = EdgeInsets.fromLTRB(12, 6, 12, 6);
 
   final String title;
   final IconData? icon;
   final Widget? trailing;
   final Widget child;
+  final EdgeInsetsGeometry margin;
+  final bool focusable;
+  final ScrollController? scrollController;
+
+  @override
+  State<SectionCard> createState() => _SectionCardState();
+}
+
+class _SectionCardState extends State<SectionCard> {
+  late final FocusNode _focusNode = FocusNode(
+    debugLabel: 'section:${widget.title}',
+  )..addListener(_handleFocusNodeChanged);
+  bool _hasPrimaryFocus = false;
+
+  @override
+  void dispose() {
+    _focusNode
+      ..removeListener(_handleFocusNodeChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleFocusNodeChanged() {
+    final primary = _focusNode.hasPrimaryFocus;
+    if (_hasPrimaryFocus != primary && mounted) {
+      setState(() => _hasPrimaryFocus = primary);
+    }
+  }
+
+  void _onFocusChange(bool hasFocus) {
+    _handleFocusNodeChanged();
+    if (!hasFocus) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          alignment: 0.15,
+        ),
+      );
+    });
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (!_focusNode.hasPrimaryFocus) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key != LogicalKeyboardKey.arrowDown &&
+        key != LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.ignored;
+    }
+
+    final scrollable = Scrollable.maybeOf(context);
+    final pos =
+        (widget.scrollController != null && widget.scrollController!.hasClients)
+        ? widget.scrollController!.position
+        : scrollable?.position;
+    final cardBox = context.findRenderObject() as RenderBox?;
+    final viewportBox = scrollable?.context.findRenderObject() as RenderBox?;
+
+    if (cardBox != null &&
+        cardBox.attached &&
+        cardBox.hasSize &&
+        viewportBox != null &&
+        viewportBox.attached &&
+        viewportBox.hasSize) {
+      final cardTop = cardBox
+          .localToGlobal(Offset.zero, ancestor: viewportBox)
+          .dy;
+      final cardHeight = cardBox.size.height;
+      final cardBottom = cardTop + cardHeight;
+      final viewportHeight = viewportBox.size.height;
+
+      if (key == LogicalKeyboardKey.arrowDown) {
+        final overflowingBottom =
+            cardBottom > viewportHeight + 4 &&
+            (cardTop <= 24 || cardHeight > viewportHeight - 16);
+        if (overflowingBottom &&
+            pos != null &&
+            pos.pixels < pos.maxScrollExtent) {
+          final step = (cardBottom - viewportHeight + 16).clamp(80.0, 180.0);
+          final target = (pos.pixels + step).clamp(
+            pos.minScrollExtent,
+            pos.maxScrollExtent,
+          );
+          unawaited(
+            pos.animateTo(
+              target,
+              duration: const Duration(milliseconds: 140),
+              curve: Curves.easeOut,
+            ),
+          );
+          return KeyEventResult.handled;
+        }
+      } else {
+        final overflowingTop =
+            cardTop < -4 &&
+            (cardBottom >= viewportHeight - 24 ||
+                cardHeight > viewportHeight - 16);
+        if (overflowingTop && pos != null && pos.pixels > pos.minScrollExtent) {
+          final step = (-cardTop + 16).clamp(80.0, 180.0);
+          final target = (pos.pixels - step).clamp(
+            pos.minScrollExtent,
+            pos.maxScrollExtent,
+          );
+          unawaited(
+            pos.animateTo(
+              target,
+              duration: const Duration(milliseconds: 140),
+              curve: Curves.easeOut,
+            ),
+          );
+          return KeyEventResult.handled;
+        }
+      }
+    }
+
+    if (key == LogicalKeyboardKey.arrowDown) {
+      final moved = _focusNode.focusInDirection(TraversalDirection.down);
+      if (moved) return KeyEventResult.handled;
+      if (pos != null && pos.pixels < pos.maxScrollExtent) {
+        unawaited(
+          pos.animateTo(
+            pos.maxScrollExtent,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+          ),
+        );
+      }
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
+    final card = Card(
+      margin: widget.margin,
+      shape: widget.focusable && _hasPrimaryFocus
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: focusBorderColor, width: 3),
+            )
+          : null,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
         child: Column(
@@ -78,24 +234,31 @@ class SectionCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                if (icon != null) ...[
-                  Icon(icon, size: 20),
+                if (widget.icon != null) ...[
+                  Icon(widget.icon, size: 20),
                   const SizedBox(width: 8),
                 ],
                 Expanded(
                   child: Text(
-                    title,
+                    widget.title,
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                 ),
-                ?trailing,
+                ?widget.trailing,
               ],
             ),
             const SizedBox(height: 8),
-            child,
+            widget.child,
           ],
         ),
       ),
+    );
+    if (!widget.focusable) return card;
+    return Focus(
+      focusNode: _focusNode,
+      onFocusChange: _onFocusChange,
+      onKeyEvent: _handleKeyEvent,
+      child: card,
     );
   }
 }
@@ -105,8 +268,10 @@ Widget asyncSection<T>(
   AsyncValue<T> value,
   Widget Function(T data) builder, {
   VoidCallback? onRetry,
+  bool skipLoadingOnReload = false,
 }) {
   return value.when(
+    skipLoadingOnReload: skipLoadingOnReload,
     data: builder,
     loading: () => const Padding(
       padding: EdgeInsets.all(24),
@@ -186,6 +351,7 @@ Future<bool> confirmDialog(
       content: Text(message),
       actions: [
         TextButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(false),
           child: const Text('キャンセル'),
         ),
@@ -298,6 +464,306 @@ class KeyboardDismissOnTap extends StatelessWidget {
       behavior: HitTestBehavior.translucent,
       onTap: () => FocusScope.of(context).unfocus(),
       child: child,
+    );
+  }
+}
+
+/// Fire TV D-pad friendly text input box that avoids exposing a raw
+/// [TextField] directly on screen (which causes FireTVIME to pop up and trap
+/// D-pad focus on hover). Opens a dedicated input dialog only on explicit
+/// activation (Select / Enter / tap).
+class FireTvTextInputField extends StatefulWidget {
+  const FireTvTextInputField({
+    super.key,
+    required this.controller,
+    this.labelText,
+    this.hintText,
+    this.dialogTitle,
+    this.prefixIcon,
+    this.suffixText,
+    this.keyboardType,
+    this.textInputAction = TextInputAction.done,
+    this.minLines = 1,
+    this.maxLines = 1,
+    this.autocorrect = true,
+    this.enableSuggestions = true,
+    this.showClearButton = false,
+    this.autofocus = false,
+    this.onChanged,
+    this.onSubmitted,
+  });
+
+  final TextEditingController controller;
+  final String? labelText;
+  final String? hintText;
+  final String? dialogTitle;
+  final IconData? prefixIcon;
+  final String? suffixText;
+  final TextInputType? keyboardType;
+  final TextInputAction textInputAction;
+  final int minLines;
+  final int maxLines;
+  final bool autocorrect;
+  final bool enableSuggestions;
+  final bool showClearButton;
+  final bool autofocus;
+  final ValueChanged<String>? onChanged;
+  final ValueChanged<String>? onSubmitted;
+
+  @override
+  State<FireTvTextInputField> createState() => _FireTvTextInputFieldState();
+}
+
+class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'fireTvTextInput');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onControllerChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant FireTvTextInputField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onControllerChanged);
+      widget.controller.addListener(_onControllerChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openInputDialog() async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => _FireTvTextInputDialog(
+        title:
+            widget.dialogTitle ?? widget.labelText ?? widget.hintText ?? '入力',
+        initialValue: widget.controller.text,
+        hintText: widget.hintText,
+        suffixText: widget.suffixText,
+        keyboardType: widget.keyboardType,
+        textInputAction: widget.textInputAction,
+        minLines: widget.minLines,
+        maxLines: widget.maxLines,
+        autocorrect: widget.autocorrect,
+        enableSuggestions: widget.enableSuggestions,
+      ),
+    );
+    if (!mounted) return;
+    if (result != null) {
+      widget.controller.value = TextEditingValue(
+        text: result,
+        selection: TextSelection.collapsed(offset: result.length),
+      );
+      widget.onChanged?.call(result);
+      widget.onSubmitted?.call(result);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
+  }
+
+  void _clear() {
+    widget.controller.clear();
+    widget.onChanged?.call('');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final text = widget.controller.text;
+    final hasText = text.isNotEmpty;
+    final borderColor = _focused
+        ? (isDark ? Colors.amberAccent : Colors.amber)
+        : theme.colorScheme.outlineVariant;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: InkWell(
+            focusNode: _focusNode,
+            autofocus: widget.autofocus,
+            onFocusChange: (focused) {
+              if (_focused != focused) setState(() => _focused = focused);
+            },
+            borderRadius: BorderRadius.circular(8),
+            onTap: _openInputDialog,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerLow,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: borderColor,
+                  width: _focused ? 3 : 1,
+                ),
+              ),
+              child: Row(
+                children: [
+                  if (widget.prefixIcon != null) ...[
+                    Icon(
+                      widget.prefixIcon,
+                      size: 20,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (widget.labelText != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 2),
+                            child: Text(
+                              widget.labelText!,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        Text(
+                          hasText ? text : (widget.hintText ?? '決定キーで入力'),
+                          maxLines: widget.maxLines > 1 ? 2 : 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: hasText
+                                ? theme.colorScheme.onSurface
+                                : theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (widget.suffixText != null && hasText) ...[
+                    const SizedBox(width: 4),
+                    Text(
+                      widget.suffixText!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 8),
+                  Icon(
+                    Icons.edit_outlined,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (widget.showClearButton && hasText) ...[
+          const SizedBox(width: 4),
+          IconButton(
+            icon: const Icon(Icons.clear),
+            tooltip: 'クリア',
+            onPressed: _clear,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _FireTvTextInputDialog extends StatefulWidget {
+  const _FireTvTextInputDialog({
+    required this.title,
+    required this.initialValue,
+    this.hintText,
+    this.suffixText,
+    this.keyboardType,
+    this.textInputAction = TextInputAction.done,
+    this.minLines = 1,
+    this.maxLines = 1,
+    this.autocorrect = true,
+    this.enableSuggestions = true,
+  });
+
+  final String title;
+  final String initialValue;
+  final String? hintText;
+  final String? suffixText;
+  final TextInputType? keyboardType;
+  final TextInputAction textInputAction;
+  final int minLines;
+  final int maxLines;
+  final bool autocorrect;
+  final bool enableSuggestions;
+
+  @override
+  State<_FireTvTextInputDialog> createState() => _FireTvTextInputDialogState();
+}
+
+class _FireTvTextInputDialogState extends State<_FireTvTextInputDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialValue);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: SingleChildScrollView(
+        child: TextField(
+          controller: _controller,
+          autofocus: true,
+          keyboardType: widget.keyboardType,
+          textInputAction: widget.textInputAction,
+          minLines: widget.minLines,
+          maxLines: widget.maxLines,
+          autocorrect: widget.autocorrect,
+          enableSuggestions: widget.enableSuggestions,
+          decoration: InputDecoration(
+            border: const OutlineInputBorder(),
+            hintText: widget.hintText,
+            suffixText: widget.suffixText,
+          ),
+          onSubmitted: widget.maxLines == 1
+              ? (value) => Navigator.of(context).pop(value)
+              : null,
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _controller.clear,
+          child: const Text('クリア'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(null),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_controller.text),
+          child: const Text('決定'),
+        ),
+      ],
     );
   }
 }

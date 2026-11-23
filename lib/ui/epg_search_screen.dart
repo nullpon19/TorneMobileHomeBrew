@@ -32,6 +32,7 @@ import 'epg_screen.dart';
 import 'epg_search.dart';
 import 'format.dart';
 import 'live_screen.dart';
+import 'multi_nasne_policy.dart';
 import 'widgets.dart';
 
 class EpgSearchScreen extends ConsumerStatefulWidget {
@@ -45,7 +46,6 @@ class EpgSearchScreen extends ConsumerStatefulWidget {
 
 class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   final _queryController = TextEditingController();
-  String _query = '';
 
   /// The query the results actually reflect (plan 98):
   /// keystrokes land here only once typing settles for
@@ -72,7 +72,6 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   }
 
   void _onQueryChanged(String value) {
-    setState(() => _query = value);
     _debounce?.cancel();
     _debounce = Timer(queryDebounce, () {
       if (mounted) setState(() => _appliedQuery = value);
@@ -82,10 +81,7 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   void _clearQuery() {
     _debounce?.cancel();
     _queryController.clear();
-    setState(() {
-      _query = '';
-      _appliedQuery = '';
-    });
+    setState(() => _appliedQuery = '');
   }
 
   EpgSearchIndex _indexFor(EpgGuide? terrestrial, EpgGuide? bs) {
@@ -122,23 +118,15 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: TextField(
+            child: FireTvTextInputField(
               controller: _queryController,
+              labelText: 'キーワード',
+              hintText: '番組名・内容・出演者など',
+              dialogTitle: 'キーワードを入力',
+              prefixIcon: Icons.search,
+              showClearButton: true,
               autofocus: true,
-              decoration: InputDecoration(
-                labelText: 'キーワード',
-                hintText: '番組名・内容・出演者など',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        tooltip: 'クリア',
-                        onPressed: _clearQuery,
-                      ),
-                border: const OutlineInputBorder(),
-              ),
-              onChanged: _onQueryChanged,
+              onChanged: (v) => v.isEmpty ? _clearQuery() : _onQueryChanged(v),
             ),
           ),
           Padding(
@@ -196,11 +184,32 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
     if (hits.isEmpty) {
       return const Center(child: Text('見つかりませんでした。'));
     }
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final activeRegs = regs.length > 1
+        ? regs
+        : <RegisteredNasne>[widget.reg];
+    final isMultiNasne = activeRegs.length > 1;
+    final ownedSchedules = <OwnedRecordSchedule>[
+      for (final r in activeRegs)
+        for (final s
+            in (ref.watch(schedulesProvider(r)).value ??
+                const <RecordSchedule>[]))
+          OwnedRecordSchedule(reg: r, schedule: s),
+    ];
+    final reservedColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.redAccent
+        : const Color(0xFFD32F2F);
     return ListView.builder(
       itemCount: hits.length,
       itemBuilder: (context, index) {
         final hit = hits[index];
         final event = hit.event;
+        final matched = findMatchingOwnedSchedule(
+          ownedSchedules,
+          hit.channel,
+          event,
+        );
         return ListTile(
           title: Text(event.title ?? '番組情報なし'),
           subtitle: Text(
@@ -209,12 +218,20 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
             '${formatTimeJst(event.end)}',
           ),
           isThreeLine: true,
+          trailing: matched != null
+              ? Icon(Icons.fiber_manual_record, size: 12, color: reservedColor)
+              : null,
           onTap: () => showEpgEventDetail(
             context,
             reg: widget.reg,
             channel: hit.channel,
             channelName: hit.channelName,
             event: event,
+            existingSchedule: matched?.schedule,
+            existingScheduleReg: matched?.reg,
+            reservedNasneName: isMultiNasne && matched != null
+                ? nasneDisplayLabel(matched.reg)
+                : null,
             onWatch: () => openLiveChannelForEpg(
               context,
               ref,

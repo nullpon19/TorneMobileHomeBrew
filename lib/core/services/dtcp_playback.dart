@@ -6,6 +6,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import '../diagnostics.dart';
@@ -88,6 +89,13 @@ class PlaybackKeySource {
     }
   }
 
+  /// Forces a fresh AKE authentication even when the local key cache is
+  /// populated (used after prolonged cellular outages).
+  Future<void> forceReauthenticate() async {
+    final fresh = await _reauthenticateOnce();
+    await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 20));
+  }
+
   Future<ExchangeKeySession> _reauthenticateOnce() async {
     final inFlight = _reauthInFlight;
     if (inFlight != null) return inFlight;
@@ -105,11 +113,16 @@ class PlaybackKeySource {
   }
 }
 
+/// Plaintext proxy window cap used on Android / Fire TV (reduced from 32 MiB
+/// to 8 MiB to curb initial LAN burst pressure on 1 GB RAM Fire TV sticks).
+const int androidProxyWindowCapBytes = 8 * 1024 * 1024;
+
 class DtcpPlaybackEngine implements PlaybackEngine {
   DtcpPlaybackEngine({
     required this.credentialStore,
     required SrmStore srmStore,
     this.diag = const DiagLog.none(),
+    this.autoReconnect = false,
     AkeConnectionFactory? akeConnectionFactory,
     AkeClient Function(DeviceCredentials credentials)? clientFactory,
     DtcpMediaFetcher Function()? fetcherFactory,
@@ -133,6 +146,9 @@ class DtcpPlaybackEngine implements PlaybackEngine {
 
   /// Diagnostics sink (plan 28), categories playback/network/ake.
   final DiagLog diag;
+
+  /// Enables unlimited background reconnects inside the loopback proxy.
+  final bool autoReconnect;
   final AkeClient Function(DeviceCredentials credentials) _clientFactory;
   final DtcpMediaFetcher Function() _fetcherFactory;
 
@@ -174,13 +190,14 @@ class DtcpPlaybackEngine implements PlaybackEngine {
       'res quality=${res.quality ?? '(none)'}; '
       'credentials -> HEAD -> AKE -> proxy',
     );
-    return _start(res);
+    return _start(res, isLive: true);
   }
 
   Future<PlaybackSession> _start(
     TitleRes res, {
     int? seekTotalBytes,
     Duration? seekTotalDuration,
+    bool isLive = false,
   }) async {
     final stopwatch = Stopwatch()..start();
     var stage = 'credentials';
@@ -240,6 +257,12 @@ class DtcpPlaybackEngine implements PlaybackEngine {
         diag: diag,
         totalBytes: seekTotalBytes,
         totalDuration: seekTotalDuration,
+        windowCapBytesOverride: Platform.isAndroid
+            ? androidProxyWindowCapBytes
+            : null,
+        isLive: isLive,
+        autoReconnect: autoReconnect,
+        onReauthenticate: autoReconnect ? keySource.forceReauthenticate : null,
       );
       diag(
         DiagCategory.playback,
@@ -256,7 +279,7 @@ class DtcpPlaybackEngine implements PlaybackEngine {
   }
 }
 
-class _DtcpPlaybackSession implements PlaybackSession {
+class _DtcpPlaybackSession implements PlaybackSession, StreamTransferMetrics {
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
 
   final DtcpProxy _proxy;
@@ -266,6 +289,18 @@ class _DtcpPlaybackSession implements PlaybackSession {
 
   @override
   Uri get mediaUri => _proxy.uri;
+
+  @override
+  int get servedBytes => _proxy.servedBytes;
+
+  @override
+  DateTime? get firstByteServedAt => _proxy.firstByteServedAt;
+
+  @override
+  DateTime? get lastByteServedAt => _proxy.lastByteServedAt;
+
+  @override
+  int get consecutiveReconnectErrors => _proxy.consecutiveReconnectErrors;
 
   @override
   Future<void> stop() async {

@@ -171,24 +171,591 @@
 library;
 
 import 'dart:async';
+import 'dart:convert' show jsonDecode;
+import 'dart:io' show Directory, Platform;
+import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
+import 'live_recording_policy.dart';
+import 'multi_nasne_policy.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
 import 'player_error_policy.dart';
 import 'player_resume_policy.dart';
-import 'player_safe_area_policy.dart';
 import 'player_seek_policy.dart';
 import 'player_speed_policy.dart';
 import 'player_teardown_policy.dart';
 import 'player_track_policy.dart';
+
+/// Returns the overlay spinner caption while waiting for initial video frames
+/// or recovering from mid-stream buffering, or `null` once ready/paused.
+String? playerLoadingLabel({
+  required bool interrupted,
+  required bool hasVideoFrame,
+  required bool playingStarted,
+  required bool playingNow,
+  required bool buffering,
+}) {
+  if (interrupted) return null;
+  if (!hasVideoFrame || !playingStarted) return '読み込み中…';
+  if (buffering && playingNow) return 'バッファリング中…';
+  return null;
+}
+
+/// Combines [description] and [longDescription] for the in-player OSD detail
+/// viewer, deduplicating identical or prefix-contained text.
+String? formatProgramDetailBody({
+  String? description,
+  String? longDescription,
+}) {
+  final short = description?.trim() ?? '';
+  final long = longDescription?.trim() ?? '';
+  if (short.isEmpty && long.isEmpty) return null;
+  if (short.isEmpty) return long;
+  if (long.isEmpty) return short;
+  if (long == short || long.startsWith(short)) return long;
+  if (short.startsWith(long)) return short;
+  return '$short\n\n$long';
+}
+
+/// High-contrast button style for [PlayerOsdButtonBar] items so D-pad focus is
+/// immediately visible over video playback.
+ButtonStyle osdButtonStyle() {
+  return ButtonStyle(
+    backgroundColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.amberAccent;
+      }
+      return Colors.white12;
+    }),
+    foregroundColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.black;
+      }
+      return Colors.white;
+    }),
+    iconColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return Colors.black;
+      }
+      return Colors.white;
+    }),
+    side: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.focused)) {
+        return const BorderSide(color: Colors.white, width: 2.5);
+      }
+      return const BorderSide(color: Colors.white38);
+    }),
+    elevation: WidgetStateProperty.resolveWith(
+      (states) => states.contains(WidgetState.focused) ? 4 : 0,
+    ),
+    overlayColor: WidgetStateProperty.resolveWith((states) {
+      if (states.contains(WidgetState.pressed)) return Colors.white24;
+      return Colors.transparent;
+    }),
+  );
+}
+
+/// Label for the OSD button that dismisses only the OSD menu bar.
+const String playerOsdCloseMenuLabel = 'メニューを閉じる';
+
+/// Extracts `cache-duration` (in seconds) from mpv's JSON `demuxer-cache-state`
+/// property, or returns `null` when unavailable or unparseable.
+double? parseDemuxerCacheStateDuration(String raw) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return null;
+  try {
+    final decoded = jsonDecode(trimmed);
+    if (decoded is! Map) return null;
+    final rawDur = decoded['cache-duration'];
+    final double? value;
+    if (rawDur is num) {
+      value = rawDur.toDouble();
+    } else if (rawDur is String) {
+      value = double.tryParse(rawDur);
+    } else {
+      value = null;
+    }
+    if (value == null || !value.isFinite || value < 0) return null;
+    return value;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Returns `true` only once the initial playback has genuinely started and
+/// exited mpv's initial pre-buffer pause.
+bool shouldLatchInitialPlaybackStarted({
+  required bool hasVideoFrame,
+  required bool playingNow,
+  required bool buffering,
+  Duration? positionAtFirstFrame,
+  Duration currentPosition = Duration.zero,
+}) {
+  if (!hasVideoFrame || !playingNow) return false;
+  if (!buffering) return true;
+  if (positionAtFirstFrame != null &&
+      currentPosition - positionAtFirstFrame >= const Duration(seconds: 1)) {
+    return true;
+  }
+  return false;
+}
+
+double _clampedStepSeconds(DateTime from, DateTime to) {
+  final raw = to.difference(from).inMilliseconds / 1000.0;
+  if (!raw.isFinite || raw <= 0) return 0.0;
+  return raw > 2.0 ? 2.0 : raw;
+}
+
+/// Advances the fallback pre-buffer elapsed counter for unseekable live TS
+/// streams only while decrypted bytes are actively flowing from the proxy.
+({double accumulatedSeconds, int lastServedBytes, DateTime? lastTickAt})
+advanceLiveTransferSeconds({
+  required double currentAccumulatedSeconds,
+  required int previousServedBytes,
+  required DateTime? previousTickAt,
+  required int servedBytes,
+  required DateTime? firstByteServedAt,
+  required DateTime? lastByteServedAt,
+  required DateTime now,
+  Duration stallGrace = const Duration(milliseconds: 2500),
+}) {
+  if (firstByteServedAt == null || servedBytes <= 0) {
+    return (
+      accumulatedSeconds: currentAccumulatedSeconds,
+      lastServedBytes: servedBytes,
+      lastTickAt: null,
+    );
+  }
+  final bytesGrew = servedBytes > previousServedBytes;
+  final recentlyActive =
+      lastByteServedAt != null && now.difference(lastByteServedAt) <= stallGrace;
+  if (!bytesGrew && !recentlyActive) {
+    return (
+      accumulatedSeconds: currentAccumulatedSeconds,
+      lastServedBytes: servedBytes,
+      lastTickAt: now,
+    );
+  }
+  final stepSec = previousTickAt == null
+      ? _clampedStepSeconds(firstByteServedAt, now)
+      : _clampedStepSeconds(previousTickAt, now);
+  return (
+    accumulatedSeconds: currentAccumulatedSeconds + stepSec,
+    lastServedBytes: servedBytes,
+    lastTickAt: now,
+  );
+}
+
+/// Computes accumulated pre-buffer seconds (clamped to `[0, targetSeconds]`)
+/// from all available mpv cache signals, falling back to [liveTransferSeconds]
+/// when mpv leaves all cache properties at zero on unseekable live TS streams.
+int computePreBufferSeconds({
+  required int targetSeconds,
+  required double demuxerCacheDuration,
+  required double bufferingPercentage,
+  required double bufferDeltaSeconds,
+  double liveTransferSeconds = 0.0,
+}) {
+  if (targetSeconds <= 0) return 0;
+  final fromDuration =
+      demuxerCacheDuration.isFinite && demuxerCacheDuration > 0
+      ? demuxerCacheDuration
+      : 0.0;
+  final fromPercent =
+      bufferingPercentage.isFinite && bufferingPercentage > 0
+      ? (bufferingPercentage.clamp(0.0, 100.0) / 100.0) * targetSeconds
+      : 0.0;
+  final fromDelta = bufferDeltaSeconds.isFinite && bufferDeltaSeconds > 0
+      ? bufferDeltaSeconds
+      : 0.0;
+  final mpvBest = math.max(fromDuration, math.max(fromPercent, fromDelta));
+  final fallback = liveTransferSeconds.isFinite && liveTransferSeconds > 0
+      ? liveTransferSeconds
+      : 0.0;
+  final best = mpvBest > 0 ? mpvBest : fallback;
+  return best.clamp(0.0, targetSeconds.toDouble()).floor();
+}
+
+/// Outcome for resolving a system Back (`PopScope`) while the player is open.
+enum PlayerBackOutcome {
+  suppressed,
+  closeDetail,
+  closeOsd,
+  confirmExit,
+  popPlayer,
+}
+
+/// Resolves what a platform Back invocation should do for the current overlay,
+/// error state, exit-dialog state, and debounce-suppression state.
+PlayerBackOutcome resolvePlayerBackOutcome({
+  required bool detailOpen,
+  required bool osdOpen,
+  bool errorOpen = false,
+  bool exitConfirmOpen = false,
+  DateTime? suppressUntil,
+  DateTime? now,
+}) {
+  if (exitConfirmOpen) return PlayerBackOutcome.suppressed;
+  final current = now ?? DateTime.now();
+  if (suppressUntil != null && current.isBefore(suppressUntil)) {
+    return PlayerBackOutcome.suppressed;
+  }
+  if (detailOpen) return PlayerBackOutcome.closeDetail;
+  if (osdOpen) return PlayerBackOutcome.closeOsd;
+  if (errorOpen) return PlayerBackOutcome.popPlayer;
+  return PlayerBackOutcome.confirmExit;
+}
+
+/// Returns whether player interruption notices, auto-resume scheduling, and
+/// background error banners must be suppressed (on completion or active
+/// recording-conflict preemption / channel switch).
+bool shouldSuppressPlayerInterruption({
+  required bool completed,
+  required bool conflictHandled,
+  required bool switchingChannel,
+}) => completed || conflictHandled || switchingChannel;
+
+/// Prompts for confirmation before stopping active playback via Back, with the
+/// default focus placed on keeping playback running so accidental presses cancel.
+Future<bool> showPlayerExitConfirmDialog(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('再生を終了しますか？'),
+      content: const Text('再生を終了して前の画面に戻ります。'),
+      actions: [
+        TextButton(
+          autofocus: true,
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+          child: const Text('再生を続ける'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(dialogContext).pop(true),
+          child: const Text('終了する'),
+        ),
+      ],
+    ),
+  );
+  return confirmed == true;
+}
+
+/// Formats the top-right 5-second notice shown after seamless live failover.
+String buildLiveFailoverNotice({
+  String? fromNasneName,
+  required RegisteredNasne toRegistration,
+}) =>
+    '${fromNasneName ?? '他の nasne'} で録画開始のため ${nasneDisplayLabel(toRegistration)} へ切替';
+
+/// Prompts when live TV playback cannot start or is interrupted because another
+/// channel has claimed the single tuner for a scheduled recording. Returns
+/// `true` to switch to the recording channel, or `false`/`null` to close/exit.
+Future<bool?> showLiveRecordingConflictDialog(
+  BuildContext context, {
+  required LiveRecordingConflict conflict,
+  required bool midStream,
+}) {
+  final targetCh = conflict.channelName;
+  final baseDesc = (targetCh != null && targetCh.isNotEmpty)
+      ? '$targetCh「${conflict.displayTitle}」'
+      : '「${conflict.displayTitle}」';
+  final targetDesc =
+      (conflict.nasneName != null && conflict.nasneName!.isNotEmpty)
+      ? '${conflict.nasneName}: $baseDesc'
+      : baseDesc;
+  final body = midStream
+      ? '他チャンネルで録画（$targetDesc）が開始されたため、視聴が中断されました。'
+      : '現在、他チャンネルで録画中（$targetDesc）のため、このチャンネルは視聴できません。';
+  final hasSwitchTarget = conflict.liveChannel != null;
+  return showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(midStream ? '他チャンネルの録画が開始されました' : '他チャンネルで録画中です'),
+      content: Text(body),
+      actions: [
+        TextButton(
+          autofocus: !hasSwitchTarget,
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+          child: Text(midStream ? '視聴を終了する' : '閉じる'),
+        ),
+        if (hasSwitchTarget)
+          FilledButton(
+            autofocus: true,
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(midStream ? '録画中のチャンネルに切り替える' : '録画中のチャンネルを視聴'),
+          ),
+      ],
+    ),
+  );
+}
+
+/// Traps D-pad directional focus within the OSD action bar and loops
+/// horizontally between the first and last buttons so focus never escapes.
+class PlayerOsdButtonBar extends StatelessWidget {
+  const PlayerOsdButtonBar({
+    super.key,
+    required this.focusScopeNode,
+    required this.children,
+    required this.onClose,
+    this.onInteraction,
+  });
+
+  final FocusScopeNode focusScopeNode;
+  final List<Widget> children;
+  final VoidCallback onClose;
+  final VoidCallback? onInteraction;
+
+  List<FocusNode> _buttons() => focusScopeNode.traversalDescendants
+      .where((n) => n.canRequestFocus && !n.skipTraversal)
+      .toList();
+
+  FocusNode? _adjacentRowButton(
+    List<FocusNode> buttons,
+    FocusNode current, {
+    required bool down,
+  }) {
+    final cur = current.rect.center;
+    final candidates = buttons.where((b) {
+      final cy = b.rect.center.dy;
+      return down ? cy > cur.dy + 12 : cy < cur.dy - 12;
+    }).toList();
+    if (candidates.isEmpty) return null;
+    final targetY = candidates
+        .map((b) => b.rect.center.dy)
+        .reduce(down ? math.min : math.max);
+    final rowButtons = candidates
+        .where((b) => (b.rect.center.dy - targetY).abs() <= 12)
+        .toList();
+    rowButtons.sort(
+      (a, b) => (a.rect.center.dx - cur.dx).abs().compareTo(
+        (b.rect.center.dx - cur.dx).abs(),
+      ),
+    );
+    return rowButtons.first;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusScope(
+      node: focusScopeNode,
+      autofocus: true,
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+          return KeyEventResult.ignored;
+        }
+        final key = event.logicalKey;
+        onInteraction?.call();
+        if (event is KeyDownEvent &&
+            (key == LogicalKeyboardKey.escape ||
+                key == LogicalKeyboardKey.goBack)) {
+          onClose();
+          return KeyEventResult.handled;
+        }
+        final buttons = _buttons();
+        if (buttons.isEmpty) return KeyEventResult.handled;
+        final currentIdx = buttons.indexWhere(
+          (n) => n.hasPrimaryFocus || n.hasFocus,
+        );
+        if (key == LogicalKeyboardKey.arrowRight) {
+          final next = currentIdx < 0 ? 0 : (currentIdx + 1) % buttons.length;
+          buttons[next].requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowLeft) {
+          final prev = currentIdx < 0
+              ? buttons.length - 1
+              : (currentIdx - 1 + buttons.length) % buttons.length;
+          buttons[prev].requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowDown ||
+            key == LogicalKeyboardKey.arrowUp) {
+          if (currentIdx < 0) {
+            buttons.first.requestFocus();
+            return KeyEventResult.handled;
+          }
+          final target = _adjacentRowButton(
+            buttons,
+            buttons[currentIdx],
+            down: key == LogicalKeyboardKey.arrowDown,
+          );
+          (target ?? buttons[currentIdx]).requestFocus();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: Wrap(spacing: 10, runSpacing: 8, children: children),
+    );
+  }
+}
+
+/// Translucent upper-half overlay panel displaying full programme metadata and
+/// descriptions during playback, with Fire TV D-pad scroll and close support.
+class ProgramDetailOverlayPanel extends StatelessWidget {
+  const ProgramDetailOverlayPanel({
+    super.key,
+    required this.title,
+    this.meta,
+    required this.body,
+    required this.scrollController,
+    required this.focusNode,
+    required this.onClose,
+    required this.onScrollDelta,
+  });
+
+  final String title;
+  final String? meta;
+  final String body;
+  final ScrollController scrollController;
+  final FocusNode focusNode;
+  final VoidCallback onClose;
+  final void Function(double delta) onScrollDelta;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxHeight = MediaQuery.sizeOf(context).height * 0.45;
+    return GestureDetector(
+      onTap: () {},
+      child: Focus(
+        focusNode: focusNode,
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+            return KeyEventResult.ignored;
+          }
+          final key = event.logicalKey;
+          if (key == LogicalKeyboardKey.arrowDown) {
+            onScrollDelta(88);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.arrowUp) {
+            onScrollDelta(-88);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.pageDown) {
+            onScrollDelta(220);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.pageUp) {
+            onScrollDelta(-220);
+            return KeyEventResult.handled;
+          }
+          if (event is KeyDownEvent &&
+              (key == LogicalKeyboardKey.escape ||
+                  key == LogicalKeyboardKey.goBack ||
+                  key == LogicalKeyboardKey.select ||
+                  key == LogicalKeyboardKey.enter ||
+                  key == LogicalKeyboardKey.numpadEnter ||
+                  key == LogicalKeyboardKey.gameButtonA)) {
+            onClose();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.handled;
+        },
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: Container(
+            key: const ValueKey('player_program_detail_panel'),
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 16),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.88),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: Colors.amberAccent.withValues(alpha: 0.85),
+                width: 1.5,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          if (meta != null && meta!.isNotEmpty) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              meta!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    ExcludeFocus(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Colors.white38),
+                        ),
+                        onPressed: onClose,
+                        icon: const Icon(Icons.close, size: 18),
+                        label: const Text('閉じる'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '上下キーでスクロール ／ 決定・戻るキーで閉じる',
+                  style: TextStyle(color: Colors.amberAccent, fontSize: 11),
+                ),
+                const Divider(color: Colors.white24, height: 14),
+                Flexible(
+                  child: Scrollbar(
+                    controller: scrollController,
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: scrollController,
+                      padding: const EdgeInsets.only(right: 12),
+                      child: Text(
+                        body,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          height: 1.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({
@@ -197,8 +764,19 @@ class PlayerScreen extends ConsumerStatefulWidget {
     required this.session,
     this.live = false,
     this.initialStart,
+    this.knownDuration,
     this.onResumePosition,
     this.loadChapters,
+    this.programDetailTitle,
+    this.programDetailMeta,
+    this.programDetailBody,
+    this.currentLiveChannel,
+    this.initialRecordingSchedules = const [],
+    this.onCheckRecordingConflict,
+    this.onBuildRecordingChannelPlayer,
+    this.onBuildFailoverPlayer,
+    this.initialCornerNotice,
+    this.nowProvider,
   });
 
   /// Display heading: a recording's title, or a live channel's
@@ -219,6 +797,10 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// so the proxy's time-seek path establishes the stream at
   /// that position from the first byte.
   final Duration? initialStart;
+
+  /// Total programme duration from nasne metadata, used as a fallback when
+  /// mpv has not yet settled [PlayerState.duration] on stream start.
+  final Duration? knownDuration;
 
   /// Where the position a recording was stopped at goes when
   /// this screen closes (plan 102): the unit is told, so its
@@ -254,6 +836,49 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// must not delay or fail it.
   final Future<List<Duration>> Function()? loadChapters;
 
+  /// Full programme heading shown in the OSD detail viewer (defaults to [title]).
+  final String? programDetailTitle;
+
+  /// Single-line metadata (broadcast time, channel, genre) shown above [programDetailBody].
+  final String? programDetailMeta;
+
+  /// Combined full programme description body shown when opening "番組詳細" in the OSD.
+  final String? programDetailBody;
+
+  /// Channel metadata for live viewing so same-channel recording status and
+  /// other-channel recording conflicts can be detected.
+  final LiveChannel? currentLiveChannel;
+
+  /// Snapshot of reservations captured when opening live playback.
+  final List<RecordSchedule> initialRecordingSchedules;
+
+  /// Called when live playback stalls/reconnects repeatedly to detect whether a
+  /// scheduled recording on another channel claimed the single tuner.
+  final Future<LiveRecordingConflict?> Function()? onCheckRecordingConflict;
+
+  /// Builds the replacement [PlayerScreen] when switching to a recording channel.
+  final Future<Widget> Function(LiveChannel target)?
+      onBuildRecordingChannelPlayer;
+
+  /// Builds the replacement [PlayerScreen] when automatically failing over to
+  /// another registered nasne whose tuner is still free.
+  final Future<Widget> Function(
+    RegisteredNasne targetReg,
+    LiveChannel targetChannel,
+    String? notice,
+  )?
+  onBuildFailoverPlayer;
+
+  /// Optional 5-second top-right notice shown right after opening (e.g. after a
+  /// multi-nasne auto-failover switch).
+  final String? initialCornerNotice;
+
+  /// Injectable clock for testing same-channel recording notices.
+  final DateTime Function()? nowProvider;
+
+  static const Duration rewindStep = Duration(seconds: -10);
+  static const Duration forwardStep = Duration(seconds: 10);
+
   @override
   ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
 }
@@ -265,6 +890,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _watchdog;
   bool _playing = false;
+  bool _buffering = true;
+  bool _hasVideoFrame = false;
   String? _error;
 
   /// Interruption state (plan 80): playback that had started
@@ -274,6 +901,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _interrupted = false;
   String? _interruptDetail;
   Timer? _stallTimer;
+  Timer? _autoResumeTimer;
+  Timer? _resumeWatchdogTimer;
+  int _autoResumeAttempts = 0;
+  int _autoResumeCountdown = 0;
+  bool _autoResumeDisabled = false;
+
+  /// Live recording tracking (same-channel OSD/corner notice and other-channel
+  /// tuner conflict preemption).
+  bool _sameChannelRecording = false;
+  bool? _lastSameChannelRecording;
+  LiveRecordingCornerNotice? _cornerRecordingNotice;
+  String? _customCornerNoticeText;
+  Timer? _recordingStatusTimer;
+  Timer? _cornerNoticeTimer;
+  Timer? _customCornerNoticeTimer;
+  bool _checkingConflict = false;
+  bool _conflictHandled = false;
+  bool _switchingChannel = false;
+  Timer? _liveConflictPollTimer;
 
   /// The latest value of the playing stream (unlike
   /// [_playing], which latches once playback has started),
@@ -283,6 +929,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// resume should return to.
   bool _playingNow = false;
   bool _completed = false;
+  bool _autoPoppedOnComplete = false;
   bool _bufferingSincePlaying = false;
   Duration _lastPosition = Duration.zero;
 
@@ -349,68 +996,260 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// error normally surfaces first and this stays a backstop.
   static const Duration startTimeout = Duration(seconds: 45);
 
-  /// mpv's network timeout, set before opening (plan 30). The
-  /// factory default of 5 s is shorter than a slow path's time to
-  /// first byte even with the streaming proxy.
-  static const int mpvNetworkTimeoutSeconds = 30;
-
-  /// Seek bar dimensions in the video controls (player UI
-  /// follow-up). The stock Material theme's visible bar is
-  /// 2.4 px inside a 36 px container with a 12.8 px thumb;
-  /// the container is the touch target, so it grows to
-  /// 48 px, the thumb to 16 px and the visible bar to 4 px.
-  /// The desktop theme takes the same three values.
-  static const double seekBarThickness = 4.0;
-  static const double seekBarTouchHeight = 48.0;
-  static const double seekBarThumbDiameter = 16.0;
-
-  /// How far the non-fullscreen seek bar is lifted off the
-  /// video's bottom edge (player UI follow-up). Outside
-  /// fullscreen the stock theme gives the bar a zero margin
-  /// and the controls no safe-area padding, leaving it
-  /// under the iPhone home indicator; the fullscreen theme
-  /// already carries a 42 px margin over the safe-area
-  /// padding and keeps it. This lift is only the gap kept
-  /// above the gesture area: the theme adds the device's
-  /// bottom view padding under it (plan 105, see
-  /// player_safe_area_policy).
-  static const double seekBarBottomLift = 12.0;
-
-  /// The diagnostics log, captured in [initState] (plan
-  /// 104): dispose and the teardown it drives read no
+  /// The diagnostics log and Fire TV helper, captured in [initState]
+  /// (plan 104): dispose and the teardown it drives read no
   /// provider through ref — Riverpod 3 throws once the
   /// widget is deactivating, and a throw there aborts the
   /// teardown (see player_teardown_policy).
   late final DiagLog _diag;
+  late final FireTvHelper _fireTvHelper;
+
+  final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
+  final FocusScopeNode _osdFocusScopeNode = FocusScopeNode(
+    debugLabel: 'playerOsdScope',
+  );
+  final FocusNode _osdFirstFocusNode = FocusNode(debugLabel: 'playerOsdFirst');
+  final FocusNode _osdDetailButtonFocusNode = FocusNode(
+    debugLabel: 'playerOsdDetailButton',
+  );
+  final FocusNode _detailFocusNode = FocusNode(debugLabel: 'playerDetail');
+  final FocusNode _resumeButtonFocusNode = FocusNode(
+    debugLabel: 'playerResumeButton',
+  );
+  final FocusNode _closeBannerFocusNode = FocusNode(
+    debugLabel: 'playerCloseBannerButton',
+  );
+  final FocusNode _errorBackFocusNode = FocusNode(
+    debugLabel: 'playerErrorBack',
+  );
+
+  bool _osdOpen = false;
+  Timer? _osdTimer;
+  bool _detailOpen = false;
+  bool _exitConfirmOpen = false;
+  DateTime? _suppressBackPopUntil;
+  final ScrollController _detailScrollController = ScrollController();
+
+  IconData? _hudIcon;
+  String? _hudText;
+  Timer? _hudTimer;
+
+  bool _seekHudVisible = false;
+  IconData? _seekHudIcon;
+  String? _seekHudActionLabel;
+  Timer? _seekHudTimer;
+
+  Timer? _seekDebounceTimer;
+  Duration _pendingSeekOffset = Duration.zero;
+  Duration? _seekBasePosition;
+  Duration? _committedSeekTarget;
+  Timer? _committedSeekHoldTimer;
+
+  Duration _duration = Duration.zero;
+  Duration _bufferEndPosition = Duration.zero;
+  Duration? _initialBufferPosition;
+  double _bufferedAheadSeconds = 0.0;
+  double _bufferingPercentage = 0.0;
+  MpvBufferPlan? _bufferPlan;
+  Directory? _usedDiskCacheDir;
+  Timer? _preBufferPollTimer;
+  bool _pollingBufferProps = false;
+  bool _initialPlaybackStarted = false;
+  Duration? _positionAtFirstFrame;
+  int _lastObservedServedBytes = 0;
+  DateTime? _lastLiveTransferTickAt;
+  double _liveTransferAccumulatedSeconds = 0.0;
+
+  bool get _isPreBuffering {
+    final plan = _bufferPlan;
+    return plan != null &&
+        plan.cachePauseInitial &&
+        plan.cachePauseWaitSeconds > 0 &&
+        !_initialPlaybackStarted;
+  }
+
+  bool _maybeLatchInitialPlaybackStarted() {
+    if (_initialPlaybackStarted) return false;
+    final ready = shouldLatchInitialPlaybackStarted(
+      hasVideoFrame: _hasVideoFrame,
+      playingNow: _playingNow,
+      buffering: _buffering,
+      positionAtFirstFrame: _positionAtFirstFrame,
+      currentPosition: _lastPosition,
+    );
+    if (!ready) return false;
+    _initialPlaybackStarted = true;
+    _stopPreBufferPoller();
+    return true;
+  }
+
+  double get _bufferDeltaSeconds {
+    if (_bufferEndPosition <= Duration.zero) return 0.0;
+    final base = _lastPosition > Duration.zero
+        ? _lastPosition
+        : _initialBufferPosition;
+    if (base == null) return 0.0;
+    final diff = _bufferEndPosition - base;
+    return diff > Duration.zero ? diff.inMilliseconds / 1000.0 : 0.0;
+  }
+
+  int get _effectivePreBufferSeconds => computePreBufferSeconds(
+    targetSeconds: _bufferPlan?.cachePauseWaitSeconds ?? 0,
+    demuxerCacheDuration: _bufferedAheadSeconds,
+    bufferingPercentage: _bufferingPercentage,
+    bufferDeltaSeconds: _bufferDeltaSeconds,
+    liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
+  );
+
+  void _startPreBufferPoller() {
+    _preBufferPollTimer?.cancel();
+    _preBufferPollTimer = Timer.periodic(const Duration(milliseconds: 500), (
+      _,
+    ) {
+      if (!mounted || !_isPreBuffering) {
+        _stopPreBufferPoller();
+        return;
+      }
+      unawaited(_pollMpvBufferProperties());
+    });
+    unawaited(_pollMpvBufferProperties());
+  }
+
+  void _stopPreBufferPoller() {
+    _preBufferPollTimer?.cancel();
+    _preBufferPollTimer = null;
+  }
+
+  Future<void> _pollMpvBufferProperties() async {
+    if (_pollingBufferProps || !mounted) return;
+    final platform = _player.platform;
+    _pollingBufferProps = true;
+    final prevPreSec = _effectivePreBufferSeconds;
+    final prevAheadFloor = _bufferedAheadSeconds.floor();
+    try {
+      if (platform is NativePlayer) {
+        var parsedCacheDuration = 0.0;
+        try {
+          final rawDur = await platform.getProperty('demuxer-cache-duration');
+          final parsed = double.tryParse(rawDur);
+          if (parsed != null && parsed.isFinite && parsed >= 0) {
+            parsedCacheDuration = parsed;
+            _bufferedAheadSeconds = parsed;
+          }
+        } catch (_) {}
+        try {
+          final rawState = await platform.getProperty('demuxer-cache-state');
+          final parsed = parseDemuxerCacheStateDuration(rawState);
+          if (parsed != null &&
+              (parsed > _bufferedAheadSeconds || parsedCacheDuration <= 0)) {
+            _bufferedAheadSeconds = parsed;
+          }
+        } catch (_) {}
+        try {
+          final rawPct = await platform.getProperty('cache-buffering-state');
+          final parsed = double.tryParse(rawPct);
+          if (parsed != null && parsed.isFinite) {
+            _bufferingPercentage = parsed.clamp(0.0, 100.0).toDouble();
+          }
+        } catch (_) {}
+      }
+      if (widget.live && _isPreBuffering) {
+        if (widget.session case final StreamTransferMetrics metrics) {
+          final next = advanceLiveTransferSeconds(
+            currentAccumulatedSeconds: _liveTransferAccumulatedSeconds,
+            previousServedBytes: _lastObservedServedBytes,
+            previousTickAt: _lastLiveTransferTickAt,
+            servedBytes: metrics.servedBytes,
+            firstByteServedAt: metrics.firstByteServedAt,
+            lastByteServedAt: metrics.lastByteServedAt,
+            now: DateTime.now(),
+          );
+          _liveTransferAccumulatedSeconds = next.accumulatedSeconds;
+          _lastObservedServedBytes = next.lastServedBytes;
+          _lastLiveTransferTickAt = next.lastTickAt;
+        }
+      }
+      if (!mounted) return;
+      final nextPreSec = _effectivePreBufferSeconds;
+      if ((_isPreBuffering && nextPreSec != prevPreSec) ||
+          ((_osdOpen || _seekHudVisible) &&
+              _bufferedAheadSeconds.floor() != prevAheadFloor)) {
+        setState(() {});
+      }
+    } finally {
+      _pollingBufferProps = false;
+    }
+  }
+
+  static const Duration _rewindStep = PlayerScreen.rewindStep;
+  static const Duration _forwardStep = PlayerScreen.forwardStep;
+  static const List<int> _autoResumeBackoffSeconds = [3, 5, 8, 10];
+
+  void _onVideoRectChanged() {
+    final r = _videoController.rect.value;
+    if (!_hasVideoFrame &&
+        r != null &&
+        r.width > 0 &&
+        r.height > 0 &&
+        mounted) {
+      setState(() {
+        _hasVideoFrame = true;
+        _positionAtFirstFrame ??= _lastPosition;
+        _maybeLatchInitialPlaybackStarted();
+      });
+    }
+  }
 
   @override
   void initState() {
     super.initState();
     _diag = ref.read(diagLogProvider);
+    _fireTvHelper = ref.read(fireTvHelperProvider);
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
+    unawaited(_fireTvHelper.setMediaVolumeMax());
     _player = Player();
+    unawaited(_player.setVolume(100.0));
     _videoController = VideoController(_player);
+    _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
     _subscriptions.add(
       _player.stream.playing.listen((playing) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: playing=$playing');
         _wakelockSession.setPlaying(playing);
         final wasPlaying = _playingNow;
-        _playingNow = playing;
+        if (mounted) {
+          setState(() {
+            _playingNow = playing;
+            if (playing) {
+              _playing = true;
+              _interrupted = false;
+              _interruptDetail = null;
+            }
+            _maybeLatchInitialPlaybackStarted();
+          });
+        } else {
+          _playingNow = playing;
+          if (playing) _playing = true;
+          _maybeLatchInitialPlaybackStarted();
+        }
         if (playing) {
-          _playing = true;
           _watchdog?.cancel();
+          _resumeWatchdogTimer?.cancel();
+          _autoResumeTimer?.cancel();
+          _autoResumeCountdown = 0;
+          _autoResumeDisabled = false;
+          if (!_buffering) {
+            _autoResumeAttempts = 0;
+          }
           // A (re)start clears any interruption state
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
           _stallTimer?.cancel();
           _bufferingSincePlaying = false;
-          if (_interrupted && mounted) {
-            setState(() {
-              _interrupted = false;
-              _interruptDetail = null;
-            });
-          }
         } else if (wasPlaying) {
           _onPlaybackStopped();
         }
@@ -418,6 +1257,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.buffering.listen((buffering) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: buffering=$buffering');
         if (_playingNow) {
           // Buffering while mpv is trying to play is the
@@ -426,17 +1266,108 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           // while playing is a recovery and clears it.
           _bufferingSincePlaying = buffering;
         }
+        if (!buffering && _playingNow) {
+          _autoResumeAttempts = 0;
+        }
+        if (widget.live &&
+            widget.onCheckRecordingConflict != null &&
+            !_conflictHandled) {
+          if (buffering) {
+            _startLiveConflictPoller();
+          } else {
+            _stopLiveConflictPoller();
+          }
+        }
+        final changed = _buffering != buffering;
+        _buffering = buffering;
+        final latched = _maybeLatchInitialPlaybackStarted();
+        if (mounted && (changed || latched)) {
+          setState(() {});
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.width.listen((width) {
+        if (!_hasVideoFrame && width != null && width > 0 && mounted) {
+          setState(() {
+            _hasVideoFrame = true;
+            _positionAtFirstFrame ??= _lastPosition;
+            _maybeLatchInitialPlaybackStarted();
+          });
+        }
       }),
     );
     _subscriptions.add(
       _player.stream.completed.listen((completed) {
         _diag(DiagCategory.playback, 'player: completed=$completed');
         _completed = completed;
+        if (completed && !widget.live && _playing) {
+          _handleRecordedCompletion('mpv completed');
+        }
       }),
     );
     _subscriptions.add(
       _player.stream.position.listen((position) {
         _lastPosition = position;
+        var shouldRebuild = false;
+        if (!_initialPlaybackStarted &&
+            _hasVideoFrame &&
+            _maybeLatchInitialPlaybackStarted()) {
+          shouldRebuild = true;
+        }
+        final committed = _committedSeekTarget;
+        if (committed != null &&
+            (position - committed).abs() <= const Duration(seconds: 2)) {
+          _committedSeekTarget = null;
+          _committedSeekHoldTimer?.cancel();
+          if (_seekHudVisible) shouldRebuild = true;
+        }
+        if (shouldRebuild && mounted) setState(() {});
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.duration.listen((duration) {
+        if (duration > Duration.zero && duration != _duration) {
+          if (mounted) {
+            setState(() => _duration = duration);
+          } else {
+            _duration = duration;
+          }
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.buffer.listen((bufferEnd) {
+        final prevPreSec = _effectivePreBufferSeconds;
+        final prevDeltaFloor = _bufferDeltaSeconds.floor();
+        if (bufferEnd > Duration.zero && _initialBufferPosition == null) {
+          _initialBufferPosition = bufferEnd <= const Duration(seconds: 5)
+              ? Duration.zero
+              : bufferEnd;
+        }
+        if (bufferEnd != _bufferEndPosition) {
+          _bufferEndPosition = bufferEnd;
+          if (mounted &&
+              ((_isPreBuffering &&
+                      _effectivePreBufferSeconds != prevPreSec) ||
+                  ((_osdOpen || _seekHudVisible) &&
+                      _bufferDeltaSeconds.floor() != prevDeltaFloor))) {
+            setState(() {});
+          }
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.bufferingPercentage.listen((pct) {
+        if (!pct.isFinite) return;
+        final clamped = pct.clamp(0.0, 100.0).toDouble();
+        final prevPreSec = _effectivePreBufferSeconds;
+        _bufferingPercentage = clamped;
+        if (mounted &&
+            _isPreBuffering &&
+            _effectivePreBufferSeconds != prevPreSec) {
+          setState(() {});
+        }
       }),
     );
     _subscriptions.add(
@@ -478,6 +1409,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.error.listen((error) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: error: $error');
         if (!playerErrorIsFatal(
           error,
@@ -502,37 +1434,399 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         _watchdog?.cancel();
         if (!mounted) return;
         if (_playing) {
+          if (!widget.live && _isEffectivelyCompleted) {
+            _handleRecordedCompletion('trailing error near end: $error');
+            return;
+          }
           // The failure arrived after playback had started
           // (plan 80): an interruption, not a failed start.
           // Keep the frozen frame and offer the in-place
           // resume instead of replacing the screen with the
           // start-failure message.
-          setState(() {
-            _interrupted = true;
-            _interruptDetail = error;
-          });
+          _enterInterruptedState(error);
         } else if (_error == null) {
-          setState(() => _error = error);
+          _setStartError(error);
         }
       }),
     );
     _observeSeekable();
+    _observeCacheDuration();
     _open();
     _loadChapters();
+    if (widget.initialCornerNotice != null &&
+        widget.initialCornerNotice!.isNotEmpty) {
+      _customCornerNoticeText = widget.initialCornerNotice;
+      _customCornerNoticeTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        setState(() => _customCornerNoticeText = null);
+      });
+    }
+    if (widget.live && widget.currentLiveChannel != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _updateSameChannelRecordingStatus();
+      });
+      _recordingStatusTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _updateSameChannelRecordingStatus(),
+      );
+    }
+  }
+
+  bool get _isEffectivelyCompleted =>
+      _completed ||
+      isNearRecordedEnd(
+        live: widget.live,
+        position: _lastPosition,
+        duration: _effectiveDuration,
+      );
+
+  void _handleRecordedCompletion(String reason) {
+    if (widget.live || !_playing) return;
+    _completed = true;
+    _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
+    _wakelockSession.setPlaying(false);
+    _diag(DiagCategory.playback, 'player: recorded playback finished ($reason)');
+    if (mounted && (_interrupted || _autoResumeCountdown != 0 || _buffering)) {
+      setState(() {
+        _interrupted = false;
+        _autoResumeCountdown = 0;
+        _buffering = false;
+      });
+    }
+    if (_autoPoppedOnComplete) return;
+    _autoPoppedOnComplete = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final nav = Navigator.of(context);
+      if (_exitConfirmOpen) {
+        if (nav.canPop()) nav.pop(true);
+        return;
+      }
+      if (nav.canPop()) {
+        nav.pop();
+      }
+    });
+  }
+
+  Future<void> _confirmExitPlayback() async {
+    if (_exitConfirmOpen || !mounted) return;
+    _exitConfirmOpen = true;
+    var confirmed = false;
+    try {
+      confirmed = await showPlayerExitConfirmDialog(context);
+    } finally {
+      _exitConfirmOpen = false;
+    }
+    if (!mounted) return;
+    if (confirmed) {
+      final nav = Navigator.of(context);
+      if (nav.canPop()) nav.pop();
+      return;
+    }
+    _suppressBackPopUntil = DateTime.now().add(
+      const Duration(milliseconds: 300),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final target = _interrupted ? _resumeButtonFocusNode : _rootFocusNode;
+      if (target.canRequestFocus) {
+        target.requestFocus();
+      }
+    });
+  }
+
+  void _setStartError(String error, {bool allowAfterConflict = false}) {
+    _stopPreBufferPoller();
+    if (!mounted) return;
+    if (!allowAfterConflict && (_conflictHandled || _switchingChannel)) return;
+    setState(() => _error = error);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          _error != null &&
+          (allowAfterConflict || (!_conflictHandled && !_switchingChannel)) &&
+          _errorBackFocusNode.canRequestFocus) {
+        _errorBackFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _enterInterruptedState(String? detail) {
+    _stopPreBufferPoller();
+    if (!mounted ||
+        shouldSuppressPlayerInterruption(
+          completed: _completed,
+          conflictHandled: _conflictHandled,
+          switchingChannel: _switchingChannel,
+        )) {
+      return;
+    }
+    if (widget.live && widget.onCheckRecordingConflict != null) {
+      unawaited(_handlePossibleLiveRecordingConflict());
+    }
+    setState(() {
+      _interrupted = true;
+      if (detail != null) _interruptDetail = detail;
+    });
+    _scheduleAutoResume();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          _interrupted &&
+          !_conflictHandled &&
+          !_switchingChannel &&
+          _resumeButtonFocusNode.canRequestFocus) {
+        _resumeButtonFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _scheduleAutoResume() {
+    _autoResumeTimer?.cancel();
+    if (_autoResumeDisabled ||
+        !_interrupted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        !mounted) {
+      return;
+    }
+    final delaySec = _autoResumeBackoffSeconds[
+        math.min(_autoResumeAttempts, _autoResumeBackoffSeconds.length - 1)];
+    _autoResumeAttempts++;
+    setState(() => _autoResumeCountdown = delaySec);
+    _diag(
+      DiagCategory.playback,
+      'player: scheduling auto-resume attempt $_autoResumeAttempts in ${delaySec}s',
+    );
+    _autoResumeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted ||
+          !_interrupted ||
+          _autoResumeDisabled ||
+          _conflictHandled ||
+          _switchingChannel) {
+        timer.cancel();
+        return;
+      }
+      if (_autoResumeCountdown <= 1) {
+        timer.cancel();
+        if (mounted) {
+          setState(() => _autoResumeCountdown = 0);
+        }
+        unawaited(_resume());
+      } else {
+        setState(() => _autoResumeCountdown--);
+      }
+    });
   }
 
   void _onStartTimeout() {
-    if (!mounted || _playing || _error != null) return;
+    if (!mounted ||
+        _playing ||
+        _error != null ||
+        _conflictHandled ||
+        _switchingChannel) {
+      return;
+    }
+    if (widget.live && widget.onCheckRecordingConflict != null) {
+      unawaited(_handlePossibleLiveRecordingConflict());
+    }
+    final timeoutSec = _bufferPlan?.startTimeoutSeconds ?? startTimeout.inSeconds;
     _diag(
       DiagCategory.playback,
-      'player: no playback within ${startTimeout.inSeconds} seconds; '
+      'player: no playback within $timeoutSec seconds; '
       'showing a timeout error',
     );
-    setState(
-      () => _error =
-          '再生が開始できませんでした (${startTimeout.inSeconds} 秒以内に'
-          '映像が届きませんでした)。',
+    _setStartError(
+      '再生が開始できませんでした ($timeoutSec 秒以内に映像が届きませんでした)。',
     );
+  }
+
+  DateTime _now() => widget.nowProvider?.call() ?? DateTime.now();
+
+  void _updateSameChannelRecordingStatus() {
+    final channel = widget.currentLiveChannel;
+    if (!mounted || !widget.live || channel == null) return;
+    final recordingNow =
+        findActiveSameChannelRecording(
+          widget.initialRecordingSchedules,
+          currentChannel: channel,
+          now: _now(),
+        ) !=
+        null;
+    final notice = resolveLiveRecordingCornerNotice(
+      previousRecording: _lastSameChannelRecording,
+      currentRecording: recordingNow,
+    );
+    _lastSameChannelRecording = recordingNow;
+    if (_sameChannelRecording != recordingNow || notice != null) {
+      setState(() {
+        _sameChannelRecording = recordingNow;
+        if (notice != null) {
+          _cornerRecordingNotice = notice;
+        }
+      });
+    }
+    if (notice != null) {
+      _cornerNoticeTimer?.cancel();
+      _cornerNoticeTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        setState(() => _cornerRecordingNotice = null);
+      });
+    }
+  }
+
+  void _startLiveConflictPoller() {
+    if (_liveConflictPollTimer != null ||
+        _conflictHandled ||
+        !widget.live ||
+        widget.onCheckRecordingConflict == null) {
+      return;
+    }
+    _liveConflictPollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!mounted || _conflictHandled || !_buffering) {
+        _stopLiveConflictPoller();
+        return;
+      }
+      if (widget.session case final StreamTransferMetrics metrics) {
+        if (metrics.consecutiveReconnectErrors >= 2) {
+          unawaited(_handlePossibleLiveRecordingConflict());
+        }
+      }
+    });
+  }
+
+  void _stopLiveConflictPoller() {
+    _liveConflictPollTimer?.cancel();
+    _liveConflictPollTimer = null;
+  }
+
+  Future<void> _handlePossibleLiveRecordingConflict() async {
+    final check = widget.onCheckRecordingConflict;
+    if (check == null ||
+        _checkingConflict ||
+        _conflictHandled ||
+        !mounted ||
+        !widget.live) {
+      return;
+    }
+    _checkingConflict = true;
+    LiveRecordingConflict? conflict;
+    try {
+      conflict = await check();
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: conflict check failed: $e');
+    } finally {
+      _checkingConflict = false;
+    }
+    if (conflict == null || _conflictHandled || !mounted) return;
+
+    _conflictHandled = true;
+    _autoResumeDisabled = true;
+    _stopLiveConflictPoller();
+    _stopPreBufferPoller();
+    _watchdog?.cancel();
+    _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
+    _recordingStatusTimer?.cancel();
+    _cornerNoticeTimer?.cancel();
+    _customCornerNoticeTimer?.cancel();
+    _osdTimer?.cancel();
+    _hudTimer?.cancel();
+
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel());
+    }
+    _subscriptions.clear();
+
+    setState(() {
+      _interrupted = false;
+      _interruptDetail = null;
+      _autoResumeCountdown = 0;
+      _osdOpen = false;
+      _detailOpen = false;
+      _hudText = null;
+      _cornerRecordingNotice = null;
+      _customCornerNoticeText = null;
+    });
+
+    await _player.stop().timeout(
+      const Duration(seconds: 2),
+      onTimeout: () {},
+    ).catchError((_) {});
+    await widget.session.stop().timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {},
+    ).catchError((_) {});
+    if (!mounted) return;
+
+    final failoverReg = conflict.failoverRegistration;
+    final failoverCh = conflict.failoverChannel;
+    final buildFailover = widget.onBuildFailoverPlayer;
+    if (failoverReg != null && failoverCh != null && buildFailover != null) {
+      final notice = buildLiveFailoverNotice(
+        fromNasneName: conflict.nasneName,
+        toRegistration: failoverReg,
+      );
+      setState(() {
+        _switchingChannel = true;
+        _error = null;
+      });
+      try {
+        final nextPlayer = await buildFailover(failoverReg, failoverCh, notice);
+        if (!mounted) return;
+        await Navigator.of(context).pushReplacement(
+          MaterialPageRoute<void>(builder: (_) => nextPlayer),
+        );
+        return;
+      } catch (e) {
+        _diag(
+          DiagCategory.playback,
+          'player: failover switch failed, falling back to conflict dialog: $e',
+        );
+        if (!mounted) return;
+        setState(() => _switchingChannel = false);
+      }
+    }
+    if (!mounted) return;
+
+    final shouldSwitch = await showLiveRecordingConflictDialog(
+      context,
+      conflict: conflict,
+      midStream: true,
+    );
+    if (!mounted) return;
+
+    final target = conflict.liveChannel;
+    final buildNext = widget.onBuildRecordingChannelPlayer;
+    if (shouldSwitch == true && target != null && buildNext != null) {
+      setState(() {
+        _switchingChannel = true;
+        _error = null;
+      });
+      try {
+        final nextPlayer = await buildNext(target);
+        if (!mounted) return;
+        await Navigator.of(context).pushReplacement(
+          MaterialPageRoute<void>(builder: (_) => nextPlayer),
+        );
+      } catch (e) {
+        _diag(
+          DiagCategory.playback,
+          'player: recording channel switch failed: $e',
+        );
+        if (!mounted) return;
+        setState(() => _switchingChannel = false);
+        _setStartError(
+          '録画中のチャンネルへの切り替えに失敗しました。録画終了後に再度お試しください。',
+          allowAfterConflict: true,
+        );
+      }
+      return;
+    }
+
+    final nav = Navigator.of(context);
+    if (nav.canPop()) nav.pop();
   }
 
   /// A playing→stopped transition (plan 80): when the
@@ -540,11 +1834,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// grace period to recover on its own before surfacing
   /// anything.
   void _onPlaybackStopped() {
+    if (_conflictHandled || _switchingChannel) return;
     if (!playbackStoppedEarly(
       alreadyPlaying: _playing,
       completed: _completed,
       bufferedBeforeStop: _bufferingSincePlaying,
     )) {
+      return;
+    }
+    if (!widget.live && _isEffectivelyCompleted) {
+      _handleRecordedCompletion('stopped after buffering near end');
       return;
     }
     _diag(
@@ -558,7 +1857,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _onStallTimeout() {
-    if (!mounted || _playingNow || _completed || _error != null) {
+    if (!mounted ||
+        _playingNow ||
+        _completed ||
+        _error != null ||
+        _conflictHandled ||
+        _switchingChannel) {
+      return;
+    }
+    if (!widget.live && _isEffectivelyCompleted) {
+      _handleRecordedCompletion('stall timeout near end');
       return;
     }
     _diag(
@@ -566,32 +1874,64 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: playback did not recover; showing the '
       'interruption notice (plan 80)',
     );
-    setState(() => _interrupted = true);
+    _enterInterruptedState(null);
   }
 
-  /// Re-establishes playback after an interruption, in
-  /// place (plan 80): the session — authentication, the
-  /// loopback proxy and all — is still alive (only leaving
-  /// the screen stops it), so resuming re-opens the same
-  /// stream URL on the same player and, for a recording,
-  /// starts from the last observed position. The title is
-  /// never re-opened from the list, and nothing is
-  /// re-asked. The player's properties (cache mode, sid)
-  /// persist across the re-open; the track listener
-  /// re-applies the caption selection when the new track
-  /// list settles, exactly as at the first open.
   Future<void> _resume() async {
+    if (!mounted || _conflictHandled || _switchingChannel) return;
     _diag(
       DiagCategory.playback,
       'player: resuming after an interruption at '
       '${_lastPosition.inSeconds}s (live=${widget.live})',
     );
     _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
     setState(() {
+      _autoResumeDisabled = false;
+      _autoResumeCountdown = 0;
       _interrupted = false;
       _interruptDetail = null;
+      _buffering = true;
+      _bufferingPercentage = 0.0;
+      _bufferedAheadSeconds = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
+      _positionAtFirstFrame = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
+    });
+    if (_isPreBuffering) {
+      _startPreBufferPoller();
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          !_conflictHandled &&
+          !_switchingChannel &&
+          _rootFocusNode.canRequestFocus) {
+        _rootFocusNode.requestFocus();
+      }
+    });
+    _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
+      if (!mounted ||
+          _playingNow ||
+          _completed ||
+          _interrupted ||
+          _error != null ||
+          _conflictHandled ||
+          _switchingChannel) {
+        return;
+      }
+      if (!widget.live && _isEffectivelyCompleted) {
+        _handleRecordedCompletion('resume watchdog near end');
+        return;
+      }
+      _enterInterruptedState('再接続がタイムアウトしました。電波状況を確認して再試行します。');
     });
     try {
+      await _player.setVolume(100.0);
+      if (!mounted || _conflictHandled || _switchingChannel) return;
       await _player.open(
         Media(
           widget.session.mediaUri.toString(),
@@ -600,15 +1940,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               : null,
         ),
       );
+      if (!mounted || _conflictHandled || _switchingChannel) return;
+      await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
+      if (!mounted || _conflictHandled || _switchingChannel) return;
       _diag(DiagCategory.playback, 'player: resume failed: $e');
-      if (mounted) {
-        setState(() {
-          _interrupted = true;
-          _interruptDetail = '$e';
-        });
-      }
+      _resumeWatchdogTimer?.cancel();
+      _enterInterruptedState('$e');
     }
   }
 
@@ -707,28 +2046,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
-  /// Seeks by [offset] (±[skipSeekStep]) from the current
-  /// position (player UI follow-up). Reached only through
-  /// the skip buttons, which stay disabled while [_seekable]
-  /// is false; a refusal that still comes back lands on the
-  /// error stream and is classified there (see
-  /// player_error_policy), so it cannot fail a playback
-  /// already under way.
-  Future<void> _skipSeek(Duration offset) async {
-    final target = skipSeekTarget(
-      position: _player.state.position,
-      offset: offset,
-      duration: _player.state.duration,
-    );
-    _diag(
-      DiagCategory.playback,
-      'player: skip seek by ${offset.inSeconds}s '
-      'to ${target.inSeconds}s',
-    );
+  Future<void> _observeCacheDuration() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
     try {
-      await _player.seek(target);
+      await platform.observeProperty('demuxer-cache-duration', (value) async {
+        final parsed = double.tryParse(value);
+        if (parsed == null || parsed.isNaN || parsed.isInfinite) return;
+        final clamped = math.max(0.0, parsed);
+        final prevPreSec = _effectivePreBufferSeconds;
+        final prevFloor = _bufferedAheadSeconds.floor();
+        _bufferedAheadSeconds = clamped;
+        final waitingForInitial = _isPreBuffering;
+        if (mounted &&
+            ((waitingForInitial && _effectivePreBufferSeconds != prevPreSec) ||
+                ((_osdOpen || _seekHudVisible) && clamped.floor() != prevFloor))) {
+          setState(() {});
+        }
+      });
     } catch (e) {
-      _diag(DiagCategory.playback, 'player: skip seek failed: $e');
+      _diag(
+        DiagCategory.playback,
+        'player: demuxer-cache-duration observation failed: $e',
+      );
     }
   }
 
@@ -780,6 +2120,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: chapter seek ${forward ? 'next' : 'previous'} '
       'to ${target.inSeconds}s (plan 112)',
     );
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (_seekHudVisible && mounted) setState(() {});
+    });
+    _showSeekHud(
+      forward ? Icons.fast_forward : Icons.fast_rewind,
+      forward ? '次チャプター' : '前チャプター',
+    );
     try {
       await _player.seek(target);
     } catch (e) {
@@ -790,50 +2140,91 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Future<void> _open() async {
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
     try {
+      final bufferSeconds = !widget.live
+          ? ref.read(recordedBufferSecondsProvider)
+          : ref.read(liveBufferSecondsProvider);
+      final cacheDir = ref.read(mpvCacheDirectoryProvider);
+      final availableDiskBytes =
+          (bufferSeconds >= 60 && Platform.isAndroid)
+          ? await _fireTvHelper.getCacheAvailableBytes()
+          : null;
+      final plan = computeMpvBufferPlan(
+        live: widget.live,
+        bufferSeconds: bufferSeconds,
+        isAndroid: Platform.isAndroid,
+        availableDiskBytes: availableDiskBytes,
+        cacheDirPath: cacheDir?.path,
+      );
+      if (!mounted) return;
+      _bufferPlan = plan;
+      _initialPlaybackStarted = false;
+      _positionAtFirstFrame = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
+      _bufferingPercentage = 0.0;
+      _bufferedAheadSeconds = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
+      _usedDiskCacheDir = plan.useDiskCache ? cacheDir : null;
+      _watchdog?.cancel();
+      _watchdog = Timer(
+        Duration(seconds: plan.startTimeoutSeconds),
+        _onStartTimeout,
+      );
+
       final platform = _player.platform;
       if (platform is NativePlayer) {
         await platform.setProperty(
           'network-timeout',
-          '$mpvNetworkTimeoutSeconds',
+          '${plan.networkTimeoutSeconds}',
         );
-        _diag(
-          DiagCategory.playback,
-          'player: mpv network-timeout set to '
-          '${mpvNetworkTimeoutSeconds}s',
-        );
-        // Captions default to off (plan 53): pin the subtitle
-        // selection to "no track" before the stream opens, so
-        // mpv's auto-selection never gets a say. The tracks
-        // listener re-applies the resolution once the demuxer's
-        // track list settles.
         await platform.setProperty('sid', 'no');
-        _diag(DiagCategory.playback, 'player: mpv sid pinned to no (default)');
-        // mpv's cache follows the playback kind (plans 54
-        // and 80; see player_cache_policy). Live keeps it
-        // off: with the demuxer cache on, an audio track
-        // switch on the unseekable live stream never
-        // re-engages decoding (measured 30 s and counting),
-        // and the proxy's prefetch queue is the jitter
-        // buffer. Recordings turn it on, sized by the two
-        // demuxer limits, so the demuxer's probe and seek
-        // re-reads (plan 78.1) are absorbed locally instead
-        // of round-tripping the proxy per hop.
-        final cacheMode = mpvCacheMode(live: widget.live);
-        await platform.setProperty('cache', cacheMode);
-        if (!widget.live) {
+        await platform.setProperty('cache', plan.useCache ? 'yes' : 'no');
+        if (plan.useCache) {
           await platform.setProperty(
             'demuxer-max-bytes',
-            '$recordingDemuxerMaxBytes',
+            '${plan.demuxerMaxBytes}',
           );
           await platform.setProperty(
             'demuxer-max-back-bytes',
-            '$recordingDemuxerMaxBackBytes',
+            '${plan.demuxerMaxBackBytes}',
           );
+          await platform.setProperty(
+            'demuxer-readahead-secs',
+            '${plan.readaheadSeconds}',
+          );
+          await platform.setProperty('cache-pause', 'yes');
+          await platform.setProperty(
+            'cache-pause-initial',
+            plan.cachePauseInitial ? 'yes' : 'no',
+          );
+          if (plan.cachePauseWaitSeconds > 0) {
+            await platform.setProperty(
+              'cache-pause-wait',
+              '${plan.cachePauseWaitSeconds}',
+            );
+          }
+          if (plan.useDiskCache && plan.cacheDirPath != null) {
+            await platform.setProperty('cache-on-disk', 'yes');
+            await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
+          } else {
+            await platform.setProperty('cache-on-disk', 'no');
+          }
         }
         _diag(
           DiagCategory.playback,
-          'player: mpv cache=$cacheMode (live=${widget.live})',
+          'player: mpv buffer plan: target=${plan.configuredSeconds}s '
+          'cache=${plan.useCache} disk=${plan.useDiskCache} '
+          'maxBytes=${plan.demuxerMaxBytes} back=${plan.demuxerMaxBackBytes} '
+          'wait=${plan.cachePauseWaitSeconds}s netTimeout=${plan.networkTimeoutSeconds}s',
         );
+      }
+      if (mounted) {
+        setState(() {});
+        if (plan.cachePauseInitial && plan.cachePauseWaitSeconds > 0) {
+          _startPreBufferPoller();
+        }
       }
       final start =
           (!widget.live &&
@@ -848,9 +2239,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           '(plan 86)',
         );
       }
+      await _player.setVolume(100.0);
       await _player.open(
         Media(widget.session.mediaUri.toString(), start: start),
       );
+      await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: open completed');
       await _applySubtitleSelection();
     } catch (e) {
@@ -865,181 +2258,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         return;
       }
       _watchdog?.cancel();
-      if (mounted) setState(() => _error = '$e');
+      _setStartError('$e');
     }
-  }
-
-  /// The Material (Android / iOS) controls theme with this
-  /// screen's seek bar dimensions (player UI follow-up)
-  /// and, for recordings, the ±10 s skip buttons in the
-  /// transport row. Built from media_kit's defaults via
-  /// copyWith so the gestures and the rest of the stock
-  /// behaviour carry over unchanged.
-  ///
-  /// Outside fullscreen the bottom margins also clear the
-  /// system gesture area (plan 105): the seek bar's margin
-  /// and the bottom button bar's margin grow by
-  /// [bottomViewPadding], the device's bottom view
-  /// padding, and the button bar's right margin moves the
-  /// fullscreen button in from the corner (see
-  /// player_safe_area_policy). Fullscreen needs none of
-  /// this: media_kit pads the fullscreen controls by the
-  /// safe area itself, under the stock 42 px margins.
-  MaterialVideoControlsThemeData _materialControlsTheme({
-    required bool fullscreen,
-    double bottomViewPadding = 0,
-  }) {
-    final base = fullscreen
-        ? kDefaultMaterialVideoControlsThemeDataFullscreen
-        : kDefaultMaterialVideoControlsThemeData;
-    var data = base.copyWith(
-      seekBarHeight: seekBarThickness,
-      seekBarContainerHeight: seekBarTouchHeight,
-      seekBarThumbSize: seekBarThumbDiameter,
-    );
-    if (!fullscreen) {
-      data = data.copyWith(
-        seekBarMargin: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: seekBarBottomMargin(
-            lift: seekBarBottomLift,
-            viewPaddingBottom: bottomViewPadding,
-          ),
-        ),
-        bottomButtonBarMargin: EdgeInsets.only(
-          left: 16,
-          right: bottomButtonBarRightMargin,
-          bottom: bottomButtonBarBottomMargin(bottomViewPadding),
-        ),
-      );
-    }
-    if (!widget.live) {
-      data = data.copyWith(
-        primaryButtonBar: _recordedPrimaryButtonBar(
-          playIconSize: fullscreen ? 56.0 : 48.0,
-        ),
-      );
-    }
-    return data;
-  }
-
-  /// The desktop controls theme with the same seek bar
-  /// dimensions (player UI follow-up); the desktop defaults
-  /// are one data set for both normal and fullscreen. The
-  /// skip buttons join the bottom transport row, which is
-  /// where the desktop controls keep theirs.
-  MaterialDesktopVideoControlsThemeData _desktopControlsTheme() {
-    var data = kDefaultMaterialDesktopVideoControlsThemeData.copyWith(
-      seekBarHeight: seekBarThickness,
-      seekBarContainerHeight: seekBarTouchHeight,
-      seekBarThumbSize: seekBarThumbDiameter,
-    );
-    if (!widget.live) {
-      data = data.copyWith(bottomButtonBar: _recordedDesktopButtonBar());
-    }
-    return data;
-  }
-
-  /// The Material transport row for recordings: media_kit's
-  /// stock row with a ±10 s skip button flanking the
-  /// play/pause button on each side (player UI follow-up),
-  /// and — when the title has chapter points — a chapter
-  /// button outside each skip button (plan 112).
-  List<Widget> _recordedPrimaryButtonBar({required double playIconSize}) => [
-    const Spacer(flex: 2),
-    const MaterialSkipPreviousButton(),
-    const Spacer(),
-    if (_chapters.isNotEmpty) ...[
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: false,
-        onSeek: () => _seekToChapter(forward: false),
-      ),
-      const Spacer(),
-    ],
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: -skipSeekStep,
-      onSkip: _skipSeek,
-    ),
-    const Spacer(),
-    MaterialPlayOrPauseButton(iconSize: playIconSize),
-    const Spacer(),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: skipSeekStep,
-      onSkip: _skipSeek,
-    ),
-    if (_chapters.isNotEmpty) ...[
-      const Spacer(),
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: true,
-        onSeek: () => _seekToChapter(forward: true),
-      ),
-    ],
-    const Spacer(),
-    const MaterialSkipNextButton(),
-    const Spacer(flex: 2),
-  ];
-
-  /// The desktop bottom row for recordings: the stock row
-  /// with the ±10 s skip buttons after the skip-next button
-  /// (player UI follow-up) and, when the title has chapter
-  /// points, the chapter buttons after them (plan 112).
-  List<Widget> _recordedDesktopButtonBar() => [
-    const MaterialDesktopSkipPreviousButton(),
-    const MaterialDesktopPlayOrPauseButton(),
-    const MaterialDesktopSkipNextButton(),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: -skipSeekStep,
-      onSkip: _skipSeek,
-      iconSize: 28,
-    ),
-    _SkipSeekButton(
-      seekable: _seekable,
-      offset: skipSeekStep,
-      onSkip: _skipSeek,
-      iconSize: 28,
-    ),
-    if (_chapters.isNotEmpty) ...[
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: false,
-        onSeek: () => _seekToChapter(forward: false),
-        iconSize: 28,
-      ),
-      _ChapterSkipButton(
-        seekable: _seekable,
-        forward: true,
-        onSeek: () => _seekToChapter(forward: true),
-        iconSize: 28,
-      ),
-    ],
-    const MaterialDesktopVolumeButton(),
-    const MaterialDesktopPositionIndicator(),
-    const Spacer(),
-    const MaterialDesktopFullscreenButton(),
-  ];
-
-  /// The video controls with the chapter ticks overlaid
-  /// on the seek bar (plan 112): the stock adaptive
-  /// controls, plus the ticks layer aligned to their
-  /// seek bar. Only built while the title has chapter
-  /// points — the plain adaptive controls serve live
-  /// viewing and chapterless recordings, exactly as
-  /// before.
-  Widget _controlsWithChapterTicks(VideoState state) {
-    return Stack(
-      children: [
-        AdaptiveVideoControls(state),
-        Positioned.fill(
-          child: _ChapterTicksOverlay(player: _player, chapters: _chapters),
-        ),
-      ],
-    );
   }
 
   /// The position leaving this screen reports to the unit,
@@ -1105,6 +2325,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dispose on leaving failed: $e');
     }
+    final cacheDir = _usedDiskCacheDir;
+    if (cacheDir != null) {
+      try {
+        if (await cacheDir.exists()) {
+          await for (final entry in cacheDir.list()) {
+            await entry.delete(recursive: true);
+          }
+        }
+      } catch (_) {}
+    }
   }
 
   /// Stops the playback session (plan 104): closes the
@@ -1136,6 +2366,50 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
+        (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
+        (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
+        (name: 'pre-buffer poller', run: () => _preBufferPollTimer?.cancel()),
+        (
+          name: 'recording status timer',
+          run: () => _recordingStatusTimer?.cancel(),
+        ),
+        (name: 'corner notice timer', run: () => _cornerNoticeTimer?.cancel()),
+        (
+          name: 'custom corner notice timer',
+          run: () => _customCornerNoticeTimer?.cancel(),
+        ),
+        (
+          name: 'live conflict poller',
+          run: () => _liveConflictPollTimer?.cancel(),
+        ),
+        (name: 'osd timer', run: () => _osdTimer?.cancel()),
+        (name: 'hud timer', run: () => _hudTimer?.cancel()),
+        (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
+        (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
+        (
+          name: 'seek hold timer',
+          run: () => _committedSeekHoldTimer?.cancel(),
+        ),
+        (
+          name: 'focus nodes',
+          run: () {
+            _rootFocusNode.dispose();
+            _osdFocusScopeNode.dispose();
+            _osdFirstFocusNode.dispose();
+            _osdDetailButtonFocusNode.dispose();
+            _detailFocusNode.dispose();
+            _detailScrollController.dispose();
+            _resumeButtonFocusNode.dispose();
+            _closeBannerFocusNode.dispose();
+            _errorBackFocusNode.dispose();
+          },
+        ),
+        (
+          name: 'system ui restore',
+          run: () => unawaited(
+            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+          ),
+        ),
         (name: 'wakelock', run: () => _wakelockSession.release()),
         (
           name: 'subscriptions',
@@ -1144,6 +2418,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               subscription.cancel();
             }
           },
+        ),
+        (
+          name: 'video rect listener',
+          run: () => _videoController.rect.removeListener(_onVideoRectChanged),
         ),
         (name: 'player', run: () => unawaited(_stopAndDisposePlayer())),
         (name: 'session', run: () => unawaited(_stopSession())),
@@ -1163,136 +2441,1129 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     super.dispose();
   }
 
+  String _formatClock(Duration d) {
+    final total = d.isNegative ? 0 : d.inSeconds;
+    final hours = total ~/ 3600;
+    final minutes = (total % 3600) ~/ 60;
+    final seconds = total % 60;
+    final mm = minutes.toString().padLeft(2, '0');
+    final ss = seconds.toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:$mm:$ss' : '$mm:$ss';
+  }
+
+  void _showHudMessage(IconData icon, String text) {
+    _hudTimer?.cancel();
+    setState(() {
+      _hudIcon = icon;
+      _hudText = text;
+    });
+    _hudTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _hudIcon = null;
+          _hudText = null;
+        });
+      }
+    });
+  }
+
+  bool get _hasProgramDetail =>
+      (widget.programDetailBody?.trim().isNotEmpty ?? false);
+
+  void _openDetail() {
+    if (!_hasProgramDetail) return;
+    _osdTimer?.cancel();
+    setState(() => _detailOpen = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_detailOpen) return;
+      if (_detailScrollController.hasClients) {
+        _detailScrollController.jumpTo(0);
+      }
+      if (_detailFocusNode.canRequestFocus) {
+        _detailFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _closeDetail({bool fromBackKey = false}) {
+    if (fromBackKey) {
+      _suppressBackPopUntil = DateTime.now().add(
+        const Duration(milliseconds: 450),
+      );
+    }
+    if (!_detailOpen) return;
+    setState(() => _detailOpen = false);
+    if (_osdOpen) {
+      _resetOsdTimer();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_osdOpen) return;
+        if (_osdDetailButtonFocusNode.canRequestFocus) {
+          _osdDetailButtonFocusNode.requestFocus();
+        } else if (_osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+      });
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _rootFocusNode.canRequestFocus) {
+          _rootFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _scrollDetailBy(double delta) {
+    if (!_detailScrollController.hasClients) return;
+    final pos = _detailScrollController.position;
+    final target = (pos.pixels + delta)
+        .clamp(pos.minScrollExtent, pos.maxScrollExtent)
+        .toDouble();
+    if (target == pos.pixels) return;
+    unawaited(
+      _detailScrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 90),
+        curve: Curves.easeOut,
+      ),
+    );
+  }
+
+  void _openOsd() {
+    setState(() => _osdOpen = true);
+    unawaited(_pollMpvBufferProperties());
+    _resetOsdTimer();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _osdFirstFocusNode.canRequestFocus) {
+        _osdFirstFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _closeOsd({bool fromBackKey = false}) {
+    if (fromBackKey) {
+      _suppressBackPopUntil = DateTime.now().add(
+        const Duration(milliseconds: 450),
+      );
+    }
+    _osdTimer?.cancel();
+    if (!_osdOpen && !_detailOpen) return;
+    setState(() {
+      _osdOpen = false;
+      _detailOpen = false;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _rootFocusNode.canRequestFocus) {
+        _rootFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _toggleOsd() {
+    if (_osdOpen) {
+      _closeOsd();
+    } else {
+      _openOsd();
+    }
+  }
+
+  void _resetOsdTimer() {
+    _osdTimer?.cancel();
+    _osdTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && _osdOpen && !_detailOpen) _closeOsd();
+    });
+  }
+
+  Duration get _effectiveDuration =>
+      _duration > Duration.zero ? _duration : (widget.knownDuration ?? Duration.zero);
+
+  Duration? get _seekHudPositionOverride {
+    if (_seekBasePosition != null) {
+      return skipSeekTarget(
+        position: _seekBasePosition!,
+        offset: _pendingSeekOffset,
+        duration: _effectiveDuration,
+      );
+    }
+    return _committedSeekTarget;
+  }
+
+  String _formatSeekDelta(int totalSec) {
+    final sign = totalSec >= 0 ? '+' : '-';
+    final absSec = totalSec.abs();
+    final min = absSec ~/ 60;
+    final sec = absSec % 60;
+    if (min > 0 && sec > 0) return '$sign$min分$sec秒';
+    if (min > 0) return '$sign$min分';
+    return '$sign$absSec秒';
+  }
+
+  void _showSeekHud(IconData icon, String actionLabel) {
+    _seekHudTimer?.cancel();
+    unawaited(_pollMpvBufferProperties());
+    setState(() {
+      _seekHudVisible = true;
+      _seekHudIcon = icon;
+      _seekHudActionLabel = actionLabel;
+    });
+    _seekHudTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _seekHudVisible = false;
+          _seekHudIcon = null;
+          _seekHudActionLabel = null;
+        });
+      }
+    });
+  }
+
+  void _togglePlayPauseWithHud() {
+    final willPlay = !_playingNow;
+    unawaited(_player.playOrPause());
+    if (widget.live) {
+      _showHudMessage(
+        willPlay ? Icons.play_arrow : Icons.pause,
+        willPlay ? '再生' : '一時停止',
+      );
+    } else {
+      _showSeekHud(
+        willPlay ? Icons.play_arrow : Icons.pause,
+        willPlay ? '再生' : '一時停止',
+      );
+    }
+  }
+
+  void _queueRelativeSeek(Duration delta) {
+    if (widget.live) return;
+    _seekBasePosition ??= _committedSeekTarget ?? _player.state.position;
+    _pendingSeekOffset += delta;
+    _showSeekHud(
+      _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_10,
+      _formatSeekDelta(_pendingSeekOffset.inSeconds),
+    );
+    _seekDebounceTimer?.cancel();
+    _seekDebounceTimer = Timer(const Duration(milliseconds: 250), () {
+      unawaited(_commitPendingSeek());
+    });
+  }
+
+  Future<void> _commitPendingSeek() async {
+    final base = _seekBasePosition;
+    final offset = _pendingSeekOffset;
+    _seekBasePosition = null;
+    _pendingSeekOffset = Duration.zero;
+    if (base == null || offset == Duration.zero) return;
+    final target = skipSeekTarget(
+      position: base,
+      offset: offset,
+      duration: _effectiveDuration,
+    );
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (_seekHudVisible && mounted) setState(() {});
+    });
+    _diag(
+      DiagCategory.playback,
+      'player: dpad seek by ${offset.inSeconds}s to ${target.inSeconds}s',
+    );
+    try {
+      await _player.seek(target);
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: dpad seek failed: $e');
+    }
+  }
+
+  void _cyclePlaybackRate() {
+    if (!canChangePlaybackSpeed(live: widget.live)) return;
+    final idx = playbackSpeeds.indexOf(_playbackRate);
+    final next = playbackSpeeds[(idx + 1) % playbackSpeeds.length];
+    unawaited(_selectPlaybackRate(next));
+    _resetOsdTimer();
+  }
+
+  void _cycleAudioTrack() {
+    if (!canSwitchAudio(_realAudioTracks.length)) return;
+    final next = (_selectedAudioIndex + 1) % _realAudioTracks.length;
+    unawaited(_selectAudioTrack(next));
+    _resetOsdTimer();
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (_interrupted) {
+      if (event is KeyDownEvent &&
+          (key == LogicalKeyboardKey.select ||
+              key == LogicalKeyboardKey.enter ||
+              key == LogicalKeyboardKey.numpadEnter ||
+              key == LogicalKeyboardKey.gameButtonA ||
+              key == LogicalKeyboardKey.mediaPlayPause)) {
+        if (!_closeBannerFocusNode.hasFocus) {
+          unawaited(_resume());
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    }
+    if (_detailOpen) {
+      if (event is KeyDownEvent &&
+          (key == LogicalKeyboardKey.escape ||
+              key == LogicalKeyboardKey.goBack)) {
+        _closeDetail(fromBackKey: true);
+      }
+      return KeyEventResult.handled;
+    }
+    if (_osdOpen) {
+      if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
+        _closeOsd(fromBackKey: true);
+        return KeyEventResult.handled;
+      }
+      _resetOsdTimer();
+      if (key == LogicalKeyboardKey.arrowLeft ||
+          key == LogicalKeyboardKey.arrowRight ||
+          key == LogicalKeyboardKey.arrowUp ||
+          key == LogicalKeyboardKey.arrowDown) {
+        if (_osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    final isRepeat = event is KeyRepeatEvent;
+    if (key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.mediaRewind) {
+      if (widget.live) {
+        if (!isRepeat) {
+          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+        }
+      } else {
+        _queueRelativeSeek(_rewindStep);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.mediaFastForward) {
+      if (widget.live) {
+        if (!isRepeat) {
+          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+        }
+      } else {
+        _queueRelativeSeek(_forwardStep);
+      }
+      return KeyEventResult.handled;
+    }
+    if (isRepeat) return KeyEventResult.ignored;
+
+    if (key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter ||
+        key == LogicalKeyboardKey.space ||
+        key == LogicalKeyboardKey.gameButtonA ||
+        key == LogicalKeyboardKey.mediaPlayPause) {
+      _togglePlayPauseWithHud();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.mediaPlay) {
+      unawaited(_player.play());
+      if (widget.live) {
+        _showHudMessage(Icons.play_arrow, '再生');
+      } else {
+        _showSeekHud(Icons.play_arrow, '再生');
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.mediaPause) {
+      unawaited(_player.pause());
+      if (widget.live) {
+        _showHudMessage(Icons.pause, '一時停止');
+      } else {
+        _showSeekHud(Icons.pause, '一時停止');
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown ||
+        key == LogicalKeyboardKey.contextMenu ||
+        key == LogicalKeyboardKey.info) {
+      _openOsd();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
   Widget build(BuildContext context) {
-    // The device's bottom view padding — the home
-    // indicator's area on iPhone / iPad, the gesture
-    // bar's on Android, zero where the system keeps the
-    // window clear. The non-fullscreen controls' bottom
-    // margins grow by it (plan 105, see
-    // player_safe_area_policy). viewPadding, not
-    // padding: it reports the raw inset whether or not
-    // an ancestor has consumed the padding form.
-    final bottomViewPadding = MediaQuery.viewPaddingOf(context).bottom;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.title),
-        actions: [
-          if (canChangePlaybackSpeed(live: widget.live))
-            PopupMenuButton<double>(
-              tooltip: '再生速度',
-              initialValue: _playbackRate,
-              onSelected: _selectPlaybackRate,
-              itemBuilder: (context) => [
-                for (final rate in playbackSpeeds)
-                  CheckedPopupMenuItem<double>(
-                    value: rate,
-                    checked: rate == _playbackRate,
-                    child: Text(playbackSpeedLabel(rate)),
-                  ),
-              ],
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Row(
+    final loadingLabel = playerLoadingLabel(
+      interrupted: _interrupted,
+      hasVideoFrame: _hasVideoFrame,
+      playingStarted: _playing,
+      playingNow: _playingNow,
+      buffering: _buffering,
+    );
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        switch (resolvePlayerBackOutcome(
+          detailOpen: _detailOpen,
+          osdOpen: _osdOpen,
+          errorOpen: _error != null,
+          exitConfirmOpen: _exitConfirmOpen,
+          suppressUntil: _suppressBackPopUntil,
+        )) {
+          case PlayerBackOutcome.suppressed:
+            return;
+          case PlayerBackOutcome.closeDetail:
+            _closeDetail(fromBackKey: true);
+            return;
+          case PlayerBackOutcome.closeOsd:
+            _closeOsd(fromBackKey: true);
+            return;
+          case PlayerBackOutcome.confirmExit:
+            unawaited(_confirmExitPlayback());
+            return;
+          case PlayerBackOutcome.popPlayer:
+            Navigator.of(context).pop();
+            return;
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: _switchingChannel
+            ? const Center(
+                child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.speed),
-                    if (_playbackRate != 1.0) ...[
-                      const SizedBox(width: 4),
-                      Text(playbackSpeedLabel(_playbackRate)),
-                    ],
+                    CircularProgressIndicator(color: Colors.white),
+                    SizedBox(height: 16),
+                    Text(
+                      '録画中のチャンネルに切り替えています…',
+                      style: TextStyle(color: Colors.white, fontSize: 16),
+                    ),
                   ],
                 ),
-              ),
-            ),
-          if (canSwitchAudio(_realAudioTracks.length))
-            PopupMenuButton<int>(
-              tooltip: '音声',
-              icon: const Icon(Icons.audiotrack),
-              initialValue: _selectedAudioIndex,
-              onSelected: _selectAudioTrack,
-              itemBuilder: (context) => [
-                for (var i = 0; i < _realAudioTracks.length; i++)
-                  CheckedPopupMenuItem<int>(
-                    value: i,
-                    checked: i == _selectedAudioIndex,
-                    child: Text(audioTrackLabel(i)),
-                  ),
-              ],
-            ),
-          if (canToggleSubtitles(_realSubtitleTracks.length))
-            IconButton(
-              tooltip: '字幕',
-              icon: Icon(
-                _subtitlesOn ? Icons.closed_caption : Icons.closed_caption_off,
-              ),
-              onPressed: _toggleSubtitles,
-            ),
-        ],
-      ),
-      body: _error != null
-          ? Center(
-              child: SingleChildScrollView(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const Text('再生を開始できませんでした。', textAlign: TextAlign.center),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'nasne との接続やネットワークの状態を確認して、'
-                        'もう一度お試しください。',
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 8),
-                      // The raw player error (an mpv message, or
-                      // this screen's own timeout wording) is
-                      // diagnostic text, not something a viewer
-                      // can act on: it sits behind the detail
-                      // expander (plan 86, plan 85 item 9), and
-                      // is in the diagnostic log as well.
-                      ExpansionTile(
-                        title: const Text('詳細'),
-                        children: [
-                          Text(
-                            _error!,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            )
-          : Stack(
-              children: [
-                MaterialVideoControlsTheme(
-                  normal: _materialControlsTheme(
-                    fullscreen: false,
-                    bottomViewPadding: bottomViewPadding,
-                  ),
-                  fullscreen: _materialControlsTheme(fullscreen: true),
-                  child: MaterialDesktopVideoControlsTheme(
-                    normal: _desktopControlsTheme(),
-                    fullscreen: _desktopControlsTheme(),
-                    child: Video(
-                      controller: _videoController,
-                      // The stock adaptive controls, with
-                      // the chapter ticks overlaid while
-                      // the title has points (plan 112).
-                      controls: _chapters.isEmpty
-                          ? AdaptiveVideoControls
-                          : _controlsWithChapterTicks,
+              )
+            : _error != null
+            ? Center(
+                child: SingleChildScrollView(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.error_outline,
+                          size: 48,
+                          color: Colors.redAccent,
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          '再生を開始できませんでした。',
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(color: Colors.white),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'nasne との接続やネットワークの状態を確認して、'
+                          'もう一度お試しください。',
+                          style: TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          focusNode: _errorBackFocusNode,
+                          autofocus: true,
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.arrow_back),
+                          label: const Text('戻る'),
+                        ),
+                        const SizedBox(height: 16),
+                        ExpansionTile(
+                          collapsedTextColor: Colors.white70,
+                          textColor: Colors.white,
+                          iconColor: Colors.white70,
+                          collapsedIconColor: Colors.white70,
+                          title: const Text('詳細'),
+                          children: [
+                            Text(
+                              _error!,
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                if (_interrupted) _buildInterruptionBanner(),
+              )
+            : Focus(
+                focusNode: _rootFocusNode,
+                autofocus: true,
+                onKeyEvent: _handleKeyEvent,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _toggleOsd,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Video(
+                        controller: _videoController,
+                        controls: NoVideoControls,
+                      ),
+                      if (!_conflictHandled &&
+                          (loadingLabel != null ||
+                              (!_interrupted && _isPreBuffering)))
+                        _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
+                      if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                      if (_cornerRecordingNotice != null &&
+                          !_osdOpen &&
+                          !_detailOpen &&
+                          !_interrupted &&
+                          _error == null &&
+                          !_switchingChannel)
+                        _buildCornerRecordingNotice(),
+                      if (_seekHudVisible && !_osdOpen && !widget.live)
+                        _buildSeekHud(),
+                      if (_osdOpen) _buildRemoteOsd(),
+                      if (_detailOpen && _hasProgramDetail)
+                        Positioned(
+                          top: 20,
+                          left: 28,
+                          right: 28,
+                          child: ProgramDetailOverlayPanel(
+                            title: widget.programDetailTitle ?? widget.title,
+                            meta: widget.programDetailMeta,
+                            body: widget.programDetailBody!,
+                            scrollController: _detailScrollController,
+                            focusNode: _detailFocusNode,
+                            onClose: () => _closeDetail(fromBackKey: true),
+                            onScrollDelta: _scrollDetailBy,
+                          ),
+                        ),
+                      if (_interrupted && !_conflictHandled && !_switchingChannel)
+                        _buildInterruptionBanner(),
+                    ],
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  String _formatShortDurationSeconds(int seconds) {
+    if (seconds <= 0) return '0秒';
+    final min = seconds ~/ 60;
+    final sec = seconds % 60;
+    if (min > 0 && sec > 0) return '$min分$sec秒';
+    if (min > 0) return '$min分';
+    return '$sec秒';
+  }
+
+  Widget _buildLoadingOverlay(String fallbackLabel) {
+    final plan = _bufferPlan;
+    final showPreBuffer = _isPreBuffering;
+    final targetSec = showPreBuffer ? plan!.cachePauseWaitSeconds : 0;
+    final curSec = showPreBuffer ? _effectivePreBufferSeconds : 0;
+    final progress = showPreBuffer && targetSec > 0
+        ? (curSec / targetSec).clamp(0.0, 1.0)
+        : null;
+    final caption = showPreBuffer
+        ? 'バッファ蓄積中… ${_formatShortDurationSeconds(curSec)} / ${_formatShortDurationSeconds(targetSec)}'
+        : fallbackLabel;
+    return IgnorePointer(
+      child: Center(
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            color: Colors.black87,
+            borderRadius: BorderRadius.all(Radius.circular(12)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      caption,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ],
+                ),
+                if (progress != null) ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: 220,
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      backgroundColor: Colors.white24,
+                      color: Colors.lightBlueAccent,
+                      minHeight: 5,
+                    ),
+                  ),
+                ],
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecordingPillBadge({
+    required String label,
+    required bool ended,
+    double fontSize = 12,
+    EdgeInsetsGeometry padding = const EdgeInsets.symmetric(
+      horizontal: 8,
+      vertical: 3,
+    ),
+  }) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: ended ? const Color(0xCC263238) : const Color(0xFFC62828),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            ended ? Icons.stop : Icons.fiber_manual_record,
+            size: fontSize,
+            color: Colors.white,
+          ),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: fontSize,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCornerRecordingNotice() {
+    final customText = _customCornerNoticeText;
+    if (customText != null) {
+      return Positioned(
+        top: 16,
+        right: 20,
+        child: IgnorePointer(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xCC1E3A5F),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.swap_horiz, size: 14, color: Colors.white),
+                const SizedBox(width: 4),
+                Text(
+                  customText,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    final notice = _cornerRecordingNotice;
+    if (notice == null) return const SizedBox.shrink();
+    final ended = notice == LiveRecordingCornerNotice.ended;
+    return Positioned(
+      top: 16,
+      right: 20,
+      child: IgnorePointer(
+        child: _buildRecordingPillBadge(
+          label: ended ? '録画終了' : '録画中',
+          ended: ended,
+          fontSize: 13,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBufferBadge() {
+    final plan = _bufferPlan;
+    final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
+    final targetSec = plan?.configuredSeconds ?? 0;
+    if (aheadSec <= 0 && targetSec <= 0) return const SizedBox.shrink();
+    final text = targetSec > 0
+        ? 'バッファ: ${_formatShortDurationSeconds(aheadSec)} / 設定 ${_formatShortDurationSeconds(targetSec)}'
+        : 'バッファ: ${_formatShortDurationSeconds(aheadSec)}';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.white12,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(color: Colors.white70, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _buildSeekBarSection({required bool isSeekingPreview}) {
+    return StreamBuilder<Duration>(
+      stream: _player.stream.position,
+      initialData: _lastPosition,
+      builder: (context, snapshot) {
+        final dur = _effectiveDuration;
+        final pos = _seekHudPositionOverride ?? (snapshot.data ?? _lastPosition);
+        final clampedPos = dur > Duration.zero && pos > dur
+            ? dur
+            : (pos.isNegative ? Duration.zero : pos);
+        final posFraction = dur > Duration.zero
+            ? (clampedPos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
+            : 0.0;
+        final aheadMillis =
+            _lastPosition.inMilliseconds +
+            (_bufferedAheadSeconds * 1000).round();
+        final maxBufferMillis = math.max(
+          _bufferEndPosition.inMilliseconds,
+          aheadMillis,
+        );
+        final bufferFraction = dur > Duration.zero
+            ? (maxBufferMillis / dur.inMilliseconds).clamp(posFraction, 1.0)
+            : posFraction;
+        final ticks = chapterTickFractions(chapters: _chapters, duration: dur);
+        final remaining = dur > clampedPos ? dur - clampedPos : Duration.zero;
+        final barColor = isSeekingPreview || _seekHudPositionOverride != null
+            ? Colors.amberAccent
+            : Colors.lightBlueAccent;
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SizedBox(
+              height: 18,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final width = constraints.maxWidth;
+                  final thumbLeft = (width * posFraction - 7)
+                      .clamp(0.0, math.max(0.0, width - 14))
+                      .toDouble();
+                  return Stack(
+                    alignment: Alignment.centerLeft,
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width,
+                          color: Colors.white24,
+                        ),
+                      ),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width * bufferFraction,
+                          color: Colors.white54,
+                        ),
+                      ),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width * posFraction,
+                          color: barColor,
+                        ),
+                      ),
+                      for (final tick in ticks)
+                        Positioned(
+                          left: (width * tick - 1)
+                              .clamp(0.0, math.max(0.0, width - 2))
+                              .toDouble(),
+                          top: 3,
+                          width: 2,
+                          height: 12,
+                          child: const ColoredBox(color: Colors.white70),
+                        ),
+                      Positioned(
+                        left: thumbLeft,
+                        top: 2,
+                        child: Container(
+                          width: 14,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.white,
+                            border: Border.all(color: barColor, width: 2.5),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Text(
+                  dur > Duration.zero
+                      ? '${_formatClock(clampedPos)} / ${_formatClock(dur)}'
+                      : _formatClock(clampedPos),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                if (dur > Duration.zero)
+                  Text(
+                    '残り -${_formatClock(remaining)}',
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSeekHud() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(28, 22, 28, 24),
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Colors.transparent, Colors.black87, Colors.black],
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.amberAccent),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_seekHudIcon != null) ...[
+                          Icon(
+                            _seekHudIcon,
+                            color: Colors.amberAccent,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 6),
+                        ],
+                        Text(
+                          _seekHudActionLabel ?? '',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  _buildBufferBadge(),
+                ],
+              ),
+              const SizedBox(height: 10),
+              _buildSeekBarSection(isSeekingPreview: true),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusHud() {
+    return Positioned(
+      top: 24,
+      left: 24,
+      right: 24,
+      child: IgnorePointer(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.black87,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_hudIcon != null) ...[
+                  Icon(_hudIcon, color: Colors.white, size: 28),
+                  const SizedBox(width: 12),
+                ],
+                Flexible(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _hudText ?? '',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteOsd() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.transparent, Colors.black87, Colors.black],
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                _buildBufferBadge(),
+                if (widget.live && _sameChannelRecording) ...[
+                  const SizedBox(width: 8),
+                  _buildRecordingPillBadge(label: '録画中', ended: false),
+                ],
+                const SizedBox(width: 8),
+                if (widget.live)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.redAccent,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      'LIVE',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            if (!widget.live) ...[
+              const SizedBox(height: 8),
+              _buildSeekBarSection(isSeekingPreview: false),
+            ],
+            const SizedBox(height: 12),
+            PlayerOsdButtonBar(
+              focusScopeNode: _osdFocusScopeNode,
+              onClose: () => _closeOsd(fromBackKey: true),
+              onInteraction: _resetOsdTimer,
+              children: [
+                  _osdButton(
+                    focusNode: _osdFirstFocusNode,
+                    autofocus: true,
+                    icon: _playingNow ? Icons.pause : Icons.play_arrow,
+                    label: _playingNow ? '一時停止' : '再生',
+                    onPressed: () {
+                      _togglePlayPauseWithHud();
+                      _resetOsdTimer();
+                    },
+                  ),
+                  if (!widget.live) ...[
+                    _osdButton(
+                      icon: Icons.replay_10,
+                      label: '-10秒',
+                      onPressed: () {
+                        _queueRelativeSeek(_rewindStep);
+                        _resetOsdTimer();
+                      },
+                    ),
+                    _osdButton(
+                      icon: Icons.forward_10,
+                      label: '+10秒',
+                      onPressed: () {
+                        _queueRelativeSeek(_forwardStep);
+                        _resetOsdTimer();
+                      },
+                    ),
+                    if (_chapters.isNotEmpty) ...[
+                      _osdButton(
+                        icon: Icons.fast_rewind,
+                        label: '前チャプター',
+                        onPressed: () {
+                          unawaited(_seekToChapter(forward: false));
+                          _resetOsdTimer();
+                        },
+                      ),
+                      _osdButton(
+                        icon: Icons.fast_forward,
+                        label: '次チャプター',
+                        onPressed: () {
+                          unawaited(_seekToChapter(forward: true));
+                          _resetOsdTimer();
+                        },
+                      ),
+                    ],
+                  ],
+                  if (canChangePlaybackSpeed(live: widget.live))
+                    _osdButton(
+                      icon: Icons.speed,
+                      label: '速度 ${playbackSpeedLabel(_playbackRate)}',
+                      onPressed: _cyclePlaybackRate,
+                    ),
+                  if (canSwitchAudio(_realAudioTracks.length))
+                    _osdButton(
+                      icon: Icons.audiotrack,
+                      label: audioTrackLabel(_selectedAudioIndex),
+                      onPressed: _cycleAudioTrack,
+                    ),
+                  if (canToggleSubtitles(_realSubtitleTracks.length))
+                    _osdButton(
+                      icon: _subtitlesOn
+                          ? Icons.closed_caption
+                          : Icons.closed_caption_off,
+                      label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
+                      onPressed: () {
+                        _toggleSubtitles();
+                        _resetOsdTimer();
+                      },
+                    ),
+                  if (_hasProgramDetail)
+                    _osdButton(
+                      focusNode: _osdDetailButtonFocusNode,
+                      icon: Icons.info_outline,
+                      label: _detailOpen ? '詳細を閉じる' : '番組詳細',
+                      onPressed: () =>
+                          _detailOpen ? _closeDetail() : _openDetail(),
+                    ),
+                  _osdButton(
+                    icon: Icons.close,
+                    label: playerOsdCloseMenuLabel,
+                    onPressed: _closeOsd,
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _osdButton({
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required IconData icon,
+    required String label,
+    required VoidCallback onPressed,
+  }) {
+    return OutlinedButton.icon(
+      focusNode: focusNode,
+      autofocus: autofocus,
+      style: osdButtonStyle(),
+      onPressed: onPressed,
+      icon: Icon(icon, size: 20),
+      label: Text(label),
     );
   }
 
@@ -1302,25 +3573,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// (see [_resume]); the close button dismisses the notice
   /// and leaves the stopped frame as it is.
   Widget _buildInterruptionBanner() {
+    final countdownText = !_autoResumeDisabled && _autoResumeCountdown > 0
+        ? 'あと $_autoResumeCountdown 秒で自動再接続します…（$_autoResumeAttempts回目）'
+        : '電波復帰を待っています…（決定キーで今すぐ再開）';
     return Positioned(
       left: 0,
       right: 0,
       bottom: 0,
       child: Container(
         color: Colors.black87,
-        // The banner's buttons sit at the screen's bottom
-        // edge like the controls do, so its bottom padding
-        // clears the gesture area the same way (plan 105,
-        // see player_safe_area_policy).
-        padding: EdgeInsets.fromLTRB(
-          16,
-          10,
-          16,
-          10 + bottomGestureInset(MediaQuery.viewPaddingOf(context).bottom),
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         child: Row(
           children: [
-            const Icon(Icons.error_outline, color: Colors.white),
+            const Icon(Icons.wifi_off, color: Colors.amberAccent),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -1332,6 +3597,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     style: TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    countdownText,
+                    style: const TextStyle(
+                      color: Colors.amberAccent,
+                      fontSize: 13,
                     ),
                   ),
                   if (_interruptDetail != null)
@@ -1348,329 +3621,45 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               ),
             ),
             const SizedBox(width: 12),
-            FilledButton(onPressed: _resume, child: const Text('再開')),
-            IconButton(
-              tooltip: '閉じる',
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => setState(() => _interrupted = false),
+            FocusTraversalGroup(
+              child: Wrap(
+                spacing: 10,
+                children: [
+                  FilledButton.icon(
+                    focusNode: _resumeButtonFocusNode,
+                    autofocus: true,
+                    onPressed: _resume,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('今すぐ再開'),
+                  ),
+                  OutlinedButton.icon(
+                    focusNode: _closeBannerFocusNode,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                    onPressed: () {
+                      _autoResumeTimer?.cancel();
+                      setState(() {
+                        _autoResumeDisabled = true;
+                        _autoResumeCountdown = 0;
+                        _interrupted = false;
+                      });
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted && _rootFocusNode.canRequestFocus) {
+                          _rootFocusNode.requestFocus();
+                        }
+                      });
+                    },
+                    icon: const Icon(Icons.close, size: 18),
+                    label: const Text('閉じる'),
+                  ),
+                ],
+              ),
             ),
           ],
         ),
       ),
     );
   }
-}
-
-/// A ±10-second skip button for the video controls' button
-/// bars (player UI follow-up). Follows the seekable signal
-/// the player screen observes from mpv: enabled — and white,
-/// like the neighbouring transport buttons — while the
-/// stream is seekable, and a disabled, dimmed button while
-/// it is not, so an unseekable stream shows its state
-/// instead of inviting a seek that would be refused.
-class _SkipSeekButton extends StatelessWidget {
-  const _SkipSeekButton({
-    required this.seekable,
-    required this.offset,
-    required this.onSkip,
-    this.iconSize = 36,
-  });
-
-  /// The observed seekable signal (see _PlayerScreenState).
-  final ValueListenable<bool> seekable;
-
-  /// How far this button seeks: −[skipSeekStep] or
-  /// +[skipSeekStep]; the sign also picks the icon.
-  final Duration offset;
-
-  /// Invoked with [offset] when the button is tapped.
-  final void Function(Duration offset) onSkip;
-
-  /// Icon size: 36 in the Material transport row, matching
-  /// its larger centre buttons; the desktop row passes its
-  /// own 28.
-  final double iconSize;
-
-  @override
-  Widget build(BuildContext context) {
-    final forward = offset > Duration.zero;
-    return ValueListenableBuilder<bool>(
-      valueListenable: seekable,
-      builder: (context, canSeek, _) => IconButton(
-        tooltip: forward ? '10秒スキップ' : '10秒戻し',
-        iconSize: iconSize,
-        color: Colors.white,
-        onPressed: canSeek ? () => onSkip(offset) : null,
-        icon: Icon(forward ? Icons.forward_10 : Icons.replay_10),
-      ),
-    );
-  }
-}
-
-/// A chapter skip button for the video controls' button
-/// bars (plan 112): seeks to the adjacent chapter point
-/// (see player_chapter_policy for which point that is).
-/// Like the ±10 s skip buttons it follows the seekable
-/// signal — enabled and white while the stream is
-/// seekable, disabled and dimmed while it is not — and
-/// the bars only include it when the title has chapter
-/// points at all.
-class _ChapterSkipButton extends StatelessWidget {
-  const _ChapterSkipButton({
-    required this.seekable,
-    required this.forward,
-    required this.onSeek,
-    this.iconSize = 36,
-  });
-
-  /// The observed seekable signal (see _PlayerScreenState).
-  final ValueListenable<bool> seekable;
-
-  /// True for the next-chapter button, false for the
-  /// previous-chapter one; also picks the icon.
-  final bool forward;
-
-  /// Invoked when the button is tapped.
-  final VoidCallback onSeek;
-
-  /// Icon size, matching the neighbouring transport
-  /// buttons (see _SkipSeekButton).
-  final double iconSize;
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<bool>(
-      valueListenable: seekable,
-      builder: (context, canSeek, _) => IconButton(
-        tooltip: forward ? '次のチャプター' : '前のチャプター',
-        iconSize: iconSize,
-        color: Colors.white,
-        onPressed: canSeek ? onSeek : null,
-        icon: Icon(forward ? Icons.fast_forward : Icons.fast_rewind),
-      ),
-    );
-  }
-}
-
-/// The chapter ticks on the seek bar (plan 112): one
-/// mark per chapter point, drawn over the stock seek
-/// bar's line.
-///
-/// media_kit's controls expose neither a slot in their
-/// seek bar nor their own visibility, so two alignments
-/// are maintained here, both best-effort:
-///
-/// - Geometry: the line's extent and centre are
-///   computed from the effective controls theme — the
-///   same values the controls lay the bar out with —
-///   via player_chapter_policy, so the ticks follow
-///   the app's theming (including the safe-area lift
-///   of plan 105, which reaches the ticks through the
-///   theme's seek bar margin, and the fullscreen
-///   safe-area padding the controls substitute).
-/// - Visibility: the stock controls show on
-///   interaction and fade after their hover duration.
-///   This overlay mirrors that from the pointer
-///   activity it can observe through a translucent
-///   listener, fading on the same duration. The one
-///   divergence the mirror cannot see is a tap meant
-///   to hide the controls: the ticks then stay for
-///   the remainder of the hover duration.
-class _ChapterTicksOverlay extends StatefulWidget {
-  const _ChapterTicksOverlay({required this.player, required this.chapters});
-
-  final Player player;
-
-  /// The title's chapter points (see
-  /// _PlayerScreenState._chapters).
-  final List<Duration> chapters;
-
-  @override
-  State<_ChapterTicksOverlay> createState() => _ChapterTicksOverlayState();
-}
-
-class _ChapterTicksOverlayState extends State<_ChapterTicksOverlay> {
-  bool _visible = false;
-  Timer? _hideTimer;
-  StreamSubscription<Duration>? _durationSubscription;
-  Duration _duration = Duration.zero;
-
-  /// The hover duration of the controls theme resolved
-  /// by the latest build; the hide timer mirrors it.
-  Duration _hoverDuration = const Duration(seconds: 3);
-
-  @override
-  void initState() {
-    super.initState();
-    _duration = widget.player.state.duration;
-    _durationSubscription = widget.player.stream.duration.listen((duration) {
-      if (mounted && duration != _duration) {
-        setState(() => _duration = duration);
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _hideTimer?.cancel();
-    _durationSubscription?.cancel();
-    super.dispose();
-  }
-
-  /// Notes an interaction: the ticks show, and the
-  /// hide timer restarts — the mirror of the stock
-  /// controls' show-and-fade (see the class comment).
-  void _poke() {
-    if (!_visible) setState(() => _visible = true);
-    _hideTimer?.cancel();
-    _hideTimer = Timer(_hoverDuration, () {
-      if (mounted) setState(() => _visible = false);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final fractions = chapterTickFractions(
-      chapters: widget.chapters,
-      duration: _duration,
-    );
-    if (fractions.isEmpty) return const SizedBox.expand();
-    final platform = Theme.of(context).platform;
-    final fullscreen = isFullscreen(context);
-    final themePadding = fullscreen
-        ? MediaQuery.of(context).padding
-        : EdgeInsets.zero;
-    // The line's geometry depends on the video area's
-    // size, which the layout constraints give (the
-    // overlay fills the controls' stack).
-    ({double left, double right, double centerY}) lineFor(Size area) {
-      if (platform == TargetPlatform.android ||
-          platform == TargetPlatform.iOS) {
-        final themeWidget = MaterialVideoControlsTheme.maybeOf(context);
-        final data = fullscreen
-            ? (themeWidget?.fullscreen ??
-                  kDefaultMaterialVideoControlsThemeDataFullscreen)
-            : (themeWidget?.normal ?? kDefaultMaterialVideoControlsThemeData);
-        _hoverDuration = data.controlsHoverDuration;
-        return materialChapterSeekBarLine(
-          areaWidth: area.width,
-          areaHeight: area.height,
-          columnPadding: data.padding ?? themePadding,
-          seekBarMargin: data.seekBarMargin,
-          seekBarHeight: data.seekBarHeight,
-        );
-      }
-      final themeWidget = MaterialDesktopVideoControlsTheme.maybeOf(context);
-      final data = fullscreen
-          ? (themeWidget?.fullscreen ??
-                kDefaultMaterialDesktopVideoControlsThemeDataFullscreen)
-          : (themeWidget?.normal ??
-                kDefaultMaterialDesktopVideoControlsThemeData);
-      _hoverDuration = data.controlsHoverDuration;
-      return desktopChapterSeekBarLine(
-        areaWidth: area.width,
-        areaHeight: area.height,
-        columnPadding: data.padding ?? themePadding,
-        seekBarMargin: data.seekBarMargin,
-        seekBarContainerHeight: data.seekBarContainerHeight,
-        buttonBarExtent:
-            data.buttonBarHeight +
-            data.bottomButtonBarMargin.top +
-            data.bottomButtonBarMargin.bottom,
-        seekBarTranslate: data.bottomButtonBar.isNotEmpty
-            ? desktopSeekBarTranslateWithButtonBar
-            : 0,
-      );
-    }
-
-    if (platform != TargetPlatform.android &&
-        platform != TargetPlatform.iOS &&
-        platform != TargetPlatform.macOS &&
-        platform != TargetPlatform.windows &&
-        platform != TargetPlatform.linux) {
-      // No stock seek bar on this platform (the
-      // adaptive controls show none), so no ticks.
-      return const SizedBox.expand();
-    }
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final line = lineFor(Size(constraints.maxWidth, constraints.maxHeight));
-        return Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) => _poke(),
-          onPointerMove: (_) => _poke(),
-          onPointerHover: (_) => _poke(),
-          child: IgnorePointer(
-            child: AnimatedOpacity(
-              opacity: _visible ? 1.0 : 0.0,
-              duration: const Duration(milliseconds: 300),
-              child: CustomPaint(
-                painter: _ChapterTicksPainter(
-                  fractions: fractions,
-                  left: line.left,
-                  right: line.right,
-                  centerY: line.centerY,
-                ),
-                size: Size.infinite,
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// Paints the chapter ticks: a short vertical mark at
-/// each chapter fraction, centred on the seek bar's
-/// line (see _ChapterTicksOverlay for how the line is
-/// located).
-class _ChapterTicksPainter extends CustomPainter {
-  const _ChapterTicksPainter({
-    required this.fractions,
-    required this.left,
-    required this.right,
-    required this.centerY,
-  });
-
-  /// Chapter positions as fractions of the duration.
-  final List<double> fractions;
-
-  /// The seek bar line's horizontal extent and
-  /// vertical centre, in the overlay's coordinates.
-  final double left;
-  final double right;
-  final double centerY;
-
-  /// Tick dimensions: taller than the 4 px line so
-  /// the marks read as its divisions, narrow enough
-  /// not to be mistaken for the thumb.
-  static const double tickHeight = 12;
-  static const double tickWidth = 2;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final width = right - left;
-    if (width <= 0) return;
-    final paint = Paint()..color = const Color(0xE6FFFFFF);
-    for (final fraction in fractions) {
-      final x = left + width * fraction;
-      canvas.drawRect(
-        Rect.fromLTWH(
-          x - tickWidth / 2,
-          centerY - tickHeight / 2,
-          tickWidth,
-          tickHeight,
-        ),
-        paint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(_ChapterTicksPainter oldDelegate) =>
-      !listEquals(oldDelegate.fractions, fractions) ||
-      oldDelegate.left != left ||
-      oldDelegate.right != right ||
-      oldDelegate.centerY != centerY;
 }

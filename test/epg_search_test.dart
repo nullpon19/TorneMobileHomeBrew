@@ -14,6 +14,7 @@ import 'package:tmhb/core/core.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/epg_search.dart';
 import 'package:tmhb/ui/epg_search_screen.dart';
+import 'package:tmhb/ui/widgets.dart';
 
 const _reg = RegisteredNasne(
   host: '192.0.2.1',
@@ -244,7 +245,11 @@ void main() {
         host(const EpgSearchScreen(reg: _reg), guide: futureGuide()),
       );
       await tester.pump();
+      await tester.tap(find.byType(FireTvTextInputField));
+      await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField), 'ドラマ');
+      await tester.tap(find.text('決定'));
+      await tester.pumpAndSettle();
       // The query applies after the debounce settles (plan 98).
       await tester.pump(const Duration(milliseconds: 250));
       expect(find.text('明日のドラマ'), findsOneWidget);
@@ -263,12 +268,16 @@ void main() {
         host(const EpgSearchScreen(reg: _reg), guide: futureGuide()),
       );
       await tester.pump();
+      await tester.tap(find.byType(FireTvTextInputField));
+      await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField), 'ドラマ');
+      await tester.tap(find.text('決定'));
       await tester.pump();
-      // The keystroke alone has not applied a search yet.
+      await tester.pump(const Duration(milliseconds: 50));
+      // Before debounce elapses, the search has not applied yet.
       expect(find.text('明日のドラマ'), findsNothing);
       expect(find.textContaining('キーワードを入力するか'), findsOneWidget);
-      // Once typing settles, the search runs.
+      // Once the debounce settles, the search runs.
       await tester.pump(const Duration(milliseconds: 250));
       expect(find.text('明日のドラマ'), findsOneWidget);
     });

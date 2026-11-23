@@ -11,9 +11,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 
 import '../core/core.dart';
+import '../ui/player_cache_policy.dart';
 import 'ake_socket.dart';
 import 'debug_log.dart';
 import 'file_pick.dart';
+import 'firetv_helper.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
@@ -197,30 +199,32 @@ final hiddenEpgGenresProvider =
       HiddenEpgGenresNotifier.new,
     );
 
-/// The playback quality every viewing starts with (Discord
-/// request, 2026-11-21): false = the content's original quality
-/// (DR / 3倍 as recorded), true = the mobile transcode. One
-/// value serves live viewing and recordings alike — the plan-33
-/// choice is the same original/mobile pair on both detail
-/// screens. The value is the single one the settings screen's
-/// default and the detail screens' choices both read and
-/// write: changing the quality on a detail screen updates it,
-/// so the next viewing starts where the last one left off.
-/// Nothing stored means the original quality.
+/// Default playback quality preference: `false` = original quality (`元画質`),
+/// `true` = mobile transcode (`モバイル`). Per-title / per-channel choices on
+/// the detail screens override only that playback session without mutating
+/// this default.
 class PlaybackQualityNotifier extends Notifier<bool> {
-  static const _key = 'playback_use_mobile';
+  static const _key = 'firetv_default_use_mobile';
+  bool _dirty = false;
 
   @override
   bool build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
-      if (value == 'true' && !state) state = true;
+      if (_dirty) return;
+      if (value == 'true' && !state) {
+        state = true;
+      } else if (value == 'false' && state) {
+        state = false;
+      }
     });
     return false;
   }
 
   Future<void> set(bool useMobile) async {
+    _dirty = true;
     state = useMobile;
     await ref.read(keyValueStoreProvider).write(_key, '$useMobile');
   }
@@ -235,6 +239,174 @@ final playbackQualityProvider = NotifierProvider<PlaybackQualityNotifier, bool>(
 /// The bootstrap overrides this with the real directory; null in
 /// tests / headless contexts (debug logging then stays off).
 final storeDirectoryProvider = Provider<Directory?>((ref) => null);
+
+/// Directory reserved for mpv `cache-on-disk` temporary files on Fire TV.
+final mpvCacheDirectoryProvider = Provider<Directory?>((ref) => null);
+
+/// Persisted recorded playback buffer target in seconds (default 5 min).
+class RecordedBufferSecondsNotifier extends Notifier<int> {
+  static const _key = 'firetv_recorded_buffer_seconds';
+
+  @override
+  int build() {
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      final parsed = raw == null ? null : int.tryParse(raw);
+      if (parsed != null &&
+          recordedBufferOptionsSeconds.contains(parsed) &&
+          parsed != state) {
+        state = parsed;
+      }
+    });
+    return defaultRecordedBufferSeconds;
+  }
+
+  Future<void> set(int seconds) async {
+    if (!recordedBufferOptionsSeconds.contains(seconds)) return;
+    state = seconds;
+    await ref.read(keyValueStoreProvider).write(_key, '$seconds');
+  }
+}
+
+final recordedBufferSecondsProvider =
+    NotifierProvider<RecordedBufferSecondsNotifier, int>(
+      RecordedBufferSecondsNotifier.new,
+    );
+
+/// Persisted live playback initial buffer target in seconds (default 0 = off).
+class LiveBufferSecondsNotifier extends Notifier<int> {
+  static const _key = 'firetv_live_buffer_seconds';
+
+  @override
+  int build() {
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      final parsed = raw == null ? null : int.tryParse(raw);
+      if (parsed != null &&
+          liveBufferOptionsSeconds.contains(parsed) &&
+          parsed != state) {
+        state = parsed;
+      }
+    });
+    return defaultLiveBufferSeconds;
+  }
+
+  Future<void> set(int seconds) async {
+    if (!liveBufferOptionsSeconds.contains(seconds)) return;
+    state = seconds;
+    await ref.read(keyValueStoreProvider).write(_key, '$seconds');
+  }
+}
+
+final liveBufferSecondsProvider =
+    NotifierProvider<LiveBufferSecondsNotifier, int>(
+      LiveBufferSecondsNotifier.new,
+    );
+
+/// Persisted night mode preference (dark theme toggle, default off = light).
+class NightModeNotifier extends Notifier<bool> {
+  static const _key = 'firetv_night_mode';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == 'true' && !state) {
+        state = true;
+      } else if (raw == 'false' && state) {
+        state = false;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final nightModeProvider = NotifierProvider<NightModeNotifier, bool>(
+  NightModeNotifier.new,
+);
+
+/// Persisted preference for automatic series folder grouping in Recorded Titles
+/// (default on).
+class GroupTitlesNotifier extends Notifier<bool> {
+  static const _key = 'firetv_group_titles';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == 'true' && !state) {
+        state = true;
+      } else if (raw == 'false' && state) {
+        state = false;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final groupTitlesProvider = NotifierProvider<GroupTitlesNotifier, bool>(
+  GroupTitlesNotifier.new,
+);
+
+/// Visual style for scheduled/reserved programme tiles in the EPG grid.
+enum EpgReservedStyle { fill, border }
+
+/// Persisted EPG reserved-programme highlight style (default solid red fill).
+class EpgReservedStyleNotifier extends Notifier<EpgReservedStyle> {
+  static const _key = 'firetv_epg_reserved_style';
+  bool _dirty = false;
+
+  @override
+  EpgReservedStyle build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == EpgReservedStyle.border.name &&
+          state != EpgReservedStyle.border) {
+        state = EpgReservedStyle.border;
+      } else if (raw == EpgReservedStyle.fill.name &&
+          state != EpgReservedStyle.fill) {
+        state = EpgReservedStyle.fill;
+      }
+    });
+    return EpgReservedStyle.fill;
+  }
+
+  Future<void> set(EpgReservedStyle style) async {
+    _dirty = true;
+    state = style;
+    await ref.read(keyValueStoreProvider).write(_key, style.name);
+  }
+}
+
+final epgReservedStyleProvider =
+    NotifierProvider<EpgReservedStyleNotifier, EpgReservedStyle>(
+      EpgReservedStyleNotifier.new,
+    );
 
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
@@ -323,11 +495,15 @@ final fileBytesPickerProvider = Provider<FileBytesPicker>(
   (ref) => FileBytesPicker(),
 );
 
+/// Platform helper for Fire TV (volume max, Tailscale, local file scan).
+final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
+
 final playbackEngineProvider = Provider<PlaybackEngine>(
   (ref) => DtcpPlaybackEngine(
     credentialStore: ref.watch(credentialStoreProvider),
     srmStore: ref.watch(srmStoreProvider),
     diag: ref.watch(diagLogProvider),
+    autoReconnect: Platform.isAndroid,
     akeConnectionFactory: (host, port) =>
         nativeAkeConnectionFactory(host, port, diag: ref.read(diagLogProvider)),
   ),
@@ -365,6 +541,7 @@ DeviceServices assembleDeviceServices(
   CredentialStore? credentialStore,
   SrmStore? srmStore,
   DiagLog? diagLog,
+  bool? autoReconnect,
 }) {
   final device = describedDevice ?? NasneDevice.direct(reg.host);
   final plain = WebApiTransport(reg.host, client: client);
@@ -418,6 +595,7 @@ DeviceServices assembleDeviceServices(
           srmStore ??
           KeyValueSrmStore(srmKeyValueStore ?? InMemoryKeyValueStore()),
       diag: diagLog ?? const DiagLog.none(),
+      autoReconnect: autoReconnect ?? Platform.isAndroid,
       akeConnectionFactory: (host, port) => nativeAkeConnectionFactory(
         host,
         port,

@@ -12,6 +12,7 @@ import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/core/core.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/playback_launcher.dart';
+import 'package:tmhb/ui/widgets.dart';
 
 import 'dtcp_kat.dart';
 
@@ -62,6 +63,21 @@ void main() {
       expect(find.textContaining('デバイス ID'), findsNothing);
     });
 
+    Future<void> enterPair(WidgetTester tester, String cert, String key) async {
+      final fields = find.byType(FireTvTextInputField);
+      await tester.tap(fields.first);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), cert);
+      await tester.tap(find.text('決定'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(fields.last);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), key);
+      await tester.tap(find.text('決定'));
+      await tester.pumpAndSettle();
+    }
+
     testWidgets('unreadable paste reports plainly', (tester) async {
       // A tall viewport so the whole form is built without
       // scrolling (the lazy list otherwise leaves the save
@@ -72,9 +88,7 @@ void main() {
       await tester.pumpWidget(_app(_store(), const DtcpCredentialScreen()));
       await tester.pumpAndSettle();
 
-      final fields = find.byType(TextField);
-      await tester.enterText(fields.first, 'zzz');
-      await tester.enterText(fields.last, 'zzz');
+      await enterPair(tester, 'zzz', 'zzz');
       await tester.tap(find.text('検証して保存'));
       await tester.pumpAndSettle();
 
@@ -89,9 +103,7 @@ void main() {
       await tester.pumpWidget(_app(_store(), const DtcpCredentialScreen()));
       await tester.pumpAndSettle();
 
-      final fields = find.byType(TextField);
-      await tester.enterText(fields.first, '00');
-      await tester.enterText(fields.last, '00');
+      await enterPair(tester, '00', '00');
       await tester.tap(find.text('検証して保存'));
       await tester.pumpAndSettle();
 

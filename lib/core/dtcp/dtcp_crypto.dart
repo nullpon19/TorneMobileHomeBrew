@@ -17,6 +17,7 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:pointycastle/export.dart' as pc;
 
 import '../errors.dart';
+import 'native_aes.dart';
 
 // ---------------------------------------------------------------------------
 // Byte / BigInt helpers
@@ -314,22 +315,49 @@ Uint8List aesBlock(List<int> key, List<int> block16, {required bool encrypt}) {
 /// ciphertext block, which is what makes this possible; the
 /// whole-buffer [aesCbcDecrypt] below is a thin wrapper over it.
 class AesCbcDecryptor {
-  AesCbcDecryptor(List<int> key, List<int> iv)
-    : _engine = _aesEngine(key, false),
-      _chain = Uint8List.fromList(iv);
+  AesCbcDecryptor(List<int> key, List<int> iv, {NativeAesBackend? nativeBackend})
+    : _chain = Uint8List.fromList(iv),
+      _native = _resolveNative(key, iv, nativeBackend) {
+    final native = _native;
+    if (native != null) {
+      _nativeRk = native.expandDecKey(key);
+      _engine = null;
+    } else {
+      _nativeRk = null;
+      _engine = _aesEngine(key, false);
+    }
+  }
 
-  final pc.AESEngine _engine;
+  static NativeAesBackend? _resolveNative(
+    List<int> key,
+    List<int> iv,
+    NativeAesBackend? explicit,
+  ) {
+    if (key.length != 16 || iv.length != 16) return null;
+    return explicit ?? NativeAesBackend.instance;
+  }
+
+  final NativeAesBackend? _native;
+  late final Uint32List? _nativeRk;
+  late final pc.AESEngine? _engine;
   final Uint8List _chain;
   final Uint8List _block = Uint8List(16);
 
   /// Decrypts [length] bytes of [data] starting at [offset];
   /// [length] must be a multiple of 16. Returns a fresh buffer.
   Uint8List decryptBlocks(Uint8List data, int offset, int length) {
+    if (length == 0) return Uint8List(0);
+    final native = _native;
+    final rk = _nativeRk;
+    if (native != null && rk != null) {
+      return native.decryptCbc(rk, _chain, data, offset, length);
+    }
+    final engine = _engine!;
     final out = Uint8List(length);
     final scratch = Uint8List(16);
     for (var done = 0; done < length; done += 16) {
       scratch.setRange(0, 16, data, offset + done);
-      _engine.processBlock(data, offset + done, _block, 0);
+      engine.processBlock(data, offset + done, _block, 0);
       for (var i = 0; i < 16; i++) {
         out[done + i] = _block[i] ^ _chain[i];
       }

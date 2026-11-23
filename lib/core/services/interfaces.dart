@@ -196,6 +196,16 @@ abstract interface class PlaybackSession {
   Future<void> stop();
 }
 
+/// Optional read-only streaming transfer counters exposed by a loopback
+/// [PlaybackSession] so the player can observe whether decrypted bytes are
+/// actively flowing during unseekable live pre-buffering.
+abstract interface class StreamTransferMetrics {
+  int get servedBytes;
+  DateTime? get firstByteServedAt;
+  DateTime? get lastByteServedAt;
+  int get consecutiveReconnectErrors;
+}
+
 /// Playback boundary (plan 5.7). v1 shipped only the stub, which
 /// reports [NasneErrorCategory.unsupported]; Phase 5 substitutes
 /// the DTCP-IP engine (plan 26) behind the same boundary.
