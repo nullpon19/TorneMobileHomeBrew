@@ -956,7 +956,7 @@ void main() {
   });
 
   group('AppShell Back-key exit confirmation', () {
-    testWidgets('shows confirmation dialog on root Back and cancels cleanly', (
+    testWidgets('moves focus to rail first on Back, then shows exit confirmation', (
       tester,
     ) async {
       tester.view.physicalSize = const Size(1280, 720);
@@ -981,6 +981,28 @@ void main() {
 
       expect(find.text('アプリを終了しますか？'), findsNothing);
 
+      // 1st Back from right pane focuses active 'ホーム' item in NavigationRail.
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.text('アプリを終了しますか？'), findsNothing);
+      final railFocused = FocusManager.instance.primaryFocus?.context;
+      expect(railFocused, isNotNull);
+      expect(
+        find.ancestor(
+          of: find.byWidget(railFocused!.widget),
+          matching: find.byType(NavigationRail),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byWidget(railFocused.widget),
+          matching: find.text('ホーム'),
+        ),
+        findsOneWidget,
+      );
+
+      // 2nd Back while focus is in NavigationRail shows exit confirmation.
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
 
@@ -998,7 +1020,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('アプリを終了しますか？'), findsNothing);
 
-      // Confirm guard resets so Back opens the confirmation again.
+      // Confirm guard resets and focus remains in NavigationRail so Back opens it again.
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
       expect(find.text('アプリを終了しますか？'), findsOneWidget);
@@ -1760,7 +1782,8 @@ void main() {
         PlayerBackOutcome.suppressed,
       );
 
-      // Without suppression: detail closes before OSD, OSD closes before popPlayer.
+      // Without suppression: detail closes before OSD, OSD closes before confirmExit,
+      // while error screen pops immediately and open exit dialog suppresses duplicate Back.
       expect(
         resolvePlayerBackOutcome(
           detailOpen: true,
@@ -1786,7 +1809,27 @@ void main() {
           suppressUntil: expiredSuppress,
           now: now,
         ),
+        PlayerBackOutcome.confirmExit,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          errorOpen: true,
+          suppressUntil: expiredSuppress,
+          now: now,
+        ),
         PlayerBackOutcome.popPlayer,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          exitConfirmOpen: true,
+          suppressUntil: expiredSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.suppressed,
       );
     });
 
@@ -1817,7 +1860,8 @@ void main() {
                   suppressUntil = DateTime.now().add(
                     const Duration(milliseconds: 450),
                   );
-                } else if (outcome == PlayerBackOutcome.popPlayer) {
+                } else if (outcome == PlayerBackOutcome.confirmExit ||
+                    outcome == PlayerBackOutcome.popPlayer) {
                   rootPopped = true;
                 }
               },
@@ -2443,6 +2487,365 @@ void main() {
         isTrue,
       );
     });
+  });
+
+  group('Phase 17: Right-pane Back to NavigationRail & Player Back confirmation', () {
+    testWidgets(
+      'Back from right pane focuses current NavigationRail destination and pops pushed routes first',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:back-to-rail',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'テストnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+
+        void expectFocusedRailLabel(String label) {
+          final ctx = FocusManager.instance.primaryFocus?.context;
+          expect(ctx, isNotNull);
+          expect(
+            find.ancestor(
+              of: find.byWidget(ctx!.widget),
+              matching: find.byType(NavigationRail),
+            ),
+            findsOneWidget,
+          );
+          expect(
+            find.descendant(
+              of: find.byWidget(ctx.widget),
+              matching: find.text(label),
+            ),
+            findsOneWidget,
+          );
+        }
+
+        // Switch to '録画済み' and focus a control in the right pane.
+        container.read(tabIndexProvider.notifier).select(AppTabs.titles);
+        await tester.pumpAndSettle();
+        final refreshBtn = find
+            .descendant(
+              of: find.byType(TitlesScreen),
+              matching: find.byIcon(Icons.refresh),
+            )
+            .first;
+        Focus.of(tester.element(refreshBtn)).requestFocus();
+        await tester.pump();
+
+        // Back moves focus directly to '録画済み' in NavigationRail (no exit dialog).
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsNothing);
+        expectFocusedRailLabel('録画済み');
+
+        // Switch to '設定', scroll down to '見ないジャンル' tile, then test pushed route & Back.
+        container.read(tabIndexProvider.notifier).select(AppTabs.settings);
+        await tester.pumpAndSettle();
+        final settingsScrollable = find.descendant(
+          of: find.byType(SettingsScreen),
+          matching: find.byType(Scrollable),
+        );
+        final hiddenGenresTile = find.text('見ないジャンル');
+        await tester.scrollUntilVisible(
+          hiddenGenresTile,
+          300,
+          scrollable: settingsScrollable,
+        );
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(hiddenGenresTile)).requestFocus();
+        await tester.pump();
+
+        // Push deep screen ('見ないジャンル'), then Back pops ONLY that deep screen.
+        await tester.tap(hiddenGenresTile);
+        await tester.pumpAndSettle();
+        expect(find.byType(BackButton), findsOneWidget);
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsNothing);
+        expect(find.byType(BackButton), findsNothing);
+        expect(find.text('見ないジャンル'), findsOneWidget);
+
+        // Back from right pane on SettingsScreen focuses '設定' in NavigationRail.
+        Focus.of(tester.element(find.text('見ないジャンル'))).requestFocus();
+        await tester.pump();
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsNothing);
+        expectFocusedRailLabel('設定');
+      },
+    );
+
+    testWidgets(
+      'AppShell EpgScreen uses 2-step Back: grid -> top bar -> NavigationRail -> exit dialog',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:epg-two-step-back',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const channel = Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2222,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト放送',
+        );
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final noonUtc = DateTime.utc(jstNow.year, jstNow.month, jstNow.day, 3);
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            EpgServiceGuide(
+              channel: channel,
+              events: [
+                EpgEvent(
+                  eventId: 10,
+                  start: noonUtc,
+                  duration: const Duration(minutes: 60),
+                  title: '昼テスト番組',
+                  genreLevel1: 3,
+                ),
+              ],
+            ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'テストnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const [channel]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+
+        // Start focused inside EPG grid.
+        final tileText = find.text('昼テスト番組', skipOffstage: false);
+        await tester.ensureVisible(tileText);
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(find.text('昼テスト番組'))).requestFocus();
+        await tester.pump();
+
+        // 1st Back from grid jumps to EPG top bar (SegmentedButton).
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsNothing);
+        final topCtx = FocusManager.instance.primaryFocus?.context;
+        expect(topCtx, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(topCtx!.widget),
+            matching: find.byType(SegmentedButton<int>),
+          ),
+          findsOneWidget,
+        );
+
+        // 2nd Back from EPG top bar focuses '番組表' in NavigationRail.
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsNothing);
+        final railCtx = FocusManager.instance.primaryFocus?.context;
+        expect(railCtx, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(railCtx!.widget),
+            matching: find.byType(NavigationRail),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byWidget(railCtx.widget),
+            matching: find.text('番組表'),
+          ),
+          findsOneWidget,
+        );
+
+        // 3rd Back while on NavigationRail opens exit confirmation dialog.
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(find.text('アプリを終了しますか？'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'showPlayerExitConfirmDialog defaults focus to continue and confirms only on finish',
+      (tester) async {
+        bool? result;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Builder(
+              builder: (context) => Center(
+                child: ElevatedButton(
+                  onPressed: () async {
+                    result = await showPlayerExitConfirmDialog(context);
+                  },
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        // Dismiss via Back -> returns false.
+        await tester.tap(find.text('open'));
+        await tester.pumpAndSettle();
+        expect(find.text('再生を終了しますか？'), findsOneWidget);
+        final continueBtn = tester.widget<TextButton>(
+          find.ancestor(
+            of: find.text('再生を続ける'),
+            matching: find.byType(TextButton),
+          ),
+        );
+        expect(continueBtn.autofocus, isTrue);
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(result, isFalse);
+
+        // Tap '再生を続ける' -> returns false.
+        await tester.tap(find.text('open'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('再生を続ける'));
+        await tester.pumpAndSettle();
+        expect(result, isFalse);
+
+        // Tap '終了する' -> returns true.
+        await tester.tap(find.text('open'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('終了する'));
+        await tester.pumpAndSettle();
+        expect(result, isTrue);
+      },
+    );
   });
 }
 

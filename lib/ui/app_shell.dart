@@ -77,12 +77,46 @@ class AppShell extends ConsumerStatefulWidget {
 class _AppShellState extends ConsumerState<AppShell> {
   static const _destinations = AppShell._destinations;
   bool _exitDialogOpen = false;
+  final FocusNode _railFocusNode = FocusNode(debugLabel: 'appShellRail');
+  late final List<GlobalKey> _railLabelKeys = List<GlobalKey>.generate(
+    _destinations.length,
+    (_) => GlobalKey(),
+  );
+
+  @override
+  void dispose() {
+    _railFocusNode.dispose();
+    super.dispose();
+  }
+
+  bool _focusSelectedRailDestination(int activeTab) {
+    if (_railFocusNode.context == null) return false;
+    if (activeTab >= 0 && activeTab < _railLabelKeys.length) {
+      final ctx = _railLabelKeys[activeTab].currentContext;
+      if (ctx != null) {
+        final node = Focus.maybeOf(ctx);
+        if (node != null && node.canRequestFocus) {
+          node.requestFocus();
+          return true;
+        }
+      }
+    }
+    final nodes = _railFocusNode.traversalDescendants
+        .where((n) => n.canRequestFocus && !n.skipTraversal)
+        .toList();
+    if (nodes.isNotEmpty) {
+      nodes[activeTab.clamp(0, nodes.length - 1)].requestFocus();
+      return true;
+    }
+    return false;
+  }
 
   Future<void> _confirmExit() async {
     if (_exitDialogOpen || !mounted) return;
     _exitDialogOpen = true;
+    bool? shouldExit;
     try {
-      final shouldExit = await showDialog<bool>(
+      shouldExit = await showDialog<bool>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           title: const Text('アプリを終了しますか？'),
@@ -106,6 +140,15 @@ class _AppShellState extends ConsumerState<AppShell> {
     } finally {
       _exitDialogOpen = false;
     }
+    if (shouldExit != true &&
+        mounted &&
+        _railFocusNode.context != null &&
+        !_railFocusNode.hasFocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _railFocusNode.hasFocus) return;
+        _focusSelectedRailDestination(ref.read(tabIndexProvider));
+      });
+    }
   }
 
   @override
@@ -128,6 +171,10 @@ class _AppShellState extends ConsumerState<AppShell> {
         final activeTab = ref.read(tabIndexProvider);
         final handler = ref.read(tabBackHandlersProvider)[activeTab];
         if (handler != null && handler()) return;
+        if (!_railFocusNode.hasFocus &&
+            _focusSelectedRailDestination(activeTab)) {
+          return;
+        }
         unawaited(_confirmExit());
       },
       child: TailscaleGuard(
@@ -144,35 +191,43 @@ class _AppShellState extends ConsumerState<AppShell> {
                 padding: EdgeInsets.only(top: extraTop),
                 child: Row(
                   children: [
-                    NavigationRail(
-                      selectedIndex: tab,
-                      onDestinationSelected: select,
-                      labelType: NavigationRailLabelType.all,
-                      destinations: [
-                        for (final d in _destinations)
-                          NavigationRailDestination(
-                            icon: Icon(d.icon),
-                            selectedIcon: Icon(d.selectedIcon),
-                            label: Text(d.label),
+                    Focus(
+                      focusNode: _railFocusNode,
+                      canRequestFocus: false,
+                      skipTraversal: true,
+                      child: NavigationRail(
+                        selectedIndex: tab,
+                        onDestinationSelected: select,
+                        labelType: NavigationRailLabelType.all,
+                        destinations: [
+                          for (int i = 0; i < _destinations.length; i++)
+                            NavigationRailDestination(
+                              icon: Icon(_destinations[i].icon),
+                              selectedIcon: Icon(_destinations[i].selectedIcon),
+                              label: Text(
+                                _destinations[i].label,
+                                key: _railLabelKeys[i],
+                              ),
+                            ),
+                        ],
+                        trailing: Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: IconButton(
+                            tooltip: 'Tailscale を開く',
+                            icon: const Icon(Icons.vpn_lock),
+                            onPressed: () async {
+                              final ok = await ref
+                                  .read(fireTvHelperProvider)
+                                  .launchTailscale();
+                              if (!ok && context.mounted) {
+                                ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Tailscale アプリが見つかりませんでした'),
+                                  ),
+                                );
+                              }
+                            },
                           ),
-                      ],
-                      trailing: Padding(
-                        padding: const EdgeInsets.only(top: 12),
-                        child: IconButton(
-                          tooltip: 'Tailscale を開く',
-                          icon: const Icon(Icons.vpn_lock),
-                          onPressed: () async {
-                            final ok = await ref
-                                .read(fireTvHelperProvider)
-                                .launchTailscale();
-                            if (!ok && context.mounted) {
-                              ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-                                const SnackBar(
-                                  content: Text('Tailscale アプリが見つかりませんでした'),
-                                ),
-                              );
-                            }
-                          },
                         ),
                       ),
                     ),

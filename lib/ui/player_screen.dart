@@ -384,23 +384,57 @@ int computePreBufferSeconds({
 }
 
 /// Outcome for resolving a system Back (`PopScope`) while the player is open.
-enum PlayerBackOutcome { suppressed, closeDetail, closeOsd, popPlayer }
+enum PlayerBackOutcome {
+  suppressed,
+  closeDetail,
+  closeOsd,
+  confirmExit,
+  popPlayer,
+}
 
-/// Resolves what a platform Back invocation should do for the current overlay
-/// and debounce-suppression state.
+/// Resolves what a platform Back invocation should do for the current overlay,
+/// error state, exit-dialog state, and debounce-suppression state.
 PlayerBackOutcome resolvePlayerBackOutcome({
   required bool detailOpen,
   required bool osdOpen,
+  bool errorOpen = false,
+  bool exitConfirmOpen = false,
   DateTime? suppressUntil,
   DateTime? now,
 }) {
+  if (exitConfirmOpen) return PlayerBackOutcome.suppressed;
   final current = now ?? DateTime.now();
   if (suppressUntil != null && current.isBefore(suppressUntil)) {
     return PlayerBackOutcome.suppressed;
   }
   if (detailOpen) return PlayerBackOutcome.closeDetail;
   if (osdOpen) return PlayerBackOutcome.closeOsd;
-  return PlayerBackOutcome.popPlayer;
+  if (errorOpen) return PlayerBackOutcome.popPlayer;
+  return PlayerBackOutcome.confirmExit;
+}
+
+/// Prompts for confirmation before stopping active playback via Back, with the
+/// default focus placed on keeping playback running so accidental presses cancel.
+Future<bool> showPlayerExitConfirmDialog(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('再生を終了しますか？'),
+      content: const Text('再生を終了して前の画面に戻ります。'),
+      actions: [
+        TextButton(
+          autofocus: true,
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+          child: const Text('再生を続ける'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(dialogContext).pop(true),
+          child: const Text('終了する'),
+        ),
+      ],
+    ),
+  );
+  return confirmed == true;
 }
 
 /// Traps D-pad directional focus within the OSD action bar and loops
@@ -880,6 +914,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _osdOpen = false;
   Timer? _osdTimer;
   bool _detailOpen = false;
+  bool _exitConfirmOpen = false;
   DateTime? _suppressBackPopUntil;
   final ScrollController _detailScrollController = ScrollController();
 
@@ -1324,8 +1359,39 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final nav = Navigator.of(context);
+      if (_exitConfirmOpen) {
+        if (nav.canPop()) nav.pop(true);
+        return;
+      }
       if (nav.canPop()) {
         nav.pop();
+      }
+    });
+  }
+
+  Future<void> _confirmExitPlayback() async {
+    if (_exitConfirmOpen || !mounted) return;
+    _exitConfirmOpen = true;
+    var confirmed = false;
+    try {
+      confirmed = await showPlayerExitConfirmDialog(context);
+    } finally {
+      _exitConfirmOpen = false;
+    }
+    if (!mounted) return;
+    if (confirmed) {
+      final nav = Navigator.of(context);
+      if (nav.canPop()) nav.pop();
+      return;
+    }
+    _suppressBackPopUntil = DateTime.now().add(
+      const Duration(milliseconds: 300),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final target = _interrupted ? _resumeButtonFocusNode : _rootFocusNode;
+      if (target.canRequestFocus) {
+        target.requestFocus();
       }
     });
   }
@@ -2349,6 +2415,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         switch (resolvePlayerBackOutcome(
           detailOpen: _detailOpen,
           osdOpen: _osdOpen,
+          errorOpen: _error != null,
+          exitConfirmOpen: _exitConfirmOpen,
           suppressUntil: _suppressBackPopUntil,
         )) {
           case PlayerBackOutcome.suppressed:
@@ -2358,6 +2426,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             return;
           case PlayerBackOutcome.closeOsd:
             _closeOsd(fromBackKey: true);
+            return;
+          case PlayerBackOutcome.confirmExit:
+            unawaited(_confirmExitPlayback());
             return;
           case PlayerBackOutcome.popPlayer:
             Navigator.of(context).pop();
