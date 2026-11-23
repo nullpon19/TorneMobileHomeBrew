@@ -264,6 +264,32 @@ ButtonStyle osdButtonStyle() {
 /// Label for the OSD button that dismisses only the OSD menu bar.
 const String playerOsdCloseMenuLabel = 'メニューを閉じる';
 
+/// Computes accumulated pre-buffer seconds (clamped to `[0, targetSeconds]`)
+/// from all available mpv cache signals. During live `cache-pause-initial`,
+/// mpv may leave `demuxer-cache-duration` unemitted while updating
+/// `cache-buffering-state` (`bufferingPercentage`) and/or `demuxer-cache-time`.
+int computePreBufferSeconds({
+  required int targetSeconds,
+  required double demuxerCacheDuration,
+  required double bufferingPercentage,
+  required double bufferDeltaSeconds,
+}) {
+  if (targetSeconds <= 0) return 0;
+  final fromDuration =
+      demuxerCacheDuration.isFinite && demuxerCacheDuration > 0
+      ? demuxerCacheDuration
+      : 0.0;
+  final fromPercent =
+      bufferingPercentage.isFinite && bufferingPercentage > 0
+      ? (bufferingPercentage.clamp(0.0, 100.0) / 100.0) * targetSeconds
+      : 0.0;
+  final fromDelta = bufferDeltaSeconds.isFinite && bufferDeltaSeconds > 0
+      ? bufferDeltaSeconds
+      : 0.0;
+  final best = math.max(fromDuration, math.max(fromPercent, fromDelta));
+  return best.clamp(0.0, targetSeconds.toDouble()).floor();
+}
+
 /// Outcome for resolving a system Back (`PopScope`) while the player is open.
 enum PlayerBackOutcome { suppressed, closeDetail, closeOsd, popPlayer }
 
@@ -781,9 +807,91 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   Duration _duration = Duration.zero;
   Duration _bufferEndPosition = Duration.zero;
+  Duration? _initialBufferPosition;
   double _bufferedAheadSeconds = 0.0;
+  double _bufferingPercentage = 0.0;
   MpvBufferPlan? _bufferPlan;
   Directory? _usedDiskCacheDir;
+  Timer? _preBufferPollTimer;
+  bool _pollingBufferProps = false;
+
+  bool get _isPreBuffering {
+    final plan = _bufferPlan;
+    return plan != null &&
+        plan.cachePauseInitial &&
+        plan.cachePauseWaitSeconds > 0 &&
+        (!_hasVideoFrame || !_playing);
+  }
+
+  double get _bufferDeltaSeconds {
+    if (_bufferEndPosition <= Duration.zero) return 0.0;
+    final base = _lastPosition > Duration.zero
+        ? _lastPosition
+        : _initialBufferPosition;
+    if (base == null) return 0.0;
+    final diff = _bufferEndPosition - base;
+    return diff > Duration.zero ? diff.inMilliseconds / 1000.0 : 0.0;
+  }
+
+  int get _effectivePreBufferSeconds => computePreBufferSeconds(
+    targetSeconds: _bufferPlan?.cachePauseWaitSeconds ?? 0,
+    demuxerCacheDuration: _bufferedAheadSeconds,
+    bufferingPercentage: _bufferingPercentage,
+    bufferDeltaSeconds: _bufferDeltaSeconds,
+  );
+
+  void _startPreBufferPoller() {
+    _preBufferPollTimer?.cancel();
+    _preBufferPollTimer = Timer.periodic(const Duration(milliseconds: 500), (
+      _,
+    ) {
+      if (!mounted || !_isPreBuffering) {
+        _stopPreBufferPoller();
+        return;
+      }
+      unawaited(_pollMpvBufferProperties());
+    });
+    unawaited(_pollMpvBufferProperties());
+  }
+
+  void _stopPreBufferPoller() {
+    _preBufferPollTimer?.cancel();
+    _preBufferPollTimer = null;
+  }
+
+  Future<void> _pollMpvBufferProperties() async {
+    if (_pollingBufferProps || !mounted) return;
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    _pollingBufferProps = true;
+    final prevPreSec = _effectivePreBufferSeconds;
+    final prevAheadFloor = _bufferedAheadSeconds.floor();
+    try {
+      try {
+        final rawDur = await platform.getProperty('demuxer-cache-duration');
+        final parsed = double.tryParse(rawDur);
+        if (parsed != null && parsed.isFinite && parsed >= 0) {
+          _bufferedAheadSeconds = parsed;
+        }
+      } catch (_) {}
+      try {
+        final rawPct = await platform.getProperty('cache-buffering-state');
+        final parsed = double.tryParse(rawPct);
+        if (parsed != null && parsed.isFinite) {
+          _bufferingPercentage = parsed.clamp(0.0, 100.0).toDouble();
+        }
+      } catch (_) {}
+      if (!mounted) return;
+      final nextPreSec = _effectivePreBufferSeconds;
+      if ((_isPreBuffering && nextPreSec != prevPreSec) ||
+          ((_osdOpen || _seekHudVisible) &&
+              _bufferedAheadSeconds.floor() != prevAheadFloor)) {
+        setState(() {});
+      }
+    } finally {
+      _pollingBufferProps = false;
+    }
+  }
 
   static const Duration _rewindStep = PlayerScreen.rewindStep;
   static const Duration _forwardStep = PlayerScreen.forwardStep;
@@ -913,8 +1021,35 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.buffer.listen((bufferEnd) {
+        final prevPreSec = _effectivePreBufferSeconds;
+        final prevDeltaFloor = _bufferDeltaSeconds.floor();
+        if (bufferEnd > Duration.zero && _initialBufferPosition == null) {
+          _initialBufferPosition = bufferEnd <= const Duration(seconds: 5)
+              ? Duration.zero
+              : bufferEnd;
+        }
         if (bufferEnd != _bufferEndPosition) {
           _bufferEndPosition = bufferEnd;
+          if (mounted &&
+              ((_isPreBuffering &&
+                      _effectivePreBufferSeconds != prevPreSec) ||
+                  ((_osdOpen || _seekHudVisible) &&
+                      _bufferDeltaSeconds.floor() != prevDeltaFloor))) {
+            setState(() {});
+          }
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.bufferingPercentage.listen((pct) {
+        if (!pct.isFinite) return;
+        final clamped = pct.clamp(0.0, 100.0).toDouble();
+        final prevPreSec = _effectivePreBufferSeconds;
+        _bufferingPercentage = clamped;
+        if (mounted &&
+            _isPreBuffering &&
+            _effectivePreBufferSeconds != prevPreSec) {
+          setState(() {});
         }
       }),
     );
@@ -1037,6 +1172,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _setStartError(String error) {
+    _stopPreBufferPoller();
     if (!mounted) return;
     setState(() => _error = error);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1047,6 +1183,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _enterInterruptedState(String? detail) {
+    _stopPreBufferPoller();
     if (!mounted || _completed) return;
     setState(() {
       _interrupted = true;
@@ -1160,7 +1297,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _interrupted = false;
       _interruptDetail = null;
       _buffering = true;
+      _bufferingPercentage = 0.0;
+      _bufferedAheadSeconds = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
     });
+    if (_isPreBuffering) {
+      _startPreBufferPoller();
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _rootFocusNode.canRequestFocus) {
         _rootFocusNode.requestFocus();
@@ -1298,14 +1442,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         final parsed = double.tryParse(value);
         if (parsed == null || parsed.isNaN || parsed.isInfinite) return;
         final clamped = math.max(0.0, parsed);
+        final prevPreSec = _effectivePreBufferSeconds;
         final prevFloor = _bufferedAheadSeconds.floor();
         _bufferedAheadSeconds = clamped;
-        final waitingForInitial =
-            (_bufferPlan?.cachePauseInitial ?? false) &&
-            (!_hasVideoFrame || _buffering || !_playing);
+        final waitingForInitial = _isPreBuffering;
         if (mounted &&
-            clamped.floor() != prevFloor &&
-            (_osdOpen || _seekHudVisible || waitingForInitial)) {
+            ((waitingForInitial && _effectivePreBufferSeconds != prevPreSec) ||
+                ((_osdOpen || _seekHudVisible) && clamped.floor() != prevFloor))) {
           setState(() {});
         }
       });
@@ -1402,6 +1545,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       );
       if (!mounted) return;
       _bufferPlan = plan;
+      _bufferingPercentage = 0.0;
+      _bufferedAheadSeconds = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
       _usedDiskCacheDir = plan.useDiskCache ? cacheDir : null;
       _watchdog?.cancel();
       _watchdog = Timer(
@@ -1453,6 +1600,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           'maxBytes=${plan.demuxerMaxBytes} back=${plan.demuxerMaxBackBytes} '
           'wait=${plan.cachePauseWaitSeconds}s netTimeout=${plan.networkTimeoutSeconds}s',
         );
+      }
+      if (mounted) {
+        setState(() {});
+        if (plan.cachePauseInitial && plan.cachePauseWaitSeconds > 0) {
+          _startPreBufferPoller();
+        }
       }
       final start =
           (!widget.live &&
@@ -1596,6 +1749,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
         (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
         (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
+        (name: 'pre-buffer poller', run: () => _preBufferPollTimer?.cancel()),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
         (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
@@ -1744,6 +1898,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _openOsd() {
     setState(() => _osdOpen = true);
+    unawaited(_pollMpvBufferProperties());
     _resetOsdTimer();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _osdFirstFocusNode.canRequestFocus) {
@@ -1812,6 +1967,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _showSeekHud(IconData icon, String actionLabel) {
     _seekHudTimer?.cancel();
+    unawaited(_pollMpvBufferProperties());
     setState(() {
       _seekHudVisible = true;
       _seekHudIcon = icon;
@@ -2150,15 +2306,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   Widget _buildLoadingOverlay(String fallbackLabel) {
     final plan = _bufferPlan;
-    final showPreBuffer =
-        plan != null &&
-        plan.cachePauseInitial &&
-        plan.cachePauseWaitSeconds > 0 &&
-        (!_hasVideoFrame || !_playing);
-    final targetSec = showPreBuffer ? plan.cachePauseWaitSeconds : 0;
-    final curSec = showPreBuffer
-        ? _bufferedAheadSeconds.clamp(0.0, targetSec.toDouble()).floor()
-        : 0;
+    final showPreBuffer = _isPreBuffering;
+    final targetSec = showPreBuffer ? plan!.cachePauseWaitSeconds : 0;
+    final curSec = showPreBuffer ? _effectivePreBufferSeconds : 0;
     final progress = showPreBuffer && targetSec > 0
         ? (curSec / targetSec).clamp(0.0, 1.0)
         : null;
@@ -2217,7 +2367,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   Widget _buildBufferBadge() {
     final plan = _bufferPlan;
-    final aheadSec = _bufferedAheadSeconds.floor();
+    final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
     final targetSec = plan?.configuredSeconds ?? 0;
     if (aheadSec <= 0 && targetSec <= 0) return const SizedBox.shrink();
     final text = targetSec > 0

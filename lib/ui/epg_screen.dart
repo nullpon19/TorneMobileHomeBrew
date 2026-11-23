@@ -344,9 +344,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   final _bodyController = ScrollController();
   final _gridController = ScrollController();
   final FocusNode _topBarFocusNode = FocusNode(debugLabel: 'epgTopBar');
-  final FocusScopeNode _gridFocusScopeNode = FocusScopeNode(
-    debugLabel: 'epgGrid',
-  );
+  final FocusNode _gridFocusNode = FocusNode(debugLabel: 'epgGrid');
   late final Map<int, bool Function()> _tabBackHandlers;
   bool _syncing = false;
 
@@ -374,7 +372,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
       _tabBackHandlers.remove(AppTabs.epg);
     }
     _topBarFocusNode.dispose();
-    _gridFocusScopeNode.dispose();
+    _gridFocusNode.dispose();
     _rulerController.dispose();
     _bodyController.dispose();
     _gridController.dispose();
@@ -391,7 +389,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   }
 
   bool _handleBackFromGrid() {
-    if (!_gridFocusScopeNode.hasFocus) return false;
+    if (!_gridFocusNode.hasFocus) return false;
     _focusTopBar();
     return true;
   }
@@ -573,7 +571,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
               rulerController: _rulerController,
               bodyController: _bodyController,
               gridController: _gridController,
-              gridFocusScopeNode: _gridFocusScopeNode,
+              gridFocusNode: _gridFocusNode,
               onJumpToTopBar: _focusTopBar,
               scrolledToNow: _scrolledToNow,
               onScrolledToNow: () => _scrolledToNow = true,
@@ -598,7 +596,7 @@ class _GuideView extends StatelessWidget {
     required this.rulerController,
     required this.bodyController,
     required this.gridController,
-    required this.gridFocusScopeNode,
+    required this.gridFocusNode,
     required this.onJumpToTopBar,
     required this.scrolledToNow,
     required this.onScrolledToNow,
@@ -621,7 +619,7 @@ class _GuideView extends StatelessWidget {
   final ScrollController rulerController;
   final ScrollController bodyController;
   final ScrollController gridController;
-  final FocusScopeNode gridFocusScopeNode;
+  final FocusNode gridFocusNode;
   final VoidCallback onJumpToTopBar;
   final bool scrolledToNow;
   final VoidCallback onScrolledToNow;
@@ -690,8 +688,10 @@ class _GuideView extends StatelessWidget {
               ),
               const VerticalDivider(width: 1),
               Expanded(
-                child: FocusScope(
-                  node: gridFocusScopeNode,
+                child: Focus(
+                  focusNode: gridFocusNode,
+                  canRequestFocus: false,
+                  skipTraversal: true,
                   onKeyEvent: (node, event) {
                     if (event is KeyDownEvent &&
                         (event.logicalKey == LogicalKeyboardKey.contextMenu ||

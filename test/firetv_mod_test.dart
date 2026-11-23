@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:tmhb/app/bs_epg_providers.dart';
 import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
@@ -2051,6 +2052,223 @@ void main() {
           ),
           findsOneWidget,
         );
+      },
+    );
+  });
+
+  group('Phase 15: EPG NavigationRail left escape & pre-buffer progress', () {
+    test('computePreBufferSeconds tracks percentage, buffer delta, and duration', () {
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 0,
+          demuxerCacheDuration: 12,
+          bufferingPercentage: 50,
+          bufferDeltaSeconds: 10,
+        ),
+        0,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 30,
+          demuxerCacheDuration: 0,
+          bufferingPercentage: 0,
+          bufferDeltaSeconds: 0,
+        ),
+        0,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 30,
+          demuxerCacheDuration: double.nan,
+          bufferingPercentage: 50,
+          bufferDeltaSeconds: 0,
+        ),
+        15,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 30,
+          demuxerCacheDuration: 0,
+          bufferingPercentage: 100,
+          bufferDeltaSeconds: 0,
+        ),
+        30,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 30,
+          demuxerCacheDuration: 0,
+          bufferingPercentage: 10,
+          bufferDeltaSeconds: 22.8,
+        ),
+        22,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 30,
+          demuxerCacheDuration: 45,
+          bufferingPercentage: 20,
+          bufferDeltaSeconds: 10,
+        ),
+        30,
+      );
+    });
+
+    testWidgets(
+      'AppShell EpgScreen lets Left move from grid, day chips, and top bar back to NavigationRail',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:epg-rail-escape',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const channel = Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2222,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト放送',
+        );
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final noonUtc = DateTime.utc(jstNow.year, jstNow.month, jstNow.day, 3);
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            EpgServiceGuide(
+              channel: channel,
+              events: [
+                EpgEvent(
+                  eventId: 10,
+                  start: noonUtc,
+                  duration: const Duration(minutes: 60),
+                  title: '昼テスト番組',
+                  genreLevel1: 3,
+                ),
+              ],
+            ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'テストnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const [channel]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+
+        bool primaryIsInRail() {
+          final primaryContext = FocusManager.instance.primaryFocus?.context;
+          if (primaryContext == null) return false;
+          return find
+              .ancestor(
+                of: find.byWidget(primaryContext.widget),
+                matching: find.byType(NavigationRail),
+              )
+              .evaluate()
+              .isNotEmpty;
+        }
+
+        // 1) Left from leftmost EPG event tile moves to NavigationRail.
+        final tileText = find.text('昼テスト番組', skipOffstage: false);
+        await tester.ensureVisible(tileText);
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(find.text('昼テスト番組'))).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(primaryIsInRail(), isTrue);
+
+        // 2) Left from first day chip moves to NavigationRail.
+        final firstChip = find.byType(ChoiceChip).first;
+        Focus.of(tester.element(firstChip)).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(primaryIsInRail(), isTrue);
+
+        // 3) Back/Menu jumps from grid to top bar ('地デジ'), and Left from '地デジ' reaches NavigationRail.
+        Focus.of(tester.element(find.text('昼テスト番組'))).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump();
+        final topSegContext = FocusManager.instance.primaryFocus?.context;
+        expect(topSegContext, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(topSegContext!.widget),
+            matching: find.byType(SegmentedButton<int>),
+          ),
+          findsOneWidget,
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(primaryIsInRail(), isTrue);
       },
     );
   });
