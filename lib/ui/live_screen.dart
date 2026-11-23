@@ -16,6 +16,8 @@
 /// already listed item).
 library;
 
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -24,6 +26,7 @@ import '../app/state.dart';
 import '../core/core.dart';
 import 'epg_subchannel_visibility.dart';
 import 'format.dart';
+import 'live_recording_policy.dart';
 import 'playback_launcher.dart';
 import 'player_screen.dart';
 import 'schedules_screen.dart' show twoPaneBreakpoint;
@@ -61,7 +64,10 @@ class _LiveScreenState extends ConsumerState<LiveScreen> {
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
-              onPressed: () => ref.invalidate(liveChannelsProvider(reg)),
+              onPressed: () {
+                ref.invalidate(liveChannelsProvider(reg));
+                ref.invalidate(schedulesProvider(reg));
+              },
             ),
         ],
       ),
@@ -132,6 +138,9 @@ class _LiveList extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final bands = ref.watch(liveChannelsProvider(reg));
     final showSubchannels = ref.watch(showSubchannelsProvider);
+    final schedules =
+        ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
+    final now = DateTime.now();
     return asyncSection(bands, (list) {
       // The guide's subchannel switch applies to this list
       // too (plan 95): the same setting, not a new one.
@@ -166,22 +175,35 @@ class _LiveList extends ConsumerWidget {
           final twoPane = constraints.maxWidth >= twoPaneBreakpoint;
           final listView = ListView(
             children: [
-              for (final channel in selectedBand.channels)
-                ListTile(
-                  selected: channel.id == selectedId,
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  leading: const Icon(Icons.live_tv_outlined),
-                  title: Text(channel.channelName ?? channel.programTitle),
-                  subtitle: Text(
-                    _channelSubtitle(channel),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  onTap: () => onSelect(channel, twoPane),
+              for (final channel in selectedBand.channels) ...[
+                Builder(
+                  builder: (context) {
+                    final isRecording =
+                        findActiveSameChannelRecording(
+                          schedules,
+                          currentChannel: channel,
+                          now: now,
+                        ) !=
+                        null;
+                    return ListTile(
+                      selected: channel.id == selectedId,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      leading: const Icon(Icons.live_tv_outlined),
+                      title: Text(channel.channelName ?? channel.programTitle),
+                      subtitle: Text(
+                        _channelSubtitle(channel),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: isRecording ? const _LiveRecordingBadge() : null,
+                      onTap: () => onSelect(channel, twoPane),
+                    );
+                  },
                 ),
+              ],
             ],
           );
           final content = Column(
@@ -397,11 +419,27 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
     final originalLabel = originalRes?.quality == null
         ? '元画質'
         : '元画質 (${resQualityLabel(originalRes!.quality)})';
+    final schedules =
+        ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
+    final isChannelRecording =
+        findActiveSameChannelRecording(
+          schedules,
+          currentChannel: ch,
+          now: DateTime.now(),
+        ) !=
+        null;
     final start = ch.programStart;
     final end = ch.programEnd;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (isChannelRecording) ...[
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: _LiveRecordingBadge(),
+          ),
+          const SizedBox(height: 8),
+        ],
         Text(
           ch.programTitle,
           style: Theme.of(context).textTheme.titleLarge,
@@ -467,55 +505,249 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
 
   Future<void> _watch(BuildContext context, WidgetRef ref) async {
     if (_starting) return;
-    final engine = ref.read(deviceServicesProvider(reg)).playback;
-    if (!engine.isSupported) {
-      await showPlaybackUnsupportedDialog(context, subject: 'TV視聴');
-      return;
-    }
-    if (channel.res.isEmpty) {
-      showSnack(context, '視聴可能なコンテンツがありません');
-      return;
-    }
     final bool useMobile =
         _useMobileChoice ?? ref.read(playbackQualityProvider);
-    final res = useMobile
-        ? (channel.mobileRes ?? channel.originalRes ?? channel.res.first)
-        : (channel.originalRes ?? channel.mobileRes ?? channel.res.first);
-    final start = channel.programStart;
-    final end = channel.programEnd;
-    final detailMetaParts = <String>[
-      if (channel.channelName != null && channel.channelName!.isNotEmpty)
-        channel.channelName!,
-      if (start != null && end != null)
-        '${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}',
-      if (channel.genre != null && channel.genre!.isNotEmpty) channel.genre!,
-    ];
-    final detailMeta = detailMetaParts.isEmpty
-        ? null
-        : detailMetaParts.join(' ・ ');
-    final detailBody = formatProgramDetailBody(
-      description: channel.description,
-      longDescription: channel.longDescription,
-    );
     setState(() => _starting = true);
     try {
-      await startPlaybackAndShowPlayer(
+      await _launchLiveChannel(
         context: context,
         ref: ref,
-        start: () => engine.startLivePlayback(channel, res),
-        buildPlayer: (session) => PlayerScreen(
-          title: channel.channelName ?? channel.programTitle,
-          session: session,
-          live: true,
-          programDetailTitle: channel.programTitle,
-          programDetailMeta: detailMeta,
-          programDetailBody: detailBody,
-        ),
-        unsupportedSubject: 'TV視聴',
-        startFailureMessage: '視聴を開始できませんでした',
+        reg: reg,
+        channel: channel,
+        useMobile: useMobile,
       );
     } finally {
       if (mounted) setState(() => _starting = false);
     }
   }
+}
+
+/// Compact red badge marking a live channel that is currently being recorded.
+class _LiveRecordingBadge extends StatelessWidget {
+  const _LiveRecordingBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xFFC62828),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.fiber_manual_record, size: 10, color: Colors.white),
+          SizedBox(width: 4),
+          Text(
+            '録画中',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<PlaybackSession> _startLiveSession(
+  PlaybackEngine engine,
+  LiveChannel channel, {
+  required bool useMobile,
+  required bool allowQualityFallback,
+}) async {
+  final primaryRes = useMobile
+      ? (channel.mobileRes ?? channel.originalRes ?? channel.res.first)
+      : (channel.originalRes ?? channel.mobileRes ?? channel.res.first);
+  final secondaryRes = useMobile
+      ? (channel.originalRes != primaryRes ? channel.originalRes : null)
+      : (channel.mobileRes != primaryRes ? channel.mobileRes : null);
+  try {
+    return await engine.startLivePlayback(channel, primaryRes);
+  } on NasneError {
+    if (!allowQualityFallback || secondaryRes == null) rethrow;
+    return engine.startLivePlayback(channel, secondaryRes);
+  }
+}
+
+Future<List<RecordSchedule>> _fetchFreshSchedules(
+  ProviderContainer container,
+  RegisteredNasne reg,
+) async {
+  try {
+    return await container
+        .read(deviceServicesProvider(reg))
+        .schedules
+        .listSchedules();
+  } catch (_) {
+    return container.read(schedulesProvider(reg)).value ??
+        const <RecordSchedule>[];
+  }
+}
+
+Future<LiveRecordingConflict?> _resolveOtherChannelConflict(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  LiveChannel currentChannel, {
+  List<RecordSchedule>? knownSchedules,
+}) async {
+  final schedules = knownSchedules ?? await _fetchFreshSchedules(container, reg);
+  final conflictSchedule = findActiveOtherChannelRecording(
+    schedules,
+    currentChannel: currentChannel,
+    now: DateTime.now(),
+  );
+  if (conflictSchedule == null) return null;
+  List<LiveBand> bands = const [];
+  try {
+    bands = await container.read(liveChannelsProvider(reg).future);
+  } catch (_) {
+    bands = container.read(liveChannelsProvider(reg)).value ?? const [];
+  }
+  final target = findLiveChannelForSchedule(bands, conflictSchedule);
+  final title = conflictSchedule.title;
+  final displayTitle = (title == null || title.isEmpty) ? '予約番組' : title;
+  return LiveRecordingConflict(
+    schedule: conflictSchedule,
+    displayTitle: displayTitle,
+    channelName: target?.channelName,
+    liveChannel: target,
+  );
+}
+
+Widget _buildLivePlayerScreen({
+  required ProviderContainer container,
+  required RegisteredNasne reg,
+  required LiveChannel channel,
+  required PlaybackSession session,
+  required bool useMobile,
+  required List<RecordSchedule> initialSchedules,
+}) {
+  final start = channel.programStart;
+  final end = channel.programEnd;
+  final detailMetaParts = <String>[
+    if (channel.channelName != null && channel.channelName!.isNotEmpty)
+      channel.channelName!,
+    if (start != null && end != null)
+      '${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}',
+    if (channel.genre != null && channel.genre!.isNotEmpty) channel.genre!,
+  ];
+  final detailMeta =
+      detailMetaParts.isEmpty ? null : detailMetaParts.join(' ・ ');
+  final detailBody = formatProgramDetailBody(
+    description: channel.description,
+    longDescription: channel.longDescription,
+  );
+  return PlayerScreen(
+    title: channel.channelName ?? channel.programTitle,
+    session: session,
+    live: true,
+    programDetailTitle: channel.programTitle,
+    programDetailMeta: detailMeta,
+    programDetailBody: detailBody,
+    currentLiveChannel: channel,
+    initialRecordingSchedules: initialSchedules,
+    onCheckRecordingConflict: () =>
+        _resolveOtherChannelConflict(container, reg, channel),
+    onBuildRecordingChannelPlayer: (target) async {
+      final services = container.read(deviceServicesProvider(reg));
+      final targetSchedules = await _fetchFreshSchedules(container, reg);
+      final targetSession = await _startLiveSession(
+        services.playback,
+        target,
+        useMobile: useMobile,
+        allowQualityFallback: true,
+      );
+      return _buildLivePlayerScreen(
+        container: container,
+        reg: reg,
+        channel: target,
+        session: targetSession,
+        useMobile: useMobile,
+        initialSchedules: targetSchedules,
+      );
+    },
+  );
+}
+
+Future<void> _launchLiveChannel({
+  required BuildContext context,
+  required WidgetRef ref,
+  required RegisteredNasne reg,
+  required LiveChannel channel,
+  required bool useMobile,
+  bool checkConflictBeforeStart = true,
+  bool allowQualityFallback = false,
+}) async {
+  final container = ProviderScope.containerOf(context);
+  final engine = container.read(deviceServicesProvider(reg)).playback;
+  if (!engine.isSupported) {
+    await showPlaybackUnsupportedDialog(context, subject: 'TV視聴');
+    return;
+  }
+  if (channel.res.isEmpty) {
+    showSnack(context, '視聴可能なコンテンツがありません');
+    return;
+  }
+  final freshSchedules = await _fetchFreshSchedules(container, reg);
+  if (!context.mounted) return;
+  if (checkConflictBeforeStart) {
+    final conflict = await _resolveOtherChannelConflict(
+      container,
+      reg,
+      channel,
+      knownSchedules: freshSchedules,
+    );
+    if (!context.mounted) return;
+    if (conflict != null) {
+      final switchToRecording = await showLiveRecordingConflictDialog(
+        context,
+        conflict: conflict,
+        midStream: false,
+      );
+      if (!context.mounted) return;
+      if (switchToRecording == true && conflict.liveChannel != null) {
+        await _launchLiveChannel(
+          context: context,
+          ref: ref,
+          reg: reg,
+          channel: conflict.liveChannel!,
+          useMobile: useMobile,
+          checkConflictBeforeStart: false,
+          allowQualityFallback: true,
+        );
+      }
+      return;
+    }
+  }
+  final sameChannelRecording =
+      findActiveSameChannelRecording(
+        freshSchedules,
+        currentChannel: channel,
+        now: DateTime.now(),
+      ) !=
+      null;
+  await startPlaybackAndShowPlayer(
+    context: context,
+    ref: ref,
+    start: () => _startLiveSession(
+      engine,
+      channel,
+      useMobile: useMobile,
+      allowQualityFallback: allowQualityFallback || sameChannelRecording,
+    ),
+    buildPlayer: (session) => _buildLivePlayerScreen(
+      container: container,
+      reg: reg,
+      channel: channel,
+      session: session,
+      useMobile: useMobile,
+      initialSchedules: freshSchedules,
+    ),
+    unsupportedSubject: 'TV視聴',
+    startFailureMessage: '視聴を開始できませんでした',
+  );
 }

@@ -383,6 +383,7 @@ class DtcpProxy {
   int _servedBytes = 0;
   DateTime? _firstServedAt;
   DateTime? _lastServedAt;
+  int _consecutiveReconnectErrors = 0;
   int _requestCount = 0;
 
   /// Total plaintext bytes written to the downstream player so far.
@@ -395,6 +396,9 @@ class DtcpProxy {
   /// Wall-clock time of the most recent plaintext chunk sent on the active
   /// legacy stream, or `null` if nothing has been served yet.
   DateTime? get lastByteServedAt => _lastServedAt;
+
+  /// Number of consecutive upstream reconnect attempts without decrypting data.
+  int get consecutiveReconnectErrors => _consecutiveReconnectErrors;
   bool _claimed = false;
   bool _stopRequested = false;
   bool _downstreamGone = false;
@@ -603,6 +607,7 @@ class DtcpProxy {
               plainBytes = decryptor.plaintextBytes;
               for (final piece in pieces) {
                 consecutiveErrors = 0;
+                _consecutiveReconnectErrors = 0;
                 if (!firstPlainLogged) {
                   firstPlainLogged = true;
                   _diag(
@@ -674,6 +679,7 @@ class DtcpProxy {
         }
         final delay = _backoffForAttempt(consecutiveErrors);
         consecutiveErrors++;
+        _consecutiveReconnectErrors = consecutiveErrors;
         _diag(
           DiagCategory.playback,
           'proxy: live reconnect attempt $consecutiveErrors after '

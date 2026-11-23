@@ -23,7 +23,7 @@ class HomeScreen extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('torne mobile HB'),
+        title: const Text('torne HB FireTV'),
         actions: [
           if (selected != null)
             IconButton(

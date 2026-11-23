@@ -656,8 +656,14 @@ void main() {
       // never mid-column (plan 22): the scroll moved, and the
       // settled offset is a whole number of columns.
       final pixels = scrollable.position.pixels;
+      final colWidth = resolveEpgChannelWidth(
+        scrollable.position.viewportDimension,
+      );
       expect(pixels, greaterThan(0));
-      expect(pixels % 172, anyOf(closeTo(0, 1.0), closeTo(172, 1.0)));
+      expect(
+        pixels % colWidth,
+        anyOf(closeTo(0, 1.0), closeTo(colWidth, 1.0)),
+      );
       // And the position must go idle: a snap simulation that is
       // re-created on completion loops forever and blocks all
       // further pointer input to the grid (plan 23).
@@ -820,8 +826,14 @@ void main() {
           matching: find.byWidgetPredicate((w) =>
               w is Scrollable && w.axisDirection == AxisDirection.right)));
       final pixels = scrollable.position.pixels;
+      final colWidth = resolveEpgChannelWidth(
+        scrollable.position.viewportDimension,
+      );
       expect(pixels, greaterThan(0));
-      expect(pixels % 172, anyOf(closeTo(0, 1.0), closeTo(172, 1.0)));
+      expect(
+        pixels % colWidth,
+        anyOf(closeTo(0, 1.0), closeTo(colWidth, 1.0)),
+      );
       expect(scrollable.position.activity, isA<IdleScrollActivity>());
     });
 
@@ -921,7 +933,11 @@ void main() {
       }
       // The channel axis still settles on a column boundary and
       // both positions come fully to rest.
-      expect(hPos.pixels % 172, anyOf(closeTo(0, 1.0), closeTo(172, 1.0)));
+      final colWidth = resolveEpgChannelWidth(hPos.viewportDimension);
+      expect(
+        hPos.pixels % colWidth,
+        anyOf(closeTo(0, 1.0), closeTo(colWidth, 1.0)),
+      );
       expect(hPos.activity, isA<IdleScrollActivity>());
       expect(vPos.activity, isA<IdleScrollActivity>());
 
@@ -940,7 +956,10 @@ void main() {
       for (var i = 0; i < 30; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
-      expect(hPos.pixels % 172, anyOf(closeTo(0, 1.0), closeTo(172, 1.0)));
+      expect(
+        hPos.pixels % colWidth,
+        anyOf(closeTo(0, 1.0), closeTo(colWidth, 1.0)),
+      );
       expect(hPos.activity, isA<IdleScrollActivity>());
       expect(vPos.activity, isA<IdleScrollActivity>());
     });
@@ -1083,7 +1102,11 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(hPos.pixels, greaterThan(0));
-      expect(hPos.pixels % 172, anyOf(closeTo(0, 1.0), closeTo(172, 1.0)));
+      final colWidth = resolveEpgChannelWidth(hPos.viewportDimension);
+      expect(
+        hPos.pixels % colWidth,
+        anyOf(closeTo(0, 1.0), closeTo(colWidth, 1.0)),
+      );
       // The snap must come fully to rest (plan 23: a snap physics
       // that keeps re-creating its ballistic simulation leaves the
       // position scrolling forever and the grid stops accepting

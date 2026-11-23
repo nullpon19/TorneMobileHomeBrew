@@ -1,6 +1,6 @@
 /// App shell smoke test: with no registrations the app boots into
 /// the v1 shell, shows the registration prompt on the home tab, and
-/// carries the display title "torne mobile HB".
+/// carries the display title "torne HB FireTV".
 library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -19,7 +19,7 @@ void main() {
 
     final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
     expect(app.title, 'torne HB FireTV');
-    expect(find.text('torne mobile HB'), findsWidgets);
+    expect(find.text('torne HB FireTV'), findsWidgets);
     expect(find.text('nasne が登録されていません'), findsOneWidget);
     expect(find.text('設定で登録する'), findsOneWidget);
 

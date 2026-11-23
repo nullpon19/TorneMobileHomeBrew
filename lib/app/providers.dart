@@ -370,6 +370,44 @@ final groupTitlesProvider = NotifierProvider<GroupTitlesNotifier, bool>(
   GroupTitlesNotifier.new,
 );
 
+/// Visual style for scheduled/reserved programme tiles in the EPG grid.
+enum EpgReservedStyle { fill, border }
+
+/// Persisted EPG reserved-programme highlight style (default solid red fill).
+class EpgReservedStyleNotifier extends Notifier<EpgReservedStyle> {
+  static const _key = 'firetv_epg_reserved_style';
+  bool _dirty = false;
+
+  @override
+  EpgReservedStyle build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == EpgReservedStyle.border.name &&
+          state != EpgReservedStyle.border) {
+        state = EpgReservedStyle.border;
+      } else if (raw == EpgReservedStyle.fill.name &&
+          state != EpgReservedStyle.fill) {
+        state = EpgReservedStyle.fill;
+      }
+    });
+    return EpgReservedStyle.fill;
+  }
+
+  Future<void> set(EpgReservedStyle style) async {
+    _dirty = true;
+    state = style;
+    await ref.read(keyValueStoreProvider).write(_key, style.name);
+  }
+}
+
+final epgReservedStyleProvider =
+    NotifierProvider<EpgReservedStyleNotifier, EpgReservedStyle>(
+      EpgReservedStyleNotifier.new,
+    );
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {

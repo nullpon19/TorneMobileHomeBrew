@@ -184,6 +184,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
+import 'live_recording_policy.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
 import 'player_error_policy.dart';
@@ -435,6 +436,44 @@ Future<bool> showPlayerExitConfirmDialog(BuildContext context) async {
     ),
   );
   return confirmed == true;
+}
+
+/// Prompts when live TV playback cannot start or is interrupted because another
+/// channel has claimed the single tuner for a scheduled recording. Returns
+/// `true` to switch to the recording channel, or `false`/`null` to close/exit.
+Future<bool?> showLiveRecordingConflictDialog(
+  BuildContext context, {
+  required LiveRecordingConflict conflict,
+  required bool midStream,
+}) {
+  final targetCh = conflict.channelName;
+  final targetDesc = (targetCh != null && targetCh.isNotEmpty)
+      ? '$targetCh「${conflict.displayTitle}」'
+      : '「${conflict.displayTitle}」';
+  final body = midStream
+      ? '他チャンネルで録画（$targetDesc）が開始されたため、視聴が中断されました。'
+      : '現在、他チャンネルで録画中（$targetDesc）のため、このチャンネルは視聴できません。';
+  final hasSwitchTarget = conflict.liveChannel != null;
+  return showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(midStream ? '他チャンネルの録画が開始されました' : '他チャンネルで録画中です'),
+      content: Text(body),
+      actions: [
+        TextButton(
+          autofocus: !hasSwitchTarget,
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+          child: Text(midStream ? '視聴を終了する' : '閉じる'),
+        ),
+        if (hasSwitchTarget)
+          FilledButton(
+            autofocus: true,
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(midStream ? '録画中のチャンネルに切り替える' : '録画中のチャンネルを視聴'),
+          ),
+      ],
+    ),
+  );
 }
 
 /// Traps D-pad directional focus within the OSD action bar and loops
@@ -710,6 +749,11 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.programDetailTitle,
     this.programDetailMeta,
     this.programDetailBody,
+    this.currentLiveChannel,
+    this.initialRecordingSchedules = const [],
+    this.onCheckRecordingConflict,
+    this.onBuildRecordingChannelPlayer,
+    this.nowProvider,
   });
 
   /// Display heading: a recording's title, or a live channel's
@@ -778,6 +822,24 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// Combined full programme description body shown when opening "番組詳細" in the OSD.
   final String? programDetailBody;
 
+  /// Channel metadata for live viewing so same-channel recording status and
+  /// other-channel recording conflicts can be detected.
+  final LiveChannel? currentLiveChannel;
+
+  /// Snapshot of reservations captured when opening live playback.
+  final List<RecordSchedule> initialRecordingSchedules;
+
+  /// Called when live playback stalls/reconnects repeatedly to detect whether a
+  /// scheduled recording on another channel claimed the single tuner.
+  final Future<LiveRecordingConflict?> Function()? onCheckRecordingConflict;
+
+  /// Builds the replacement [PlayerScreen] when switching to a recording channel.
+  final Future<Widget> Function(LiveChannel target)?
+      onBuildRecordingChannelPlayer;
+
+  /// Injectable clock for testing same-channel recording notices.
+  final DateTime Function()? nowProvider;
+
   static const Duration rewindStep = Duration(seconds: -10);
   static const Duration forwardStep = Duration(seconds: 10);
 
@@ -808,6 +870,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   int _autoResumeAttempts = 0;
   int _autoResumeCountdown = 0;
   bool _autoResumeDisabled = false;
+
+  /// Live recording tracking (same-channel OSD/corner notice and other-channel
+  /// tuner conflict preemption).
+  bool _sameChannelRecording = false;
+  bool? _lastSameChannelRecording;
+  LiveRecordingCornerNotice? _cornerRecordingNotice;
+  Timer? _recordingStatusTimer;
+  Timer? _cornerNoticeTimer;
+  bool _checkingConflict = false;
+  bool _conflictHandled = false;
+  bool _switchingChannel = false;
+  Timer? _liveConflictPollTimer;
 
   /// The latest value of the playing stream (unlike
   /// [_playing], which latches once playback has started),
@@ -1155,6 +1229,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         if (!buffering && _playingNow) {
           _autoResumeAttempts = 0;
         }
+        if (widget.live &&
+            widget.onCheckRecordingConflict != null &&
+            !_conflictHandled) {
+          if (buffering) {
+            _startLiveConflictPoller();
+          } else {
+            _stopLiveConflictPoller();
+          }
+        }
         final changed = _buffering != buffering;
         _buffering = buffering;
         final latched = _maybeLatchInitialPlaybackStarted();
@@ -1329,6 +1412,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _observeCacheDuration();
     _open();
     _loadChapters();
+    if (widget.live && widget.currentLiveChannel != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _updateSameChannelRecordingStatus();
+      });
+      _recordingStatusTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _updateSameChannelRecordingStatus(),
+      );
+    }
   }
 
   bool get _isEffectivelyCompleted =>
@@ -1410,6 +1502,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   void _enterInterruptedState(String? detail) {
     _stopPreBufferPoller();
     if (!mounted || _completed) return;
+    if (widget.live &&
+        widget.onCheckRecordingConflict != null &&
+        !_conflictHandled) {
+      unawaited(_handlePossibleLiveRecordingConflict());
+    }
     setState(() {
       _interrupted = true;
       if (detail != null) _interruptDetail = detail;
@@ -1454,6 +1551,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _onStartTimeout() {
     if (!mounted || _playing || _error != null) return;
+    if (widget.live &&
+        widget.onCheckRecordingConflict != null &&
+        !_conflictHandled) {
+      unawaited(_handlePossibleLiveRecordingConflict());
+    }
     final timeoutSec = _bufferPlan?.startTimeoutSeconds ?? startTimeout.inSeconds;
     _diag(
       DiagCategory.playback,
@@ -1463,6 +1565,144 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _setStartError(
       '再生が開始できませんでした ($timeoutSec 秒以内に映像が届きませんでした)。',
     );
+  }
+
+  DateTime _now() => widget.nowProvider?.call() ?? DateTime.now();
+
+  void _updateSameChannelRecordingStatus() {
+    final channel = widget.currentLiveChannel;
+    if (!mounted || !widget.live || channel == null) return;
+    final recordingNow =
+        findActiveSameChannelRecording(
+          widget.initialRecordingSchedules,
+          currentChannel: channel,
+          now: _now(),
+        ) !=
+        null;
+    final notice = resolveLiveRecordingCornerNotice(
+      previousRecording: _lastSameChannelRecording,
+      currentRecording: recordingNow,
+    );
+    _lastSameChannelRecording = recordingNow;
+    if (_sameChannelRecording != recordingNow || notice != null) {
+      setState(() {
+        _sameChannelRecording = recordingNow;
+        if (notice != null) {
+          _cornerRecordingNotice = notice;
+        }
+      });
+    }
+    if (notice != null) {
+      _cornerNoticeTimer?.cancel();
+      _cornerNoticeTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        setState(() => _cornerRecordingNotice = null);
+      });
+    }
+  }
+
+  void _startLiveConflictPoller() {
+    if (_liveConflictPollTimer != null ||
+        _conflictHandled ||
+        !widget.live ||
+        widget.onCheckRecordingConflict == null) {
+      return;
+    }
+    _liveConflictPollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!mounted || _conflictHandled || !_buffering) {
+        _stopLiveConflictPoller();
+        return;
+      }
+      if (widget.session case final StreamTransferMetrics metrics) {
+        if (metrics.consecutiveReconnectErrors >= 2) {
+          unawaited(_handlePossibleLiveRecordingConflict());
+        }
+      }
+    });
+  }
+
+  void _stopLiveConflictPoller() {
+    _liveConflictPollTimer?.cancel();
+    _liveConflictPollTimer = null;
+  }
+
+  Future<void> _handlePossibleLiveRecordingConflict() async {
+    final check = widget.onCheckRecordingConflict;
+    if (check == null ||
+        _checkingConflict ||
+        _conflictHandled ||
+        !mounted ||
+        !widget.live) {
+      return;
+    }
+    _checkingConflict = true;
+    LiveRecordingConflict? conflict;
+    try {
+      conflict = await check();
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: conflict check failed: $e');
+    } finally {
+      _checkingConflict = false;
+    }
+    if (conflict == null || _conflictHandled || !mounted) return;
+
+    _conflictHandled = true;
+    _stopLiveConflictPoller();
+    _stopPreBufferPoller();
+    _watchdog?.cancel();
+    _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
+    _recordingStatusTimer?.cancel();
+    _cornerNoticeTimer?.cancel();
+
+    setState(() {
+      _interrupted = false;
+      _autoResumeCountdown = 0;
+      _cornerRecordingNotice = null;
+    });
+
+    unawaited(_player.pause().catchError((_) {}));
+    await widget.session.stop().timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {},
+    );
+    if (!mounted) return;
+
+    final shouldSwitch = await showLiveRecordingConflictDialog(
+      context,
+      conflict: conflict,
+      midStream: true,
+    );
+    if (!mounted) return;
+
+    final target = conflict.liveChannel;
+    final buildNext = widget.onBuildRecordingChannelPlayer;
+    if (shouldSwitch == true && target != null && buildNext != null) {
+      setState(() {
+        _switchingChannel = true;
+        _error = null;
+      });
+      try {
+        final nextPlayer = await buildNext(target);
+        if (!mounted) return;
+        await Navigator.of(context).pushReplacement(
+          MaterialPageRoute<void>(builder: (_) => nextPlayer),
+        );
+      } catch (e) {
+        _diag(
+          DiagCategory.playback,
+          'player: recording channel switch failed: $e',
+        );
+        if (!mounted) return;
+        setState(() => _switchingChannel = false);
+        _setStartError('録画中のチャンネルへの切り替えに失敗しました。録画終了後に再度お試しください。');
+      }
+      return;
+    }
+
+    final nav = Navigator.of(context);
+    if (nav.canPop()) nav.pop();
   }
 
   /// A playing→stopped transition (plan 80): when the
@@ -1986,6 +2226,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
         (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
         (name: 'pre-buffer poller', run: () => _preBufferPollTimer?.cancel()),
+        (
+          name: 'recording status timer',
+          run: () => _recordingStatusTimer?.cancel(),
+        ),
+        (name: 'corner notice timer', run: () => _cornerNoticeTimer?.cancel()),
+        (
+          name: 'live conflict poller',
+          run: () => _liveConflictPollTimer?.cancel(),
+        ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
         (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
@@ -2437,7 +2686,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       },
       child: Scaffold(
         backgroundColor: Colors.black,
-        body: _error != null
+        body: _switchingChannel
+            ? const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(color: Colors.white),
+                    SizedBox(height: 16),
+                    Text(
+                      '録画中のチャンネルに切り替えています…',
+                      style: TextStyle(color: Colors.white, fontSize: 16),
+                    ),
+                  ],
+                ),
+              )
+            : _error != null
             ? Center(
                 child: SingleChildScrollView(
                   child: Padding(
@@ -2511,6 +2774,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                           (!_interrupted && _isPreBuffering))
                         _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
                       if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                      if (_cornerRecordingNotice != null &&
+                          !_osdOpen &&
+                          !_detailOpen &&
+                          !_interrupted &&
+                          _error == null &&
+                          !_switchingChannel)
+                        _buildCornerRecordingNotice(),
                       if (_seekHudVisible && !_osdOpen && !widget.live)
                         _buildSeekHud(),
                       if (_osdOpen) _buildRemoteOsd(),
@@ -2603,6 +2873,61 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecordingPillBadge({
+    required String label,
+    required bool ended,
+    double fontSize = 12,
+    EdgeInsetsGeometry padding = const EdgeInsets.symmetric(
+      horizontal: 8,
+      vertical: 3,
+    ),
+  }) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: ended ? const Color(0xCC263238) : const Color(0xFFC62828),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            ended ? Icons.stop : Icons.fiber_manual_record,
+            size: fontSize,
+            color: Colors.white,
+          ),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: fontSize,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCornerRecordingNotice() {
+    final notice = _cornerRecordingNotice;
+    if (notice == null) return const SizedBox.shrink();
+    final ended = notice == LiveRecordingCornerNotice.ended;
+    return Positioned(
+      top: 16,
+      right: 20,
+      child: IgnorePointer(
+        child: _buildRecordingPillBadge(
+          label: ended ? '録画終了' : '録画中',
+          ended: ended,
+          fontSize: 13,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         ),
       ),
     );
@@ -2919,6 +3244,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 ),
                 const SizedBox(width: 12),
                 _buildBufferBadge(),
+                if (widget.live && _sameChannelRecording) ...[
+                  const SizedBox(width: 8),
+                  _buildRecordingPillBadge(label: '録画中', ended: false),
+                ],
                 const SizedBox(width: 8),
                 if (widget.live)
                   Container(

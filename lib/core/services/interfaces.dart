@@ -203,6 +203,7 @@ abstract interface class StreamTransferMetrics {
   int get servedBytes;
   DateTime? get firstByteServedAt;
   DateTime? get lastByteServedAt;
+  int get consecutiveReconnectErrors;
 }
 
 /// Playback boundary (plan 5.7). v1 shipped only the stub, which

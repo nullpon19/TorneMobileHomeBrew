@@ -40,6 +40,75 @@ const double _maxFitChannelWidth = 210;
 const double _rulerWidth = 40;
 const double _headerHeight = 54;
 
+/// Shared solid red fill colour for reserved EPG tiles in both light and dark
+/// themes so reservations stand out distinctly from reddish genre tints.
+const Color epgReservedFillColor = Color(0xFFC62828);
+
+/// Merges all scheduled reservations and currently-recording titles across all
+/// broadcasting bands (terrestrial / BS / CS) into clamped minute ranges in
+/// `[dayStart, dayEnd)` for the left-edge time ruler indicator.
+List<({double startMin, double endMin})> buildEpgRulerReservedSpans({
+  required List<RecordSchedule> schedules,
+  required DateTime dayStart,
+  required DateTime dayEnd,
+  List<RecordedTitle> recordingTitles = const [],
+  DateTime? now,
+}) {
+  if (!dayEnd.isAfter(dayStart)) return const [];
+  final raw = <({double startMin, double endMin})>[];
+  final current = now ?? DateTime.now();
+
+  void addInterval(DateTime start, DateTime end) {
+    if (!end.isAfter(dayStart) || !start.isBefore(dayEnd)) return;
+    final clippedStart = start.isBefore(dayStart) ? dayStart : start;
+    final clippedEnd = end.isAfter(dayEnd) ? dayEnd : end;
+    if (!clippedEnd.isAfter(clippedStart)) return;
+    final startMin =
+        clippedStart.difference(dayStart).inMilliseconds /
+        Duration.millisecondsPerMinute;
+    final endMin =
+        clippedEnd.difference(dayStart).inMilliseconds /
+        Duration.millisecondsPerMinute;
+    raw.add((startMin: startMin, endMin: endMin));
+  }
+
+  for (final s in schedules) {
+    if (s.durationSeconds <= 0) continue;
+    addInterval(s.start, s.end);
+  }
+  for (final t in recordingTitles) {
+    if (!t.recordingFlag) continue;
+    final start = t.scheduledStart;
+    if (start == null) continue;
+    final durSec = t.scheduledDurationSeconds ?? 0;
+    final DateTime end;
+    if (durSec > 0) {
+      end = start.add(Duration(seconds: durSec));
+    } else {
+      final elapsedSec = current.difference(start).inSeconds;
+      end = start.add(Duration(seconds: math.max(60, elapsedSec)));
+    }
+    addInterval(start, end);
+  }
+
+  if (raw.isEmpty) return const [];
+  raw.sort((a, b) => a.startMin.compareTo(b.startMin));
+  final merged = <({double startMin, double endMin})>[raw.first];
+  for (var i = 1; i < raw.length; i++) {
+    final prev = merged.last;
+    final next = raw[i];
+    if (next.startMin <= prev.endMin) {
+      merged[merged.length - 1] = (
+        startMin: prev.startMin,
+        endMin: math.max(prev.endMin, next.endMin),
+      );
+    } else {
+      merged.add(next);
+    }
+  }
+  return merged;
+}
+
 /// Computes the per-channel column width for an EPG grid of [viewportWidth].
 /// Chooses an exact divisor of [viewportWidth] near 172dp (down to 156dp)
 /// so an integer number of columns fills the viewport edge-to-edge without
@@ -565,6 +634,16 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
         : ref.watch(epgGuideProvider(reg));
     final schedules =
         ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
+    final recordingTitles = ref.watch(titlesProvider(reg).exists)
+        ? (ref
+                  .watch(titlesProvider(reg))
+                  .value
+                  ?.titles
+                  .where((t) => t.recordingFlag)
+                  .toList() ??
+              const <RecordedTitle>[])
+        : const <RecordedTitle>[];
+    final reservedStyle = ref.watch(epgReservedStyleProvider);
     final logos = isBs
         ? (ref.watch(bsChannelLogosProvider(reg)).value ??
               const <int, List<int>>{})
@@ -604,6 +683,8 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
                 ref.watch(showSubchannelsProvider),
               ),
               schedules: schedules,
+              recordingTitles: recordingTitles,
+              reservedStyle: reservedStyle,
               hiddenGenres: ref.watch(hiddenEpgGenresProvider),
               onWatchEvent: (channel) => openLiveChannelForEpg(
                 context,
@@ -637,6 +718,8 @@ class _GuideView extends StatelessWidget {
     required this.reg,
     required this.guide,
     required this.schedules,
+    required this.recordingTitles,
+    required this.reservedStyle,
     required this.hiddenGenres,
     required this.onWatchEvent,
     required this.logos,
@@ -654,6 +737,8 @@ class _GuideView extends StatelessWidget {
   final RegisteredNasne reg;
   final EpgGuide guide;
   final List<RecordSchedule> schedules;
+  final List<RecordedTitle> recordingTitles;
+  final EpgReservedStyle reservedStyle;
 
   /// Genres the viewer marked as not watched (plan 95):
   /// their tiles paint blank.
@@ -698,6 +783,12 @@ class _GuideView extends StatelessWidget {
         : (days.contains(today) ? today : days.first);
     final dayStart = _EpgScreenState._jstDayStart(day);
     final dayEnd = dayStart.add(const Duration(days: 1));
+    final reservedSpans = buildEpgRulerReservedSpans(
+      schedules: schedules,
+      dayStart: dayStart,
+      dayEnd: dayEnd,
+      recordingTitles: recordingTitles,
+    );
 
     // Initial position: one hour before "now" when today is shown.
     if (!scrolledToNow && day == today) {
@@ -731,7 +822,12 @@ class _GuideView extends StatelessWidget {
                 child: Column(
                   children: [
                     const SizedBox(height: _headerHeight),
-                    Expanded(child: _TimeRuler(controller: rulerController)),
+                    Expanded(
+                      child: _TimeRuler(
+                        controller: rulerController,
+                        reservedSpans: reservedSpans,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -774,6 +870,7 @@ class _GuideView extends StatelessWidget {
                                   reg: reg,
                                   services: guide.services,
                                   schedules: schedules,
+                                  reservedStyle: reservedStyle,
                                   hiddenGenres: hiddenGenres,
                                   onWatchEvent: onWatchEvent,
                                   dayStart: dayStart,
@@ -889,13 +986,19 @@ class _ChannelHeader extends StatelessWidget {
 }
 
 class _TimeRuler extends StatelessWidget {
-  const _TimeRuler({required this.controller});
+  const _TimeRuler({
+    required this.controller,
+    this.reservedSpans = const [],
+  });
 
   final ScrollController controller;
+  final List<({double startMin, double endMin})> reservedSpans;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final barColor = isDark ? Colors.redAccent : const Color(0xFFD32F2F);
     return SingleChildScrollView(
       controller: controller,
       physics: const NeverScrollableScrollPhysics(),
@@ -903,11 +1006,27 @@ class _TimeRuler extends StatelessWidget {
         height: 24 * 60 * _pxPerMinute,
         child: Stack(
           children: [
+            for (final span in reservedSpans)
+              Positioned(
+                top: span.startMin * _pxPerMinute,
+                right: 0,
+                width: 4,
+                height: math.max(
+                  4.0,
+                  (span.endMin - span.startMin) * _pxPerMinute,
+                ),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: barColor,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
             for (var hour = 0; hour < 24; hour++)
               Positioned(
                 top: hour * 60 * _pxPerMinute + 2,
                 left: 0,
-                right: 0,
+                right: 5,
                 child: Text(
                   '$hour',
                   textAlign: TextAlign.center,
@@ -926,6 +1045,7 @@ class _DayGrid extends StatelessWidget {
     required this.reg,
     required this.services,
     required this.schedules,
+    required this.reservedStyle,
     required this.hiddenGenres,
     required this.onWatchEvent,
     required this.dayStart,
@@ -937,6 +1057,7 @@ class _DayGrid extends StatelessWidget {
   final RegisteredNasne reg;
   final List<EpgServiceGuide> services;
   final List<RecordSchedule> schedules;
+  final EpgReservedStyle reservedStyle;
   final Set<int> hiddenGenres;
   final void Function(Channel channel) onWatchEvent;
   final DateTime dayStart;
@@ -994,6 +1115,7 @@ class _DayGrid extends StatelessWidget {
                               event.genreLevel1,
                               hiddenGenres,
                             ),
+                            reservedStyle: reservedStyle,
                             matchedSchedule: findMatchingSchedule(
                               schedules,
                               services[i].channel,
@@ -1030,6 +1152,7 @@ class _EventTile extends StatefulWidget {
     required this.reg,
     required this.dayStart,
     required this.suppressed,
+    required this.reservedStyle,
     this.matchedSchedule,
     required this.onWatch,
   });
@@ -1045,6 +1168,7 @@ class _EventTile extends StatefulWidget {
   /// surface colour — no tint, no text — so it does not draw
   /// the eye. The slot and the tap (the detail dialog) stay.
   final bool suppressed;
+  final EpgReservedStyle reservedStyle;
 
   /// Existing scheduled recording matching this broadcast event, if any.
   final RecordSchedule? matchedSchedule;
@@ -1079,19 +1203,30 @@ class _EventTileState extends State<_EventTile> {
     final height = math.max(10, (endMin - startMin) * _pxPerMinute - 1);
     final title = event.title;
     final timeText = formatTimeJst(event.start);
+    final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
+    final reservedBorderColor = isDark
+        ? Colors.redAccent
+        : const Color(0xFFD32F2F);
+    final useReservedFill =
+        isReserved && widget.reservedStyle == EpgReservedStyle.fill;
+    final useReservedBorder =
+        isReserved && widget.reservedStyle == EpgReservedStyle.border;
+    final reservedDotColor = useReservedFill
+        ? Colors.white
+        : reservedBorderColor;
     final timeStyle = theme.textTheme.labelSmall?.copyWith(
-      color: theme.colorScheme.primary,
+      color: useReservedFill ? Colors.white : theme.colorScheme.primary,
       fontWeight: FontWeight.bold,
+    );
+    final titleStyle = theme.textTheme.bodySmall?.copyWith(
+      color: useReservedFill ? Colors.white : null,
     );
     // Title lines that fit under the time line: the time line is
     // about 16px at the labelSmall size and a title line about
     // 17px, with 2px of vertical padding at each edge.
     final maxTitleLines = ((height - 4 - 16) / 17).floor();
-    final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
-    final reservedBorderColor = isDark
-        ? Colors.redAccent
-        : const Color(0xFFD32F2F);
-    final Widget content = widget.suppressed
+    final hideContent = widget.suppressed && !useReservedFill;
+    final Widget content = hideContent
         ? const SizedBox.expand()
         : maxTitleLines >= 1
         ? Padding(
@@ -1105,7 +1240,7 @@ class _EventTileState extends State<_EventTile> {
                       Icon(
                         Icons.fiber_manual_record,
                         size: 10,
-                        color: reservedBorderColor,
+                        color: reservedDotColor,
                       ),
                       const SizedBox(width: 2),
                     ],
@@ -1123,7 +1258,7 @@ class _EventTileState extends State<_EventTile> {
                   Expanded(
                     child: Text(
                       title,
-                      style: theme.textTheme.bodySmall,
+                      style: titleStyle,
                       overflow: TextOverflow.ellipsis,
                       maxLines: maxTitleLines.clamp(1, 4),
                     ),
@@ -1142,7 +1277,7 @@ class _EventTileState extends State<_EventTile> {
                   Icon(
                     Icons.fiber_manual_record,
                     size: 9,
-                    color: reservedBorderColor,
+                    color: reservedDotColor,
                   ),
                   const SizedBox(width: 2),
                 ],
@@ -1155,7 +1290,7 @@ class _EventTileState extends State<_EventTile> {
                   Expanded(
                     child: Text(
                       title,
-                      style: theme.textTheme.bodySmall?.copyWith(
+                      style: titleStyle?.copyWith(
                         fontSize: 10,
                         height: 1.1,
                       ),
@@ -1179,7 +1314,7 @@ class _EventTileState extends State<_EventTile> {
                 borderRadius: BorderRadius.circular(3),
                 border: Border.all(color: focusBorderColor, width: 3),
               )
-            : isReserved
+            : useReservedBorder
             ? BoxDecoration(
                 borderRadius: BorderRadius.circular(3),
                 border: Border.all(color: reservedBorderColor, width: 2.5),
@@ -1190,8 +1325,11 @@ class _EventTileState extends State<_EventTile> {
           // plan 85 item 10); events without a known genre
           // keep the neutral colour they have always had.
           // A suppressed genre (plan 95) paints the plain
-          // surface instead, with no text below.
-          color: widget.suppressed
+          // surface instead, with no text below (unless solid-filled for a
+          // scheduled recording).
+          color: useReservedFill
+              ? epgReservedFillColor
+              : widget.suppressed
               ? theme.colorScheme.surface
               : epgGenreTileColor(
                   genreLevel1: event.genreLevel1,
@@ -1222,7 +1360,7 @@ class _EventTileState extends State<_EventTile> {
               fit: StackFit.expand,
               children: [
                 content,
-                if (_focused && isReserved)
+                if (_focused && useReservedBorder)
                   Positioned.fill(
                     child: IgnorePointer(
                       child: Padding(

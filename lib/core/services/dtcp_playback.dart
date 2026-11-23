@@ -300,6 +300,9 @@ class _DtcpPlaybackSession implements PlaybackSession, StreamTransferMetrics {
   DateTime? get lastByteServedAt => _proxy.lastByteServedAt;
 
   @override
+  int get consecutiveReconnectErrors => _proxy.consecutiveReconnectErrors;
+
+  @override
   Future<void> stop() async {
     if (_stopped) return;
     _stopped = true;

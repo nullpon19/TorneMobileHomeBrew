@@ -213,6 +213,40 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '録画予約済みの表示',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<EpgReservedStyle>(
+                  segments: const [
+                    ButtonSegment(
+                      value: EpgReservedStyle.fill,
+                      label: Text('赤塗りつぶし'),
+                    ),
+                    ButtonSegment(
+                      value: EpgReservedStyle.border,
+                      label: Text('赤枠'),
+                    ),
+                  ],
+                  selected: {ref.watch(epgReservedStyleProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(epgReservedStyleProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '番組表で録画予約が入っている番組を目立たせる表示スタイルを選びます。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
           const Divider(),
           _sectionTitle(context, '再生'),
           Padding(
@@ -385,7 +419,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Text(
               '発見にはローカルネットワークへのアクセス許可が必要です (iOS では許可ダイアログが'
               '表示される場合があります)。発見できない環境では手動登録を使ってください。\n\n'
-              'torne mobile HB $appVersionLabel',
+              'torne HB FireTV $appVersionLabel',
             ),
           ),
         ],

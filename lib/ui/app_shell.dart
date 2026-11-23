@@ -13,6 +13,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../app/providers.dart';
 import '../app/state.dart';
+import '../core/core.dart';
 import 'epg_screen.dart';
 import 'home_screen.dart';
 import 'live_screen.dart';
@@ -77,6 +78,7 @@ class AppShell extends ConsumerStatefulWidget {
 class _AppShellState extends ConsumerState<AppShell> {
   static const _destinations = AppShell._destinations;
   bool _exitDialogOpen = false;
+  bool _userMovedIntoHomePane = false;
   final FocusNode _railFocusNode = FocusNode(debugLabel: 'appShellRail');
   late final List<GlobalKey> _railLabelKeys = List<GlobalKey>.generate(
     _destinations.length,
@@ -84,9 +86,44 @@ class _AppShellState extends ConsumerState<AppShell> {
   );
 
   @override
+  void initState() {
+    super.initState();
+    _railFocusNode.addListener(_handleRailFocusChange);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_railFocusNode.context != null && !_railFocusNode.hasFocus) {
+        _focusSelectedRailDestination(ref.read(tabIndexProvider));
+      }
+    });
+  }
+
+  @override
   void dispose() {
+    _railFocusNode.removeListener(_handleRailFocusChange);
     _railFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handleRailFocusChange() {
+    if (_railFocusNode.hasFocus) {
+      _userMovedIntoHomePane = false;
+    }
+  }
+
+  void _restoreHomeRailFocusIfNeeded() {
+    if (ref.read(tabIndexProvider) != AppTabs.home || _userMovedIntoHomePane) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (ref.read(tabIndexProvider) != AppTabs.home ||
+          _userMovedIntoHomePane) {
+        return;
+      }
+      if (_railFocusNode.context != null && !_railFocusNode.hasFocus) {
+        _focusSelectedRailDestination(AppTabs.home);
+      }
+    });
   }
 
   bool _focusSelectedRailDestination(int activeTab) {
@@ -154,6 +191,14 @@ class _AppShellState extends ConsumerState<AppShell> {
   @override
   Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
+    ref.listen<AsyncValue<List<RegisteredNasne>>>(
+      registrationsProvider,
+      (prev, next) => _restoreHomeRailFocusIfNeeded(),
+    );
+    ref.listen<RegisteredNasne?>(
+      selectedRegistrationProvider,
+      (prev, next) => _restoreHomeRailFocusIfNeeded(),
+    );
     final screens = const [
       HomeScreen(),
       LiveScreen(),
@@ -162,7 +207,12 @@ class _AppShellState extends ConsumerState<AppShell> {
       EpgScreen(),
       SettingsScreen(),
     ];
-    void select(int index) => ref.read(tabIndexProvider.notifier).select(index);
+    void select(int index) {
+      if (index == AppTabs.home) {
+        _userMovedIntoHomePane = false;
+      }
+      ref.read(tabIndexProvider.notifier).select(index);
+    }
 
     return PopScope(
       canPop: false,
@@ -180,7 +230,13 @@ class _AppShellState extends ConsumerState<AppShell> {
       child: TailscaleGuard(
         child: LayoutBuilder(
         builder: (context, constraints) {
-          final body = IndexedStack(index: tab, children: screens);
+          final body = IndexedStack(
+            index: tab,
+            children: [
+              for (var i = 0; i < screens.length; i++)
+                ExcludeFocus(excluding: i != tab, child: screens[i]),
+            ],
+          );
           if (constraints.maxWidth >= railBreakpoint) {
             final reportedTopInset = MediaQuery.paddingOf(context).top;
             final extraTop = wideLayoutMinTopInset > reportedTopInset
@@ -189,51 +245,93 @@ class _AppShellState extends ConsumerState<AppShell> {
             return Scaffold(
               body: Padding(
                 padding: EdgeInsets.only(top: extraTop),
-                child: Row(
-                  children: [
-                    Focus(
-                      focusNode: _railFocusNode,
-                      canRequestFocus: false,
-                      skipTraversal: true,
-                      child: NavigationRail(
-                        selectedIndex: tab,
-                        onDestinationSelected: select,
-                        labelType: NavigationRailLabelType.all,
-                        destinations: [
-                          for (int i = 0; i < _destinations.length; i++)
-                            NavigationRailDestination(
-                              icon: Icon(_destinations[i].icon),
-                              selectedIcon: Icon(_destinations[i].selectedIcon),
-                              label: Text(
-                                _destinations[i].label,
-                                key: _railLabelKeys[i],
+                child: FocusTraversalGroup(
+                  policy: OrderedTraversalPolicy(),
+                  child: Row(
+                    children: [
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(0),
+                        child: FocusTraversalGroup(
+                          policy: ReadingOrderTraversalPolicy(),
+                          child: Focus(
+                            focusNode: _railFocusNode,
+                            canRequestFocus: false,
+                            skipTraversal: true,
+                            onKeyEvent: (node, event) {
+                              if ((event is KeyDownEvent ||
+                                      event is KeyRepeatEvent) &&
+                                  event.logicalKey ==
+                                      LogicalKeyboardKey.arrowRight &&
+                                  ref.read(tabIndexProvider) == AppTabs.home) {
+                                _userMovedIntoHomePane = true;
+                              }
+                              return KeyEventResult.ignored;
+                            },
+                            child: NavigationRail(
+                              selectedIndex: tab,
+                              onDestinationSelected: select,
+                              labelType: NavigationRailLabelType.all,
+                              destinations: [
+                                for (int i = 0; i < _destinations.length; i++)
+                                  NavigationRailDestination(
+                                    icon: Icon(_destinations[i].icon),
+                                    selectedIcon: Icon(
+                                      _destinations[i].selectedIcon,
+                                    ),
+                                    label: Text(
+                                      _destinations[i].label,
+                                      key: _railLabelKeys[i],
+                                    ),
+                                  ),
+                              ],
+                              trailing: Padding(
+                                padding: const EdgeInsets.only(top: 12),
+                                child: IconButton(
+                                  tooltip: 'Tailscale を開く',
+                                  icon: const Icon(Icons.vpn_lock),
+                                  onPressed: () async {
+                                    final ok = await ref
+                                        .read(fireTvHelperProvider)
+                                        .launchTailscale();
+                                    if (!ok && context.mounted) {
+                                      ScaffoldMessenger.maybeOf(
+                                        context,
+                                      )?.showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'Tailscale アプリが見つかりませんでした',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  },
+                                ),
                               ),
                             ),
-                        ],
-                        trailing: Padding(
-                          padding: const EdgeInsets.only(top: 12),
-                          child: IconButton(
-                            tooltip: 'Tailscale を開く',
-                            icon: const Icon(Icons.vpn_lock),
-                            onPressed: () async {
-                              final ok = await ref
-                                  .read(fireTvHelperProvider)
-                                  .launchTailscale();
-                              if (!ok && context.mounted) {
-                                ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-                                  const SnackBar(
-                                    content: Text('Tailscale アプリが見つかりませんでした'),
-                                  ),
-                                );
-                              }
-                            },
                           ),
                         ),
                       ),
-                    ),
-                    const VerticalDivider(thickness: 1, width: 1),
-                    Expanded(child: body),
-                  ],
+                      const VerticalDivider(thickness: 1, width: 1),
+                      Expanded(
+                        child: FocusTraversalOrder(
+                          order: const NumericFocusOrder(1),
+                          child: FocusTraversalGroup(
+                            policy: ReadingOrderTraversalPolicy(),
+                            child: Listener(
+                              behavior: HitTestBehavior.translucent,
+                              onPointerDown: (_) {
+                                if (ref.read(tabIndexProvider) ==
+                                    AppTabs.home) {
+                                  _userMovedIntoHomePane = true;
+                                }
+                              },
+                              child: body,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             );
