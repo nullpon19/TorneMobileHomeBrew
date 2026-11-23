@@ -373,6 +373,7 @@ class _TitleListState extends ConsumerState<_TitleList> {
   String? _channelKey;
   String? _genre;
   bool _unwatchedOnly = false;
+  final Set<String> _expandedGroups = {};
 
   @override
   void dispose() {
@@ -493,6 +494,13 @@ class _TitleListState extends ConsumerState<_TitleList> {
                   selected: _unwatchedOnly,
                   onSelected: (value) => setState(() => _unwatchedOnly = value),
                 ),
+                FilterChip(
+                  label: const Text('番組まとめ'),
+                  selected: ref.watch(groupTitlesProvider),
+                  onSelected: (value) {
+                    ref.read(groupTitlesProvider.notifier).set(value);
+                  },
+                ),
                 if (filter.isActive) ...[
                   TextButton(
                     onPressed: _clearFilters,
@@ -579,6 +587,24 @@ class _TitleListState extends ConsumerState<_TitleList> {
         ),
       );
     }
+    final groupTitles = ref.watch(groupTitlesProvider);
+    final List<_TitleListEntry> entries;
+    if (groupTitles) {
+      final groups = groupRecordedTitles(view, sort: _sort);
+      entries = [
+        for (final group in groups)
+          if (group.isFolder) ...[
+            _FolderTitleEntry(group),
+            if (_expandedGroups.contains(group.key))
+              for (final child in group.titles)
+                _ItemTitleEntry(child, indented: true),
+          ] else
+            _ItemTitleEntry(group.titles.first),
+      ];
+    } else {
+      entries = [for (final t in view) _ItemTitleEntry(t)];
+    }
+
     return LayoutBuilder(
       builder: (context, constraints) {
         // The tap behaviour and the pane layout must agree
@@ -594,42 +620,77 @@ class _TitleListState extends ConsumerState<_TitleList> {
         // a title appeared to do nothing at all.
         final twoPane = constraints.maxWidth >= twoPaneBreakpoint;
         final listView = ListView.builder(
-          itemCount: view.length,
+          itemCount: entries.length,
           itemBuilder: (context, i) {
-            final t = view[i];
-            return ListTile(
-              selected: t.id == widget.selectedId,
-              leading: _TitleLeading(reg: reg, title: t),
-              title: Text(t.title),
-              subtitle: Text(
-                '${t.scheduledStart != null ? formatDateTimeJst(t.scheduledStart!) : ''}'
-                '${t.scheduledDurationSeconds != null ? ' (${formatDurationSeconds(t.scheduledDurationSeconds!)})' : ''}'
-                '${t.channelName != null ? ' ${t.channelName}' : ''}',
-              ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (t.protectFlag) const Icon(Icons.lock, size: 16),
-                  if (t.newFlag)
-                    const Padding(
-                      padding: EdgeInsets.only(left: 4),
-                      child: Icon(Icons.fiber_new, size: 18),
+            final entry = entries[i];
+            switch (entry) {
+              case _FolderTitleEntry(:final group):
+                final expanded = _expandedGroups.contains(group.key);
+                return _TitleGroupTile(
+                  key: ValueKey('group:${group.key}'),
+                  group: group,
+                  expanded: expanded,
+                  onTap: () {
+                    setState(() {
+                      if (!_expandedGroups.add(group.key)) {
+                        _expandedGroups.remove(group.key);
+                      }
+                    });
+                  },
+                );
+              case _ItemTitleEntry(:final title, :final indented):
+                final t = title;
+                final tile = ListTile(
+                  key: indented ? null : ValueKey('title:${t.id}'),
+                  selected: t.id == widget.selectedId,
+                  leading: _TitleLeading(reg: reg, title: t),
+                  title: Text(t.title),
+                  subtitle: Text(
+                    '${t.scheduledStart != null ? formatDateTimeJst(t.scheduledStart!) : ''}'
+                    '${t.scheduledDurationSeconds != null ? ' (${formatDurationSeconds(t.scheduledDurationSeconds!)})' : ''}'
+                    '${t.channelName != null ? ' ${t.channelName}' : ''}',
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (t.protectFlag) const Icon(Icons.lock, size: 16),
+                      if (t.newFlag)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 4),
+                          child: Icon(Icons.fiber_new, size: 18),
+                        ),
+                      if (t.copyCountRemaining != null)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 6),
+                          child: Text('残り ${t.copyCountRemaining} 回'),
+                        ),
+                    ],
+                  ),
+                  onTap: () => widget.onSelect(t, twoPane),
+                  onLongPress: () => deleteRecordedTitle(
+                    context: context,
+                    ref: ref,
+                    reg: reg,
+                    title: t,
+                  ),
+                );
+                if (!indented) return tile;
+                return Padding(
+                  key: ValueKey('title:${t.id}'),
+                  padding: const EdgeInsets.only(left: 20),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      border: Border(
+                        left: BorderSide(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                          width: 2,
+                        ),
+                      ),
                     ),
-                  if (t.copyCountRemaining != null)
-                    Padding(
-                      padding: const EdgeInsets.only(left: 6),
-                      child: Text('残り ${t.copyCountRemaining} 回'),
-                    ),
-                ],
-              ),
-              onTap: () => widget.onSelect(t, twoPane),
-              onLongPress: () => deleteRecordedTitle(
-                context: context,
-                ref: ref,
-                reg: reg,
-                title: t,
-              ),
-            );
+                    child: tile,
+                  ),
+                );
+            }
           },
         );
         if (!twoPane) return listView;
@@ -1102,5 +1163,84 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
     } finally {
       if (mounted) setState(() => _starting = false);
     }
+  }
+}
+
+sealed class _TitleListEntry {
+  const _TitleListEntry();
+}
+
+final class _FolderTitleEntry extends _TitleListEntry {
+  const _FolderTitleEntry(this.group);
+  final TitleGroup group;
+}
+
+final class _ItemTitleEntry extends _TitleListEntry {
+  const _ItemTitleEntry(this.title, {this.indented = false});
+  final RecordedTitle title;
+  final bool indented;
+}
+
+class _TitleGroupTile extends StatelessWidget {
+  const _TitleGroupTile({
+    super.key,
+    required this.group,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  final TitleGroup group;
+  final bool expanded;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final earliest = group.earliestStart;
+    final latest = group.latestStart;
+    final String? dateRange;
+    if (earliest != null && latest != null) {
+      final earliestText = formatDateJst(earliest);
+      final latestText = formatDateJst(latest);
+      dateRange = earliestText == latestText
+          ? earliestText
+          : '$earliestText 〜 $latestText';
+    } else {
+      dateRange = null;
+    }
+
+    return ListTile(
+      leading: SizedBox(
+        width: 48,
+        height: 36,
+        child: Center(
+          child: Icon(
+            expanded ? Icons.folder_open : Icons.folder,
+            color: colorScheme.primary,
+          ),
+        ),
+      ),
+      title: Text(group.label, maxLines: 2, overflow: TextOverflow.ellipsis),
+      subtitle: dateRange != null ? Text(dateRange) : null,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (group.allProtected)
+            const Padding(
+              padding: EdgeInsets.only(right: 4),
+              child: Icon(Icons.lock, size: 16),
+            ),
+          if (group.hasUnwatched)
+            const Padding(
+              padding: EdgeInsets.only(right: 6),
+              child: Icon(Icons.fiber_new, size: 18),
+            ),
+          Text('全 ${group.titles.length} 本'),
+          const SizedBox(width: 4),
+          Icon(expanded ? Icons.expand_less : Icons.expand_more),
+        ],
+      ),
+      onTap: onTap,
+    );
   }
 }

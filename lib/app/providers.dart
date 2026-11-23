@@ -338,6 +338,39 @@ final nightModeProvider = NotifierProvider<NightModeNotifier, bool>(
   NightModeNotifier.new,
 );
 
+/// Persisted preference for automatic series folder grouping in Recorded Titles
+/// (default on).
+class GroupTitlesNotifier extends Notifier<bool> {
+  static const _key = 'firetv_group_titles';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == 'true' && !state) {
+        state = true;
+      } else if (raw == 'false' && state) {
+        state = false;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final groupTitlesProvider = NotifierProvider<GroupTitlesNotifier, bool>(
+  GroupTitlesNotifier.new,
+);
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {

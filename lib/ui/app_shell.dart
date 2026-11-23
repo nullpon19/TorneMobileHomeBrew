@@ -5,6 +5,9 @@
 /// tablets and wider layouts.
 library;
 
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -32,8 +35,11 @@ const double railBreakpoint = 720;
 /// is unaffected.
 const double wideLayoutMinTopInset = 24;
 
-class AppShell extends ConsumerWidget {
+class AppShell extends ConsumerStatefulWidget {
   const AppShell({super.key});
+
+  @override
+  ConsumerState<AppShell> createState() => _AppShellState();
 
   static const _destinations = [
     (icon: Icons.home_outlined, selectedIcon: Icons.home, label: 'ホーム'),
@@ -60,8 +66,44 @@ class AppShell extends ConsumerWidget {
     (icon: Icons.settings_outlined, selectedIcon: Icons.settings, label: '設定'),
   ];
 
+}
+
+class _AppShellState extends ConsumerState<AppShell> {
+  static const _destinations = AppShell._destinations;
+  bool _exitDialogOpen = false;
+
+  Future<void> _confirmExit() async {
+    if (_exitDialogOpen || !mounted) return;
+    _exitDialogOpen = true;
+    try {
+      final shouldExit = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('アプリを終了しますか？'),
+          content: const Text('再生や操作を終了してホーム画面に戻ります。'),
+          actions: [
+            TextButton(
+              autofocus: true,
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('キャンセル'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('終了する'),
+            ),
+          ],
+        ),
+      );
+      if (shouldExit == true) {
+        await SystemNavigator.pop();
+      }
+    } finally {
+      _exitDialogOpen = false;
+    }
+  }
+
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
     final screens = const [
       HomeScreen(),
@@ -73,8 +115,14 @@ class AppShell extends ConsumerWidget {
     ];
     void select(int index) => ref.read(tabIndexProvider.notifier).select(index);
 
-    return TailscaleGuard(
-      child: LayoutBuilder(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop || _exitDialogOpen) return;
+        unawaited(_confirmExit());
+      },
+      child: TailscaleGuard(
+        child: LayoutBuilder(
         builder: (context, constraints) {
           final body = IndexedStack(index: tab, children: screens);
           if (constraints.maxWidth >= railBreakpoint) {
@@ -142,6 +190,7 @@ class AppShell extends ConsumerWidget {
             ),
           );
         },
+        ),
       ),
     );
   }

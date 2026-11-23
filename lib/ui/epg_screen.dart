@@ -898,7 +898,7 @@ class _EventTileState extends State<_EventTile> {
     final maxTitleLines = ((height - 4 - 16) / 17).floor();
     final focusBorderColor = isDark
         ? Colors.amberAccent
-        : const Color(0xFFFF6F00);
+        : const Color(0xFFD32F2F);
     return Positioned(
       top: top,
       left: 1,

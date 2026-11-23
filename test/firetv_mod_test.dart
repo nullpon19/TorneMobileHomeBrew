@@ -16,12 +16,14 @@ import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
 import 'package:tmhb/main.dart';
+import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
+import 'package:tmhb/ui/title_list_filter.dart';
 import 'package:tmhb/ui/titles_screen.dart';
 import 'package:tmhb/ui/widgets.dart';
 
@@ -781,7 +783,329 @@ void main() {
         final box = decorated.decoration as BoxDecoration;
         expect(box.border, isNotNull);
         expect(box.border!.top.width, 3);
+        expect(box.border!.top.color, const Color(0xFFD32F2F));
       },
     );
   });
+
+  group('Recorded title series grouping', () {
+    RecordedTitle title({
+      required String id,
+      required String titleText,
+      String? startJst,
+      bool protectFlag = false,
+      bool newFlag = false,
+    }) => RecordedTitle(
+      id: id,
+      title: titleText,
+      scheduledStart: startJst != null ? DateTime.parse(startJst) : null,
+      protectFlag: protectFlag,
+      newFlag: newFlag,
+    );
+
+    test('groups normalized episodes and protects distinct singletons', () {
+      final items = [
+        title(
+          id: '1',
+          titleText: '[新]わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]',
+          startJst: '2024-10-06T08:30:00+09:00',
+          newFlag: true,
+        ),
+        title(
+          id: '2',
+          titleText: 'わんだふるぷりきゅあ! #37 みんなで初デート!?[デ][字]',
+          startJst: '2024-10-13T08:29:00+09:00',
+        ),
+        title(
+          id: '3',
+          titleText: '爆上戦隊ブンブンジャー バクアゲ36 夢へと走る道[デ][字]',
+          startJst: '2024-11-10T09:30:00+09:00',
+          protectFlag: true,
+        ),
+        title(
+          id: '4',
+          titleText: '爆上戦隊ブンブンジャー バクアゲ37 秘密のテスト[終][字]',
+          startJst: '2024-11-17T09:30:00+09:00',
+          protectFlag: true,
+        ),
+        title(
+          id: '4b',
+          titleText: '爆上戦隊ブンブンジャー バクアゲ38 テスト回[字]',
+          startJst: '2024-11-24T09:30:00+09:00',
+          protectFlag: true,
+        ),
+        title(
+          id: '5',
+          titleText: '明治安田J2リーグ 秋田×山形',
+          startJst: '2024-06-23T14:00:00+09:00',
+        ),
+        title(
+          id: '6',
+          titleText: '明治安田J2リーグ 秋田×仙台',
+          startJst: '2024-09-29T14:00:00+09:00',
+        ),
+        title(
+          id: '7',
+          titleText: 'ヨルタモリ',
+          startJst: '2015-04-26T23:15:00+09:00',
+        ),
+        title(
+          id: '8',
+          titleText: 'ヨルタモリ 特別編[字]',
+          startJst: '2015-09-13T23:15:00+09:00',
+        ),
+        title(
+          id: '9',
+          titleText: '296ももクロ団 #7',
+          startJst: '2012-12-08T00:30:00+09:00',
+        ),
+        title(
+          id: '10',
+          titleText: '298ももクロ式見学ガイド もも見!! #20',
+          startJst: '2012-11-18T23:50:00+09:00',
+        ),
+        title(
+          id: '11',
+          titleText: '録画タイトルA',
+          startJst: '2026-11-15T11:34:46+09:00',
+        ),
+        title(
+          id: '12',
+          titleText: '録画タイトルB',
+          startJst: '2026-11-15T12:00:00+09:00',
+        ),
+        title(
+          id: '13',
+          titleText: '081モヤモヤさまぁ〜ず2',
+          startJst: '2017-05-06T14:00:00+09:00',
+        ),
+      ];
+
+      final groups = groupRecordedTitles(
+        items,
+        sort: TitleSortOrder.recordedNewest,
+      );
+      final folders = groups.where((g) => g.isFolder).toList();
+      final singles = groups.where((g) => !g.isFolder).toList();
+
+      expect(folders.map((g) => g.label).toSet(), {
+        'わんだふるぷりきゅあ!',
+        '爆上戦隊ブンブンジャー バクアゲ',
+        '明治安田J2リーグ',
+        'ヨルタモリ',
+      });
+      expect(singles.map((g) => g.titles.single.id).toSet(), {
+        '9',
+        '10',
+        '11',
+        '12',
+        '13',
+      });
+
+      final precure = folders.firstWhere((g) => g.label == 'わんだふるぷりきゅあ!');
+      expect(precure.hasUnwatched, isTrue);
+      expect(precure.allProtected, isFalse);
+      expect(precure.titles.map((t) => t.id), ['2', '1']);
+
+      final boon = folders.firstWhere((g) => g.label == '爆上戦隊ブンブンジャー バクアゲ');
+      expect(boon.label, '爆上戦隊ブンブンジャー バクアゲ');
+      expect(boon.titles.length, 3);
+      expect(boon.allProtected, isTrue);
+      expect(boon.hasUnwatched, isFalse);
+    });
+
+    test('outer folders and expanded episodes match selected TitleSortOrder', () {
+      final items = [
+        title(
+          id: 'p1',
+          titleText: 'わんだふるぷりきゅあ! #36',
+          startJst: '2024-10-06T08:30:00+09:00',
+        ),
+        title(
+          id: 'p2',
+          titleText: 'わんだふるぷりきゅあ! #37',
+          startJst: '2024-10-13T08:30:00+09:00',
+        ),
+        title(
+          id: 'b1',
+          titleText: 'あいうえお番組 #1',
+          startJst: '2024-09-01T10:00:00+09:00',
+        ),
+        title(
+          id: 'b2',
+          titleText: 'あいうえお番組 #2',
+          startJst: '2024-09-08T10:00:00+09:00',
+        ),
+      ];
+
+      final newest = groupRecordedTitles(
+        items,
+        sort: TitleSortOrder.recordedNewest,
+      );
+      expect(newest.map((g) => g.label), ['わんだふるぷりきゅあ!', 'あいうえお番組']);
+      expect(newest.first.titles.map((t) => t.id), ['p2', 'p1']);
+
+      final oldest = groupRecordedTitles(
+        items,
+        sort: TitleSortOrder.recordedOldest,
+      );
+      expect(oldest.map((g) => g.label), ['あいうえお番組', 'わんだふるぷりきゅあ!']);
+      expect(oldest.last.titles.map((t) => t.id), ['p1', 'p2']);
+
+      final byTitle = groupRecordedTitles(
+        items,
+        sort: TitleSortOrder.titleAsc,
+      );
+      expect(byTitle.map((g) => g.label), ['あいうえお番組', 'わんだふるぷりきゅあ!']);
+      expect(byTitle.last.titles.map((t) => t.id), ['p1', 'p2']);
+    });
+  });
+
+  group('TitlesScreen collapsible series folders & chip', () {
+    testWidgets('collapses series by default, expands inline, and toggles chip', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      const reg = RegisteredNasne(
+        host: '192.0.2.50',
+        udn: 'uuid:titles-group-test',
+        friendlyName: 'nasne',
+        macAddr: '00:11:22:33:44:66',
+      );
+      final items = [
+        RecordedTitle(
+          id: 'e36',
+          title: 'わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]',
+          scheduledStart: DateTime.parse('2024-10-06T08:30:00+09:00'),
+          newFlag: true,
+        ),
+        RecordedTitle(
+          id: 'e37',
+          title: 'わんだふるぷりきゅあ! #37 みんなで初デート!?[デ][字]',
+          scheduledStart: DateTime.parse('2024-10-13T08:30:00+09:00'),
+        ),
+        RecordedTitle(
+          id: 'solo',
+          title: '081モヤモヤさまぁ〜ず2',
+          scheduledStart: DateTime.parse('2017-05-06T14:00:00+09:00'),
+        ),
+      ];
+      final kv = InMemoryKeyValueStore();
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            registrationStoreProvider.overrideWithValue(
+              InMemoryRegistrationStore(const [reg]),
+            ),
+            keyValueStoreProvider.overrideWithValue(kv),
+            titlesProvider(reg).overrideWith(
+              () => _FixedTitlesNotifier(reg, items),
+            ),
+            titleCountsProvider.overrideWith(
+              (ref, r) async => TitleCounts(items.length, 3000),
+            ),
+            titleThumbnailProvider.overrideWith((ref, k) async => null),
+            channelsProvider.overrideWith((ref, r) async => const []),
+          ],
+          child: const MaterialApp(home: TitlesScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Collapsed folder row is shown while individual episodes remain hidden.
+      expect(find.text('わんだふるぷりきゅあ!'), findsOneWidget);
+      expect(find.text('全 2 本'), findsOneWidget);
+      expect(find.text('2024/10/06 〜 2024/10/13'), findsOneWidget);
+      expect(find.text('081モヤモヤさまぁ〜ず2'), findsOneWidget);
+      expect(
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        findsNothing,
+      );
+
+      // Tap folder to expand inline underneath.
+      await tester.tap(find.text('わんだふるぷりきゅあ!'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('わんだふるぷりきゅあ! #37 みんなで初デート!?[デ][字]'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        findsOneWidget,
+      );
+
+      // Toggle grouping OFF via FilterChip and verify persistence.
+      await tester.tap(find.text('番組まとめ'));
+      await tester.pumpAndSettle();
+      expect(find.text('全 2 本'), findsNothing);
+      expect(
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        findsOneWidget,
+      );
+      expect(await kv.read('firetv_group_titles'), 'false');
+    });
+  });
+
+  group('AppShell Back-key exit confirmation', () {
+    testWidgets('shows confirmation dialog on root Back and cancels cleanly', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            registrationStoreProvider.overrideWithValue(
+              InMemoryRegistrationStore(const []),
+            ),
+            keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+            fireTvHelperProvider.overrideWithValue(
+              _FakeFireTvHelper(reachable: true),
+            ),
+          ],
+          child: const MaterialApp(home: AppShell()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('アプリを終了しますか？'), findsNothing);
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      expect(find.text('アプリを終了しますか？'), findsOneWidget);
+      expect(find.text('終了する'), findsOneWidget);
+      final cancelButton = tester.widget<TextButton>(
+        find.ancestor(
+          of: find.text('キャンセル'),
+          matching: find.byType(TextButton),
+        ),
+      );
+      expect(cancelButton.autofocus, isTrue);
+
+      await tester.tap(find.text('キャンセル'));
+      await tester.pumpAndSettle();
+      expect(find.text('アプリを終了しますか？'), findsNothing);
+
+      // Confirm guard resets so Back opens the confirmation again.
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.text('アプリを終了しますか？'), findsOneWidget);
+    });
+  });
+}
+
+class _FixedTitlesNotifier extends TitlesNotifier {
+  _FixedTitlesNotifier(super.reg, this._items);
+  final List<RecordedTitle> _items;
+
+  @override
+  Stream<TitleListProgress> build() =>
+      Stream.value(TitleListProgress(_items, complete: true));
 }
