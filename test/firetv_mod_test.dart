@@ -23,9 +23,12 @@ import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/home_screen.dart';
 import 'package:tmhb/ui/live_recording_policy.dart';
 import 'package:tmhb/ui/live_screen.dart';
+import 'package:tmhb/ui/multi_nasne_policy.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
 import 'package:tmhb/ui/player_error_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
+import 'package:tmhb/ui/schedule_form.dart';
+import 'package:tmhb/ui/schedules_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/title_list_filter.dart';
@@ -3988,6 +3991,1387 @@ void main() {
       },
     );
   });
+
+  group('Phase 21: Remote focus audit, Live/EPG auto-refresh & multi-nasne', () {
+    test('multi-nasne policies select free tuner, failover, and largest-free-space auto schedule', () {
+      const regA = RegisteredNasne(
+        host: '192.0.2.10',
+        udn: 'uuid:a',
+        friendlyName: 'リビングnasne',
+        macAddr: '00:11:22:33:44:55',
+      );
+      const regB = RegisteredNasne(
+        host: '192.0.2.11',
+        udn: 'uuid:b',
+        friendlyName: '書斎nasne',
+        macAddr: '00:11:22:33:44:66',
+      );
+      const chNhkA = LiveChannel(
+        id: '0/video/LiveTuner/DTTB/a1',
+        bandId: '0/video/LiveTuner/DTTB',
+        networkId: 100,
+        transportStreamId: 200,
+        serviceId: 1024,
+        channelName: 'NHK総合',
+        programTitle: '番組A',
+      );
+      const chNhkB = LiveChannel(
+        id: '0/video/LiveTuner/DTTB/b1',
+        bandId: '0/video/LiveTuner/DTTB',
+        networkId: 100,
+        transportStreamId: 200,
+        serviceId: 1024,
+        channelName: 'NHK総合',
+        programTitle: '番組B',
+      );
+      const bandA = [
+        LiveBand(
+          containerId: '0/video/LiveTuner/DTTB',
+          title: '地上デジタル',
+          channels: [chNhkA],
+        ),
+      ];
+      const bandB = [
+        LiveBand(
+          containerId: '0/video/LiveTuner/DTTB',
+          title: '地上デジタル',
+          channels: [chNhkB],
+        ),
+      ];
+
+      final mergedBands = mergeLiveBands(
+        [(reg: regA, bands: bandA), (reg: regB, bands: bandB)],
+        preferredReg: regA,
+      );
+      expect(mergedBands, hasLength(1));
+      expect(mergedBands.first.channels, hasLength(1));
+      expect(mergedBands.first.channels.first.candidates, hasLength(2));
+
+      final now = DateTime.utc(2026, 11, 23, 10, 0);
+      final busyOther = RecordSchedule(
+        id: 's1',
+        start: now.subtract(const Duration(minutes: 10)),
+        durationSeconds: 3600,
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 9999,
+        ),
+        desiredQualityMode: 100,
+        priorityFlag: 0,
+        conditionId: '',
+        desiredMatchingId: '',
+        reservationCreatorId: '',
+        recordDestinationId: 'HDD',
+      );
+      final busySame = RecordSchedule(
+        id: 's2',
+        start: now.subtract(const Duration(minutes: 10)),
+        durationSeconds: 3600,
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 1024,
+        ),
+        desiredQualityMode: 100,
+        priorityFlag: 0,
+        conditionId: '',
+        desiredMatchingId: '',
+        reservationCreatorId: '',
+        recordDestinationId: 'HDD',
+      );
+
+      // regA busy with another channel, regB idle -> selects regB.
+      final pickIdle = selectLiveTunerCandidate(
+        candidates: mergedBands.first.channels.first.candidates,
+        schedulesByHost: {
+          regA.host: [busyOther],
+          regB.host: const [],
+        },
+        now: now,
+        preferredReg: regA,
+      );
+      expect(pickIdle?.target.reg.host, regB.host);
+      expect(pickIdle?.sameChannelRecording, isFalse);
+
+      // regA busy other, regB recording same channel -> selects regB with sameChannelRecording=true.
+      final pickSame = selectLiveTunerCandidate(
+        candidates: mergedBands.first.channels.first.candidates,
+        schedulesByHost: {
+          regA.host: [busyOther],
+          regB.host: [busySame],
+        },
+        now: now,
+        preferredReg: regA,
+      );
+      expect(pickSame?.target.reg.host, regB.host);
+      expect(pickSame?.sameChannelRecording, isTrue);
+
+      // Both busy with other channels -> null.
+      final pickNone = selectLiveTunerCandidate(
+        candidates: mergedBands.first.channels.first.candidates,
+        schedulesByHost: {
+          regA.host: [busyOther],
+          regB.host: [busyOther],
+        },
+        now: now,
+      );
+      expect(pickNone, isNull);
+
+      // Auto schedule picks conflict-free unit with largest free HDD space.
+      final autoPicked = selectAutoScheduleNasne(
+        candidates: const [regA, regB],
+        hasConflictByHost: {regA.host: false, regB.host: false},
+        freeBytesByHost: {
+          regA.host: 100 * 1024 * 1024,
+          regB.host: 500 * 1024 * 1024,
+        },
+        preferredReg: regA,
+      );
+      expect(autoPicked?.host, regB.host);
+
+      final autoAvoidConflict = selectAutoScheduleNasne(
+        candidates: const [regA, regB],
+        hasConflictByHost: {regA.host: true, regB.host: false},
+        freeBytesByHost: {
+          regA.host: 900 * 1024 * 1024,
+          regB.host: 100 * 1024 * 1024,
+        },
+      );
+      expect(autoAvoidConflict?.host, regB.host);
+    });
+
+    testWidgets(
+      'EpgScreen 960x540 AppBar Search & Refresh are reachable via D-pad despite scrolled tiles',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:epg-960',
+          friendlyName: 'メインnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final dayStartUtc = DateTime.utc(
+          jstNow.year,
+          jstNow.month,
+          jstNow.day,
+        ).subtract(const Duration(hours: 9));
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            for (var c = 1; c <= 6; c++)
+              EpgServiceGuide(
+                channel: Channel(
+                  broadcastingType: 2,
+                  networkId: 0x1000 + c,
+                  transportStreamId: 0x2000 + c,
+                  serviceId: 0x3000 + c,
+                  serviceType: 1,
+                  channelNumber: c,
+                  serviceName: 'テスト局$c',
+                ),
+                events: [
+                  for (var h = 0; h < 24; h++)
+                    EpgEvent(
+                      eventId: c * 100 + h,
+                      start: dayStartUtc.add(Duration(hours: h)),
+                      duration: const Duration(hours: 1),
+                      title: '番組$c-$h',
+                      genreLevel1: 3,
+                    ),
+                ],
+              ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'メインnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith(
+                (ref, r) async => [for (final s in guide.services) s.channel],
+              ),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+
+        // Scroll grid far down so upper events overlap AppBar vertically.
+        final lateTile = find.text('番組5-20', skipOffstage: false);
+        await tester.ensureVisible(lateTile);
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(find.text('番組5-20'))).requestFocus();
+        await tester.pump();
+
+        // Jump to top bar -> starts at '地デジ' in SegmentedButton.
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump();
+        expect(
+          find.ancestor(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byType(SegmentedButton<int>),
+          ),
+          findsOneWidget,
+        );
+
+        // ArrowRight steps: '地デジ' -> 'BS' -> Search -> Refresh.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(
+          find.ancestor(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byType(SegmentedButton<int>),
+          ),
+          findsOneWidget,
+        );
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(
+          find.descendant(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byIcon(Icons.search),
+          ),
+          findsOneWidget,
+        );
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        expect(
+          find.descendant(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byIcon(Icons.refresh),
+          ),
+          findsOneWidget,
+        );
+
+        // ArrowDown from top bar goes to ChoiceChip, ArrowUp returns to AppBar,
+        // and ArrowDown from ChoiceChip enters a visible grid tile.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        expect(
+          find.ancestor(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byType(ChoiceChip),
+          ),
+          findsOneWidget,
+        );
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        final gridFocusCtx = FocusManager.instance.primaryFocus?.context;
+        expect(gridFocusCtx, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(gridFocusCtx!.widget),
+            matching: find.byType(ChoiceChip),
+          ),
+          findsNothing,
+        );
+
+        // Jump back to top bar, ArrowLeft from '地デジ' returns to NavigationRail.
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(
+          find.ancestor(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byType(NavigationRail),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'AppShell right-pane ArrowUp reaches AppBar refresh from Home and Live',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:right-up',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const liveBands = [
+          LiveBand(
+            containerId: '0/video/LiveTuner/DTTB',
+            title: '地上デジタル',
+            channels: [
+              LiveChannel(
+                id: 'ch1',
+                bandId: '0/video/LiveTuner/DTTB',
+                channelName: '総合テレビ',
+                programTitle: 'テスト放送',
+              ),
+            ],
+          ),
+          LiveBand(
+            containerId: '0/video/LiveTuner/BS',
+            title: 'BS',
+            channels: [
+              LiveChannel(
+                id: 'ch2',
+                bandId: '0/video/LiveTuner/BS',
+                channelName: 'BS1',
+                programTitle: 'BS放送',
+              ),
+            ],
+          ),
+        ];
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'テストnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith((ref, r) async => liveBands),
+              channelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith(
+                (ref, r) async => const EpgGuide(broadcastingType: 2, services: []),
+              ),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Home: move into right pane ('本体情報'), press ArrowUp -> reaches Refresh IconButton.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+        expect(
+          find.ancestor(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byType(AppBar),
+          ),
+          findsOneWidget,
+        );
+
+        // Live: switch tab, focus '地デジ', press ArrowUp -> reaches Refresh IconButton.
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.live);
+        await tester.pumpAndSettle();
+
+        final bsSeg = find.text('地デジ');
+        Focus.of(tester.element(bsSeg)).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+        expect(
+          find.descendant(
+            of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+            matching: find.byIcon(Icons.refresh),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'SchedulesScreen places 新規予約 in AppBar without FAB and FireTvTimePickerDialog steps cleanly',
+      (tester) async {
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:sched',
+          friendlyName: 'nasne-1',
+          macAddr: '00:11:22:33:44:55',
+        );
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+            ],
+            child: const MaterialApp(home: SchedulesScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.byType(FloatingActionButton), findsNothing);
+        expect(
+          find.descendant(
+            of: find.byType(AppBar),
+            matching: find.text('新規予約'),
+          ),
+          findsOneWidget,
+        );
+
+        TimeOfDay? pickedTime;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: ElevatedButton(
+                  onPressed: () async {
+                    pickedTime = await showDialog<TimeOfDay>(
+                      context: context,
+                      builder: (_) => const FireTvTimePickerDialog(
+                        initialTime: TimeOfDay(hour: 10, minute: 30),
+                      ),
+                    );
+                  },
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.tap(find.text('open'));
+        await tester.pumpAndSettle();
+        // '+1時間' has autofocus.
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pump();
+        expect(find.text('11:30'), findsOneWidget);
+        await tester.tap(find.text('+10分'));
+        await tester.pump();
+        expect(find.text('11:40'), findsOneWidget);
+        await tester.tap(find.text('決定'));
+        await tester.pumpAndSettle();
+        expect(pickedTime, const TimeOfDay(hour: 11, minute: 40));
+      },
+    );
+
+    testWidgets(
+      'SettingsScreen registered nasne tap menu switches host & buffer options move cleanly per ArrowDown',
+      (tester) async {
+        const reg1 = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:1',
+          friendlyName: 'リビング',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const reg2 = RegisteredNasne(
+          host: '192.0.2.11',
+          udn: 'uuid:2',
+          friendlyName: '書斎',
+          macAddr: '00:11:22:33:44:66',
+        );
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg1, reg2]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('書斎'));
+        await tester.pumpAndSettle();
+        expect(find.text('この nasne を使う'), findsOneWidget);
+        await tester.tap(find.text('この nasne を使う'));
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(SettingsScreen)),
+        );
+        expect(container.read(selectedHostProvider), reg2.host);
+
+        // Scroll to Live buffer setting and verify 1 ArrowDown moves 1 option.
+        final liveBufFinder = find.text('Live のバッファ時間（遅延再生）');
+        await tester.scrollUntilVisible(
+          liveBufFinder,
+          300,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(liveBufFinder);
+        await tester.pumpAndSettle();
+
+        final initialCtx = FocusManager.instance.primaryFocus!.context!;
+        expect(
+          find.ancestor(
+            of: find.byWidget(initialCtx.widget),
+            matching: find.byType(SimpleDialog),
+          ),
+          findsOneWidget,
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        final nextCtx = FocusManager.instance.primaryFocus!.context!;
+        expect(nextCtx, isNot(same(initialCtx)));
+      },
+    );
+
+    testWidgets(
+      'TitleDetailView protection row is single-focus reachable via ArrowUp and confirmDialog focuses cancel',
+      (tester) async {
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:prot',
+          friendlyName: 'nasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const title = RecordedTitle(
+          id: '10',
+          title: '保護テスト番組',
+          protectFlag: false,
+        );
+        var protectCalled = false;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              deviceServicesProvider.overrideWith(
+                (ref, r) => DeviceServices(
+                  deviceInfo: _StubDeviceInfo(),
+                  settings: _StubSettings(),
+                  schedules: _FixedScheduleService(const []),
+                  titles: _FakeProtectTitleCatalog(
+                    onProtect: (_) => protectCalled = true,
+                  ),
+                  metadata: _StubMetadata(),
+                  live: _StubLiveCatalog(),
+                  playback: _RecordingFallbackLiveEngine(),
+                ),
+              ),
+              channelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+            ],
+            child: const MaterialApp(
+              home: Scaffold(
+                body: TitleDetailView(
+                  reg: reg,
+                  title: title,
+                  autofocusPlay: true,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // ArrowUp from autofocused '再生' reaches ProtectionRow; Select toggles it.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(protectCalled, isTrue);
+
+        // confirmDialog puts autofocus on 'キャンセル'.
+        bool? confirmResult;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () async {
+                  confirmResult = await confirmDialog(
+                    context,
+                    title: '確認',
+                    message: '削除しますか？',
+                  );
+                },
+                child: const Text('confirm'),
+              ),
+            ),
+          ),
+        );
+        await tester.tap(find.text('confirm'));
+        await tester.pumpAndSettle();
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(confirmResult, isFalse);
+      },
+    );
+
+    testWidgets(
+      'AppShell auto-refreshes Live and EPG on tab revisit without flashing LoadingView',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:autorefresh',
+          friendlyName: 'nasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        var liveFetches = 0;
+        var epgFetches = 0;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'nasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith((ref, r) async {
+                liveFetches++;
+                return [
+                  LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [
+                      LiveChannel(
+                        id: 'ch1',
+                        bandId: '0/video/LiveTuner/DTTB',
+                        channelName: 'NHK総合',
+                        programTitle: 'Live節目#$liveFetches',
+                      ),
+                    ],
+                  ),
+                ];
+              }),
+              channelsProvider.overrideWith(
+                (ref, r) async => const [
+                  Channel(
+                    broadcastingType: 2,
+                    networkId: 1,
+                    transportStreamId: 1,
+                    serviceId: 1,
+                    serviceType: 1,
+                    channelNumber: 1,
+                    serviceName: 'NHK総合',
+                  ),
+                ],
+              ),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async {
+                epgFetches++;
+                final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+                final noonUtc = DateTime.utc(jstNow.year, jstNow.month, jstNow.day, 3);
+                return EpgGuide(
+                  broadcastingType: 2,
+                  services: [
+                    EpgServiceGuide(
+                      channel: const Channel(
+                        broadcastingType: 2,
+                        networkId: 1,
+                        transportStreamId: 1,
+                        serviceId: 1,
+                        serviceType: 1,
+                        channelNumber: 1,
+                        serviceName: 'NHK総合',
+                      ),
+                      events: [
+                        EpgEvent(
+                          eventId: epgFetches,
+                          start: noonUtc,
+                          duration: const Duration(hours: 1),
+                          title: 'EPG番組#$epgFetches',
+                          genreLevel1: 3,
+                        ),
+                      ],
+                    ),
+                  ],
+                );
+              }),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(liveFetches, 1);
+        expect(epgFetches, 1);
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.live);
+        await tester.pumpAndSettle();
+        expect(liveFetches, 2);
+        expect(find.textContaining('Live節目#2'), findsOneWidget);
+
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+        expect(epgFetches, 2);
+      },
+    );
+
+    testWidgets(
+      'Multi-nasne UI merges Schedules & colliding-ID Titles while 1-nasne keeps zero multi-nasne chrome',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg1 = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:m1',
+          friendlyName: 'nasne-1',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const reg2 = RegisteredNasne(
+          host: '192.0.2.11',
+          udn: 'uuid:m2',
+          friendlyName: 'nasne-2',
+          macAddr: '00:11:22:33:44:66',
+        );
+        const titleOn1 = RecordedTitle(id: '1', title: '番組A(1号機)');
+        const titleOn2 = RecordedTitle(id: '1', title: '番組B(2号機)');
+        final start1 = DateTime.utc(2026, 11, 24, 1, 0);
+        final start2 = DateTime.utc(2026, 11, 24, 2, 0);
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg1, reg2]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async => DeviceInfo(
+                  name: r.friendlyName,
+                  softwareVersion: '0260',
+                ),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => NetworkInfo(
+                  macAddr: r.macAddr,
+                  ipv4Addr: r.host,
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => [
+                  RecordSchedule(
+                    id: '10',
+                    start: r.host == reg1.host ? start1 : start2,
+                    durationSeconds: 1800,
+                    channel: const ScheduleChannel(
+                      broadcastingType: 2,
+                      channelType: 2,
+                      serviceId: 1,
+                    ),
+                    desiredQualityMode: 100,
+                    priorityFlag: 0,
+                    conditionId: '',
+                    desiredMatchingId: '',
+                    reservationCreatorId: '',
+                    recordDestinationId: 'HDD',
+                    title: r.host == reg1.host ? '予約X(1号機)' : '予約Y(2号機)',
+                  ),
+                ],
+              ),
+              titlesProvider(reg1).overrideWith(
+                () => _FixedTitlesNotifier(reg1, const [titleOn1]),
+              ),
+              titlesProvider(reg2).overrideWith(
+                () => _FixedTitlesNotifier(reg2, const [titleOn2]),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(1, 1000),
+              ),
+              epgGuideProvider.overrideWith(
+                (ref, r) async => const EpgGuide(broadcastingType: 2, services: []),
+              ),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Multi-nasne Home shows nasne switcher bar.
+        expect(
+          find.descendant(
+            of: find.byType(HomeScreen),
+            matching: find.byType(SegmentedButton<String>),
+          ),
+          findsOneWidget,
+        );
+
+        // Schedules merges both nasnes' reservations with owner tags.
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.schedules);
+        await tester.pumpAndSettle();
+        expect(find.textContaining('予約X(1号機)'), findsOneWidget);
+        expect(find.textContaining('予約Y(2号機)'), findsOneWidget);
+        expect(find.textContaining('[nasne-1]'), findsOneWidget);
+        expect(find.textContaining('[nasne-2]'), findsOneWidget);
+
+        // Titles merges colliding id '1' from both nasnes and shows nasne filter.
+        container.read(tabIndexProvider.notifier).select(AppTabs.titles);
+        await tester.pumpAndSettle();
+        expect(find.text('全 2 件（2台合計・上限 2000 件）'), findsOneWidget);
+        expect(find.text('全 nasne'), findsOneWidget);
+        expect(find.text('番組A(1号機)'), findsOneWidget);
+        expect(find.text('番組B(2号機)'), findsOneWidget);
+        await tester.tap(find.text('番組B(2号機)'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('nasne-2'), findsWidgets);
+
+        // Single-nasne mode shows zero multi-nasne switcher chrome.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg1]),
+              ),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async => const DeviceInfo(
+                  name: 'nasne-1',
+                  softwareVersion: '0260',
+                ),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => NetworkInfo(
+                  macAddr: reg1.macAddr,
+                  ipv4Addr: reg1.host,
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+            ],
+            child: const MaterialApp(home: HomeScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.byType(SegmentedButton<String>), findsNothing);
+      },
+    );
+
+    test(
+      'resolveLiveRecordingConflictOrFailover picks free nasne or falls back to conflict with nasneName',
+      () async {
+        const reg1 = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:f1',
+          friendlyName: 'リビングnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const reg2 = RegisteredNasne(
+          host: '192.0.2.11',
+          udn: 'uuid:f2',
+          friendlyName: '書斎nasne',
+          macAddr: '00:11:22:33:44:66',
+        );
+        const ch = LiveChannel(
+          id: 'ch1',
+          bandId: '0/video/LiveTuner/DTTB',
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 1024,
+          channelName: 'NHK総合',
+          programTitle: '本番組',
+        );
+        const chOther = LiveChannel(
+          id: 'ch2',
+          bandId: '0/video/LiveTuner/DTTB',
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 9999,
+          channelName: 'Eテレ',
+          programTitle: '裏番組録画',
+        );
+        final now = DateTime.now();
+        final activeOtherSched = RecordSchedule(
+          id: 'r1',
+          start: now.subtract(const Duration(minutes: 5)),
+          durationSeconds: 3600,
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 9999,
+          ),
+          desiredQualityMode: 100,
+          priorityFlag: 0,
+          conditionId: '',
+          desiredMatchingId: '',
+          reservationCreatorId: '',
+          recordDestinationId: 'HDD',
+          title: '裏番組録画',
+        );
+
+        // Case 1: reg1 busy on Eテレ, reg2 idle -> automatic failover to reg2.
+        final c1 = ProviderContainer(
+          overrides: [
+            deviceServicesProvider.overrideWith(
+              (ref, r) => DeviceServices(
+                deviceInfo: _StubDeviceInfo(),
+                settings: _StubSettings(),
+                schedules: _FixedScheduleService(
+                  r.host == reg1.host ? [activeOtherSched] : const [],
+                ),
+                titles: _StubTitleCatalog(),
+                metadata: _StubMetadata(),
+                live: _FixedLiveCatalog([
+                  const LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [ch, chOther],
+                  ),
+                ]),
+                playback: _RecordingFallbackLiveEngine(),
+              ),
+            ),
+          ],
+        );
+        addTearDown(c1.dispose);
+
+        final res1 = await resolveLiveRecordingConflictOrFailover(
+          c1,
+          reg1,
+          ch,
+          multiNasneRegs: const [reg1, reg2],
+        );
+        expect(res1, isNotNull);
+        expect(res1!.nasneName, 'リビングnasne');
+        expect(res1.failoverRegistration?.host, reg2.host);
+        expect(
+          buildLiveFailoverNotice(
+            fromNasneName: res1.nasneName,
+            toRegistration: res1.failoverRegistration!,
+          ),
+          'リビングnasne で録画開始のため 書斎nasne へ切替',
+        );
+
+        // Case 2: both reg1 & reg2 busy on another channel -> no failover, dialog info populated.
+        final c2 = ProviderContainer(
+          overrides: [
+            deviceServicesProvider.overrideWith(
+              (ref, r) => DeviceServices(
+                deviceInfo: _StubDeviceInfo(),
+                settings: _StubSettings(),
+                schedules: _FixedScheduleService([activeOtherSched]),
+                titles: _StubTitleCatalog(),
+                metadata: _StubMetadata(),
+                live: _FixedLiveCatalog([
+                  const LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [ch, chOther],
+                  ),
+                ]),
+                playback: _RecordingFallbackLiveEngine(),
+              ),
+            ),
+          ],
+        );
+        addTearDown(c2.dispose);
+
+        final res2 = await resolveLiveRecordingConflictOrFailover(
+          c2,
+          reg1,
+          ch,
+          multiNasneRegs: const [reg1, reg2],
+        );
+        expect(res2, isNotNull);
+        expect(res2!.nasneName, 'リビングnasne');
+        expect(res2.failoverRegistration, isNull);
+        expect(res2.channelName, 'Eテレ');
+      },
+    );
+
+    testWidgets(
+      'EpgScreen aggregates reservations across nasnes and ScheduleFormPage auto-selects largest free HDD unit',
+      (tester) async {
+        const reg1 = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:e1',
+          friendlyName: 'nasne-1',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const reg2 = RegisteredNasne(
+          host: '192.0.2.11',
+          udn: 'uuid:e2',
+          friendlyName: 'nasne-2',
+          macAddr: '00:11:22:33:44:66',
+        );
+        const ch = Channel(
+          broadcastingType: 2,
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト局',
+        );
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final noonUtc = DateTime.utc(jstNow.year, jstNow.month, jstNow.day, 3);
+        final eventOn2 = EpgEvent(
+          eventId: 42,
+          start: noonUtc,
+          duration: const Duration(hours: 1),
+          title: '2号機で予約済みの番組',
+          genreLevel1: 3,
+        );
+        final schedOn2 = RecordSchedule(
+          id: 's-on-2',
+          start: noonUtc,
+          durationSeconds: 3600,
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x3333,
+          ),
+          desiredQualityMode: 100,
+          priorityFlag: 0,
+          conditionId: '',
+          desiredMatchingId: ',,0x1111,0x002a',
+          reservationCreatorId: '',
+          recordDestinationId: 'HDD',
+          title: '2号機で予約済みの番組',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg1, reg2]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              epgGuideProvider.overrideWith(
+                (ref, r) async => EpgGuide(
+                  broadcastingType: 2,
+                  services: [
+                    EpgServiceGuide(channel: ch, events: [eventOn2]),
+                  ],
+                ),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => r.host == reg2.host ? [schedOn2] : const [],
+              ),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: EpgScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final tile = find.text('2号機で予約済みの番組', skipOffstage: false);
+        await tester.ensureVisible(tile);
+        await tester.pumpAndSettle();
+        await tester.tap(tile);
+        await tester.pumpAndSettle();
+
+        expect(find.text('録画予約済み（nasne-2）'), findsOneWidget);
+        await tester.tap(find.text('閉じる'));
+        await tester.pumpAndSettle();
+
+        // ScheduleFormPage auto-select routes to conflict-free reg2 with larger free HDD.
+        String? createdOnHost;
+        final schedSvc1 = _RecordingScheduleService(
+          onCreate: () => createdOnHost = reg1.host,
+        );
+        final schedSvc2 = _RecordingScheduleService(
+          onCreate: () => createdOnHost = reg2.host,
+        );
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg1, reg2]),
+              ),
+              channelsProvider.overrideWith((ref, r) async => const [ch]),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => [
+                  HddDetail(
+                    const HddEntry(
+                      id: 0,
+                      internal: false,
+                      mounted: true,
+                      registered: true,
+                    ),
+                    HddInfo(
+                      id: 0,
+                      internal: false,
+                      format: 'ext4',
+                      name: '内蔵',
+                      freeBytes: r.host == reg2.host
+                          ? 900 * 1024 * 1024
+                          : 100 * 1024 * 1024,
+                      totalBytes: 1000 * 1024 * 1024,
+                      usedBytes: 100 * 1024 * 1024,
+                    ),
+                  ),
+                ],
+              ),
+              deviceServicesProvider.overrideWith(
+                (ref, r) => DeviceServices(
+                  deviceInfo: _StubDeviceInfo(),
+                  settings: _StubSettings(),
+                  schedules: r.host == reg1.host ? schedSvc1 : schedSvc2,
+                  titles: _StubTitleCatalog(),
+                  metadata: _StubMetadata(),
+                  live: _StubLiveCatalog(),
+                  playback: _RecordingFallbackLiveEngine(),
+                ),
+              ),
+            ],
+            child: MaterialApp(home: ScheduleFormPage.create(reg1)),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('録画する nasne'), findsOneWidget);
+        await tester.ensureVisible(find.text('予約を作成'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('予約を作成'));
+        await tester.pumpAndSettle();
+        expect(createdOnHost, reg2.host);
+      },
+    );
+  });
+}
+
+class _FakeProtectTitleCatalog implements TitleCatalogService {
+  _FakeProtectTitleCatalog({required this.onProtect});
+  final void Function(bool protect) onProtect;
+
+  @override
+  Future<void> setTitleProtection(
+    RecordedTitle title, {
+    required bool protect,
+  }) async {
+    onProtect(protect);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _FixedLiveCatalog implements LiveCatalogService {
+  _FixedLiveCatalog(this._bands);
+  final List<LiveBand> _bands;
+
+  @override
+  Future<List<LiveBand>> listLiveChannels() async => _bands;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _RecordingScheduleService implements ScheduleService {
+  _RecordingScheduleService({required this.onCreate});
+  final VoidCallback onCreate;
+
+  @override
+  Future<List<RecordSchedule>> listSchedules({
+    int startingIndex = 0,
+    int requestedCount = 50,
+  }) async => const [];
+
+  @override
+  Future<List<RecordSchedule>> checkConflicts(
+    NewRecordSchedule candidate,
+  ) async => const [];
+
+  @override
+  Future<String> createSchedule(NewRecordSchedule candidate) async {
+    onCreate();
+    return 'new-1';
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _DeferredRegistrationStore implements RegistrationStore {

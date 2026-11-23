@@ -268,8 +268,10 @@ Widget asyncSection<T>(
   AsyncValue<T> value,
   Widget Function(T data) builder, {
   VoidCallback? onRetry,
+  bool skipLoadingOnReload = false,
 }) {
   return value.when(
+    skipLoadingOnReload: skipLoadingOnReload,
     data: builder,
     loading: () => const Padding(
       padding: EdgeInsets.all(24),
@@ -349,6 +351,7 @@ Future<bool> confirmDialog(
       content: Text(message),
       actions: [
         TextButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(false),
           child: const Text('キャンセル'),
         ),
@@ -485,6 +488,7 @@ class FireTvTextInputField extends StatefulWidget {
     this.autocorrect = true,
     this.enableSuggestions = true,
     this.showClearButton = false,
+    this.autofocus = false,
     this.onChanged,
     this.onSubmitted,
   });
@@ -502,6 +506,7 @@ class FireTvTextInputField extends StatefulWidget {
   final bool autocorrect;
   final bool enableSuggestions;
   final bool showClearButton;
+  final bool autofocus;
   final ValueChanged<String>? onChanged;
   final ValueChanged<String>? onSubmitted;
 
@@ -590,6 +595,7 @@ class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
         Expanded(
           child: InkWell(
             focusNode: _focusNode,
+            autofocus: widget.autofocus,
             onFocusChange: (focused) {
               if (_focused != focused) setState(() => _focused = focused);
             },

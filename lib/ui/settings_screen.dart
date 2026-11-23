@@ -84,24 +84,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     title: Text(reg.friendlyName),
                     subtitle: Text('${reg.host}\nMAC ${maskMac(reg.macAddr)}'),
                     isThreeLine: true,
-                    trailing: PopupMenuButton<String>(
-                      onSelected: (action) =>
-                          _onRegistrationAction(action, reg),
-                      itemBuilder: (context) => [
-                        if (selected?.host != reg.host)
-                          const PopupMenuItem(
-                            value: 'select',
-                            child: Text('この nasne を使う'),
-                          ),
-                        const PopupMenuItem(
-                          value: 'verify',
-                          child: Text('登録を検証'),
-                        ),
-                        const PopupMenuItem(
-                          value: 'remove',
-                          child: Text('登録を解除'),
-                        ),
-                      ],
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _showRegistrationActions(
+                      reg,
+                      isSelected: selected?.host == reg.host,
                     ),
                   ),
               ],
@@ -586,47 +572,65 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           for (final opt in options)
-            SimpleDialogOption(
-              onPressed: () => Navigator.of(dialogContext).pop(opt),
-              child: Focus(
-                autofocus: opt == current,
-                child: Builder(
-                  builder: (focusContext) {
-                    final focused = Focus.of(focusContext).hasFocus;
-                    final label = formatBufferDurationLabel(opt);
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(6),
-                        border: focused
-                            ? Border.all(color: Colors.amber, width: 2)
-                            : null,
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            opt == current
-                                ? Icons.check_circle
-                                : Icons.radio_button_unchecked,
-                            size: 20,
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(child: Text(label)),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-              ),
+            _BufferOptionTile(
+              label: formatBufferDurationLabel(opt),
+              selected: opt == current,
+              autofocus: opt == current,
+              onTap: () => Navigator.of(dialogContext).pop(opt),
             ),
         ],
       ),
     );
     if (chosen != null) {
       await onSelected(chosen);
+    }
+  }
+
+  Future<void> _showRegistrationActions(
+    RegisteredNasne reg, {
+    required bool isSelected,
+  }) async {
+    final title = reg.friendlyName.trim().isNotEmpty
+        ? reg.friendlyName.trim()
+        : reg.host;
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        contentPadding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!isSelected)
+              ListTile(
+                autofocus: true,
+                leading: const Icon(Icons.check_circle_outline),
+                title: const Text('この nasne を使う'),
+                onTap: () => Navigator.of(dialogContext).pop('select'),
+              ),
+            ListTile(
+              autofocus: isSelected,
+              leading: const Icon(Icons.verified_outlined),
+              title: const Text('登録を検証'),
+              onTap: () => Navigator.of(dialogContext).pop('verify'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('登録を解除'),
+              onTap: () => Navigator.of(dialogContext).pop('remove'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('閉じる'),
+          ),
+        ],
+      ),
+    );
+    if (action != null && mounted) {
+      await _onRegistrationAction(action, reg);
     }
   }
 
@@ -661,5 +665,65 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         if (!mounted) return;
         showSnack(context, '登録を解除しました');
     }
+  }
+}
+
+class _BufferOptionTile extends StatefulWidget {
+  const _BufferOptionTile({
+    required this.label,
+    required this.selected,
+    required this.autofocus,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final bool autofocus;
+  final VoidCallback onTap;
+
+  @override
+  State<_BufferOptionTile> createState() => _BufferOptionTileState();
+}
+
+class _BufferOptionTileState extends State<_BufferOptionTile> {
+  bool _focused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final focusColor = isDark ? Colors.amberAccent : Colors.amber;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+      child: InkWell(
+        autofocus: widget.autofocus,
+        borderRadius: BorderRadius.circular(8),
+        onFocusChange: (focused) {
+          if (_focused != focused) setState(() => _focused = focused);
+        },
+        onTap: widget.onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: _focused ? focusColor : Colors.transparent,
+              width: 2.5,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                widget.selected
+                    ? Icons.check_circle
+                    : Icons.radio_button_unchecked,
+                size: 20,
+              ),
+              const SizedBox(width: 12),
+              Expanded(child: Text(widget.label)),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

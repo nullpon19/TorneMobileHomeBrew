@@ -28,6 +28,7 @@ import 'epg_search_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'live_screen.dart';
+import 'multi_nasne_policy.dart';
 import 'schedule_form.dart';
 import 'schedules_screen.dart';
 import 'epg_subchannel_visibility.dart';
@@ -556,7 +557,8 @@ class EpgScreen extends ConsumerStatefulWidget {
   ConsumerState<EpgScreen> createState() => _EpgScreenState();
 }
 
-class _EpgScreenState extends ConsumerState<EpgScreen> {
+class _EpgScreenState extends ConsumerState<EpgScreen>
+    with WidgetsBindingObserver {
   /// Selected day as a JST calendar date (stored as a UTC-midnight
   /// DateTime of the JST date fields, like format.dart's helpers).
   DateTime? _selectedDay;
@@ -567,13 +569,18 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   final _bodyController = ScrollController();
   final _gridController = ScrollController();
   final FocusNode _topBarFocusNode = FocusNode(debugLabel: 'epgTopBar');
+  final FocusNode _daySelectorFocusNode = FocusNode(
+    debugLabel: 'epgDaySelector',
+  );
   final FocusNode _gridFocusNode = FocusNode(debugLabel: 'epgGrid');
+  final GlobalKey _gridViewportKey = GlobalKey();
   late final Map<int, bool Function()> _tabBackHandlers;
   bool _syncing = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _link(_rulerController, _bodyController);
     _link(_bodyController, _rulerController);
     _tabBackHandlers = ref.read(tabBackHandlersProvider);
@@ -590,11 +597,22 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        mounted &&
+        ref.read(tabIndexProvider) == AppTabs.epg) {
+      _refreshOnReveal();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (_tabBackHandlers[AppTabs.epg] == _handleBackFromGrid) {
       _tabBackHandlers.remove(AppTabs.epg);
     }
     _topBarFocusNode.dispose();
+    _daySelectorFocusNode.dispose();
     _gridFocusNode.dispose();
     _rulerController.dispose();
     _bodyController.dispose();
@@ -602,13 +620,229 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
     super.dispose();
   }
 
-  void _focusTopBar() {
-    final targets = _topBarFocusNode.traversalDescendants
-        .where((n) => n.canRequestFocus && !n.skipTraversal)
-        .toList();
-    if (targets.isNotEmpty) {
-      targets.first.requestFocus();
+  RegisteredNasne? _resolveActiveEpgReg(
+    List<RegisteredNasne> regs,
+    RegisteredNasne? selected,
+  ) {
+    if (regs.isEmpty) return selected;
+    final isBs = _selectedBand == bsBroadcastingType;
+    if (selected != null) {
+      final async = isBs
+          ? ref.read(bsEpgGuideProvider(selected))
+          : ref.read(epgGuideProvider(selected));
+      if (!async.hasError) return selected;
     }
+    for (final r in regs) {
+      final async = isBs
+          ? ref.read(bsEpgGuideProvider(r))
+          : ref.read(epgGuideProvider(r));
+      if (!async.hasError) return r;
+    }
+    return selected ?? regs.first;
+  }
+
+  void _refreshBandOnSwitch(int band) {
+    final regs =
+        ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final selected = ref.read(selectedRegistrationProvider);
+    final activeRegs = regs.isNotEmpty
+        ? regs
+        : (selected != null ? [selected] : const <RegisteredNasne>[]);
+    for (final r in activeRegs) {
+      final sched = ref.read(schedulesProvider(r));
+      if (sched.hasValue && !sched.isLoading) {
+        ref.invalidate(schedulesProvider(r));
+      }
+    }
+    final target = _resolveActiveEpgReg(activeRegs, selected);
+    if (target == null) return;
+    if (band == bsBroadcastingType) {
+      final bs = ref.read(bsEpgGuideProvider(target));
+      if (bs.hasValue && !bs.isLoading) {
+        ref.invalidate(bsEpgGuideProvider(target));
+      }
+    } else {
+      final t = ref.read(epgGuideProvider(target));
+      if (t.hasValue && !t.isLoading) {
+        ref.invalidate(epgGuideProvider(target));
+      }
+    }
+  }
+
+  void _refreshOnReveal() => _refreshBandOnSwitch(_selectedBand);
+
+  List<FocusNode> _sortedFocusableDescendants(FocusNode root) {
+    final targets = root.traversalDescendants
+        .where(
+          (n) => n.canRequestFocus && !n.skipTraversal && n.context != null,
+        )
+        .toList();
+    targets.sort((a, b) => a.rect.center.dx.compareTo(b.rect.center.dx));
+    return targets;
+  }
+
+  FocusNode _nearestHorizontally(List<FocusNode> targets, double targetDx) {
+    var best = targets.first;
+    var bestDist = (best.rect.center.dx - targetDx).abs();
+    for (var i = 1; i < targets.length; i++) {
+      final d = (targets[i].rect.center.dx - targetDx).abs();
+      if (d < bestDist) {
+        best = targets[i];
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  bool _focusLeftNavigationRail(double referenceY) {
+    final epgBox = context.findRenderObject() as RenderBox?;
+    if (epgBox == null || !epgBox.attached || !epgBox.hasSize) return false;
+    final epgLeft = epgBox.localToGlobal(Offset.zero).dx;
+    if (epgLeft <= 1.0) return false;
+    final scope =
+        FocusManager.instance.primaryFocus?.nearestScope ??
+        _topBarFocusNode.nearestScope;
+    if (scope == null) return false;
+    final leftNodes = scope.traversalDescendants.where((n) {
+      if (!n.canRequestFocus || n.skipTraversal || n.context == null) {
+        return false;
+      }
+      final r = n.rect;
+      return r.width > 0 && r.height > 0 && r.right <= epgLeft + 2.0;
+    }).toList();
+    if (leftNodes.isEmpty) return false;
+    leftNodes.sort(
+      (a, b) => (a.rect.center.dy - referenceY).abs().compareTo(
+        (b.rect.center.dy - referenceY).abs(),
+      ),
+    );
+    leftNodes.first.requestFocus();
+    return true;
+  }
+
+  void _focusTopBar({double? preferredDx}) {
+    final targets = _sortedFocusableDescendants(_topBarFocusNode);
+    if (targets.isEmpty) return;
+    if (preferredDx == null) {
+      targets.first.requestFocus();
+      return;
+    }
+    _nearestHorizontally(targets, preferredDx).requestFocus();
+  }
+
+  bool _focusDaySelector({double? preferredDx}) {
+    final targets = _sortedFocusableDescendants(_daySelectorFocusNode);
+    if (targets.isEmpty) return false;
+    final target = preferredDx == null
+        ? targets.first
+        : _nearestHorizontally(targets, preferredDx);
+    target.requestFocus();
+    final ctx = target.context;
+    if (ctx != null) {
+      unawaited(
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 120),
+          alignment: 0.5,
+        ),
+      );
+    }
+    return true;
+  }
+
+  bool _focusVisibleGridTile({double? preferredDx}) {
+    final vpBox =
+        _gridViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    final Rect? vp = (vpBox != null && vpBox.attached && vpBox.hasSize)
+        ? vpBox.localToGlobal(Offset.zero) & vpBox.size
+        : null;
+    final allNodes = _gridFocusNode.traversalDescendants
+        .where(
+          (n) => n.canRequestFocus && !n.skipTraversal && n.context != null,
+        )
+        .toList();
+    if (allNodes.isEmpty) return false;
+    final visibleNodes = [
+      for (final n in allNodes)
+        if (() {
+          final r = n.rect;
+          if (r.width <= 0 || r.height <= 0) return false;
+          if (vp != null) {
+            return r.bottom > vp.top + 6.0 &&
+                r.top < vp.bottom - 2.0 &&
+                r.right > vp.left + 6.0 &&
+                r.left < vp.right - 2.0;
+          }
+          return r.bottom > 0 && r.right > 0;
+        }())
+          n,
+    ];
+    final pool = visibleNodes.isNotEmpty ? visibleNodes : allNodes;
+    final refDx = preferredDx ?? (vp != null ? vp.left : 0.0);
+    var minColDx = double.infinity;
+    for (final n in pool) {
+      final d = (n.rect.center.dx - refDx).abs();
+      if (d < minColDx) minColDx = d;
+    }
+    final columnTiles = pool
+        .where((n) => (n.rect.center.dx - refDx).abs() <= minColDx + 16.0)
+        .toList();
+    columnTiles.sort((a, b) => a.rect.top.compareTo(b.rect.top));
+    final chosen = columnTiles.first;
+    chosen.requestFocus();
+    if (vp != null && chosen.rect.top < vp.top && chosen.context != null) {
+      unawaited(
+        Scrollable.ensureVisible(
+          chosen.context!,
+          duration: const Duration(milliseconds: 120),
+          alignment: 0.05,
+        ),
+      );
+    }
+    return true;
+  }
+
+  KeyEventResult _handleTopBarKeyEvent(
+    FocusNode node,
+    KeyEvent event, {
+    required bool inlineBand,
+  }) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final targets = _sortedFocusableDescendants(_topBarFocusNode);
+    if (targets.isEmpty) return KeyEventResult.ignored;
+    final curIdx = targets.indexWhere((n) => n.hasPrimaryFocus || n.hasFocus);
+    final cur = curIdx >= 0 ? targets[curIdx] : targets.first;
+    final key = event.logicalKey;
+
+    if (key == LogicalKeyboardKey.arrowRight) {
+      if (curIdx < 0) {
+        targets.first.requestFocus();
+      } else if (curIdx + 1 < targets.length) {
+        targets[curIdx + 1].requestFocus();
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      if (curIdx > 0) {
+        targets[curIdx - 1].requestFocus();
+      } else {
+        _focusLeftNavigationRail(cur.rect.center.dy);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowDown) {
+      final dx = cur.rect.center.dx;
+      if (!_focusDaySelector(preferredDx: dx)) {
+        _focusVisibleGridTile(preferredDx: dx);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp && inlineBand) {
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   bool _handleBackFromGrid() {
@@ -637,16 +871,30 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
         ButtonSegment<int>(value: bsBroadcastingType, label: Text('BS')),
       ],
       selected: {_selectedBand},
-      onSelectionChanged: (selection) => setState(() {
-        _selectedBand = selection.first;
-        _scrolledToNow = false;
-      }),
+      onSelectionChanged: (selection) {
+        final nextBand = selection.first;
+        setState(() {
+          _selectedBand = nextBand;
+          _scrolledToNow = false;
+        });
+        _refreshBandOnSwitch(nextBand);
+      },
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<int>(tabIndexProvider, (prev, next) {
+      if (prev != AppTabs.epg && next == AppTabs.epg) {
+        _refreshOnReveal();
+      }
+    });
     final reg = ref.watch(selectedRegistrationProvider);
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final activeRegs = regs.length > 1
+        ? regs
+        : (reg != null ? [reg] : const <RegisteredNasne>[]);
     return LayoutBuilder(
       builder: (context, constraints) {
         final inlineBand = constraints.maxWidth >= epgInlineBandBreakpoint;
@@ -657,6 +905,8 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
                 focusNode: _topBarFocusNode,
                 canRequestFocus: false,
                 skipTraversal: true,
+                onKeyEvent: (node, event) =>
+                    _handleTopBarKeyEvent(node, event, inlineBand: inlineBand),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -667,24 +917,30 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
                     IconButton(
                       icon: const Icon(Icons.search),
                       tooltip: '番組検索',
-                      onPressed: () => Navigator.of(context).push(
-                        MaterialPageRoute<void>(
-                          builder: (_) => EpgSearchScreen(reg: reg),
-                        ),
-                      ),
+                      onPressed: () {
+                        final searchReg =
+                            _resolveActiveEpgReg(activeRegs, reg) ?? reg;
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) => EpgSearchScreen(reg: searchReg),
+                          ),
+                        );
+                      },
                     ),
                     IconButton(
                       icon: const Icon(Icons.refresh),
                       tooltip: '更新',
                       onPressed: () {
-                        ref.invalidate(schedulesProvider(reg));
-                        if (_selectedBand == terrestrialBroadcastingType) {
-                          ref.invalidate(epgGuideProvider(reg));
-                          ref.invalidate(channelLogosProvider(reg));
-                        } else {
-                          ref.invalidate(bsChannelsProvider(reg));
-                          ref.invalidate(bsEpgGuideProvider(reg));
-                          ref.invalidate(bsChannelLogosProvider(reg));
+                        for (final r in activeRegs) {
+                          ref.invalidate(schedulesProvider(r));
+                          if (_selectedBand == terrestrialBroadcastingType) {
+                            ref.invalidate(epgGuideProvider(r));
+                            ref.invalidate(channelLogosProvider(r));
+                          } else {
+                            ref.invalidate(bsChannelsProvider(r));
+                            ref.invalidate(bsEpgGuideProvider(r));
+                            ref.invalidate(bsChannelLogosProvider(r));
+                          }
                         }
                       },
                     ),
@@ -734,25 +990,49 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
 
   Widget _buildBandGuide(RegisteredNasne reg, {required bool showBandRow}) {
     final isBs = _selectedBand == bsBroadcastingType;
-    final guideAsync = isBs
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final activeRegs = regs.length > 1 ? regs : <RegisteredNasne>[reg];
+    final isMultiNasne = activeRegs.length > 1;
+    var guideReg = reg;
+    var guideAsync = isBs
         ? ref.watch(bsEpgGuideProvider(reg))
         : ref.watch(epgGuideProvider(reg));
-    final schedules =
-        ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
-    final recordingTitles = ref.watch(titlesProvider(reg).exists)
-        ? (ref
-                  .watch(titlesProvider(reg))
+    if (isMultiNasne && guideAsync.hasError) {
+      for (final candidate in activeRegs) {
+        if (candidate.host == reg.host) continue;
+        final candidateAsync = isBs
+            ? ref.watch(bsEpgGuideProvider(candidate))
+            : ref.watch(epgGuideProvider(candidate));
+        if (!candidateAsync.hasError) {
+          guideReg = candidate;
+          guideAsync = candidateAsync;
+          break;
+        }
+      }
+    }
+    final ownedSchedules = <OwnedRecordSchedule>[
+      for (final r in activeRegs)
+        for (final s
+            in (ref.watch(schedulesProvider(r)).value ??
+                const <RecordSchedule>[]))
+          OwnedRecordSchedule(reg: r, schedule: s),
+    ];
+    final recordingTitles = <RecordedTitle>[
+      for (final r in activeRegs)
+        if (ref.watch(titlesProvider(r).exists))
+          ...(ref
+                  .watch(titlesProvider(r))
                   .value
                   ?.titles
-                  .where((t) => t.recordingFlag)
-                  .toList() ??
-              const <RecordedTitle>[])
-        : const <RecordedTitle>[];
+                  .where((t) => t.recordingFlag) ??
+              const <RecordedTitle>[]),
+    ];
     final reservedStyle = ref.watch(epgReservedStyleProvider);
     final logos = isBs
-        ? (ref.watch(bsChannelLogosProvider(reg)).value ??
+        ? (ref.watch(bsChannelLogosProvider(guideReg)).value ??
               const <int, List<int>>{})
-        : (ref.watch(channelLogosProvider(reg)).value ??
+        : (ref.watch(channelLogosProvider(guideReg)).value ??
               const <int, List<int>>{});
 
     return Column(
@@ -764,37 +1044,43 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
               focusNode: _topBarFocusNode,
               canRequestFocus: false,
               skipTraversal: true,
+              onKeyEvent: (node, event) =>
+                  _handleTopBarKeyEvent(node, event, inlineBand: false),
               child: _buildBandSelector(),
             ),
           ),
         Expanded(
           child: guideAsync.when(
+            skipLoadingOnReload: true,
             loading: () => const LoadingView(),
             error: (e, _) => ErrorView(
               message: userMessageForError(e),
               onRetry: () {
-                if (isBs) {
-                  ref.invalidate(bsChannelsProvider(reg));
-                  ref.invalidate(bsEpgGuideProvider(reg));
-                } else {
-                  ref.invalidate(epgGuideProvider(reg));
+                for (final r in activeRegs) {
+                  if (isBs) {
+                    ref.invalidate(bsChannelsProvider(r));
+                    ref.invalidate(bsEpgGuideProvider(r));
+                  } else {
+                    ref.invalidate(epgGuideProvider(r));
+                  }
                 }
               },
             ),
             data: (guide) => _GuideView(
-              reg: reg,
+              reg: guideReg,
               guide: guideWithSubchannelSetting(
                 guide,
                 ref.watch(showSubchannelsProvider),
               ),
-              schedules: schedules,
+              ownedSchedules: ownedSchedules,
+              isMultiNasne: isMultiNasne,
               recordingTitles: recordingTitles,
               reservedStyle: reservedStyle,
               hiddenGenres: ref.watch(hiddenEpgGenresProvider),
               onWatchEvent: (channel) => openLiveChannelForEpg(
                 context,
                 ref,
-                reg: reg,
+                reg: guideReg,
                 channel: channel,
               ),
               logos: logos,
@@ -806,8 +1092,16 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
               rulerController: _rulerController,
               bodyController: _bodyController,
               gridController: _gridController,
+              daySelectorFocusNode: _daySelectorFocusNode,
               gridFocusNode: _gridFocusNode,
-              onJumpToTopBar: _focusTopBar,
+              gridViewportKey: _gridViewportKey,
+              onJumpToTopBar: ({double? preferredDx}) =>
+                  _focusTopBar(preferredDx: preferredDx),
+              onJumpToDaySelector: ({double? preferredDx}) =>
+                  _focusDaySelector(preferredDx: preferredDx),
+              onJumpToVisibleGrid: ({double? preferredDx}) =>
+                  _focusVisibleGridTile(preferredDx: preferredDx),
+              onEscapeLeftToRail: _focusLeftNavigationRail,
               scrolledToNow: _scrolledToNow,
               onScrolledToNow: () => _scrolledToNow = true,
             ),
@@ -822,7 +1116,8 @@ class _GuideView extends StatelessWidget {
   const _GuideView({
     required this.reg,
     required this.guide,
-    required this.schedules,
+    required this.ownedSchedules,
+    required this.isMultiNasne,
     required this.recordingTitles,
     required this.reservedStyle,
     required this.hiddenGenres,
@@ -833,15 +1128,21 @@ class _GuideView extends StatelessWidget {
     required this.rulerController,
     required this.bodyController,
     required this.gridController,
+    required this.daySelectorFocusNode,
     required this.gridFocusNode,
+    required this.gridViewportKey,
     required this.onJumpToTopBar,
+    required this.onJumpToDaySelector,
+    required this.onJumpToVisibleGrid,
+    required this.onEscapeLeftToRail,
     required this.scrolledToNow,
     required this.onScrolledToNow,
   });
 
   final RegisteredNasne reg;
   final EpgGuide guide;
-  final List<RecordSchedule> schedules;
+  final List<OwnedRecordSchedule> ownedSchedules;
+  final bool isMultiNasne;
   final List<RecordedTitle> recordingTitles;
   final EpgReservedStyle reservedStyle;
 
@@ -858,10 +1159,74 @@ class _GuideView extends StatelessWidget {
   final ScrollController rulerController;
   final ScrollController bodyController;
   final ScrollController gridController;
+  final FocusNode daySelectorFocusNode;
   final FocusNode gridFocusNode;
-  final VoidCallback onJumpToTopBar;
+  final GlobalKey gridViewportKey;
+  final void Function({double? preferredDx}) onJumpToTopBar;
+  final bool Function({double? preferredDx}) onJumpToDaySelector;
+  final bool Function({double? preferredDx}) onJumpToVisibleGrid;
+  final bool Function(double referenceY) onEscapeLeftToRail;
   final bool scrolledToNow;
   final VoidCallback onScrolledToNow;
+
+  KeyEventResult _handleGridKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is KeyDownEvent &&
+        (event.logicalKey == LogicalKeyboardKey.contextMenu ||
+            event.logicalKey == LogicalKeyboardKey.info ||
+            event.logicalKey == LogicalKeyboardKey.escape)) {
+      onJumpToTopBar();
+      return KeyEventResult.handled;
+    }
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary == null || primary.context == null) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    final pRect = primary.rect;
+    if (key == LogicalKeyboardKey.arrowUp) {
+      final hasAboveInColumn = gridFocusNode.traversalDescendants.any((n) {
+        if (n == primary ||
+            !n.canRequestFocus ||
+            n.skipTraversal ||
+            n.context == null) {
+          return false;
+        }
+        final r = n.rect;
+        if (r.width <= 0 || r.height <= 0) return false;
+        final overlapsX = r.right > pRect.left + 4 && r.left < pRect.right - 4;
+        return overlapsX && r.center.dy < pRect.top - 1.0;
+      });
+      if (!hasAboveInColumn) {
+        if (!onJumpToDaySelector(preferredDx: pRect.center.dx)) {
+          onJumpToTopBar(preferredDx: pRect.center.dx);
+        }
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      final scrolledLeft = gridController.hasClients && gridController.offset > 1.0;
+      if (!scrolledLeft) {
+        final hasLeftColumn = gridFocusNode.traversalDescendants.any((n) {
+          if (n == primary ||
+              !n.canRequestFocus ||
+              n.skipTraversal ||
+              n.context == null) {
+            return false;
+          }
+          final r = n.rect;
+          return r.width > 0 && r.height > 0 && r.center.dx < pRect.left - 1.0;
+        });
+        if (!hasLeftColumn && onEscapeLeftToRail(pRect.center.dy)) {
+          return KeyEventResult.handled;
+        }
+      }
+    }
+    return KeyEventResult.ignored;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -888,6 +1253,7 @@ class _GuideView extends StatelessWidget {
         : (days.contains(today) ? today : days.first);
     final dayStart = _EpgScreenState._jstDayStart(day);
     final dayEnd = dayStart.add(const Duration(days: 1));
+    final schedules = [for (final o in ownedSchedules) o.schedule];
     final reservedSpans = buildEpgRulerReservedSpans(
       schedules: schedules,
       dayStart: dayStart,
@@ -916,7 +1282,15 @@ class _GuideView extends StatelessWidget {
 
     return Column(
       children: [
-        _DaySelector(days: days, selected: day, onSelect: onSelectDay),
+        _DaySelector(
+          days: days,
+          selected: day,
+          onSelect: onSelectDay,
+          focusNode: daySelectorFocusNode,
+          onJumpUpToTopBar: (dx) => onJumpToTopBar(preferredDx: dx),
+          onJumpDownToGrid: (dx) => onJumpToVisibleGrid(preferredDx: dx),
+          onEscapeLeftToRail: onEscapeLeftToRail,
+        ),
         const Divider(height: 1),
         Expanded(
           child: Row(
@@ -942,16 +1316,7 @@ class _GuideView extends StatelessWidget {
                   focusNode: gridFocusNode,
                   canRequestFocus: false,
                   skipTraversal: true,
-                  onKeyEvent: (node, event) {
-                    if (event is KeyDownEvent &&
-                        (event.logicalKey == LogicalKeyboardKey.contextMenu ||
-                            event.logicalKey == LogicalKeyboardKey.info ||
-                            event.logicalKey == LogicalKeyboardKey.escape)) {
-                      onJumpToTopBar();
-                      return KeyEventResult.handled;
-                    }
-                    return KeyEventResult.ignored;
-                  },
+                  onKeyEvent: _handleGridKeyEvent,
                   child: LayoutBuilder(
                     builder: (context, constraints) {
                       final channelWidth = resolveEpgChannelWidth(
@@ -971,10 +1336,12 @@ class _GuideView extends StatelessWidget {
                                 channelWidth: channelWidth,
                               ),
                               Expanded(
+                                key: gridViewportKey,
                                 child: _DayGrid(
                                   reg: reg,
                                   services: guide.services,
-                                  schedules: schedules,
+                                  ownedSchedules: ownedSchedules,
+                                  isMultiNasne: isMultiNasne,
                                   reservedStyle: reservedStyle,
                                   hiddenGenres: hiddenGenres,
                                   onWatchEvent: onWatchEvent,
@@ -1005,35 +1372,109 @@ class _DaySelector extends StatelessWidget {
     required this.days,
     required this.selected,
     required this.onSelect,
+    required this.focusNode,
+    required this.onJumpUpToTopBar,
+    required this.onJumpDownToGrid,
+    required this.onEscapeLeftToRail,
   });
 
   final List<DateTime> days;
   final DateTime selected;
   final ValueChanged<DateTime> onSelect;
+  final FocusNode focusNode;
+  final void Function(double preferredDx) onJumpUpToTopBar;
+  final void Function(double preferredDx) onJumpDownToGrid;
+  final bool Function(double referenceY) onEscapeLeftToRail;
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final targets = focusNode.traversalDescendants
+        .where(
+          (n) => n.canRequestFocus && !n.skipTraversal && n.context != null,
+        )
+        .toList()
+      ..sort((a, b) => a.rect.center.dx.compareTo(b.rect.center.dx));
+    if (targets.isEmpty) return KeyEventResult.ignored;
+    final curIdx = targets.indexWhere((n) => n.hasPrimaryFocus || n.hasFocus);
+    final cur = curIdx >= 0 ? targets[curIdx] : targets.first;
+    final key = event.logicalKey;
+
+    if (key == LogicalKeyboardKey.arrowUp) {
+      onJumpUpToTopBar(cur.rect.center.dx);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowDown) {
+      onJumpDownToGrid(cur.rect.center.dx);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight) {
+      if (curIdx >= 0 && curIdx + 1 < targets.length) {
+        final next = targets[curIdx + 1];
+        next.requestFocus();
+        if (next.context != null) {
+          unawaited(
+            Scrollable.ensureVisible(
+              next.context!,
+              duration: const Duration(milliseconds: 120),
+              alignment: 0.5,
+            ),
+          );
+        }
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      if (curIdx > 0) {
+        final prev = targets[curIdx - 1];
+        prev.requestFocus();
+        if (prev.context != null) {
+          unawaited(
+            Scrollable.ensureVisible(
+              prev.context!,
+              duration: const Duration(milliseconds: 120),
+              alignment: 0.5,
+            ),
+          );
+        }
+      } else {
+        onEscapeLeftToRail(cur.rect.center.dy);
+      }
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
 
   @override
   Widget build(BuildContext context) {
     final today = _EpgScreenState._jstDateOf(DateTime.now());
-    return SizedBox(
-      height: 48,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        children: [
-          for (final day in days)
-            Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: ChoiceChip(
-                label: Text(
-                  day == today
-                      ? '今日 ${day.month}/${day.day}'
-                      : '${day.month}/${day.day} (${formatWeekdayJst(day.add(const Duration(hours: 9)))})',
+    return Focus(
+      focusNode: focusNode,
+      canRequestFocus: false,
+      skipTraversal: true,
+      onKeyEvent: _handleKeyEvent,
+      child: SizedBox(
+        height: 48,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          children: [
+            for (final day in days)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: ChoiceChip(
+                  label: Text(
+                    day == today
+                        ? '今日 ${day.month}/${day.day}'
+                        : '${day.month}/${day.day} (${formatWeekdayJst(day.add(const Duration(hours: 9)))})',
+                  ),
+                  selected: day == selected,
+                  onSelected: (_) => onSelect(day),
                 ),
-                selected: day == selected,
-                onSelected: (_) => onSelect(day),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1149,7 +1590,8 @@ class _DayGrid extends StatelessWidget {
   const _DayGrid({
     required this.reg,
     required this.services,
-    required this.schedules,
+    required this.ownedSchedules,
+    required this.isMultiNasne,
     required this.reservedStyle,
     required this.hiddenGenres,
     required this.onWatchEvent,
@@ -1161,7 +1603,8 @@ class _DayGrid extends StatelessWidget {
 
   final RegisteredNasne reg;
   final List<EpgServiceGuide> services;
-  final List<RecordSchedule> schedules;
+  final List<OwnedRecordSchedule> ownedSchedules;
+  final bool isMultiNasne;
   final EpgReservedStyle reservedStyle;
   final Set<int> hiddenGenres;
   final void Function(Channel channel) onWatchEvent;
@@ -1215,11 +1658,12 @@ class _DayGrid extends StatelessWidget {
                               hiddenGenres,
                             ),
                             reservedStyle: reservedStyle,
-                            matchedSchedule: findMatchingSchedule(
-                              schedules,
+                            matchedOwnedSchedule: findMatchingOwnedSchedule(
+                              ownedSchedules,
                               services[i].channel,
                               event,
                             ),
+                            showNasneOwnerName: isMultiNasne,
                             onWatch: () =>
                                 onWatchEvent(services[i].channel),
                           ),
@@ -1254,7 +1698,8 @@ class _EventTile extends StatefulWidget {
     required this.dayStart,
     required this.suppressed,
     required this.reservedStyle,
-    this.matchedSchedule,
+    this.matchedOwnedSchedule,
+    this.showNasneOwnerName = false,
     required this.onWatch,
   });
 
@@ -1272,7 +1717,8 @@ class _EventTile extends StatefulWidget {
   final EpgReservedStyle reservedStyle;
 
   /// Existing scheduled recording matching this broadcast event, if any.
-  final RecordSchedule? matchedSchedule;
+  final OwnedRecordSchedule? matchedOwnedSchedule;
+  final bool showNasneOwnerName;
 
   /// Opens live viewing for this tile's channel (plan 95);
   /// the detail dialog offers it only while the event is on
@@ -1291,7 +1737,8 @@ class _EventTileState extends State<_EventTile> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     final event = widget.event;
-    final isReserved = widget.matchedSchedule != null;
+    final matchedOwned = widget.matchedOwnedSchedule;
+    final isReserved = matchedOwned != null;
     final startMin = math.max(
       0,
       event.start.difference(widget.dayStart).inMinutes,
@@ -1454,7 +1901,12 @@ class _EventTileState extends State<_EventTile> {
               channel: widget.channel,
               channelName: widget.channelName,
               event: event,
-              existingSchedule: widget.matchedSchedule,
+              existingSchedule: matchedOwned?.schedule,
+              existingScheduleReg: matchedOwned?.reg,
+              reservedNasneName:
+                  widget.showNasneOwnerName && matchedOwned != null
+                  ? nasneDisplayLabel(matchedOwned.reg)
+                  : null,
               onWatch: widget.onWatch,
             ),
             child: Stack(
@@ -1554,6 +2006,21 @@ RecordSchedule? findMatchingSchedule(
   return null;
 }
 
+/// Variant of [findMatchingSchedule] that retains the owning nasne record.
+OwnedRecordSchedule? findMatchingOwnedSchedule(
+  List<OwnedRecordSchedule> ownedSchedules,
+  Channel channel,
+  EpgEvent event,
+) {
+  final raw = [for (final o in ownedSchedules) o.schedule];
+  final matched = findMatchingSchedule(raw, channel, event);
+  if (matched == null) return null;
+  for (final o in ownedSchedules) {
+    if (identical(o.schedule, matched)) return o;
+  }
+  return null;
+}
+
 void showEpgEventDetail(
   BuildContext context, {
   required RegisteredNasne reg,
@@ -1561,6 +2028,8 @@ void showEpgEventDetail(
   required String channelName,
   required EpgEvent event,
   RecordSchedule? existingSchedule,
+  RegisteredNasne? existingScheduleReg,
+  String? reservedNasneName,
   VoidCallback? onWatch,
 }) {
   final now = DateTime.now();
@@ -1571,14 +2040,16 @@ void showEpgEventDetail(
     builder: (dialogContext) => EpgEventDetailDialog(
       event: event,
       channelName: channelName,
+      reservedNasneName: reservedNasneName,
       onEditSchedule: existingSchedule != null
           ? () {
               Navigator.of(dialogContext).pop();
               Navigator.of(context).push(
                 MaterialPageRoute<void>(
                   builder: (_) => ScheduleDetailPage(
-                    reg: reg,
+                    reg: existingScheduleReg ?? reg,
                     scheduleId: existingSchedule.id,
+                    autofocusEdit: true,
                   ),
                 ),
               );
@@ -1608,11 +2079,12 @@ void showEpgEventDetail(
   );
 }
 
-class EpgEventDetailDialog extends StatelessWidget {
+class EpgEventDetailDialog extends StatefulWidget {
   const EpgEventDetailDialog({
     super.key,
     required this.event,
     required this.channelName,
+    this.reservedNasneName,
     this.onReserve,
     this.onEditSchedule,
     this.onWatch,
@@ -1620,6 +2092,7 @@ class EpgEventDetailDialog extends StatelessWidget {
 
   final EpgEvent event;
   final String channelName;
+  final String? reservedNasneName;
 
   /// Opens the prefilled reservation form (plan 28); null when
   /// the event has already ended or is already scheduled.
@@ -1633,95 +2106,194 @@ class EpgEventDetailDialog extends StatelessWidget {
   final VoidCallback? onWatch;
 
   @override
+  State<EpgEventDetailDialog> createState() => _EpgEventDetailDialogState();
+}
+
+class _EpgEventDetailDialogState extends State<EpgEventDetailDialog> {
+  final ScrollController _scrollController = ScrollController();
+  bool _bodyFocused = false;
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleBodyKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (!_scrollController.hasClients) return KeyEventResult.ignored;
+    final pos = _scrollController.position;
+    if (pos.maxScrollExtent <= 0) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowDown) {
+      if (pos.pixels < pos.maxScrollExtent - 1.0) {
+        final next = (pos.pixels + 72.0).clamp(
+          pos.minScrollExtent,
+          pos.maxScrollExtent,
+        );
+        unawaited(
+          _scrollController.animateTo(
+            next,
+            duration: const Duration(milliseconds: 100),
+            curve: Curves.easeOut,
+          ),
+        );
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      if (pos.pixels > pos.minScrollExtent + 1.0) {
+        final next = (pos.pixels - 72.0).clamp(
+          pos.minScrollExtent,
+          pos.maxScrollExtent,
+        );
+        unawaited(
+          _scrollController.animateTo(
+            next,
+            duration: const Duration(milliseconds: 100),
+            curve: Curves.easeOut,
+          ),
+        );
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final event = widget.event;
     final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
     final genreLabel = epgGenreLabel(event.genreLevel1);
-    final reservedColor = theme.brightness == Brightness.dark
+    final reservedColor = isDark
         ? Colors.redAccent
         : const Color(0xFFD32F2F);
+    final focusPrimaryReserve = widget.onReserve != null;
+    final focusPrimaryEdit =
+        !focusPrimaryReserve && widget.onEditSchedule != null;
+    final focusPrimaryWatch =
+        !focusPrimaryReserve && !focusPrimaryEdit && widget.onWatch != null;
+    final focusClose =
+        !focusPrimaryReserve && !focusPrimaryEdit && !focusPrimaryWatch;
+    final reservedText = widget.reservedNasneName != null
+        ? '録画予約済み（${widget.reservedNasneName}）'
+        : '録画予約済み';
     return AlertDialog(
       title: Text(event.title ?? '番組情報なし'),
-      content: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(channelName, style: theme.textTheme.bodySmall),
-            if (genreLabel != null)
-              Text('ジャンル: $genreLabel', style: theme.textTheme.bodySmall),
-            Text(
-              '${formatDateTimeWithWeekdayJst(event.start)} 〜 '
-              '${formatTimeJst(event.end)}'
-              '（${event.duration.inMinutes}分）',
-              style: theme.textTheme.bodyMedium,
-            ),
-            if (onEditSchedule != null) ...[
-              const SizedBox(height: 6),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.fiber_manual_record, size: 12, color: reservedColor),
-                  const SizedBox(width: 4),
-                  Text(
-                    '録画予約済み',
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      color: reservedColor,
-                      fontWeight: FontWeight.bold,
-                    ),
+      content: Focus(
+        onFocusChange: (focused) {
+          if (_bodyFocused != focused) setState(() => _bodyFocused = focused);
+        },
+        onKeyEvent: _handleBodyKeyEvent,
+        child: Container(
+          padding: const EdgeInsets.all(4),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: _bodyFocused
+                ? Border.all(
+                    color: isDark ? Colors.amberAccent : Colors.amber,
+                    width: 2,
+                  )
+                : null,
+          ),
+          child: SingleChildScrollView(
+            controller: _scrollController,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(widget.channelName, style: theme.textTheme.bodySmall),
+                if (genreLabel != null)
+                  Text('ジャンル: $genreLabel', style: theme.textTheme.bodySmall),
+                Text(
+                  '${formatDateTimeWithWeekdayJst(event.start)} 〜 '
+                  '${formatTimeJst(event.end)}'
+                  '（${event.duration.inMinutes}分）',
+                  style: theme.textTheme.bodyMedium,
+                ),
+                if (widget.onEditSchedule != null) ...[
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.fiber_manual_record,
+                        size: 12,
+                        color: reservedColor,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        reservedText,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: reservedColor,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
-              ),
-            ],
-            if (event.shortText != null && event.shortText!.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(event.shortText!),
-            ],
-            if (event.description != null && event.description!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text('番組内容', style: theme.textTheme.titleSmall),
-              const SizedBox(height: 4),
-              Text(event.description!),
-            ],
-            if (event.cast != null && event.cast!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text('出演者', style: theme.textTheme.titleSmall),
-              const SizedBox(height: 4),
-              Text(event.cast!),
-            ],
-            for (final item in event.extendedItems) ...[
-              const SizedBox(height: 12),
-              Text(item.label, style: theme.textTheme.titleSmall),
-              const SizedBox(height: 4),
-              Text(item.value),
-            ],
-            if (event.extendedText != null &&
-                event.extendedText!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text(event.extendedText!),
-            ],
-          ],
+                if (event.shortText != null && event.shortText!.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(event.shortText!),
+                ],
+                if (event.description != null &&
+                    event.description!.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text('番組内容', style: theme.textTheme.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(event.description!),
+                ],
+                if (event.cast != null && event.cast!.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text('出演者', style: theme.textTheme.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(event.cast!),
+                ],
+                for (final item in event.extendedItems) ...[
+                  const SizedBox(height: 12),
+                  Text(item.label, style: theme.textTheme.titleSmall),
+                  const SizedBox(height: 4),
+                  Text(item.value),
+                ],
+                if (event.extendedText != null &&
+                    event.extendedText!.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(event.extendedText!),
+                ],
+              ],
+            ),
+          ),
         ),
       ),
       actions: [
         TextButton(
+          autofocus: focusClose,
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('閉じる'),
         ),
-        if (onWatch != null)
+        if (widget.onWatch != null)
           FilledButton.icon(
-            onPressed: onWatch,
+            autofocus: focusPrimaryWatch,
+            onPressed: widget.onWatch,
             icon: const Icon(Icons.live_tv, size: 18),
             label: const Text('試聴'),
           ),
-        if (onEditSchedule != null)
+        if (widget.onEditSchedule != null)
           FilledButton.icon(
-            onPressed: onEditSchedule,
+            autofocus: focusPrimaryEdit,
+            onPressed: widget.onEditSchedule,
             icon: const Icon(Icons.edit_outlined, size: 18),
             label: const Text('予約を編集'),
           )
-        else if (onReserve != null)
+        else if (widget.onReserve != null)
           FilledButton.icon(
-            onPressed: onReserve,
+            autofocus: focusPrimaryReserve,
+            onPressed: widget.onReserve,
             icon: const Icon(Icons.fiber_manual_record, size: 18),
             label: const Text('録画予約'),
           ),

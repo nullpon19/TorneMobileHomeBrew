@@ -11,6 +11,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 import 'format.dart';
+import 'multi_nasne_policy.dart';
 import 'widgets.dart';
 
 class HomeScreen extends ConsumerWidget {
@@ -29,7 +30,17 @@ class HomeScreen extends ConsumerWidget {
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
-              onPressed: () => invalidateDeviceData(ref, selected),
+              onPressed: () {
+                final regs =
+                    registrations.value ?? const <RegisteredNasne>[];
+                if (regs.length > 1) {
+                  for (final r in regs) {
+                    invalidateDeviceData(ref, r);
+                  }
+                } else {
+                  invalidateDeviceData(ref, selected);
+                }
+              },
             ),
         ],
       ),
@@ -39,14 +50,56 @@ class HomeScreen extends ConsumerWidget {
           message: '登録情報の読み込みに失敗しました。',
           onRetry: () => ref.read(registrationsProvider.notifier).reload(),
         ),
-        data: (_) {
+        data: (list) {
           if (selected == null) {
             return NoDeviceView(
               onRegister: () =>
                   ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
             );
           }
-          return _StatusList(reg: selected);
+          if (list.length <= 1) {
+            return _StatusList(reg: selected);
+          }
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: list.length <= 4
+                    ? SegmentedButton<String>(
+                        segments: [
+                          for (final r in list)
+                            ButtonSegment<String>(
+                              value: r.host,
+                              label: Text(nasneDisplayLabel(r)),
+                            ),
+                        ],
+                        selected: {selected.host},
+                        onSelectionChanged: (sel) => ref
+                            .read(selectedHostProvider.notifier)
+                            .select(sel.first),
+                      )
+                    : SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: [
+                            for (final r in list)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: ChoiceChip(
+                                  label: Text(nasneDisplayLabel(r)),
+                                  selected: r.host == selected.host,
+                                  onSelected: (_) => ref
+                                      .read(selectedHostProvider.notifier)
+                                      .select(r.host),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+              ),
+              Expanded(child: _StatusList(reg: selected)),
+            ],
+          );
         },
       ),
     );

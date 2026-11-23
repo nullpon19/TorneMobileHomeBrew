@@ -79,6 +79,33 @@ class TmhbApp extends ConsumerWidget {
       focusColor: (isDark ? Colors.amberAccent : Colors.amber).withValues(
         alpha: 0.28,
       ),
+      chipTheme: ChipThemeData(
+        side: WidgetStateBorderSide.resolveWith((states) {
+          if (states.contains(WidgetState.focused)) {
+            return BorderSide(
+              color: isDark ? Colors.amberAccent : Colors.amber,
+              width: 2.5,
+            );
+          }
+          if (states.contains(WidgetState.selected)) {
+            return BorderSide(color: scheme.secondaryContainer);
+          }
+          return BorderSide(color: scheme.outlineVariant);
+        }),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        focusedBorder: UnderlineInputBorder(
+          borderSide: BorderSide(
+            color: isDark ? Colors.amberAccent : Colors.amber,
+            width: 3,
+          ),
+        ),
+      ),
+      floatingActionButtonTheme: FloatingActionButtonThemeData(
+        focusColor: (isDark ? Colors.amberAccent : Colors.amber).withValues(
+          alpha: 0.35,
+        ),
+      ),
       listTileTheme: ListTileThemeData(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),

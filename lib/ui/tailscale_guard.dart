@@ -81,7 +81,18 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
     if (!force && _dismissedForSession) return;
     _checking = true;
     try {
-      final reachable = await helper.isNasneReachable(reg.host);
+      final regs =
+          ref.read(registrationsProvider).value ?? <RegisteredNasne>[reg];
+      var reachable = await helper.isNasneReachable(reg.host);
+      if (!reachable && regs.length > 1) {
+        for (final other in regs) {
+          if (other.host == reg.host) continue;
+          if (await helper.isNasneReachable(other.host)) {
+            reachable = true;
+            break;
+          }
+        }
+      }
       if (!mounted) return;
       if (reachable) {
         if (_waitingForTailscaleReturn) {

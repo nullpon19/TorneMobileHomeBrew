@@ -215,6 +215,7 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
         content: const Text('保存済みの証明書と秘密鍵を端末の金庫から削除します。削除すると録画の再生はできなくなります。'),
         actions: [
           TextButton(
+            autofocus: true,
             onPressed: () => Navigator.pop(context, false),
             child: const Text('キャンセル'),
           ),
@@ -539,6 +540,7 @@ class _FireTvFilePickerDialogState extends State<_FireTvFilePickerDialog> {
       actions: [
         if (!_hasPermission)
           FilledButton.tonal(
+            autofocus: !_loading && _files.isEmpty,
             onPressed: _loading ? null : _requestPermission,
             child: const Text('Download フォルダの権限を許可'),
           ),
@@ -555,6 +557,7 @@ class _FireTvFilePickerDialogState extends State<_FireTvFilePickerDialog> {
           child: const Text('標準ピッカーを試す'),
         ),
         TextButton(
+          autofocus: !_loading && _files.isEmpty && _hasPermission,
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('キャンセル'),
         ),

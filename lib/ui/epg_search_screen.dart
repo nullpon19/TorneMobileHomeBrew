@@ -32,6 +32,7 @@ import 'epg_screen.dart';
 import 'epg_search.dart';
 import 'format.dart';
 import 'live_screen.dart';
+import 'multi_nasne_policy.dart';
 import 'widgets.dart';
 
 class EpgSearchScreen extends ConsumerStatefulWidget {
@@ -124,6 +125,7 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
               dialogTitle: 'キーワードを入力',
               prefixIcon: Icons.search,
               showClearButton: true,
+              autofocus: true,
               onChanged: (v) => v.isEmpty ? _clearQuery() : _onQueryChanged(v),
             ),
           ),
@@ -182,9 +184,19 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
     if (hits.isEmpty) {
       return const Center(child: Text('見つかりませんでした。'));
     }
-    final schedules =
-        ref.watch(schedulesProvider(widget.reg)).value ??
-        const <RecordSchedule>[];
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final activeRegs = regs.length > 1
+        ? regs
+        : <RegisteredNasne>[widget.reg];
+    final isMultiNasne = activeRegs.length > 1;
+    final ownedSchedules = <OwnedRecordSchedule>[
+      for (final r in activeRegs)
+        for (final s
+            in (ref.watch(schedulesProvider(r)).value ??
+                const <RecordSchedule>[]))
+          OwnedRecordSchedule(reg: r, schedule: s),
+    ];
     final reservedColor = Theme.of(context).brightness == Brightness.dark
         ? Colors.redAccent
         : const Color(0xFFD32F2F);
@@ -193,7 +205,11 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
       itemBuilder: (context, index) {
         final hit = hits[index];
         final event = hit.event;
-        final matched = findMatchingSchedule(schedules, hit.channel, event);
+        final matched = findMatchingOwnedSchedule(
+          ownedSchedules,
+          hit.channel,
+          event,
+        );
         return ListTile(
           title: Text(event.title ?? '番組情報なし'),
           subtitle: Text(
@@ -211,7 +227,11 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
             channel: hit.channel,
             channelName: hit.channelName,
             event: event,
-            existingSchedule: matched,
+            existingSchedule: matched?.schedule,
+            existingScheduleReg: matched?.reg,
+            reservedNasneName: isMultiNasne && matched != null
+                ? nasneDisplayLabel(matched.reg)
+                : null,
             onWatch: () => openLiveChannelForEpg(
               context,
               ref,

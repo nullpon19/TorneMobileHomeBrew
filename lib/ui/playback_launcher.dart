@@ -114,6 +114,7 @@ Future<void> showPlaybackErrorDialog(BuildContext context, NasneError e) {
       ),
       actions: [
         TextButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('閉じる'),
         ),
@@ -144,6 +145,7 @@ Future<void> showCredentialGuidanceDialog(
           child: const Text('閉じる'),
         ),
         FilledButton(
+          autofocus: true,
           onPressed: () {
             final navigator = Navigator.of(context);
             navigator.pop();
@@ -175,6 +177,7 @@ Future<void> showPlaybackUnsupportedDialog(
       ),
       actions: [
         TextButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('閉じる'),
         ),

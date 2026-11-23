@@ -22,6 +22,7 @@ import '../app/state.dart';
 import '../core/core.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'multi_nasne_policy.dart';
 import 'schedule_channel_selection.dart';
 import 'schedule_destination.dart';
 import 'widgets.dart';
@@ -123,6 +124,8 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
   // edit fields
   final _condition = TextEditingController();
   final _destination = TextEditingController();
+  // multi-nasne target host (create mode only; null = auto)
+  String? _targetHost;
 
   bool _saving = false;
 
@@ -194,10 +197,21 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
   // -------------------------------------------------------------------------
 
   Widget _buildCreateForm(BuildContext context) {
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final showMultiTarget =
+        widget.mode == ScheduleFormMode.create && regs.length > 1;
+    final activeHost = _targetHost != null &&
+            regs.any((r) => r.host == _targetHost)
+        ? _targetHost
+        : null;
+    final targetReg = activeHost != null
+        ? regs.firstWhere((r) => r.host == activeHost, orElse: () => widget.reg)
+        : widget.reg;
     final channels = _selectedBand == bsBroadcastingType
-        ? ref.watch(bsChannelsProvider(widget.reg))
-        : ref.watch(channelsProvider(widget.reg));
-    final hddDetails = ref.watch(hddDetailsProvider(widget.reg)).value;
+        ? ref.watch(bsChannelsProvider(targetReg))
+        : ref.watch(channelsProvider(targetReg));
+    final hddDetails = ref.watch(hddDetailsProvider(targetReg)).value;
     final externalAvailable =
         hddDetails != null &&
         externalDestinationAvailable([for (final d in hddDetails) d.entry]);
@@ -230,6 +244,26 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
             padding: EdgeInsets.only(bottom: 12),
             child: Text('時刻の変更は、元の予約を削除して新しい予約を作成することで行います。'),
           ),
+        if (showMultiTarget) ...[
+          DropdownButtonFormField<String?>(
+            key: ValueKey('schedule-nasne-$activeHost'),
+            initialValue: activeHost,
+            decoration: const InputDecoration(labelText: '録画する nasne'),
+            items: [
+              const DropdownMenuItem<String?>(
+                value: null,
+                child: Text('自動選択（空きチューナー・空き容量優先）'),
+              ),
+              for (final r in regs)
+                DropdownMenuItem<String?>(
+                  value: r.host,
+                  child: Text(nasneDisplayLabel(r)),
+                ),
+            ],
+            onChanged: (value) => setState(() => _targetHost = value),
+          ),
+          const SizedBox(height: 12),
+        ],
         SegmentedButton<int>(
           segments: const [
             ButtonSegment<int>(
@@ -284,9 +318,9 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           },
           onRetry: () {
             if (_selectedBand == bsBroadcastingType) {
-              ref.invalidate(bsChannelsProvider(widget.reg));
+              ref.invalidate(bsChannelsProvider(targetReg));
             } else {
-              ref.invalidate(channelsProvider(widget.reg));
+              ref.invalidate(channelsProvider(targetReg));
             }
           },
         ),
@@ -349,7 +383,10 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
   }
 
   Future<void> _pickTime() async {
-    final picked = await showTimePicker(context: context, initialTime: _time);
+    final picked = await showDialog<TimeOfDay>(
+      context: context,
+      builder: (_) => FireTvTimePickerDialog(initialTime: _time),
+    );
     if (picked != null) setState(() => _time = picked);
   }
 
@@ -394,18 +431,34 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
 
   /// Whether an external HDD is currently known to be registered
   /// and mounted; false while the HDD list is loading or failed.
-  bool get _externalAvailableNow {
-    final details = ref.read(hddDetailsProvider(widget.reg)).value;
+  bool _externalAvailableFor(RegisteredNasne target) {
+    final details = ref.read(hddDetailsProvider(target)).value;
     if (details == null) return false;
     return externalDestinationAvailable([for (final d in details) d.entry]);
   }
 
   Future<void> _saveCreate() async {
     FocusScope.of(context).unfocus();
+    final regs =
+        ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final isMultiAuto =
+        widget.mode == ScheduleFormMode.create &&
+        regs.length > 1 &&
+        (_targetHost == null || !regs.any((r) => r.host == _targetHost));
+    final explicitTargetReg =
+        widget.mode == ScheduleFormMode.create &&
+            regs.length > 1 &&
+            _targetHost != null
+        ? regs.firstWhere(
+            (r) => r.host == _targetHost,
+            orElse: () => widget.reg,
+          )
+        : widget.reg;
+
     final channels =
         (_selectedBand == bsBroadcastingType
-                ? ref.read(bsChannelsProvider(widget.reg))
-                : ref.read(channelsProvider(widget.reg)))
+                ? ref.read(bsChannelsProvider(explicitTargetReg))
+                : ref.read(channelsProvider(explicitTargetReg)))
             .value;
     final choices = <Channel>[
       for (final c in channels ?? const <Channel>[])
@@ -432,36 +485,141 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
     final start = instantFromJstWall(
       DateTime(_date.year, _date.month, _date.day, _time.hour, _time.minute),
     );
-    final candidate = NewRecordSchedule(
-      start: start,
-      durationSeconds: minutes * 60,
-      channel: ScheduleChannel(
-        broadcastingType: channel.broadcastingType,
-        channelType: channel.broadcastingType,
-        serviceId: channel.serviceId,
-      ),
-      networkId: channel.networkId,
-      // Never associate an EPG event with a different selected channel.
-      eventId:
-          widget.prefill != null &&
-              scheduleChannelKey(widget.prefill!.channel) ==
-                  scheduleChannelKey(channel)
-          ? widget.prefill!.eventId
-          : 0,
-      desiredQualityMode: _quality,
-      priorityFlag: _priority ? 1 : 0,
-      // The landing drive follows this value (plan 89.12), so
-      // it carries the form's destination choice, clamped to
-      // the internal HDD when the external one is not (or is
-      // no longer) available.
-      recordDestinationId: effectiveRecordDestination(
-        _destinationId,
-        externalAvailable: _externalAvailableNow,
-      ),
-    );
+    NewRecordSchedule buildCandidate(RegisteredNasne target) =>
+        NewRecordSchedule(
+          start: start,
+          durationSeconds: minutes * 60,
+          channel: ScheduleChannel(
+            broadcastingType: channel.broadcastingType,
+            channelType: channel.broadcastingType,
+            serviceId: channel.serviceId,
+          ),
+          networkId: channel.networkId,
+          // Never associate an EPG event with a different selected channel.
+          eventId:
+              widget.prefill != null &&
+                  scheduleChannelKey(widget.prefill!.channel) ==
+                      scheduleChannelKey(channel)
+              ? widget.prefill!.eventId
+              : 0,
+          desiredQualityMode: _quality,
+          priorityFlag: _priority ? 1 : 0,
+          recordDestinationId: effectiveRecordDestination(
+            _destinationId,
+            externalAvailable: _externalAvailableFor(target),
+          ),
+        );
 
     setState(() => _saving = true);
-    final services = ref.read(deviceServicesProvider(widget.reg));
+
+    if (isMultiAuto) {
+      final candidate = buildCandidate(widget.reg);
+      final reachableRegs = <RegisteredNasne>[];
+      final hasConflictByHost = <String, bool>{};
+      final freeBytesByHost = <String, int>{};
+      final allConflicts = <RecordSchedule>[];
+      Object? firstError;
+
+      final results = await Future.wait([
+        for (final r in regs)
+          () async {
+            try {
+              final svc = ref.read(deviceServicesProvider(r));
+              final conflicts = await svc.schedules.checkConflicts(candidate);
+              var hdds = ref.read(hddDetailsProvider(r)).value;
+              if (hdds == null) {
+                try {
+                  hdds = await ref
+                      .read(hddDetailsProvider(r).future)
+                      .timeout(const Duration(seconds: 3));
+                } catch (_) {
+                  hdds = null;
+                }
+              }
+              return (
+                reg: r,
+                conflicts: conflicts,
+                freeBytes: totalFreeBytesForHdds(hdds),
+                error: null as Object?,
+              );
+            } catch (e) {
+              return (
+                reg: r,
+                conflicts: const <RecordSchedule>[],
+                freeBytes: -1,
+                error: e,
+              );
+            }
+          }(),
+      ]);
+
+      for (final res in results) {
+        if (res.error != null) {
+          firstError ??= res.error;
+          continue;
+        }
+        reachableRegs.add(res.reg);
+        hasConflictByHost[res.reg.host] = res.conflicts.isNotEmpty;
+        freeBytesByHost[res.reg.host] = res.freeBytes;
+        allConflicts.addAll(res.conflicts);
+      }
+
+      if (!mounted) return;
+      if (reachableRegs.isEmpty) {
+        setState(() => _saving = false);
+        showSnack(
+          context,
+          firstError != null ? userMessageForError(firstError) : '予約を作成できませんでした',
+        );
+        return;
+      }
+
+      var target = selectAutoScheduleNasne(
+        candidates: reachableRegs,
+        hasConflictByHost: hasConflictByHost,
+        freeBytesByHost: freeBytesByHost,
+        preferredReg: widget.reg,
+      );
+
+      if (target == null) {
+        final otherChannels = _selectedBand == bsBroadcastingType
+            ? (ref.read(channelsProvider(widget.reg)).value ??
+                  const <Channel>[])
+            : (ref.read(bsChannelsProvider(widget.reg)).value ??
+                  const <Channel>[]);
+        final proceed = await _showConflictWarning(allConflicts, [
+          ...choices,
+          ...otherChannels,
+        ]);
+        if (proceed != true) {
+          if (mounted) setState(() => _saving = false);
+          return;
+        }
+        target = reachableRegs.any((r) => r.host == widget.reg.host)
+            ? widget.reg
+            : reachableRegs.first;
+      }
+
+      try {
+        await ref
+            .read(deviceServicesProvider(target))
+            .schedules
+            .createSchedule(buildCandidate(target));
+      } on NasneError catch (e) {
+        if (!mounted) return;
+        setState(() => _saving = false);
+        showSnack(context, userMessageForError(e));
+        return;
+      }
+      ref.invalidate(schedulesProvider(target));
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      showSnack(context, '予約を作成しました（${nasneDisplayLabel(target)}）');
+      return;
+    }
+
+    final candidate = buildCandidate(explicitTargetReg);
+    final services = ref.read(deviceServicesProvider(explicitTargetReg));
     try {
       var conflicts = await services.schedules.checkConflicts(candidate);
       final original = widget.original;
@@ -476,9 +634,9 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       if (conflicts.isNotEmpty) {
         if (!mounted) return;
         final otherChannels = _selectedBand == bsBroadcastingType
-            ? (ref.read(channelsProvider(widget.reg)).value ??
+            ? (ref.read(channelsProvider(explicitTargetReg)).value ??
                   const <Channel>[])
-            : (ref.read(bsChannelsProvider(widget.reg)).value ??
+            : (ref.read(bsChannelsProvider(explicitTargetReg)).value ??
                   const <Channel>[]);
         final proceed = await _showConflictWarning(conflicts, [
           ...choices,
@@ -499,10 +657,15 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       showSnack(context, userMessageForError(e));
       return;
     }
-    ref.invalidate(schedulesProvider(widget.reg));
+    ref.invalidate(schedulesProvider(explicitTargetReg));
     if (!mounted) return;
     Navigator.of(context).pop();
-    showSnack(context, '予約を作成しました');
+    showSnack(
+      context,
+      regs.length > 1
+          ? '予約を作成しました（${nasneDisplayLabel(explicitTargetReg)}）'
+          : '予約を作成しました',
+    );
   }
 
   Future<bool?> _showConflictWarning(
@@ -529,6 +692,7 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
         ),
         actions: [
           TextButton(
+            autofocus: true,
             onPressed: () => Navigator.of(context).pop(false),
             child: const Text('キャンセル'),
           ),
@@ -635,5 +799,98 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
     if (!mounted) return;
     Navigator.of(context).pop();
     showSnack(context, '更新しました');
+  }
+}
+
+/// Fire TV D-pad friendly time picker dialog replacing Material's analog
+/// clock dial with straightforward step buttons.
+class FireTvTimePickerDialog extends StatefulWidget {
+  const FireTvTimePickerDialog({super.key, required this.initialTime});
+
+  final TimeOfDay initialTime;
+
+  @override
+  State<FireTvTimePickerDialog> createState() => _FireTvTimePickerDialogState();
+}
+
+class _FireTvTimePickerDialogState extends State<FireTvTimePickerDialog> {
+  late int _hour = widget.initialTime.hour;
+  late int _minute = widget.initialTime.minute;
+
+  void _addHours(int delta) => setState(() => _hour = (_hour + delta + 24) % 24);
+
+  void _addMinutes(int delta) =>
+      setState(() => _minute = (_minute + delta + 60) % 60);
+
+  @override
+  Widget build(BuildContext context) {
+    final formatted =
+        '${_hour.toString().padLeft(2, '0')}:${_minute.toString().padLeft(2, '0')}';
+    return AlertDialog(
+      title: const Text('開始時刻を選択'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            formatted,
+            style: Theme.of(context).textTheme.displaySmall?.copyWith(
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.center,
+            children: [
+              OutlinedButton(
+                onPressed: () => _addHours(-1),
+                child: const Text('-1時間'),
+              ),
+              OutlinedButton(
+                autofocus: true,
+                onPressed: () => _addHours(1),
+                child: const Text('+1時間'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.center,
+            children: [
+              OutlinedButton(
+                onPressed: () => _addMinutes(-10),
+                child: const Text('-10分'),
+              ),
+              OutlinedButton(
+                onPressed: () => _addMinutes(-1),
+                child: const Text('-1分'),
+              ),
+              OutlinedButton(
+                onPressed: () => _addMinutes(1),
+                child: const Text('+1分'),
+              ),
+              OutlinedButton(
+                onPressed: () => _addMinutes(10),
+                child: const Text('+10分'),
+              ),
+            ],
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () =>
+              Navigator.of(context).pop(TimeOfDay(hour: _hour, minute: _minute)),
+          child: const Text('決定'),
+        ),
+      ],
+    );
   }
 }

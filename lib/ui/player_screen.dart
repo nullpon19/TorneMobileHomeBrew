@@ -185,6 +185,7 @@ import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import 'live_recording_policy.dart';
+import 'multi_nasne_policy.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
 import 'player_error_policy.dart';
@@ -447,6 +448,13 @@ Future<bool> showPlayerExitConfirmDialog(BuildContext context) async {
   return confirmed == true;
 }
 
+/// Formats the top-right 5-second notice shown after seamless live failover.
+String buildLiveFailoverNotice({
+  String? fromNasneName,
+  required RegisteredNasne toRegistration,
+}) =>
+    '${fromNasneName ?? '他の nasne'} で録画開始のため ${nasneDisplayLabel(toRegistration)} へ切替';
+
 /// Prompts when live TV playback cannot start or is interrupted because another
 /// channel has claimed the single tuner for a scheduled recording. Returns
 /// `true` to switch to the recording channel, or `false`/`null` to close/exit.
@@ -456,9 +464,13 @@ Future<bool?> showLiveRecordingConflictDialog(
   required bool midStream,
 }) {
   final targetCh = conflict.channelName;
-  final targetDesc = (targetCh != null && targetCh.isNotEmpty)
+  final baseDesc = (targetCh != null && targetCh.isNotEmpty)
       ? '$targetCh「${conflict.displayTitle}」'
       : '「${conflict.displayTitle}」';
+  final targetDesc =
+      (conflict.nasneName != null && conflict.nasneName!.isNotEmpty)
+      ? '${conflict.nasneName}: $baseDesc'
+      : baseDesc;
   final body = midStream
       ? '他チャンネルで録画（$targetDesc）が開始されたため、視聴が中断されました。'
       : '現在、他チャンネルで録画中（$targetDesc）のため、このチャンネルは視聴できません。';
@@ -762,6 +774,8 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.initialRecordingSchedules = const [],
     this.onCheckRecordingConflict,
     this.onBuildRecordingChannelPlayer,
+    this.onBuildFailoverPlayer,
+    this.initialCornerNotice,
     this.nowProvider,
   });
 
@@ -846,6 +860,19 @@ class PlayerScreen extends ConsumerStatefulWidget {
   final Future<Widget> Function(LiveChannel target)?
       onBuildRecordingChannelPlayer;
 
+  /// Builds the replacement [PlayerScreen] when automatically failing over to
+  /// another registered nasne whose tuner is still free.
+  final Future<Widget> Function(
+    RegisteredNasne targetReg,
+    LiveChannel targetChannel,
+    String? notice,
+  )?
+  onBuildFailoverPlayer;
+
+  /// Optional 5-second top-right notice shown right after opening (e.g. after a
+  /// multi-nasne auto-failover switch).
+  final String? initialCornerNotice;
+
   /// Injectable clock for testing same-channel recording notices.
   final DateTime Function()? nowProvider;
 
@@ -885,8 +912,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _sameChannelRecording = false;
   bool? _lastSameChannelRecording;
   LiveRecordingCornerNotice? _cornerRecordingNotice;
+  String? _customCornerNoticeText;
   Timer? _recordingStatusTimer;
   Timer? _cornerNoticeTimer;
+  Timer? _customCornerNoticeTimer;
   bool _checkingConflict = false;
   bool _conflictHandled = false;
   bool _switchingChannel = false;
@@ -1424,6 +1453,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _observeCacheDuration();
     _open();
     _loadChapters();
+    if (widget.initialCornerNotice != null &&
+        widget.initialCornerNotice!.isNotEmpty) {
+      _customCornerNoticeText = widget.initialCornerNotice;
+      _customCornerNoticeTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        setState(() => _customCornerNoticeText = null);
+      });
+    }
     if (widget.live && widget.currentLiveChannel != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _updateSameChannelRecordingStatus();
@@ -1693,6 +1730,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _resumeWatchdogTimer?.cancel();
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
+    _customCornerNoticeTimer?.cancel();
     _osdTimer?.cancel();
     _hudTimer?.cancel();
 
@@ -1709,6 +1747,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _detailOpen = false;
       _hudText = null;
       _cornerRecordingNotice = null;
+      _customCornerNoticeText = null;
     });
 
     await _player.stop().timeout(
@@ -1719,6 +1758,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       const Duration(seconds: 3),
       onTimeout: () {},
     ).catchError((_) {});
+    if (!mounted) return;
+
+    final failoverReg = conflict.failoverRegistration;
+    final failoverCh = conflict.failoverChannel;
+    final buildFailover = widget.onBuildFailoverPlayer;
+    if (failoverReg != null && failoverCh != null && buildFailover != null) {
+      final notice = buildLiveFailoverNotice(
+        fromNasneName: conflict.nasneName,
+        toRegistration: failoverReg,
+      );
+      setState(() {
+        _switchingChannel = true;
+        _error = null;
+      });
+      try {
+        final nextPlayer = await buildFailover(failoverReg, failoverCh, notice);
+        if (!mounted) return;
+        await Navigator.of(context).pushReplacement(
+          MaterialPageRoute<void>(builder: (_) => nextPlayer),
+        );
+        return;
+      } catch (e) {
+        _diag(
+          DiagCategory.playback,
+          'player: failover switch failed, falling back to conflict dialog: $e',
+        );
+        if (!mounted) return;
+        setState(() => _switchingChannel = false);
+      }
+    }
     if (!mounted) return;
 
     final shouldSwitch = await showLiveRecordingConflictDialog(
@@ -2305,6 +2374,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           run: () => _recordingStatusTimer?.cancel(),
         ),
         (name: 'corner notice timer', run: () => _cornerNoticeTimer?.cancel()),
+        (
+          name: 'custom corner notice timer',
+          run: () => _customCornerNoticeTimer?.cancel(),
+        ),
         (
           name: 'live conflict poller',
           run: () => _liveConflictPollTimer?.cancel(),
@@ -2992,6 +3065,37 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   Widget _buildCornerRecordingNotice() {
+    final customText = _customCornerNoticeText;
+    if (customText != null) {
+      return Positioned(
+        top: 16,
+        right: 20,
+        child: IgnorePointer(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xCC1E3A5F),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.swap_horiz, size: 14, color: Colors.white),
+                const SizedBox(width: 4),
+                Text(
+                  customText,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     final notice = _cornerRecordingNotice;
     if (notice == null) return const SizedBox.shrink();
     final ended = notice == LiveRecordingCornerNotice.ended;

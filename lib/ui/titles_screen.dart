@@ -66,6 +66,7 @@ import '../app/state.dart';
 import '../core/core.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'multi_nasne_policy.dart';
 import 'playback_launcher.dart';
 import 'player_screen.dart';
 import 'title_list_filter.dart';
@@ -275,6 +276,7 @@ Future<void> _showDeleteRefusal(BuildContext context, String message) {
       content: Text(message),
       actions: [
         TextButton(
+          autofocus: true,
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('閉じる'),
         ),
@@ -291,7 +293,7 @@ class TitlesScreen extends ConsumerStatefulWidget {
 }
 
 class _TitlesScreenState extends ConsumerState<TitlesScreen> {
-  String? _selectedId;
+  String? _selectedKey;
   final FocusNode _detailPlayFocusNode = FocusNode(debugLabel: 'titlePlay');
 
   @override
@@ -303,6 +305,11 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
   @override
   Widget build(BuildContext context) {
     final reg = ref.watch(selectedRegistrationProvider);
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final activeRegs = regs.length > 1
+        ? regs
+        : (reg != null ? [reg] : const <RegisteredNasne>[]);
     return Scaffold(
       appBar: AppBar(
         title: const Text('録画済み'),
@@ -312,8 +319,10 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
               onPressed: () {
-                ref.invalidate(titlesProvider(reg));
-                ref.invalidate(titleCountsProvider(reg));
+                for (final r in activeRegs) {
+                  ref.invalidate(titlesProvider(r));
+                  ref.invalidate(titleCountsProvider(r));
+                }
               },
             ),
         ],
@@ -325,11 +334,12 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
             )
           : _TitleList(
               reg: reg,
-              selectedId: _selectedId,
+              activeRegs: activeRegs,
+              selectedKey: _selectedKey,
               detailPlayFocusNode: _detailPlayFocusNode,
-              onSelect: (title, twoPane) {
+              onSelect: (title, owner, showNasneName, twoPane) {
                 if (twoPane) {
-                  setState(() => _selectedId = title.id);
+                  setState(() => _selectedKey = ownedItemKey(owner, title.id));
                   WidgetsBinding.instance.addPostFrameCallback((_) {
                     if (mounted && _detailPlayFocusNode.canRequestFocus) {
                       _detailPlayFocusNode.requestFocus();
@@ -338,8 +348,11 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
                 } else {
                   Navigator.of(context).push(
                     MaterialPageRoute(
-                      builder: (_) =>
-                          TitleDetailPage(reg: reg, titleId: title.id),
+                      builder: (_) => TitleDetailPage(
+                        reg: owner,
+                        titleId: title.id,
+                        showNasneName: showNasneName,
+                      ),
                     ),
                   );
                 }
@@ -352,15 +365,23 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
 class _TitleList extends ConsumerStatefulWidget {
   const _TitleList({
     required this.reg,
-    required this.selectedId,
+    required this.activeRegs,
+    required this.selectedKey,
     required this.detailPlayFocusNode,
     required this.onSelect,
   });
 
   final RegisteredNasne reg;
-  final String? selectedId;
+  final List<RegisteredNasne> activeRegs;
+  final String? selectedKey;
   final FocusNode detailPlayFocusNode;
-  final void Function(RecordedTitle title, bool twoPane) onSelect;
+  final void Function(
+    RecordedTitle title,
+    RegisteredNasne owner,
+    bool showNasneName,
+    bool twoPane,
+  )
+  onSelect;
 
   @override
   ConsumerState<_TitleList> createState() => _TitleListState();
@@ -373,6 +394,7 @@ class _TitleListState extends ConsumerState<_TitleList> {
   String? _channelKey;
   String? _genre;
   bool _unwatchedOnly = false;
+  String? _nasneHostFilter;
   final Set<String> _expandedGroups = {};
 
   @override
@@ -388,30 +410,111 @@ class _TitleListState extends ConsumerState<_TitleList> {
       _channelKey = null;
       _genre = null;
       _unwatchedOnly = false;
+      _nasneHostFilter = null;
     });
   }
 
   @override
   Widget build(BuildContext context) {
     final reg = widget.reg;
-    final progress = ref.watch(titlesProvider(reg));
-    final counts = ref.watch(titleCountsProvider(reg)).value;
-    // The latest stage of the progressive load (plan 100). A
-    // stage is provisional until it is marked complete; during
-    // a refresh the previous stage stays on screen, with the
-    // loading state saying a newer one is on its way.
-    final snapshot = progress.value;
-    final allTitles = snapshot?.titles ?? const <RecordedTitle>[];
-    final stillLoading =
-        snapshot == null || !snapshot.complete || progress.isLoading;
-    // A load that failed before completing has nothing sound
-    // to show — the error view takes over, as it did when the
-    // whole list was one future. A failed *refresh* keeps the
-    // complete stage it already had.
-    final loadFailed =
-        progress.hasError && (snapshot == null || !snapshot.complete);
-    final channelChoices = titleChannelChoices(allTitles);
-    final genreChoices = titleGenreChoices(allTitles);
+    final activeRegs = widget.activeRegs;
+    final isMultiNasne = activeRegs.length > 1;
+
+    final List<RecordedTitle> allTitles;
+    final ownerByTitle = Map<RecordedTitle, RegisteredNasne>.identity();
+    final List<RecordedTitle> visibleScopeTitles;
+    final String? countsLabel;
+    final bool stillLoading;
+    final bool hasAnySnapshot;
+    final bool loadFailed;
+    final Object? firstError;
+    final List<String> failedLabels;
+
+    if (!isMultiNasne) {
+      final progress = ref.watch(titlesProvider(reg));
+      final counts = ref.watch(titleCountsProvider(reg)).value;
+      final snapshot = progress.value;
+      allTitles = snapshot?.titles ?? const <RecordedTitle>[];
+      for (final t in allTitles) {
+        ownerByTitle[t] = reg;
+      }
+      visibleScopeTitles = allTitles;
+      countsLabel = counts != null
+          ? '全 ${counts.count} 件 (上限 ${counts.max} 件)'
+          : null;
+      stillLoading =
+          snapshot == null || !snapshot.complete || progress.isLoading;
+      hasAnySnapshot = snapshot != null;
+      loadFailed =
+          progress.hasError && (snapshot == null || !snapshot.complete);
+      firstError = progress.error;
+      failedLabels = const [];
+    } else {
+      final combinedAll = <RecordedTitle>[];
+      final combinedVisible = <RecordedTitle>[];
+      final effectiveHostFilter =
+          _nasneHostFilter != null &&
+              activeRegs.any((r) => r.host == _nasneHostFilter)
+          ? _nasneHostFilter
+          : null;
+      var totalCount = 0;
+      var totalMax = 0;
+      var countLoaded = 0;
+      var anySnapshot = false;
+      var anyLoading = false;
+      Object? err;
+      final failed = <String>[];
+
+      for (final r in activeRegs) {
+        final c = ref.watch(titleCountsProvider(r)).value;
+        if (c != null) {
+          totalCount += c.count;
+          totalMax += c.max;
+          countLoaded++;
+        }
+        final progress = ref.watch(titlesProvider(r));
+        final snapshot = progress.value;
+        if (snapshot != null) {
+          anySnapshot = true;
+          for (final t in snapshot.titles) {
+            ownerByTitle[t] = r;
+            combinedAll.add(t);
+            if (effectiveHostFilter == null || r.host == effectiveHostFilter) {
+              combinedVisible.add(t);
+            }
+          }
+          if (!snapshot.complete && !progress.hasError) {
+            anyLoading = true;
+          }
+        } else if (progress.hasError) {
+          failed.add(nasneDisplayLabel(r));
+          err ??= progress.error;
+        }
+        if (progress.isLoading && !progress.hasError) {
+          anyLoading = true;
+        }
+      }
+
+      allTitles = combinedAll;
+      visibleScopeTitles = combinedVisible;
+      countsLabel = countLoaded > 0
+          ? '全 $totalCount 件（${activeRegs.length}台合計・上限 $totalMax 件）'
+          : null;
+      stillLoading = anyLoading;
+      hasAnySnapshot = anySnapshot;
+      loadFailed = !anySnapshot && !anyLoading && err != null;
+      firstError = err;
+      failedLabels = failed;
+    }
+
+    final nasneHostFilter =
+        isMultiNasne &&
+            _nasneHostFilter != null &&
+            activeRegs.any((r) => r.host == _nasneHostFilter)
+        ? _nasneHostFilter
+        : null;
+    final channelChoices = titleChannelChoices(visibleScopeTitles);
+    final genreChoices = titleGenreChoices(visibleScopeTitles);
     // A chosen value can vanish when the list refreshes (its
     // last title was deleted, say); fall back to "all" instead
     // of filtering everything out behind the user's back.
@@ -428,17 +531,32 @@ class _TitleListState extends ConsumerState<_TitleList> {
       genre: genre,
       unwatchedOnly: _unwatchedOnly,
     );
-    final filteredCount = filter.isActive
-        ? applyTitleListView(allTitles, filter: filter, sort: _sort).length
+    final hasAnyFilter = filter.isActive || nasneHostFilter != null;
+    final filteredCount = hasAnyFilter
+        ? applyTitleListView(visibleScopeTitles, filter: filter, sort: _sort)
+              .length
         : null;
     return Column(
       children: [
-        if (counts != null)
+        if (countsLabel != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text('全 ${counts.count} 件 (上限 ${counts.max} 件)'),
+              child: Text(countsLabel),
+            ),
+          ),
+        if (failedLabels.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                '一部の nasne に接続できませんでした（${failedLabels.join('、')}）',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
             ),
           ),
         Padding(
@@ -461,6 +579,23 @@ class _TitleListState extends ConsumerState<_TitleList> {
               runSpacing: 4,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
+                if (isMultiNasne)
+                  DropdownButton<String?>(
+                    value: nasneHostFilter,
+                    items: [
+                      const DropdownMenuItem<String?>(
+                        value: null,
+                        child: Text('全 nasne'),
+                      ),
+                      for (final r in activeRegs)
+                        DropdownMenuItem<String?>(
+                          value: r.host,
+                          child: Text(nasneDisplayLabel(r)),
+                        ),
+                    ],
+                    onChanged: (value) =>
+                        setState(() => _nasneHostFilter = value),
+                  ),
                 DropdownButton<TitleSortOrder>(
                   value: _sort,
                   items: [
@@ -501,7 +636,7 @@ class _TitleListState extends ConsumerState<_TitleList> {
                     ref.read(groupTitlesProvider.notifier).set(value);
                   },
                 ),
-                if (filter.isActive) ...[
+                if (hasAnyFilter) ...[
                   TextButton(
                     onPressed: _clearFilters,
                     child: const Text('条件をクリア'),
@@ -534,20 +669,27 @@ class _TitleListState extends ConsumerState<_TitleList> {
               ? Padding(
                   padding: const EdgeInsets.all(12),
                   child: ErrorView(
-                    message: userMessageForError(progress.error!),
-                    onRetry: () => ref.invalidate(titlesProvider(reg)),
+                    message: userMessageForError(firstError!),
+                    onRetry: () {
+                      for (final r in activeRegs) {
+                        ref.invalidate(titlesProvider(r));
+                      }
+                    },
                   ),
                 )
-              : snapshot == null
+              : !hasAnySnapshot
               ? const Padding(
                   padding: EdgeInsets.all(24),
                   child: Center(child: CircularProgressIndicator()),
                 )
               : _titleListBody(
                   reg: reg,
-                  list: snapshot.titles,
+                  isMultiNasne: isMultiNasne,
+                  list: visibleScopeTitles,
+                  ownerByTitle: ownerByTitle,
                   stillLoading: stillLoading,
                   filter: filter,
+                  hasAnyFilter: hasAnyFilter,
                 ),
         ),
       ],
@@ -561,13 +703,31 @@ class _TitleListState extends ConsumerState<_TitleList> {
   /// loading, not as the settled answer.
   Widget _titleListBody({
     required RegisteredNasne reg,
+    required bool isMultiNasne,
     required List<RecordedTitle> list,
+    required Map<RecordedTitle, RegisteredNasne> ownerByTitle,
     required bool stillLoading,
     required TitleListFilter filter,
+    required bool hasAnyFilter,
   }) {
     if (list.isEmpty) {
       if (stillLoading) {
         return const Center(child: Text('読み込み中…'));
+      }
+      if (hasAnyFilter) {
+        return Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('条件に合うタイトルがありません'),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: _clearFilters,
+                child: const Text('条件をクリア'),
+              ),
+            ],
+          ),
+        );
       }
       return const Center(child: Text('録画済みのタイトルはありません'));
     }
@@ -607,17 +767,6 @@ class _TitleListState extends ConsumerState<_TitleList> {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        // The tap behaviour and the pane layout must agree
-        // on what "wide" means, so both read the same
-        // width: the one this list actually gets. The tap
-        // once read the MediaQuery window width while the
-        // layout read these constraints, which the shell's
-        // navigation rail narrows; in the band between the
-        // two (a 1024-wide iPad in landscape, a Split View
-        // or Stage Manager window) a tap only updated the
-        // selection state — no detail page was pushed and
-        // no detail pane existed to show it — so selecting
-        // a title appeared to do nothing at all.
         final twoPane = constraints.maxWidth >= twoPaneBreakpoint;
         final listView = ListView.builder(
           itemCount: entries.length,
@@ -640,15 +789,20 @@ class _TitleListState extends ConsumerState<_TitleList> {
                 );
               case _ItemTitleEntry(:final title, :final indented):
                 final t = title;
+                final owner = ownerByTitle[t] ?? reg;
+                final itemKey = ownedItemKey(owner, t.id);
+                final ownerSuffix =
+                    isMultiNasne ? ' · ${nasneDisplayLabel(owner)}' : '';
                 final tile = ListTile(
-                  key: indented ? null : ValueKey('title:${t.id}'),
-                  selected: t.id == widget.selectedId,
-                  leading: _TitleLeading(reg: reg, title: t),
+                  key: indented ? null : ValueKey('title:$itemKey'),
+                  selected: itemKey == widget.selectedKey,
+                  leading: _TitleLeading(reg: owner, title: t),
                   title: Text(t.title),
                   subtitle: Text(
                     '${t.scheduledStart != null ? formatDateTimeJst(t.scheduledStart!) : ''}'
                     '${t.scheduledDurationSeconds != null ? ' (${formatDurationSeconds(t.scheduledDurationSeconds!)})' : ''}'
-                    '${t.channelName != null ? ' ${t.channelName}' : ''}',
+                    '${t.channelName != null ? ' ${t.channelName}' : ''}'
+                    '$ownerSuffix',
                   ),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -666,17 +820,17 @@ class _TitleListState extends ConsumerState<_TitleList> {
                         ),
                     ],
                   ),
-                  onTap: () => widget.onSelect(t, twoPane),
+                  onTap: () => widget.onSelect(t, owner, isMultiNasne, twoPane),
                   onLongPress: () => deleteRecordedTitle(
                     context: context,
                     ref: ref,
-                    reg: reg,
+                    reg: owner,
                     title: t,
                   ),
                 );
                 if (!indented) return tile;
                 return Padding(
-                  key: ValueKey('title:${t.id}'),
+                  key: ValueKey('title:$itemKey'),
                   padding: const EdgeInsets.only(left: 20),
                   child: DecoratedBox(
                     decoration: BoxDecoration(
@@ -695,8 +849,14 @@ class _TitleListState extends ConsumerState<_TitleList> {
         );
         if (!twoPane) return listView;
         RecordedTitle? selected;
+        RegisteredNasne? selectedOwner;
         for (final t in view) {
-          if (t.id == widget.selectedId) selected = t;
+          final owner = ownerByTitle[t] ?? reg;
+          if (ownedItemKey(owner, t.id) == widget.selectedKey) {
+            selected = t;
+            selectedOwner = owner;
+            break;
+          }
         }
         return Row(
           children: [
@@ -704,11 +864,12 @@ class _TitleListState extends ConsumerState<_TitleList> {
             const VerticalDivider(thickness: 1, width: 1),
             Expanded(
               flex: 6,
-              child: selected == null
+              child: selected == null || selectedOwner == null
                   ? const Center(child: Text('タイトルを選択してください'))
                   : TitleDetailView(
-                      reg: reg,
+                      reg: selectedOwner,
                       title: selected,
+                      showNasneName: isMultiNasne,
                       playFocusNode: widget.detailPlayFocusNode,
                     ),
             ),
@@ -819,30 +980,63 @@ class _TitleCompactThumbnail extends ConsumerWidget {
 /// plus the switch that flips it on the unit. [onChanged] is
 /// null while an update is in flight, which disables the
 /// switch.
-class _ProtectionRow extends StatelessWidget {
+class _ProtectionRow extends StatefulWidget {
   const _ProtectionRow({required this.protect, required this.onChanged});
 
   final bool protect;
   final ValueChanged<bool>? onChanged;
 
   @override
+  State<_ProtectionRow> createState() => _ProtectionRowState();
+}
+
+class _ProtectionRowState extends State<_ProtectionRow> {
+  bool _focused = false;
+
+  @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final focusBorderColor = isDark ? Colors.amberAccent : Colors.amber;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 104,
-            child: Text(
-              '保護',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onFocusChange: (focused) {
+          if (_focused != focused) setState(() => _focused = focused);
+        },
+        onTap: widget.onChanged == null
+            ? null
+            : () => widget.onChanged!(!widget.protect),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: _focused ? focusBorderColor : Colors.transparent,
+              width: 2.5,
             ),
           ),
-          Expanded(child: Text(protect ? '保護あり' : 'なし')),
-          Switch(value: protect, onChanged: onChanged),
-        ],
+          child: Row(
+            children: [
+              SizedBox(
+                width: 98,
+                child: Text(
+                  '保護',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              Expanded(child: Text(widget.protect ? '保護あり' : 'なし')),
+              ExcludeFocus(
+                child: Switch(
+                  value: widget.protect,
+                  onChanged: widget.onChanged,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -850,14 +1044,23 @@ class _ProtectionRow extends StatelessWidget {
 
 /// Detail page for narrow layouts.
 class TitleDetailPage extends ConsumerWidget {
-  const TitleDetailPage({super.key, required this.reg, required this.titleId});
+  const TitleDetailPage({
+    super.key,
+    required this.reg,
+    required this.titleId,
+    this.showNasneName = false,
+  });
 
   final RegisteredNasne reg;
   final String titleId;
+  final bool showNasneName;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final progress = ref.watch(titlesProvider(reg));
+    final regs =
+        ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final effectiveShowNasneName = showNasneName || regs.length > 1;
     return Scaffold(
       appBar: AppBar(title: const Text('タイトルの詳細')),
       body: asyncSection(progress.whenData((stage) => stage.titles), (list) {
@@ -866,6 +1069,7 @@ class TitleDetailPage extends ConsumerWidget {
             return TitleDetailView(
               reg: reg,
               title: t,
+              showNasneName: effectiveShowNasneName,
               autofocusPlay: true,
               onDeleted: () => Navigator.of(context).pop(),
             );
@@ -887,6 +1091,7 @@ class TitleDetailView extends ConsumerStatefulWidget {
     super.key,
     required this.reg,
     required this.title,
+    this.showNasneName = false,
     this.onDeleted,
     this.playFocusNode,
     this.autofocusPlay = false,
@@ -894,6 +1099,7 @@ class TitleDetailView extends ConsumerStatefulWidget {
 
   final RegisteredNasne reg;
   final RecordedTitle title;
+  final bool showNasneName;
 
   /// Runs after this title was deleted from the detail view
   /// (plan 86.3): the pushed detail page goes back to the list.
@@ -971,6 +1177,7 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
         : '元画質 (${resQualityLabel(originalRes!.quality)})';
     final channelText = t.channelName ?? channelDisplayName(channels, t.channel);
     final metaParts = <String>[
+      if (widget.showNasneName) nasneDisplayLabel(reg),
       if (t.scheduledStart != null)
         formatDateTimeWithWeekdayJst(t.scheduledStart!),
       if (t.scheduledDurationSeconds != null)

@@ -131,12 +131,20 @@ class LiveRecordingConflict {
     required this.displayTitle,
     this.channelName,
     this.liveChannel,
+    this.nasneName,
+    this.sourceRegistration,
+    this.failoverRegistration,
+    this.failoverChannel,
   });
 
   final RecordSchedule schedule;
   final String displayTitle;
   final String? channelName;
   final LiveChannel? liveChannel;
+  final String? nasneName;
+  final RegisteredNasne? sourceRegistration;
+  final RegisteredNasne? failoverRegistration;
+  final LiveChannel? failoverChannel;
 }
 
 /// Short corner notification emitted when the viewed channel starts/ends

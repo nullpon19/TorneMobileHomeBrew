@@ -80,6 +80,9 @@ class _AppShellState extends ConsumerState<AppShell> {
   bool _exitDialogOpen = false;
   bool _userMovedIntoHomePane = false;
   final FocusNode _railFocusNode = FocusNode(debugLabel: 'appShellRail');
+  final FocusNode _rightPaneFocusNode = FocusNode(
+    debugLabel: 'appShellRightPane',
+  );
   late final List<GlobalKey> _railLabelKeys = List<GlobalKey>.generate(
     _destinations.length,
     (_) => GlobalKey(),
@@ -101,7 +104,60 @@ class _AppShellState extends ConsumerState<AppShell> {
   void dispose() {
     _railFocusNode.removeListener(_handleRailFocusChange);
     _railFocusNode.dispose();
+    _rightPaneFocusNode.dispose();
     super.dispose();
+  }
+
+  static double _horizontalEdgeDistance(Rect rect, double x) {
+    if (x < rect.left) return rect.left - x;
+    if (x > rect.right) return x - rect.right;
+    return 0.0;
+  }
+
+  KeyEventResult _handleRightPaneKeyEvent(FocusNode node, KeyEvent event) {
+    if ((event is! KeyDownEvent && event is! KeyRepeatEvent) ||
+        event.logicalKey != LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.ignored;
+    }
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary == null || primary.context == null) {
+      return KeyEventResult.ignored;
+    }
+    final primaryRect = primary.rect;
+    final candidates = _rightPaneFocusNode.traversalDescendants
+        .where(
+          (n) =>
+              n != primary &&
+              n.canRequestFocus &&
+              !n.skipTraversal &&
+              n.context != null,
+        )
+        .toList();
+    final above = <FocusNode>[];
+    for (final c in candidates) {
+      final r = c.rect;
+      if (r.width <= 0 || r.height <= 0) continue;
+      if (r.center.dy <= primaryRect.top - 1) {
+        above.add(c);
+      }
+    }
+    if (above.isEmpty) return KeyEventResult.ignored;
+    final hasInBand = above.any((c) {
+      final r = c.rect;
+      return r.right > primaryRect.left && r.left < primaryRect.right;
+    });
+    if (hasInBand) return KeyEventResult.ignored;
+    above.sort((a, b) {
+      final dyCmp = (primaryRect.top - a.rect.center.dy).abs().compareTo(
+        (primaryRect.top - b.rect.center.dy).abs(),
+      );
+      if (dyCmp != 0) return dyCmp;
+      return _horizontalEdgeDistance(a.rect, primaryRect.center.dx).compareTo(
+        _horizontalEdgeDistance(b.rect, primaryRect.center.dx),
+      );
+    });
+    above.first.requestFocus();
+    return KeyEventResult.handled;
   }
 
   void _handleRailFocusChange() {
@@ -317,15 +373,21 @@ class _AppShellState extends ConsumerState<AppShell> {
                           order: const NumericFocusOrder(1),
                           child: FocusTraversalGroup(
                             policy: ReadingOrderTraversalPolicy(),
-                            child: Listener(
-                              behavior: HitTestBehavior.translucent,
-                              onPointerDown: (_) {
-                                if (ref.read(tabIndexProvider) ==
-                                    AppTabs.home) {
-                                  _userMovedIntoHomePane = true;
-                                }
-                              },
-                              child: body,
+                            child: Focus(
+                              focusNode: _rightPaneFocusNode,
+                              canRequestFocus: false,
+                              skipTraversal: true,
+                              onKeyEvent: _handleRightPaneKeyEvent,
+                              child: Listener(
+                                behavior: HitTestBehavior.translucent,
+                                onPointerDown: (_) {
+                                  if (ref.read(tabIndexProvider) ==
+                                      AppTabs.home) {
+                                    _userMovedIntoHomePane = true;
+                                  }
+                                },
+                                child: body,
+                              ),
                             ),
                           ),
                         ),
