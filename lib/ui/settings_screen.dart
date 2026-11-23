@@ -266,7 +266,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             onTap: () => _pickBufferDuration(
               title: 'Live のバッファ時間（遅延再生）',
               description:
-                  'radiko のように再生開始前に指定時間分を貯めてから流し、トンネルや短い圏外での途切れを防ぎます。',
+                  '再生開始前に指定時間分を貯めてから流し、トンネルや短い圏外での途切れを防ぎます。',
               options: liveBufferOptionsSeconds,
               current: liveBufferSeconds,
               onSelected: (value) =>

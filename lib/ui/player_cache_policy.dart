@@ -69,7 +69,7 @@ const List<int> recordedBufferOptionsSeconds = [
 /// Default recorded buffer duration: 5 minutes (background disk cache).
 const int defaultRecordedBufferSeconds = 300;
 
-/// Buffer duration choices (in seconds) for radiko-style live delayed buffering.
+/// Buffer duration choices (in seconds) for live delayed buffering.
 const List<int> liveBufferOptionsSeconds = [0, 15, 30, 60, 180, 300];
 
 /// Default live buffer duration: standard low-latency (`0` = no extra delay).
@@ -185,7 +185,7 @@ MpvBufferPlan computeMpvBufferPlan({
   final readaheadSeconds = normalized > 0 ? normalized + 15 : 20;
   final cachePauseInitial = normalized > 0;
   // Recordings start quickly (~5s) while pre-reading up to [normalized] in the
-  // background; Live waits up to [normalized] before playing like radiko.
+  // background; Live waits up to [normalized] before playing.
   final cachePauseWaitSeconds = normalized == 0
       ? 0
       : (live ? normalized : math.min(normalized, 5));

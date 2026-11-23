@@ -481,7 +481,7 @@ void main() {
       expect(tiny.demuxerMaxBytes, lessThanOrEqualTo(24 * 1024 * 1024));
     });
 
-    test('plans live radiko-style initial buffering and timeouts', () {
+    test('plans live initial buffering and timeouts', () {
       final liveOff = computeMpvBufferPlan(
         live: true,
         bufferSeconds: 0,
