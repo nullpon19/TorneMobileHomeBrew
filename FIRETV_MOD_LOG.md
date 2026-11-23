@@ -149,13 +149,19 @@
 2. **初期プリバッファ完了前の「バッファリング中…」誤切替抑止 (`lib/ui/player_screen.dart`)**:
    - `shouldLatchInitialPlaybackStarted`（`_initialPlaybackStarted` ラッチ）を導入し、映像解像度通知 (`width > 0`) が先に届いても `mpv` の初期待ち (`_buffering == true`) が明けて実再生に入るまで「バッファ蓄積中… X / Y秒」表示を維持するよう修正。
 
-### 第15弾: 右画面「戻る」で左メニュー該当機能へ復帰＆再生終了確認ダイアログ（本コミット）
+### 第15弾: 右画面「戻る」で左メニュー該当機能へ復帰＆再生終了確認ダイアログ (`b90cd80`)
 1. **トップ階層での右画面「戻る」→左メニュー（現在表示中のタブ）復帰 (`lib/ui/app_shell.dart`)**:
    - `NavigationRail` へ `_railFocusNode` と各タブのラベルキー (`_railLabelKeys`) を割り当て、ワイドレイアウトで右画面操作中に戻るキーを押した場合、アプリ終了確認を出さずに左メニューの**現在開いている機能項目**へフォーカスを戻すよう改善（左メニュー上にフォーカスがある状態で戻るを押したときのみ `'アプリを終了しますか？'` を表示）。
    - `epg_screen.dart` の既存 `tabBackHandlersProvider[AppTabs.epg]` を活かし、**番組表グリッド内のみ 2 段階**（1回目で上部バー `地デジ/BS`、2回目で左メニュー `'番組表'`、3回目で終了確認）を維持。また `Navigator.push` で開く深い階層の画面は従来どおり 1 つ前の画面へそのまま戻ります。
 2. **再生中「戻る」ボタンへの終了確認ダイアログ追加 (`lib/ui/player_screen.dart`)**:
    - `resolvePlayerBackOutcome` に `confirmExit`（`errorOpen` / `exitConfirmOpen` 引数）と `showPlayerExitConfirmDialog` を追加。
    - 番組詳細表示中・OSD 表示中は従来どおり確認なしで閉じ、通常再生中（プリバッファ／中断バナー表示中を含む）に戻るを押したときのみ **`'再生を終了しますか？'`** ダイアログを表示（初期フォーカス `'再生を続ける'`・`'終了する'` 選択時のみ `pop`・キャンセル時はプレイヤー側へフォーカス復帰）。開始エラー画面 (`_error != null`) は確認なしで即終了。
+
+### 第16弾: `radiko` 表記削除＆`<activity android:banner>` 明記 (`f6630bd` / 本コミット)
+1. **Live バッファ設定説明などからの `radiko` 表記削除 (`lib/ui/settings_screen.dart`, `lib/ui/player_cache_policy.dart`, `test/firetv_mod_test.dart`, `f6630bd`)**:
+   - 設定画面 Live バッファ選択ダイアログの説明文・コードコメント・テスト名から `radiko` 表記を削除。
+2. **Activity レベルの TV バナー宣言補強 (`android/app/src/main/AndroidManifest.xml`, `android/app/src/main/res/drawable/tv_banner.png`, 本コミット)**:
+   - `<application>` だけでなく `<activity android:name=".MainActivity">` にも `android:banner="@drawable/tv_banner"` を明記し、汎用 `res/drawable/tv_banner.png` も配置して Android TV / カスタムランチャー互換を強化。
 
 ---
 
@@ -166,8 +172,8 @@
 | `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順 |
 | `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順） |
 | `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv` に変更 |
-| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner` / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
-| `android/app/src/main/res/drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
+| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner`（`<application>` ＋ `<activity>` 双方） / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
+| `android/app/src/main/res/drawable/tv_banner.png` / `drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
 | `android/app/src/main/cpp/CMakeLists.txt` | `tmhb_aes.c` (`-O3`) のビルド対象追加 |
 | `android/app/src/main/cpp/tmhb_aes.c` | ネイティブ C T-table AES-128-CBC 復号実装 (`tmhb_aes128_cbc_decrypt` 等) |
 | `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・`MANAGE_EXTERNAL_STORAGE` 判定/設定誘導＋ファイルスキャン・`StatFs` 残容量 `getCacheAvailableBytes`） |
@@ -221,6 +227,7 @@
    - **露出 `TextField` と `FireTVIME` フォーカス閉じ込め**: Fire OS では D-pad でフォーカスが `TextField` に当たっただけで IME キーボードが自動起動し、さらに矢印キーが IME 側に吸われて抜け出せなくなる挙動があります。入力欄を通常時は表示用ボックス (`FireTvTextInputField`) にし、決定キー押下時だけ `AlertDialog` 内の `TextField` を開くことで完全に回避できました。
    - **番組表 (EPG) タイルの選択視認性**: 番組タイルがジャンル別に色分けされているため、`focusColor` による薄い背景オーバーレイでは選択位置が非常に見づらくなります。`focusColor: Colors.transparent`＋前面 `DecoratedBox` の太枠線が有効でした。
    - **ファイル選択**: Fire OS は標準 `DocumentsUI` を持たない機種が多く、通常のファイルピッカー Intent が失敗します。アプリ内候補スキャンが有効でした。なお Fire OS 8 の「すべてのファイル」設定画面 (`ManageAppPermissionsActivity.grantStoragePermissionV2`) は `READ_EXTERNAL_STORAGE` と併せて `WRITE_EXTERNAL_STORAGE` も付与しようとするため、`MANAGE_EXTERNAL_STORAGE` 単独宣言では設定アプリ側が `SecurityException` でクラッシュします（`maxSdkVersion="32"` 付きで両方宣言することで回避）。
+   - **サイドロード時のホーム画面バナー＆右上背景画像**: Fire OS 8 標準ランチャー (`com.amazon.tv.launcher`) は Amazon Appstore 経由のアプリについてサーバー側から横長バナーとフォーカス時右上背景画像 (`1920x1080`) を取得するため、サイドロード APK の場合は `android:banner` を `<application>` / `<activity>` 双方に設定しても標準ランチャー上ではグレー枠＋正方形アイコン表示にフォールバックし、右上背景も表示されない（Android TV や Projectivy 等のカスタムランチャーでは `android:banner` がそのまま有効になる）。
    - **中断バナー・エラー画面の `FocusNode` 喪失**: 再生中断バナーやエラー画面が出現した際、明示的に `FocusNode.requestFocus()` を行わないとリモコンで「再開」「戻る」が押せなくなります。
    - **車載・不安定回線とストレージ保護**: `libmpv.so` が `cache-on-disk` / `demuxer-cache-dir` に対応しているため、空き容量の少ない Fire TV Stick でも `StatFs` で `512 MiB` 以上の空きを死守しつつ長時間先読みを確保できます。また不安定回線での途中切断に備え、プロキシ側の自動再接続（AKE 再認証含む）＋ Live 再オープン許容が有効です。
 
