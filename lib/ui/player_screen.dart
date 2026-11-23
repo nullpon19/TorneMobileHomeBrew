@@ -315,6 +315,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// resume should return to.
   bool _playingNow = false;
   bool _completed = false;
+  bool _autoPoppedOnComplete = false;
   bool _bufferingSincePlaying = false;
   Duration _lastPosition = Duration.zero;
 
@@ -523,6 +524,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _player.stream.completed.listen((completed) {
         _diag(DiagCategory.playback, 'player: completed=$completed');
         _completed = completed;
+        if (completed && !widget.live && _playing) {
+          _handleRecordedCompletion('mpv completed');
+        }
       }),
     );
     _subscriptions.add(
@@ -618,6 +622,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         _watchdog?.cancel();
         if (!mounted) return;
         if (_playing) {
+          if (!widget.live && _isEffectivelyCompleted) {
+            _handleRecordedCompletion('trailing error near end: $error');
+            return;
+          }
           // The failure arrived after playback had started
           // (plan 80): an interruption, not a failed start.
           // Keep the frozen frame and offer the in-place
@@ -635,6 +643,40 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _loadChapters();
   }
 
+  bool get _isEffectivelyCompleted =>
+      _completed ||
+      isNearRecordedEnd(
+        live: widget.live,
+        position: _lastPosition,
+        duration: _effectiveDuration,
+      );
+
+  void _handleRecordedCompletion(String reason) {
+    if (widget.live || !_playing) return;
+    _completed = true;
+    _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
+    _wakelockSession.setPlaying(false);
+    _diag(DiagCategory.playback, 'player: recorded playback finished ($reason)');
+    if (mounted && (_interrupted || _autoResumeCountdown != 0 || _buffering)) {
+      setState(() {
+        _interrupted = false;
+        _autoResumeCountdown = 0;
+        _buffering = false;
+      });
+    }
+    if (_autoPoppedOnComplete) return;
+    _autoPoppedOnComplete = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final nav = Navigator.of(context);
+      if (nav.canPop()) {
+        nav.pop();
+      }
+    });
+  }
+
   void _setStartError(String error) {
     if (!mounted) return;
     setState(() => _error = error);
@@ -646,7 +688,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _enterInterruptedState(String? detail) {
-    if (!mounted) return;
+    if (!mounted || _completed) return;
     setState(() {
       _interrupted = true;
       if (detail != null) _interruptDetail = detail;
@@ -714,6 +756,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     )) {
       return;
     }
+    if (!widget.live && _isEffectivelyCompleted) {
+      _handleRecordedCompletion('stopped after buffering near end');
+      return;
+    }
     _diag(
       DiagCategory.playback,
       'player: playback stopped after buffering without '
@@ -726,6 +772,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _onStallTimeout() {
     if (!mounted || _playingNow || _completed || _error != null) {
+      return;
+    }
+    if (!widget.live && _isEffectivelyCompleted) {
+      _handleRecordedCompletion('stall timeout near end');
       return;
     }
     _diag(
@@ -759,6 +809,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
     _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
       if (!mounted || _playingNow || _completed || _interrupted || _error != null) {
+        return;
+      }
+      if (!widget.live && _isEffectivelyCompleted) {
+        _handleRecordedCompletion('resume watchdog near end');
         return;
       }
       _enterInterruptedState('再接続がタイムアウトしました。電波状況を確認して再試行します。');

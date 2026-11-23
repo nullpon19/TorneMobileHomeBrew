@@ -191,6 +191,7 @@ void main() {
         keyForLabel: (_) async => exchangeKey,
         fetcher: fetcher,
         diag: diag,
+        isLive: true,
         autoReconnect: true,
         reconnectBackoff: const [Duration(milliseconds: 15)],
       );
@@ -228,5 +229,149 @@ void main() {
       );
       expect(reopenedChunk, isNotEmpty);
     });
+
+    test(
+      'seekable proxy closes cleanly as EOF when actual bytes are slightly shorter than declared totalBytes',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        const totalBytes = 49152;
+        const actualBytes = 45056;
+        final fullPlaintext = Uint8List.fromList(
+          List.generate(totalBytes, (i) => (i * 13 + 3) & 0xFF),
+        );
+        final truncatedPacket = _buildTestPcpPacket(
+          exchangeKey,
+          Uint8List.sublistView(fullPlaintext, 0, actualBytes),
+        );
+        var upstreamAttempt = 0;
+        var reauthCount = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          if (upstreamAttempt == 1) {
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.contentType = ContentType(
+              'application',
+              'x-dtcp1',
+            );
+            request.response.contentLength = truncatedPacket.length;
+            request.response.add(truncatedPacket);
+            await request.response.close();
+          } else {
+            // Confirmation probe at EOF byte returns empty tail cleanly.
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.set(
+              'TimeSeekRange.dlna.org',
+              'npt=18.000-18.000/18.000 bytes=$actualBytes-${totalBytes - 1}/$totalBytes',
+            );
+            request.response.contentLength = 0;
+            await request.response.close();
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/pvr'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: totalBytes,
+          totalDuration: const Duration(seconds: 20),
+          autoReconnect: true,
+          onReauthenticate: () async {
+            reauthCount++;
+          },
+          reconnectBackoff: const [Duration(milliseconds: 500)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+
+        final received = BytesBuilder(copy: false);
+        try {
+          await for (final chunk in resp.timeout(const Duration(seconds: 3))) {
+            received.add(chunk);
+          }
+        } on HttpException {
+          // Expected when declared Content-Length (49152) exceeds actual EOF (45056).
+        }
+        expect(
+          received.toBytes(),
+          Uint8List.sublistView(fullPlaintext, 0, actualBytes),
+        );
+        expect(upstreamAttempt, lessThanOrEqualTo(2));
+        expect(reauthCount, 0);
+
+        // Subsequent range requests at or beyond observed _eofByte return 416.
+        final tailReq = await client.getUrl(proxy.uri);
+        tailReq.headers.set('Range', 'bytes=$actualBytes-${totalBytes - 1}');
+        final tailResp = await tailReq.close();
+        await tailResp.drain<void>();
+        expect(tailResp.statusCode, HttpStatus.requestedRangeNotSatisfiable);
+        expect(tailResp.headers.value('content-range'), 'bytes */$actualBytes');
+      },
+    );
+
+    test(
+      'non-seekable recorded proxy (isLive: false) ends cleanly at EOF without reconnecting',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final payload = Uint8List.fromList(
+          List.generate(4096, (i) => (i * 7 + 1) & 0xFF),
+        );
+        final packet = _buildTestPcpPacket(exchangeKey, payload);
+        var upstreamAttempt = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          request.response.statusCode = HttpStatus.ok;
+          request.response.contentLength = packet.length;
+          request.response.add(packet);
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/mobile_pvr'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          isLive: false,
+          autoReconnect: true,
+          reconnectBackoff: const [Duration(milliseconds: 15)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+        final received = BytesBuilder(copy: false);
+        await for (final chunk in resp.timeout(const Duration(seconds: 3))) {
+          received.add(chunk);
+        }
+        expect(received.toBytes(), payload);
+        expect(upstreamAttempt, 1);
+      },
+    );
   });
 }

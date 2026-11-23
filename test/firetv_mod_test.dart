@@ -20,6 +20,7 @@ import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
+import 'package:tmhb/ui/player_error_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
@@ -1097,6 +1098,71 @@ void main() {
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
       expect(find.text('アプリを終了しますか？'), findsOneWidget);
+    });
+  });
+
+  group('Recorded end-of-programme guard policy', () {
+    test('treats near-end stops as completion only for non-live recordings', () {
+      const thirtyMin = Duration(minutes: 30);
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: const Duration(minutes: 29, seconds: 53),
+          duration: thirtyMin,
+        ),
+        isTrue,
+      );
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: const Duration(minutes: 29, seconds: 50),
+          duration: thirtyMin,
+        ),
+        isFalse,
+      );
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: Duration.zero,
+          duration: thirtyMin,
+        ),
+        isFalse,
+      );
+      expect(
+        isNearRecordedEnd(
+          live: true,
+          position: const Duration(minutes: 29, seconds: 59),
+          duration: thirtyMin,
+        ),
+        isFalse,
+      );
+
+      // Short clips use a tightened 2s tolerance window.
+      const twentySec = Duration(seconds: 20);
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: const Duration(seconds: 19),
+          duration: twentySec,
+        ),
+        isTrue,
+      );
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: const Duration(seconds: 15),
+          duration: twentySec,
+        ),
+        isFalse,
+      );
+      expect(
+        isNearRecordedEnd(
+          live: false,
+          position: Duration.zero,
+          duration: twentySec,
+        ),
+        isFalse,
+      );
     });
   });
 }

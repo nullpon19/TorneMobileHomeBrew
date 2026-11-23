@@ -190,13 +190,14 @@ class DtcpPlaybackEngine implements PlaybackEngine {
       'res quality=${res.quality ?? '(none)'}; '
       'credentials -> HEAD -> AKE -> proxy',
     );
-    return _start(res);
+    return _start(res, isLive: true);
   }
 
   Future<PlaybackSession> _start(
     TitleRes res, {
     int? seekTotalBytes,
     Duration? seekTotalDuration,
+    bool isLive = false,
   }) async {
     final stopwatch = Stopwatch()..start();
     var stage = 'credentials';
@@ -259,6 +260,7 @@ class DtcpPlaybackEngine implements PlaybackEngine {
         windowCapBytesOverride: Platform.isAndroid
             ? androidProxyWindowCapBytes
             : null,
+        isLive: isLive,
         autoReconnect: autoReconnect,
         onReauthenticate: autoReconnect ? keySource.forceReauthenticate : null,
       );

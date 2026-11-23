@@ -93,3 +93,21 @@ bool playbackStoppedEarly({
   required bool completed,
   required bool bufferedBeforeStop,
 }) => alreadyPlaying && !completed && bufferedBeforeStop;
+
+/// Whether a recorded playback has effectively reached the end of the
+/// programme, so a trailing stop after buffering or a truncated
+/// Content-Length close is treated as normal completion rather than a
+/// mid-stream disconnect.
+bool isNearRecordedEnd({
+  required bool live,
+  required Duration position,
+  required Duration duration,
+  Duration tolerance = const Duration(seconds: 8),
+}) {
+  if (live) return false;
+  if (duration <= Duration.zero || position <= Duration.zero) return false;
+  final effectiveTolerance = duration <= const Duration(seconds: 30)
+      ? const Duration(seconds: 2)
+      : tolerance;
+  return (duration - position) <= effectiveTolerance;
+}

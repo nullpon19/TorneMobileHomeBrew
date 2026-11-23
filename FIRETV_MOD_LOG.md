@@ -75,7 +75,7 @@
 6. **ナイトモード追加 (`lib/app/providers.dart`, `lib/main.dart`, `settings_screen.dart`)**:
    - `NightModeNotifier` / `nightModeProvider` (`firetv_night_mode`、初期値 `false`＝ライト) を追加し、設定画面「表示」→「ナイトモード」スイッチで即座にダークテーマへ切替可能に拡張（`segmentedButtonTheme` のフォーカス枠もライト/ダーク双方に対応）。
 
-### 第6弾: EPG赤フォーカス枠・録画済み自動番組まとめ・終了確認ダイアログ（本コミット）
+### 第6弾: EPG赤フォーカス枠・録画済み自動番組まとめ・終了確認ダイアログ (`0aa3de7`)
 1. **番組表 (`EpgScreen`) ライトモード選択枠を赤に変更 (`lib/ui/epg_screen.dart`)**:
    - `_EventTileState.build` におけるライトモード時の 3px 前面フォーカス枠色を `#D32F2F`（Material Red 700）へ変更（ナイトモード時は `Colors.amberAccent`、背景 `focusColor` は透明のまま維持）。
 2. **録画済み一覧の torne mobile 風シリーズ自動まとめ (`lib/app/providers.dart`, `lib/ui/title_list_filter.dart`, `lib/ui/titles_screen.dart`)**:
@@ -85,6 +85,14 @@
    - フォルダ自体の並び順および展開後の各回順ともに、一覧で選択中の並び替え（録画日時新しい順・古い順・タイトル順）に連動。
 3. **戻るボタンによるアプリ終了確認ダイアログ (`lib/ui/app_shell.dart`)**:
    - `AppShell` を `ConsumerStatefulWidget` 化し、ルートを `PopScope(canPop: false)` で保護。子画面・ダイアログが開いていないルート状態で戻るキーを押した場合に `'アプリを終了しますか？'`（初期フォーカス `'キャンセル'`／`'終了する'` で `SystemNavigator.pop()`）を表示し、多重オープンは `_exitDialogOpen` で抑止。
+
+### 第7弾: 録画終端での誤再接続修正と再生完了時自動復帰（本コミット）
+1. **録画正常終了 (EOF) 時のプロキシ無制限再接続防止 (`lib/core/services/dtcp_playback.dart`, `lib/core/dtcp/dtcp_proxy.dart`)**:
+   - `DtcpPlaybackEngine._start` から `isLive` を `DtcpProxy.start` へ伝播し、非 Seekable 経路（モバイル画質などサイズ・尺欠如時）でエラー無しの正常 EOF を再接続対象とするのを Live 視聴限定に修正（通信エラー発生時の無制限再接続は維持）。
+   - Seekable 録画経路でエラー無し (`producer.error == null`) のまま宣言サイズ (`totalBytes`) 未満でストリームが終わった場合、末尾付近（残り 2 MiB または 2% 以内）の1回確認または 2 回一致で実 EOF バイト (`_eofByte`) を確定して応答を正常クローズするよう修正（以降 `_eofByte` 以降の Range 要求は即 416 を返却）。
+2. **プレイヤー終端ガードと再生完了時の自動一覧/詳細復帰 (`lib/ui/player_error_policy.dart`, `lib/ui/player_screen.dart`)**:
+   - `isNearRecordedEnd`（録画で残り 8 秒以内、30 秒以下の短尺は 2 秒以内）を追加。
+   - `mpv` の `completed=true` 通知時、および終端付近でのバッファ後停止／ストールタイムアウト／末尾エラー時にすべての自動再接続／ストール監視タイマーを止めて正常終了扱いとし、再生画面を閉じて録画一覧／詳細画面へ自動で戻るよう変更（通常のレジューム位置ゼロ報告は従来通り動作、終端での手動一時停止時は停止状態を維持）。
 
 ---
 
@@ -106,8 +114,8 @@
 | `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`NightModeNotifier` / `nightModeProvider`、`GroupTitlesNotifier` / `groupTitlesProvider`（既定 ON）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
 | `lib/core/dtcp/native_aes.dart` | `libtmhb_fcntl.so` の Dart FFI バインディング |
 | `lib/core/dtcp/dtcp_crypto.dart` | Android でのネイティブ AES 復号優先パス |
-| `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止） |
-| `lib/core/services/dtcp_playback.dart` | `PlaybackKeySource.forceReauthenticate()`、`DtcpPlaybackEngine(autoReconnect: ...)` |
+| `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止）、`isLive` 限定 EOF 再接続、Seekable 正常 EOF 打ち切り & `_eofByte` 416 |
+| `lib/core/services/dtcp_playback.dart` | `PlaybackKeySource.forceReauthenticate()`、`DtcpPlaybackEngine(autoReconnect: ...)`、`isLive` 伝播 |
 | `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠テーマ |
 | `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、ルート `PopScope` によるアプリ終了確認ダイアログ |
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー・プリセット復元ボタン |
@@ -115,7 +123,8 @@
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力） |
 | `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊） |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正 |
+| `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
 | `lib/ui/schedule_form.dart` | 長さ/条件 ID/録画先の 3 欄を `FireTvTextInputField` 化 |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
@@ -124,8 +133,8 @@
 | `lib/ui/widgets.dart` | 決定キーでダイアログ入力を開く共通 `FireTvTextInputField` / `_FireTvTextInputDialog` 追加 |
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG枠フォーカス・ロケール・番組自動まとめ・終了確認ダイアログ）のテスト |
-| `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断 & Live 再オープン非 `409`） |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG枠フォーカス・ロケール・番組自動まとめ・終了確認ダイアログ・録画終端ガード）のテスト |
+| `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |
 | `test/widget_test.dart` | アプリタイトル/初期化更新への追従 |
@@ -156,7 +165,7 @@
 
 ### 5.1 リベース / 再適用時の注意箇所
 アップストリーム更新後に `firetv-mod` をリベース／チェリーピックする際は、主に以下の競合ポイントを確認してください。
-- `lib/ui/player_screen.dart`（フルスクリーン OSD / ±10秒シーク / シークバー HUD / 事前バッファ / 自動再開・フォーカス）
+- `lib/ui/player_screen.dart` / `lib/ui/player_error_policy.dart`（フルスクリーン OSD / ±10秒シーク / シークバー HUD / 事前バッファ / 自動再開・フォーカス / 録画終了時自動復帰）
 - `lib/ui/title_list_filter.dart` / `lib/ui/titles_screen.dart` / `lib/ui/live_screen.dart`（番組自動まとめ・折りたたみフォルダ・1/4 サムネレイアウト・画質都度切替・`knownDuration`・検索入力ダイアログ）
 - `lib/ui/dtcp_credential_screen.dart` / `lib/ui/settings_screen.dart` / `lib/ui/epg_screen.dart` / `lib/ui/epg_search_screen.dart` / `lib/ui/schedule_form.dart` / `lib/ui/widgets.dart` / `lib/ui/app_shell.dart`（各入力ダイアログ・EPG赤/金枠・戻る終了確認）
 - `lib/core/dtcp/dtcp_proxy.dart` / `dtcp_crypto.dart` / `lib/core/services/dtcp_playback.dart`

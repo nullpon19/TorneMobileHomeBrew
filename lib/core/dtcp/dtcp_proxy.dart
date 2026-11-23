@@ -324,6 +324,7 @@ class DtcpProxy {
     int? totalBytes,
     Duration? totalDuration,
     int? windowCapBytesOverride,
+    bool isLive = false,
     bool autoReconnect = false,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
@@ -341,6 +342,7 @@ class DtcpProxy {
        _diag = diag, // ignore: prefer_initializing_formals
        _totalBytes = totalBytes, // ignore: prefer_initializing_formals
        _totalDuration = totalDuration, // ignore: prefer_initializing_formals
+       _isLive = isLive, // ignore: prefer_initializing_formals
        _autoReconnect = autoReconnect, // ignore: prefer_initializing_formals
        _onReauthenticate = onReauthenticate, // ignore: prefer_initializing_formals
        _reconnectBackoff = reconnectBackoff; // ignore: prefer_initializing_formals
@@ -354,6 +356,7 @@ class DtcpProxy {
   final Future<Uint8List> Function(int label) _keyForLabel;
   final DtcpMediaFetcher _fetcher;
   final DiagLog _diag;
+  final bool _isLive;
   final bool _autoReconnect;
   final Future<void> Function()? _onReauthenticate;
   final List<Duration> _reconnectBackoff;
@@ -390,6 +393,7 @@ class DtcpProxy {
   _SeekMap? _seekMap;
   _Producer? _producer;
   int _serveGeneration = 0;
+  int? _eofByte;
 
   /// How long the content stream may go without a single byte
   /// before the proxy gives up (plan 29). The reference client
@@ -450,6 +454,7 @@ class DtcpProxy {
     int? totalBytes,
     Duration? totalDuration,
     int? windowCapBytesOverride,
+    bool isLive = false,
     bool autoReconnect = false,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
@@ -470,6 +475,7 @@ class DtcpProxy {
       totalBytes: totalBytes,
       totalDuration: totalDuration,
       windowCapBytesOverride: windowCapBytesOverride,
+      isLive: isLive,
       autoReconnect: autoReconnect,
       onReauthenticate: onReauthenticate,
       reconnectBackoff: reconnectBackoff,
@@ -569,7 +575,10 @@ class DtcpProxy {
                 continue;
               }
               if (!await iterator.moveNext()) {
-                if (_autoReconnect && !_stopRequested && !_downstreamGone) {
+                if (_autoReconnect &&
+                    _isLive &&
+                    !_stopRequested &&
+                    !_downstreamGone) {
                   unexpectedEof = true;
                 }
                 break;
@@ -1140,14 +1149,29 @@ class DtcpProxy {
     }
     final ranged = range != null;
     final reqStart = ranged ? range.$1 : 0;
-    final reqEnd = ranged ? range.$2 : total - 1;
+    final eofByte = _eofByte;
+    if (eofByte != null && reqStart >= eofByte) {
+      response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+      response.headers.set('Content-Range', 'bytes */$eofByte');
+      response.contentLength = 0;
+      await response.close();
+      return;
+    }
+    var reqEnd = ranged ? range.$2 : total - 1;
+    if (eofByte != null && reqEnd >= eofByte) {
+      reqEnd = eofByte - 1;
+    }
+    final reportedTotal = eofByte ?? total;
     response.headers.contentType = ContentType('video', 'mp2t');
     response.headers.set('Accept-Ranges', 'bytes');
     response.headers.set('transferMode.dlna.org', 'Streaming');
     if (request.method == 'HEAD') {
       response.statusCode = ranged ? HttpStatus.partialContent : HttpStatus.ok;
       if (ranged) {
-        response.headers.set('Content-Range', 'bytes $reqStart-$reqEnd/$total');
+        response.headers.set(
+          'Content-Range',
+          'bytes $reqStart-$reqEnd/$reportedTotal',
+        );
       }
       response.contentLength = reqEnd - reqStart + 1;
       await response.close();
@@ -1200,7 +1224,7 @@ class DtcpProxy {
       }
       if (serveStart > reqEnd) {
         response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
-        response.headers.set('Content-Range', 'bytes */$total');
+        response.headers.set('Content-Range', 'bytes */$reportedTotal');
         response.contentLength = 0;
         await response.close();
         return;
@@ -1213,7 +1237,10 @@ class DtcpProxy {
 
     response.statusCode = ranged ? HttpStatus.partialContent : HttpStatus.ok;
     if (ranged) {
-      response.headers.set('Content-Range', 'bytes $serveStart-$reqEnd/$total');
+      response.headers.set(
+        'Content-Range',
+        'bytes $serveStart-$reqEnd/$reportedTotal',
+      );
     }
     response.contentLength = reqEnd - serveStart + 1;
     var pos = serveStart;
@@ -1350,11 +1377,27 @@ class DtcpProxy {
           break;
         }
         if (_window.end >= total || pos >= total) break;
-        // The producer ended before the content did (a truncated
-        // upstream stream): continue from the window end. Guard
-        // against a source that keeps ending at the same byte.
+        final knownEof = _eofByte;
+        if (knownEof != null && _window.end >= knownEof) break;
+        // The producer ended without error before the declared total. Near
+        // the end of the recording this reflects metadata cleartextSize variance
+        // (clean EOF), not a mid-stream drop; stop after confirmation instead
+        // of looping forever.
         if (_window.end == lastEnd) {
           stalledRestarts++;
+          final remaining = total - _window.end;
+          final nearDeclaredEnd =
+              total > 0 &&
+              (remaining <= 2 * 1024 * 1024 || remaining * 50 <= total);
+          if (nearDeclaredEnd || stalledRestarts >= 2) {
+            _eofByte = _window.end;
+            _diag(
+              DiagCategory.playback,
+              'proxy: request #$requestNo: upstream ended cleanly at '
+              'byte ${_window.end}/$total (no further bytes); closing as EOF',
+            );
+            break;
+          }
           if (_autoReconnect) {
             final delay = _backoffForAttempt(stalledRestarts - 1);
             _diag(
@@ -1367,23 +1410,6 @@ class DtcpProxy {
             }
             if (_stopRequested || generation != _serveGeneration) break;
             _fetcher.resetClient();
-            if (stalledRestarts >= 2) {
-              try {
-                await _onReauthenticate?.call();
-              } catch (e) {
-                _diag(
-                  DiagCategory.playback,
-                  'proxy: reauth attempt failed: $e',
-                );
-              }
-            }
-          } else if (stalledRestarts >= 3) {
-            _diag(
-              DiagCategory.playback,
-              'proxy: request #$requestNo: the upstream keeps '
-              'ending at byte ${_window.end}; giving up',
-            );
-            break;
           }
         } else {
           stalledRestarts = 0;
@@ -1391,7 +1417,7 @@ class DtcpProxy {
         }
         _startProducer(_window.end);
       }
-      if (pos > reqEnd) {
+      if (pos > reqEnd || (_eofByte != null && pos >= _eofByte!)) {
         completed = true;
         await response.close();
         _diag(
