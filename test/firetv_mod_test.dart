@@ -11,7 +11,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/app/firetv_helper.dart';
-import 'package:tmhb/app/firetv_preset.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
@@ -131,13 +130,14 @@ void main() {
       expect(certRect.left, lessThan(keyRect.left));
       expect((certRect.top - keyRect.top).abs(), lessThan(4));
 
-      // Action buttons sit above the inputs.
+      // Action buttons sit above the inputs, and removed built-in preset button stays absent.
       final envBtnRect = tester.getRect(
         find.text('ファイルから読み込む (credentials.env)'),
       );
       final saveBtnRect = tester.getRect(find.text('検証して保存'));
       expect(envBtnRect.bottom, lessThan(certRect.top));
       expect(saveBtnRect.bottom, lessThan(certRect.top));
+      expect(find.text('内蔵プリセットを読み込む'), findsNothing);
 
       // Explicit tap opens the input dialog and saves back on 決定.
       await tester.tap(fields.first);
@@ -324,107 +324,6 @@ void main() {
       expect(helper.volumeMaxCalls, greaterThanOrEqualTo(1));
       expect(helper.tryConnectCalls, 0);
       expect(find.text('Tailscale が起動していません'), findsNothing);
-    });
-  });
-
-  group('FireTvPreset seeding', () {
-    const samplePreset = FireTvPreset(
-      certHex: katSinkCert,
-      keyHex: katSinkPriv,
-      nasneHost: '192.168.10.171',
-      nasneUdn: 'uuid:test-nasne',
-      nasneName: 'nasne',
-      nasneMac: '00:25:dc:5a:4d:e5',
-    );
-
-    test('seeds credentials and nasne once and respects later deletion', () async {
-      final kv = InMemoryKeyValueStore();
-      final credStore = InMemoryCredentialStore(
-        authorityKeys: [hexToBytes(katAuthPub)],
-      );
-      final regStore = InMemoryRegistrationStore();
-
-      // First launch applies both presets.
-      await applyFireTvPresetsIfNeeded(
-        keyValues: kv,
-        credentialStore: credStore,
-        registrationStore: regStore,
-        preset: samplePreset,
-      );
-      expect(await credStore.hasCredentials, isTrue);
-      final regs1 = await regStore.loadAll();
-      expect(regs1.map((r) => r.host), ['192.168.10.171']);
-      expect(await kv.read(presetCredAppliedKey), 'true');
-      expect(await kv.read(presetNasneAppliedKey), 'true');
-
-      // User deletes both on a later launch; presets must not re-apply.
-      await credStore.delete();
-      await regStore.remove('192.168.10.171');
-      await applyFireTvPresetsIfNeeded(
-        keyValues: kv,
-        credentialStore: credStore,
-        registrationStore: regStore,
-        preset: samplePreset,
-      );
-      expect(await credStore.hasCredentials, isFalse);
-      expect(await regStore.loadAll(), isEmpty);
-    });
-
-    test('does not overwrite already-configured stores', () async {
-      final kv = InMemoryKeyValueStore();
-      final credStore = InMemoryCredentialStore(
-        authorityKeys: [hexToBytes(katAuthPub)],
-      );
-      await credStore.save(
-        certificate: hexToBytes(katSinkCert),
-        privateKey: hexToBytes(katSinkPriv),
-      );
-      const existingReg = RegisteredNasne(
-        host: '10.0.0.5',
-        udn: 'uuid:custom',
-        friendlyName: 'custom-nasne',
-        macAddr: '00:11:22:33:44:55',
-      );
-      final regStore = InMemoryRegistrationStore([existingReg]);
-
-      await applyFireTvPresetsIfNeeded(
-        keyValues: kv,
-        credentialStore: credStore,
-        registrationStore: regStore,
-        preset: samplePreset,
-      );
-      final regs = await regStore.loadAll();
-      expect(regs.map((r) => r.host), ['10.0.0.5']);
-    });
-
-    testWidgets('preset restore button appears and saves credentials', (
-      tester,
-    ) async {
-      tester.view.physicalSize = const Size(1280, 720);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final store = InMemoryCredentialStore(
-        authorityKeys: [hexToBytes(katAuthPub)],
-      );
-      await tester.pumpWidget(
-        ProviderScope(
-          overrides: [
-            credentialStoreProvider.overrideWithValue(store),
-            fireTvHelperProvider.overrideWithValue(_FakeFireTvHelper()),
-            fireTvPresetProvider.overrideWithValue(samplePreset),
-          ],
-          child: const MaterialApp(home: DtcpCredentialScreen()),
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      expect(find.text('内蔵プリセットを読み込む'), findsOneWidget);
-      await tester.tap(find.text('内蔵プリセットを読み込む'));
-      await tester.pumpAndSettle();
-
-      expect(await store.hasCredentials, isTrue);
-      expect(find.text('インポート済み'), findsOneWidget);
     });
   });
 
@@ -1830,6 +1729,330 @@ void main() {
       expect(hddRect.top, greaterThanOrEqualTo(deviceRect.bottom));
       expect(bcasRect.top, greaterThanOrEqualTo(networkRect.bottom));
     });
+  });
+
+  group('Phase 14: OSD Back key, SegmentedButton focus, EPG top bar jump', () {
+    test('resolvePlayerBackOutcome enforces detail -> OSD -> pop sequence & suppress guard', () {
+      expect(playerOsdCloseMenuLabel, 'メニューを閉じる');
+
+      final now = DateTime.utc(2026, 11, 23, 5, 0, 0);
+      final activeSuppress = now.add(const Duration(milliseconds: 300));
+      final expiredSuppress = now.subtract(const Duration(milliseconds: 10));
+
+      // Duplicate popRoute right after KeyDown closed detail or OSD must be suppressed.
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: true,
+          suppressUntil: activeSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.suppressed,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          suppressUntil: activeSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.suppressed,
+      );
+
+      // Without suppression: detail closes before OSD, OSD closes before popPlayer.
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: true,
+          osdOpen: true,
+          suppressUntil: expiredSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.closeDetail,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: true,
+          suppressUntil: expiredSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.closeOsd,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          suppressUntil: expiredSuppress,
+          now: now,
+        ),
+        PlayerBackOutcome.popPlayer,
+      );
+    });
+
+    testWidgets(
+      'PlayerOsdButtonBar closes on Back key without popping ancestor PopScope',
+      (tester) async {
+        var osdOpen = true;
+        var rootPopped = false;
+        DateTime? suppressUntil;
+        final scope = FocusScopeNode(debugLabel: 'testOsdBackScope');
+        final firstBtn = FocusNode(debugLabel: 'osdPlay');
+        addTearDown(scope.dispose);
+        addTearDown(firstBtn.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, _) {
+                if (didPop) return;
+                final outcome = resolvePlayerBackOutcome(
+                  detailOpen: false,
+                  osdOpen: osdOpen,
+                  suppressUntil: suppressUntil,
+                );
+                if (outcome == PlayerBackOutcome.closeOsd) {
+                  osdOpen = false;
+                  suppressUntil = DateTime.now().add(
+                    const Duration(milliseconds: 450),
+                  );
+                } else if (outcome == PlayerBackOutcome.popPlayer) {
+                  rootPopped = true;
+                }
+              },
+              child: Scaffold(
+                body: PlayerOsdButtonBar(
+                  focusScopeNode: scope,
+                  onClose: () {
+                    osdOpen = false;
+                    suppressUntil = DateTime.now().add(
+                      const Duration(milliseconds: 450),
+                    );
+                  },
+                  children: [
+                    OutlinedButton.icon(
+                      focusNode: firstBtn,
+                      autofocus: true,
+                      style: osdButtonStyle(),
+                      onPressed: () {},
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('再生'),
+                    ),
+                    OutlinedButton.icon(
+                      style: osdButtonStyle(),
+                      onPressed: () {},
+                      icon: const Icon(Icons.close),
+                      label: const Text(playerOsdCloseMenuLabel),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('メニューを閉じる'), findsOneWidget);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+        await tester.pump();
+        expect(osdOpen, isFalse);
+        expect(rootPopped, isFalse);
+
+        // Simulated platform popRoute firing on the same Back press stays suppressed.
+        await tester.binding.handlePopRoute();
+        await tester.pump();
+        expect(rootPopped, isFalse);
+
+        // Direct platform Back (without KeyDown) closes OSD first, then pops once expired.
+        osdOpen = true;
+        suppressUntil = null;
+        await tester.binding.handlePopRoute();
+        await tester.pump();
+        expect(osdOpen, isFalse);
+        expect(rootPopped, isFalse);
+
+        suppressUntil = DateTime.now().subtract(const Duration(seconds: 1));
+        await tester.binding.handlePopRoute();
+        await tester.pump();
+        expect(rootPopped, isTrue);
+      },
+    );
+
+    testWidgets(
+      'segmentedButtonTheme highlights only the focused segment without outer focus border',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+            ],
+            child: const TmhbApp(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
+        for (final theme in [app.theme!, app.darkTheme!]) {
+          final isDark = theme.brightness == Brightness.dark;
+          final style = theme.segmentedButtonTheme.style!;
+          expect(
+            style.side?.resolve({WidgetState.focused})?.color,
+            theme.colorScheme.outline,
+          );
+          expect(style.side?.resolve({WidgetState.focused})?.width, isNot(3.0));
+          expect(
+            style.backgroundColor?.resolve({WidgetState.focused}),
+            isDark ? Colors.amberAccent : Colors.amber,
+          );
+          expect(
+            style.foregroundColor?.resolve({WidgetState.focused}),
+            Colors.black,
+          );
+          expect(
+            style.iconColor?.resolve({WidgetState.focused}),
+            Colors.black,
+          );
+        }
+      },
+    );
+
+    testWidgets(
+      'EpgScreen puts band selector inline in AppBar on wide screen and jumps from grid via Menu/Back',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:epg-topbar',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const channel = Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2222,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト放送',
+        );
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final noonUtc = DateTime.utc(jstNow.year, jstNow.month, jstNow.day, 3);
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            EpgServiceGuide(
+              channel: channel,
+              events: [
+                EpgEvent(
+                  eventId: 10,
+                  start: noonUtc,
+                  duration: const Duration(minutes: 60),
+                  title: '昼テスト番組',
+                  genreLevel1: 3,
+                ),
+              ],
+            ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: EpgScreen()),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+
+        // Band selector lives inside AppBar on the same row as Search & Refresh.
+        final appBarFinder = find.byType(AppBar);
+        expect(
+          find.descendant(
+            of: appBarFinder,
+            matching: find.byType(SegmentedButton<int>),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: appBarFinder,
+            matching: find.byIcon(Icons.search),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: appBarFinder,
+            matching: find.byIcon(Icons.refresh),
+          ),
+          findsOneWidget,
+        );
+        expect(find.text('戻る / メニューで上部へ'), findsOneWidget);
+
+        // Scroll grid to noon so the tile is onstage, focus it, and press Menu.
+        final tileText = find.text('昼テスト番組', skipOffstage: false);
+        await tester.ensureVisible(tileText);
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(find.text('昼テスト番組'))).requestFocus();
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(EpgScreen)),
+        );
+        final backHandler = container.read(tabBackHandlersProvider)[AppTabs.epg];
+        expect(backHandler, isNotNull);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump();
+
+        // Focus jumped out of the grid into the top bar ('地デジ' segment).
+        final segFinder = find.byType(SegmentedButton<int>);
+        final primaryContext = FocusManager.instance.primaryFocus?.context;
+        expect(primaryContext, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(primaryContext!.widget),
+            matching: segFinder,
+          ),
+          findsOneWidget,
+        );
+        expect(backHandler!(), isFalse);
+
+        // Focus tile again and invoke Back handler directly -> jumps back up.
+        Focus.of(tester.element(find.text('昼テスト番組'))).requestFocus();
+        await tester.pump();
+        expect(backHandler(), isTrue);
+        await tester.pump();
+        final afterBackContext = FocusManager.instance.primaryFocus?.context;
+        expect(afterBackContext, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(afterBackContext!.widget),
+            matching: segFinder,
+          ),
+          findsOneWidget,
+        );
+      },
+    );
   });
 }
 

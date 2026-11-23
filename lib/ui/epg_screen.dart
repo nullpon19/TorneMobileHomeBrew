@@ -12,8 +12,8 @@
 library;
 
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -21,6 +21,7 @@ import '../app/providers.dart';
 import '../app/state.dart';
 import '../app/bs_epg_providers.dart';
 import '../core/core.dart';
+import 'app_shell.dart';
 import 'epg_genre.dart';
 import 'epg_search_screen.dart';
 import 'error_messages.dart';
@@ -321,6 +322,10 @@ class _GuideGridScrollState extends State<_GuideGridScroll> {
   }
 }
 
+/// Screen width at or above which the 地デジ/BS selector is placed inline inside
+/// the AppBar alongside the Search and Refresh actions.
+const double epgInlineBandBreakpoint = 600;
+
 class EpgScreen extends ConsumerStatefulWidget {
   const EpgScreen({super.key});
 
@@ -338,6 +343,11 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   final _rulerController = ScrollController();
   final _bodyController = ScrollController();
   final _gridController = ScrollController();
+  final FocusNode _topBarFocusNode = FocusNode(debugLabel: 'epgTopBar');
+  final FocusScopeNode _gridFocusScopeNode = FocusScopeNode(
+    debugLabel: 'epgGrid',
+  );
+  late final Map<int, bool Function()> _tabBackHandlers;
   bool _syncing = false;
 
   @override
@@ -345,6 +355,8 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
     super.initState();
     _link(_rulerController, _bodyController);
     _link(_bodyController, _rulerController);
+    _tabBackHandlers = ref.read(tabBackHandlersProvider);
+    _tabBackHandlers[AppTabs.epg] = _handleBackFromGrid;
   }
 
   void _link(ScrollController from, ScrollController to) {
@@ -358,10 +370,30 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
 
   @override
   void dispose() {
+    if (_tabBackHandlers[AppTabs.epg] == _handleBackFromGrid) {
+      _tabBackHandlers.remove(AppTabs.epg);
+    }
+    _topBarFocusNode.dispose();
+    _gridFocusScopeNode.dispose();
     _rulerController.dispose();
     _bodyController.dispose();
     _gridController.dispose();
     super.dispose();
+  }
+
+  void _focusTopBar() {
+    final targets = _topBarFocusNode.traversalDescendants
+        .where((n) => n.canRequestFocus && !n.skipTraversal)
+        .toList();
+    if (targets.isNotEmpty) {
+      targets.first.requestFocus();
+    }
+  }
+
+  bool _handleBackFromGrid() {
+    if (!_gridFocusScopeNode.hasFocus) return false;
+    _focusTopBar();
+    return true;
   }
 
   /// The JST calendar date (as UTC fields) containing [instant].
@@ -374,54 +406,112 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
   static DateTime _jstDayStart(DateTime jstDate) =>
       jstDate.subtract(const Duration(hours: 9));
 
-  @override
-  Widget build(BuildContext context) {
-    final reg = ref.watch(selectedRegistrationProvider);
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('番組表'),
-        actions: [
-          if (reg != null)
-            IconButton(
-              icon: const Icon(Icons.search),
-              tooltip: '番組検索',
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => EpgSearchScreen(reg: reg),
-                ),
-              ),
-            ),
-          if (reg != null)
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              tooltip: '更新',
-              onPressed: () {
-                ref.invalidate(schedulesProvider(reg));
-                if (_selectedBand == terrestrialBroadcastingType) {
-                  ref.invalidate(epgGuideProvider(reg));
-                  ref.invalidate(channelLogosProvider(reg));
-                } else {
-                  ref.invalidate(bsChannelsProvider(reg));
-                  ref.invalidate(bsEpgGuideProvider(reg));
-                  ref.invalidate(bsChannelLogosProvider(reg));
-                }
-              },
-            ),
-        ],
-      ),
-      body: reg == null
-          ? NoDeviceView(
-              onRegister: () =>
-                  ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
-            )
-          : ScrollConfiguration(
-              behavior: const _EpgScrollBehavior(),
-              child: _buildBandGuide(reg),
-            ),
+  Widget _buildBandSelector() {
+    return SegmentedButton<int>(
+      segments: const [
+        ButtonSegment<int>(
+          value: terrestrialBroadcastingType,
+          label: Text('地デジ'),
+        ),
+        ButtonSegment<int>(value: bsBroadcastingType, label: Text('BS')),
+      ],
+      selected: {_selectedBand},
+      onSelectionChanged: (selection) => setState(() {
+        _selectedBand = selection.first;
+        _scrolledToNow = false;
+      }),
     );
   }
 
-  Widget _buildBandGuide(RegisteredNasne reg) {
+  @override
+  Widget build(BuildContext context) {
+    final reg = ref.watch(selectedRegistrationProvider);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final inlineBand = constraints.maxWidth >= epgInlineBandBreakpoint;
+        final showHint = constraints.maxWidth >= 760;
+        final actionsRow = reg == null
+            ? null
+            : Focus(
+                focusNode: _topBarFocusNode,
+                canRequestFocus: false,
+                skipTraversal: true,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (inlineBand) ...[
+                      Center(child: _buildBandSelector()),
+                      const SizedBox(width: 8),
+                    ],
+                    IconButton(
+                      icon: const Icon(Icons.search),
+                      tooltip: '番組検索',
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => EpgSearchScreen(reg: reg),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.refresh),
+                      tooltip: '更新',
+                      onPressed: () {
+                        ref.invalidate(schedulesProvider(reg));
+                        if (_selectedBand == terrestrialBroadcastingType) {
+                          ref.invalidate(epgGuideProvider(reg));
+                          ref.invalidate(channelLogosProvider(reg));
+                        } else {
+                          ref.invalidate(bsChannelsProvider(reg));
+                          ref.invalidate(bsEpgGuideProvider(reg));
+                          ref.invalidate(bsChannelLogosProvider(reg));
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              );
+
+        return Scaffold(
+          appBar: AppBar(
+            title: inlineBand && showHint && reg != null
+                ? Row(
+                    children: [
+                      const Text('番組表'),
+                      const SizedBox(width: 12),
+                      Flexible(
+                        child: Text(
+                          '戻る / メニューで上部へ',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                              ),
+                        ),
+                      ),
+                    ],
+                  )
+                : const Text('番組表'),
+            actions: [?actionsRow],
+          ),
+          body: reg == null
+              ? NoDeviceView(
+                  onRegister: () => ref
+                      .read(tabIndexProvider.notifier)
+                      .select(AppTabs.settings),
+                )
+              : ScrollConfiguration(
+                  behavior: const _EpgScrollBehavior(),
+                  child: _buildBandGuide(reg, showBandRow: !inlineBand),
+                ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBandGuide(RegisteredNasne reg, {required bool showBandRow}) {
     final isBs = _selectedBand == bsBroadcastingType;
     final guideAsync = isBs
         ? ref.watch(bsEpgGuideProvider(reg))
@@ -436,23 +526,16 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
 
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: SegmentedButton<int>(
-            segments: const [
-              ButtonSegment<int>(
-                value: terrestrialBroadcastingType,
-                label: Text('地デジ'),
-              ),
-              ButtonSegment<int>(value: bsBroadcastingType, label: Text('BS')),
-            ],
-            selected: {_selectedBand},
-            onSelectionChanged: (selection) => setState(() {
-              _selectedBand = selection.first;
-              _scrolledToNow = false;
-            }),
+        if (showBandRow)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Focus(
+              focusNode: _topBarFocusNode,
+              canRequestFocus: false,
+              skipTraversal: true,
+              child: _buildBandSelector(),
+            ),
           ),
-        ),
         Expanded(
           child: guideAsync.when(
             loading: () => const LoadingView(),
@@ -490,6 +573,8 @@ class _EpgScreenState extends ConsumerState<EpgScreen> {
               rulerController: _rulerController,
               bodyController: _bodyController,
               gridController: _gridController,
+              gridFocusScopeNode: _gridFocusScopeNode,
+              onJumpToTopBar: _focusTopBar,
               scrolledToNow: _scrolledToNow,
               onScrolledToNow: () => _scrolledToNow = true,
             ),
@@ -513,6 +598,8 @@ class _GuideView extends StatelessWidget {
     required this.rulerController,
     required this.bodyController,
     required this.gridController,
+    required this.gridFocusScopeNode,
+    required this.onJumpToTopBar,
     required this.scrolledToNow,
     required this.onScrolledToNow,
   });
@@ -534,6 +621,8 @@ class _GuideView extends StatelessWidget {
   final ScrollController rulerController;
   final ScrollController bodyController;
   final ScrollController gridController;
+  final FocusScopeNode gridFocusScopeNode;
+  final VoidCallback onJumpToTopBar;
   final bool scrolledToNow;
   final VoidCallback onScrolledToNow;
 
@@ -601,27 +690,40 @@ class _GuideView extends StatelessWidget {
               ),
               const VerticalDivider(width: 1),
               Expanded(
-                child: _GuideGridScroll(
-                  gridController: gridController,
-                  bodyController: bodyController,
-                  child: SizedBox(
-                    width: _channelWidth * guide.services.length,
-                    child: Column(
-                      children: [
-                        _ChannelHeader(services: guide.services, logos: logos),
-                        Expanded(
-                          child: _DayGrid(
-                            reg: reg,
-                            services: guide.services,
-                            schedules: schedules,
-                            hiddenGenres: hiddenGenres,
-                            onWatchEvent: onWatchEvent,
-                            dayStart: dayStart,
-                            dayEnd: dayEnd,
-                            controller: bodyController,
+                child: FocusScope(
+                  node: gridFocusScopeNode,
+                  onKeyEvent: (node, event) {
+                    if (event is KeyDownEvent &&
+                        (event.logicalKey == LogicalKeyboardKey.contextMenu ||
+                            event.logicalKey == LogicalKeyboardKey.info ||
+                            event.logicalKey == LogicalKeyboardKey.escape)) {
+                      onJumpToTopBar();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
+                  },
+                  child: _GuideGridScroll(
+                    gridController: gridController,
+                    bodyController: bodyController,
+                    child: SizedBox(
+                      width: _channelWidth * guide.services.length,
+                      child: Column(
+                        children: [
+                          _ChannelHeader(services: guide.services, logos: logos),
+                          Expanded(
+                            child: _DayGrid(
+                              reg: reg,
+                              services: guide.services,
+                              schedules: schedules,
+                              hiddenGenres: hiddenGenres,
+                              onWatchEvent: onWatchEvent,
+                              dayStart: dayStart,
+                              dayEnd: dayEnd,
+                              controller: bodyController,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),

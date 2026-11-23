@@ -15,6 +15,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
+import android.provider.Settings
 import android.view.WindowManager
 import android.system.ErrnoException
 import android.system.Os
@@ -299,8 +300,8 @@ class MainActivity : FlutterActivity() {
         }
 
     private fun hasStoragePermission(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager()
         }
         return ContextCompat.checkSelfPermission(
             this,
@@ -308,6 +309,7 @@ class MainActivity : FlutterActivity() {
         ) == PackageManager.PERMISSION_GRANTED
     }
 
+    @Suppress("DEPRECATION")
     private fun requestStoragePermission(result: MethodChannel.Result) {
         if (hasStoragePermission()) {
             result.success(true)
@@ -315,11 +317,43 @@ class MainActivity : FlutterActivity() {
         }
         pendingStoragePermissionResult?.success(false)
         pendingStoragePermissionResult = result
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                )
+                startActivityForResult(intent, MANAGE_STORAGE_REQUEST_CODE)
+            } catch (_: Exception) {
+                try {
+                    val fallback = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:$packageName"),
+                    )
+                    startActivityForResult(fallback, MANAGE_STORAGE_REQUEST_CODE)
+                } catch (_: Exception) {
+                    val pending = pendingStoragePermissionResult
+                    pendingStoragePermissionResult = null
+                    pending?.success(false)
+                }
+            }
+            return
+        }
         ActivityCompat.requestPermissions(
             this,
             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
             STORAGE_PERMISSION_REQUEST_CODE,
         )
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == MANAGE_STORAGE_REQUEST_CODE) {
+            val pending = pendingStoragePermissionResult
+            pendingStoragePermissionResult = null
+            pending?.success(hasStoragePermission())
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -434,6 +468,7 @@ class MainActivity : FlutterActivity() {
         private const val FIRETV_HELPER_CHANNEL = "com.markun.tmhb/firetv_helper"
         private const val TAILSCALE_PACKAGE = "com.tailscale.ipn"
         private const val STORAGE_PERMISSION_REQUEST_CODE = 1001
+        private const val MANAGE_STORAGE_REQUEST_CODE = 1002
         private const val MAX_CREDENTIAL_FILE_BYTES = 1_048_576L
         private const val MAX_CREDENTIAL_CANDIDATES = 100
     }

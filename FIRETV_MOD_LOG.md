@@ -110,13 +110,26 @@
    - `schedulesProvider` と照合 (`parseScheduleEventId` / `findMatchingSchedule`) し、予約済み番組タイルを 2.5px の赤枠（ライト `#D32F2F` / ナイト `redAccent`）＋時刻横の赤ドットで囲い表示（予約済み＋フォーカス時は外側黒/金枠＋内側赤枠を併用描画）。
    - 予約済み番組の詳細ダイアログ（EPG・番組検索双方）では「録画予約」の代わりに **`'予約を編集'`** ボタンを表示し、押下で `ScheduleDetailPage`（編集／時刻変更／削除）を開くように変更。
 
-### 第10弾: ホーム画面 2 カラム並列・高さ揃え＆リモコン下端スクロール対応（本コミット）
+### 第10弾: ホーム画面 2 カラム並列・高さ揃え＆リモコン下端スクロール対応 (`a724098`)
 1. **ホーム画面のペアカード 2 カラム化＆高さ揃え (`lib/ui/home_screen.dart`, `lib/ui/widgets.dart`)**:
    - 横幅 `homeTwoColumnBreakpoint` (`600dp`) 以上（Fire TV／タブレット等）で、「本体情報」＋「HDD」および「ネットワーク」＋「B-CAS」をそれぞれ `_PairedSectionRow` (`IntrinsicHeight` + `Row(crossAxisAlignment: CrossAxisAlignment.stretch)`) により 2 カラム並列・同高さで配置。
    - 外側・中央マージンを上下カードと統一 (`12dp`) し、狭幅画面（スマホサイズ）では従来の縦 1 カラム表示を維持。
 2. **ホーム画面のリモコン D-pad フォーカス＆最下部スクロール対応 (`lib/ui/widgets.dart`, `lib/ui/home_screen.dart`)**:
    - `SectionCard` に `margin`・`focusable`・`scrollController` 対応を追加し、ホーム画面の全 6 セクションカードをフォーカス可能化（ライト時黒枠 3px / ダーク時 `amberAccent` 3px、レイアウトズレなし、エラー時「再試行」ボタンへのフォーカス移動も両立）。
    - `_StatusList` の `ListView` に `ScrollController` と `scrollCacheExtent: ScrollCacheExtent.pixels(2000)` を設定し、全カード常時探索可能にしたうえでフォーカス追従 (`Scrollable.ensureVisible`)、画面縦幅超えカードの段階スクロール、および最下段到達時の最下部スクロールを実装。
+
+### 第11弾: OSD 戻るキー修正＆「メニューを閉じる」化・プリセット廃止＆Download 権限対応・SegmentedButton 個別強調・EPG 上部バー統合（本コミット）
+1. **再生中 OSD の戻るキー挙動修正＆「メニューを閉じる」変更 (`lib/ui/player_screen.dart`)**:
+   - `PopScope(canPop: false)` ＋ `resolvePlayerBackOutcome`（詳細パネル／OSD クローズ直後の `450ms` 二重発火抑止）を導入し、OSD や番組詳細表示中にリモコンの戻るキーを押しても再生終了せず **`番組詳細のみ閉じる → OSD のみ閉じる → 再生終了`** の順に動作するよう修正。
+   - OSD 右端ボタンのラベルを `'閉じる'` から **`'メニューを閉じる'`**（`playerOsdCloseMenuLabel`）へ変更し、OSD メニューを閉じるボタンであることを明確化。
+2. **内蔵プリセットの完全廃止＆ `/sdcard/Download` 読み取り対応 (`lib/app/firetv_preset.dart` 削除, `lib/main.dart`, `lib/app/providers.dart`, `lib/ui/dtcp_credential_screen.dart`, `AndroidManifest.xml`, `MainActivity.kt`)**:
+   - 第2弾で導入していた個人プリセット関連コード（`firetv_preset.dart`, `fireTvPresetProvider`, 起動時シード処理, `'内蔵プリセットを読み込む'` ボタン）を完全削除し、ビルド時注入を使わないクリーン APK 運用へ移行。
+   - Android 11 / Fire OS 8（`targetSdk=36`）で `/sdcard/Download` 上の `.env` ファイルを参照できるよう `AndroidManifest.xml` に `MANAGE_EXTERNAL_STORAGE` を追加し、`MainActivity.kt` で `Environment.isExternalStorageManager()` 判定および設定画面 (`MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`) 誘導＋`onActivityResult` 自動再スキャンに対応。
+3. **`SegmentedButton` の個別セグメント強調テーマ (`lib/main.dart`)**:
+   - `segmentedButtonTheme` の外枠 `side` を通常枠のまま維持し、**フォーカス中のセグメント単体のみ** 背景をアンバー／金色・文字とアイコンを黒に反転させることで、「地デジ」「BS」などセットボタン群のフォーカス位置を明確化（全画面の `SegmentedButton` に一括適用）。
+4. **番組表上部バー統合＆戻る／メニューキー一発上部ジャンプ (`lib/ui/app_shell.dart`, `lib/ui/epg_screen.dart`)**:
+   - 横幅 `epgInlineBandBreakpoint` (`600dp`) 以上では `AppBar` 内に `[地デジ | BS]` セレクタと検索・更新アイコンを横 1 列に統合（タイトル横に `'戻る / メニューで上部へ'` ヒントを表示）。
+   - `AppShell` に `tabBackHandlersProvider` を追加し、番組グリッド閲覧中に戻るキーまたはリモコンのメニュー (`contextMenu` / `info`) キーを押すと 0 時台まで上スクロールせず一発で上部バー（`地デジ`/`BS`）へフォーカス復帰（上部バー上での戻るキーで従来どおり終了確認ダイアログを表示）。
 
 ---
 
@@ -127,29 +140,28 @@
 | `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順 |
 | `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順） |
 | `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv` に変更 |
-| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner` / ストレージ権限宣言 |
+| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner` / `READ_EXTERNAL_STORAGE` + `MANAGE_EXTERNAL_STORAGE` 宣言 |
 | `android/app/src/main/res/drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
 | `android/app/src/main/cpp/CMakeLists.txt` | `tmhb_aes.c` (`-O3`) のビルド対象追加 |
 | `android/app/src/main/cpp/tmhb_aes.c` | ネイティブ C T-table AES-128-CBC 復号実装 (`tmhb_aes128_cbc_decrypt` 等) |
-| `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・ストレージ/ピッカー・`StatFs` 残容量 `getCacheAvailableBytes`） |
+| `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・`MANAGE_EXTERNAL_STORAGE` 判定/設定誘導＋ファイルスキャン・`StatFs` 残容量 `getCacheAvailableBytes`） |
 | `lib/app/bootstrap.dart` | `fileStoreContainer` に `mpvCacheDirectory` オプション引数を追加 |
 | `lib/app/firetv_helper.dart` | Fire TV 向け Platform Channel ラッパー（`getCacheAvailableBytes()` ほか） |
-| `lib/app/firetv_preset.dart` | ビルド時プリセット投入 (`FireTvPreset`, `applyFireTvPresetsIfNeeded`) |
 | `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`NightModeNotifier` / `nightModeProvider`、`GroupTitlesNotifier` / `groupTitlesProvider`（既定 ON）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
 | `lib/core/dtcp/native_aes.dart` | `libtmhb_fcntl.so` の Dart FFI バインディング |
 | `lib/core/dtcp/dtcp_crypto.dart` | Android でのネイティブ AES 復号優先パス |
 | `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止）、`isLive` 限定 EOF 再接続、Seekable 正常 EOF 打ち切り & `_eofByte` 416 |
 | `lib/core/services/dtcp_playback.dart` | `PlaybackKeySource.forceReauthenticate()`、`DtcpPlaybackEngine(autoReconnect: ...)`、`isLive` 伝播 |
-| `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠テーマ |
-| `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、ルート `PopScope` によるアプリ終了確認ダイアログ |
-| `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー・プリセット復元ボタン |
-| `lib/ui/epg_screen.dart` | `_EventTile` の `focusColor` 無効化＋3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、`schedulesProvider` 照合による予約済み赤枠・赤ドット表示・詳細 `'予約を編集'` (`ScheduleDetailPage`) 切替 |
+| `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠・`SegmentedButton` 個別セグメント反転強調テーマ |
+| `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`tabBackHandlersProvider` ＋ルート `PopScope` によるアプリ終了確認ダイアログ |
+| `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー（プリセット復元 UI は削除） |
+| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤枠・赤ドット表示＆ `'予約を編集'` 切替 |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力）、検索結果の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
 | `lib/ui/home_screen.dart` | 横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
 | `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、OSD「番組詳細」データ引き渡し |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
 | `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'番組詳細'` 半画面スクロール表示含む）、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'メニューを閉じる'` 化・`'番組詳細'` 半画面スクロール表示・戻るキー二重発火抑止含む）、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
 | `lib/ui/schedule_form.dart` | 長さ/条件 ID/録画先の 3 欄を `FireTvTextInputField` 化 |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
@@ -158,7 +170,7 @@
 | `lib/ui/widgets.dart` | 決定キーでダイアログ入力を開く共通 `FireTvTextInputField` / `_FireTvTextInputDialog` 追加、`SectionCard` の `margin`・D-pad `focusable` 枠強調＆`ScrollController` 連動スクロール対応 |
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・終了確認・終端ガード・OSD詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton` 個別強調・10秒シーク・EPG上部バー統合/一発遷移/黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・終了確認・終端ガード・OSD戻るキー/「メニューを閉じる」/詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |
@@ -186,29 +198,18 @@
 
 ---
 
-## 5. アップストリーム更新時の再適用＆個人プリセット APK ビルド手順
+## 5. アップストリーム更新時の再適用＆クリーン APK ビルド手順
 
 ### 5.1 リベース / 再適用時の注意箇所
 アップストリーム更新後に `firetv-mod` をリベース／チェリーピックする際は、主に以下の競合ポイントを確認してください。
-- `lib/ui/player_screen.dart` / `lib/ui/player_error_policy.dart`（フルスクリーン OSD / ±10秒シーク / シークバー HUD / 事前バッファ / 自動再開・フォーカス / 録画終了時自動復帰）
+- `lib/ui/player_screen.dart` / `lib/ui/player_error_policy.dart`（フルスクリーン OSD / ±10秒シーク / シークバー HUD / 事前バッファ / 自動再開・フォーカス / 録画終了時自動復帰 / 戻るキー二重発火抑止）
 - `lib/ui/title_list_filter.dart` / `lib/ui/titles_screen.dart` / `lib/ui/live_screen.dart`（番組自動まとめ・折りたたみフォルダ・1/4 サムネレイアウト・画質都度切替・`knownDuration`・検索入力ダイアログ）
-- `lib/ui/dtcp_credential_screen.dart` / `lib/ui/settings_screen.dart` / `lib/ui/home_screen.dart` / `lib/ui/epg_screen.dart` / `lib/ui/epg_search_screen.dart` / `lib/ui/schedule_form.dart` / `lib/ui/widgets.dart` / `lib/ui/app_shell.dart`（各入力ダイアログ・Home 2カラム/D-padスクロール・EPG黒/金枠・戻る終了確認）
+- `lib/ui/dtcp_credential_screen.dart` / `lib/ui/settings_screen.dart` / `lib/ui/home_screen.dart` / `lib/ui/epg_screen.dart` / `lib/ui/epg_search_screen.dart` / `lib/ui/schedule_form.dart` / `lib/ui/widgets.dart` / `lib/ui/app_shell.dart`（各入力ダイアログ・Home 2カラム/D-padスクロール・EPG上部バー統合/戻る/黒・赤枠・戻る終了確認）
 - `lib/core/dtcp/dtcp_proxy.dart` / `dtcp_crypto.dart` / `lib/core/services/dtcp_playback.dart`
-- `lib/app/providers.dart` / `lib/main.dart` / `android/app/build.gradle.kts` / `MainActivity.kt`
+- `lib/app/providers.dart` / `lib/main.dart` / `android/app/build.gradle.kts` / `AndroidManifest.xml` / `MainActivity.kt`
 
-### 5.2 個人プリセット APK ビルド手順（秘密情報をソースに残さない方式）
-一時ファイル（例: `/tmp/tmhb_firetv_preset.json`、権限 `0600`）に以下のキーを格納してビルドし、ビルド直後に削除します（以下の値は**すべてダミーのプレースホルダ**です）。
-
-```json
-{
-  "TMHB_PRESET_CERT_HEX": "<176-hex-cert>",
-  "TMHB_PRESET_KEY_HEX": "<40-hex-key>",
-  "TMHB_PRESET_NASNE_HOST": "<192.168.x.x>",
-  "TMHB_PRESET_NASNE_UDN": "<uuid:...>",
-  "TMHB_PRESET_NASNE_NAME": "<nasne-name>",
-  "TMHB_PRESET_NASNE_MAC": "<XX:XX:XX:XX:XX:XX>"
-}
-```
+### 5.2 クリーン APK ビルド＆実機 Download 配置手順（個人情報をビルドに埋め込まない方式）
+第11弾以降はビルド時プリセット注入を行わず、秘密情報ゼロのクリーンな APK をビルドします。資格情報は端末の `Download` フォルダへ `.env` ファイルを配置し、アプリ内ピッカー（「Download フォルダの権限を許可」→ 全ファイルアクセス許可後に選択）から取り込みます。
 
 ```bash
 export PATH="$HOME/development/flutter/bin:$PATH"
@@ -217,8 +218,7 @@ export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
 
 cd /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew-FireTV
-flutter build apk --release --dart-define-from-file=/tmp/tmhb_firetv_preset.json
-rm -f /tmp/tmhb_firetv_preset.json
+flutter build apk --release
 
 # 出力 APK を親フォルダへ配置し Fire TV へインストール
 cp build/app/outputs/flutter-apk/app-release.apk \
@@ -226,4 +226,8 @@ cp build/app/outputs/flutter-apk/app-release.apk \
 "$ANDROID_HOME/platform-tools/adb" connect <FIRETV_IP>:5555
 "$ANDROID_HOME/platform-tools/adb" -s <FIRETV_IP>:5555 install -r \
    /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk
+
+# 必要に応じて資格情報ファイルを Fire TV の Download フォルダへ転送（取込後は端末から削除推奨）
+"$ANDROID_HOME/platform-tools/adb" -s <FIRETV_IP>:5555 push \
+   /path/to/credentials.env /sdcard/Download/credentials.env
 ```

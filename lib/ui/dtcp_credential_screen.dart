@@ -30,7 +30,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../app/firetv_helper.dart';
-import '../app/firetv_preset.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import 'widgets.dart';
@@ -208,23 +207,6 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
     }
   }
 
-  Future<void> _importFromPreset(FireTvPreset preset) async {
-    try {
-      await _import(
-        certificate: hexToBytes(preset.certHex.trim().toLowerCase()),
-        privateKey: hexToBytes(preset.keyHex.trim().toLowerCase()),
-      );
-    } catch (e) {
-      ref.read(diagLogProvider)(
-        DiagCategory.ui,
-        'preset credential decode failed',
-      );
-      if (mounted) {
-        setState(() => _error = '内蔵プリセットの読み込みに失敗しました。');
-      }
-    }
-  }
-
   Future<void> _delete() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -255,7 +237,6 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
   @override
   Widget build(BuildContext context) {
     final summary = ref.watch(credentialSummaryProvider);
-    final preset = ref.watch(fireTvPresetProvider);
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('DTCP-IP 資格情報')),
@@ -324,12 +305,6 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
                 icon: const Icon(Icons.download_done),
                 label: const Text('検証して保存'),
               ),
-              if (preset.hasCredentials)
-                FilledButton.tonalIcon(
-                  onPressed: _busy ? null : () => _importFromPreset(preset),
-                  icon: const Icon(Icons.restore),
-                  label: const Text('内蔵プリセットを読み込む'),
-                ),
               OutlinedButton.icon(
                 onPressed: _busy ? null : _delete,
                 icon: const Icon(Icons.delete_outline),
@@ -487,7 +462,7 @@ class _FireTvFilePickerDialogState extends State<_FireTvFilePickerDialog> {
     if (!mounted) return;
     if (!granted) {
       setState(() {
-        _error = 'ストレージ読み取り権限が許可されませんでした。アプリ専用フォルダを使用してください。';
+        _error = 'ストレージ読み取り権限が許可されませんでした。権限を許可するかアプリ専用フォルダを使用してください。';
       });
     }
     await _refresh();

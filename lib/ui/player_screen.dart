@@ -261,6 +261,29 @@ ButtonStyle osdButtonStyle() {
   );
 }
 
+/// Label for the OSD button that dismisses only the OSD menu bar.
+const String playerOsdCloseMenuLabel = 'メニューを閉じる';
+
+/// Outcome for resolving a system Back (`PopScope`) while the player is open.
+enum PlayerBackOutcome { suppressed, closeDetail, closeOsd, popPlayer }
+
+/// Resolves what a platform Back invocation should do for the current overlay
+/// and debounce-suppression state.
+PlayerBackOutcome resolvePlayerBackOutcome({
+  required bool detailOpen,
+  required bool osdOpen,
+  DateTime? suppressUntil,
+  DateTime? now,
+}) {
+  final current = now ?? DateTime.now();
+  if (suppressUntil != null && current.isBefore(suppressUntil)) {
+    return PlayerBackOutcome.suppressed;
+  }
+  if (detailOpen) return PlayerBackOutcome.closeDetail;
+  if (osdOpen) return PlayerBackOutcome.closeOsd;
+  return PlayerBackOutcome.popPlayer;
+}
+
 /// Traps D-pad directional focus within the OSD action bar and loops
 /// horizontally between the first and last buttons so focus never escapes.
 class PlayerOsdButtonBar extends StatelessWidget {
@@ -738,6 +761,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _osdOpen = false;
   Timer? _osdTimer;
   bool _detailOpen = false;
+  DateTime? _suppressBackPopUntil;
   final ScrollController _detailScrollController = ScrollController();
 
   IconData? _hudIcon;
@@ -1675,7 +1699,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
   }
 
-  void _closeDetail() {
+  void _closeDetail({bool fromBackKey = false}) {
+    if (fromBackKey) {
+      _suppressBackPopUntil = DateTime.now().add(
+        const Duration(milliseconds: 450),
+      );
+    }
     if (!_detailOpen) return;
     setState(() => _detailOpen = false);
     if (_osdOpen) {
@@ -1723,7 +1752,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
   }
 
-  void _closeOsd() {
+  void _closeOsd({bool fromBackKey = false}) {
+    if (fromBackKey) {
+      _suppressBackPopUntil = DateTime.now().add(
+        const Duration(milliseconds: 450),
+      );
+    }
     _osdTimer?.cancel();
     if (!_osdOpen && !_detailOpen) return;
     setState(() {
@@ -1890,13 +1924,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       if (event is KeyDownEvent &&
           (key == LogicalKeyboardKey.escape ||
               key == LogicalKeyboardKey.goBack)) {
-        _closeDetail();
+        _closeDetail(fromBackKey: true);
       }
       return KeyEventResult.handled;
     }
     if (_osdOpen) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
-        _closeOsd();
+        _closeOsd(fromBackKey: true);
         return KeyEventResult.handled;
       }
       _resetOsdTimer();
@@ -1983,13 +2017,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       buffering: _buffering,
     );
     return PopScope(
-      canPop: !_osdOpen && !_detailOpen,
+      canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
-        if (_detailOpen) {
-          _closeDetail();
-        } else if (_osdOpen) {
-          _closeOsd();
+        switch (resolvePlayerBackOutcome(
+          detailOpen: _detailOpen,
+          osdOpen: _osdOpen,
+          suppressUntil: _suppressBackPopUntil,
+        )) {
+          case PlayerBackOutcome.suppressed:
+            return;
+          case PlayerBackOutcome.closeDetail:
+            _closeDetail(fromBackKey: true);
+            return;
+          case PlayerBackOutcome.closeOsd:
+            _closeOsd(fromBackKey: true);
+            return;
+          case PlayerBackOutcome.popPlayer:
+            Navigator.of(context).pop();
+            return;
         }
       },
       child: Scaffold(
@@ -2080,7 +2126,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                             body: widget.programDetailBody!,
                             scrollController: _detailScrollController,
                             focusNode: _detailFocusNode,
-                            onClose: _closeDetail,
+                            onClose: () => _closeDetail(fromBackKey: true),
                             onScrollDelta: _scrollDetailBy,
                           ),
                         ),
@@ -2509,7 +2555,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             const SizedBox(height: 12),
             PlayerOsdButtonBar(
               focusScopeNode: _osdFocusScopeNode,
-              onClose: _closeOsd,
+              onClose: () => _closeOsd(fromBackKey: true),
               onInteraction: _resetOsdTimer,
               children: [
                   _osdButton(
@@ -2591,7 +2637,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     ),
                   _osdButton(
                     icon: Icons.close,
-                    label: '閉じる',
+                    label: playerOsdCloseMenuLabel,
                     onPressed: _closeOsd,
                   ),
               ],

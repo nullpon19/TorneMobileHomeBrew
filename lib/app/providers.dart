@@ -16,7 +16,6 @@ import 'ake_socket.dart';
 import 'debug_log.dart';
 import 'file_pick.dart';
 import 'firetv_helper.dart';
-import 'firetv_preset.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
@@ -460,11 +459,6 @@ final fileBytesPickerProvider = Provider<FileBytesPicker>(
 
 /// Platform helper for Fire TV (volume max, Tailscale, local file scan).
 final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
-
-/// Build-time personal presets (DTCP-IP credentials & default nasne).
-final fireTvPresetProvider = Provider<FireTvPreset>(
-  (ref) => const FireTvPreset.fromEnvironment(),
-);
 
 final playbackEngineProvider = Provider<PlaybackEngine>(
   (ref) => DtcpPlaybackEngine(

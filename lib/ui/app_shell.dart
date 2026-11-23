@@ -35,6 +35,12 @@ const double railBreakpoint = 720;
 /// is unaffected.
 const double wideLayoutMinTopInset = 24;
 
+/// Per-tab Back-button interceptors checked before showing the root app exit
+/// confirmation dialog. Returning `true` consumes Back within that tab.
+final tabBackHandlersProvider = Provider<Map<int, bool Function()>>(
+  (ref) => <int, bool Function()>{},
+);
+
 class AppShell extends ConsumerStatefulWidget {
   const AppShell({super.key});
 
@@ -119,6 +125,9 @@ class _AppShellState extends ConsumerState<AppShell> {
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop || _exitDialogOpen) return;
+        final activeTab = ref.read(tabIndexProvider);
+        final handler = ref.read(tabBackHandlersProvider)[activeTab];
+        if (handler != null && handler()) return;
         unawaited(_confirmExit());
       },
       child: TailscaleGuard(

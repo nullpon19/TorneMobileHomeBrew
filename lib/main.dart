@@ -18,7 +18,6 @@ import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app/bootstrap.dart';
-import 'app/firetv_preset.dart';
 import 'ui/widgets.dart';
 import 'app/lifecycle_log.dart';
 import 'app/providers.dart';
@@ -46,13 +45,6 @@ Future<void> main() async {
     storeDirectory,
     mpvCacheDirectory: mpvCacheDir,
   );
-  await applyFireTvPresetsIfNeeded(
-    keyValues: container.read(keyValueStoreProvider),
-    credentialStore: container.read(credentialStoreProvider),
-    registrationStore: container.read(registrationStoreProvider),
-    preset: container.read(fireTvPresetProvider),
-    diag: container.read(diagLogProvider),
-  );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed
   // around a playback session (the wakelock sleep investigation).
@@ -79,6 +71,7 @@ class TmhbApp extends ConsumerWidget {
       color: isDark ? Colors.amberAccent : Colors.amber,
       width: 3,
     );
+    final segmentFocusBg = isDark ? Colors.amberAccent : Colors.amber;
     return ThemeData(
       brightness: brightness,
       colorScheme: scheme,
@@ -127,11 +120,35 @@ class TmhbApp extends ConsumerWidget {
       ),
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: ButtonStyle(
-          side: WidgetStateProperty.resolveWith(
-            (states) => states.contains(WidgetState.focused)
-                ? focusBorder
-                : BorderSide(color: scheme.outline),
-          ),
+          side: WidgetStatePropertyAll(BorderSide(color: scheme.outline)),
+          backgroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.focused)) {
+              return segmentFocusBg;
+            }
+            if (states.contains(WidgetState.selected)) {
+              return scheme.secondaryContainer;
+            }
+            return null;
+          }),
+          foregroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.focused)) {
+              return Colors.black;
+            }
+            if (states.contains(WidgetState.selected)) {
+              return scheme.onSecondaryContainer;
+            }
+            return scheme.onSurface;
+          }),
+          iconColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.focused)) {
+              return Colors.black;
+            }
+            if (states.contains(WidgetState.selected)) {
+              return scheme.onSecondaryContainer;
+            }
+            return scheme.onSurface;
+          }),
+          overlayColor: const WidgetStatePropertyAll(Colors.transparent),
         ),
       ),
     );
