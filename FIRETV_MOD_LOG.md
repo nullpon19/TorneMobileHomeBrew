@@ -182,7 +182,15 @@
    - Live 再生中に別チャンネルの録画（90 秒前リード含む）が始まって停止／再接続失敗した際、無駄な無限リトライを即座に止めて `showLiveRecordingConflictDialog` を表示し、決定キー 1 回で録画中チャンネル（品質自動フォールバック付き）へ切り替えられるよう実装。
    - TV視聴一覧・詳細画面およびプレイヤー OSD 上部（`LIVE` 横）へ赤い `● 録画中` バッジを表示し、視聴中の同一チャンネルで録画が始まった／終了したタイミングで画面右上に 5 秒間の `録画中` / `録画終了` 通知を表示。
 5. **テスト＆ビルド整備 (`test/epg_test.dart`, `test/firetv_mod_test.dart`, `FIRETV_MOD_LOG.md`, `CLEANUP_BUILD_ENV.md`, `README.md`)**:
-   - 全 633 テスト全パス・`dart analyze` 問題ゼロを確認し、公開ブランチ用にドキュメント内のローカルパス表現を汎用表記へ清掃。
+   - 全テスト全パス・`dart analyze` 問題ゼロを確認し、公開ブランチ用にドキュメント内のローカルパス表現を汎用表記へ清掃。
+
+### 第19弾: 録画競合ダイアログのフォーカス・バナー遮断＆番組表「現在時刻の赤ライン」リアルタイム更新 (`e1b3640`)
+1. **録画競合ダイアログ表示中の背後バナー・フォーカス奪取を完全遮断 (`lib/ui/player_screen.dart`)**:
+   - `shouldSuppressPlayerInterruption` を追加し、競合確定時に即座に `_conflictHandled = true`・`_autoResumeDisabled = true`、全タイマー＆全ストリーム購読 (`_subscriptions`) の解除、中断バナー／OSD 非表示化を行ってから `_player.stop()` → `widget.session.stop()` の順で安全に停止するよう修正。
+   - すべての再生／中断／エラー／再接続／フォーカス要求ハンドラへ `_conflictHandled || _switchingChannel` ガードを追加し、プロキシ停止直後の `Failed to open ...` で背後の中断バナーが再出現して「今すぐ再開」へフォーカスが奪われる問題を根治。
+2. **番組表「現在時刻の赤ライン」の 15 秒リアルタイム更新 (`lib/ui/epg_screen.dart`)**:
+   - 従来の静的描画を独立した軽量 `StatefulWidget`（`EpgNowIndicatorLine` ＋ `computeEpgNowOffset`）へ分離し、番組表全体の再構築やフォーカス揺れを起こさず 15 秒周期およびアプリ復帰 (`AppLifecycleState.resumed`) 時に秒単位の端数を含めて自動再配置・日跨ぎ消去するよう修正。
+   - テスト更新・回帰テスト 4 件追加後、`dart analyze` 問題ゼロ＆全 637 テスト合格を確認。
 
 ---
 
@@ -210,14 +218,14 @@
 | `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠・`SegmentedButton` 個別セグメント反転強調テーマ |
 | `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`OrderedTraversalPolicy` + `ExcludeFocus` による起動／ホーム初回読み込み時左メニューフォーカス固定、`tabBackHandlersProvider`・右画面「戻る」時の左メニュー該当項目復帰・左メニュー上ルート `PopScope` アプリ終了確認ダイアログ |
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー（プリセット復元 UI は削除） |
-| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、整数局幅フィット (`resolveEpgChannelWidth`) ＋右端吸着修正 (`resolveEpgSnapTarget`)、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤塗りつぶし (`#C62828`)／赤枠切替・赤ドット表示＆ `'予約を編集'` 切替、時刻列 `_TimeRuler` 右端の予約／録画中赤太ボーダー |
+| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、整数局幅フィット (`resolveEpgChannelWidth`) ＋右端吸着修正 (`resolveEpgSnapTarget`)、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤塗りつぶし (`#C62828`)／赤枠切替・赤ドット表示＆ `'予約を編集'` 切替、時刻列 `_TimeRuler` 右端の予約／録画中赤太ボーダー、現在時刻赤ラインの 15 秒リアルタイム更新 (`EpgNowIndicatorLine`) |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力）、検索結果の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
 | `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
 | `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice`) ポリシー |
 | `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、`● 録画中` バッジ表示、視聴前他チャンネル録画競合案内＆切替（画質フォールバック付き）、OSD「番組詳細」＆競合判定データ引き渡し |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
 | `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'メニューを閉じる'` 化・`'番組詳細'` 半画面スクロール表示・戻るキー二重発火抑止・`LIVE` 横 `● 録画中` バッジ含む）、画面右上 5 秒間 `録画中`／`録画終了` 通知、Live 中断時の他チャンネル録画競合検知 (`showLiveRecordingConflictDialog`) ＆ 1 操作切替、再生終了確認ダイアログ (`showPlayerExitConfirmDialog` / `confirmExit`)、事前バッファ蓄積表示（`computePreBufferSeconds` ＋ `demuxer-cache-state` / `bufferingPercentage` / `buffer` 増分 / `StreamTransferMetrics` 実測フォールバック / `_initialPlaybackStarted` 早期切替抑止）、`cache-on-disk` 明示・掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'メニューを閉じる'` 化・`'番組詳細'` 半画面スクロール表示・戻るキー二重発火抑止・`LIVE` 横 `● 録画中` バッジ含む）、画面右上 5 秒間 `録画中`／`録画終了` 通知、Live 中断時の他チャンネル録画競合検知 (`showLiveRecordingConflictDialog` ＋背後バナー／フォーカス完全遮断 `shouldSuppressPlayerInterruption`) ＆ 1 操作切替、再生終了確認ダイアログ (`showPlayerExitConfirmDialog` / `confirmExit`)、事前バッファ蓄積表示（`computePreBufferSeconds` ＋ `demuxer-cache-state` / `bufferingPercentage` / `buffer` 増分 / `StreamTransferMetrics` 実測フォールバック / `_initialPlaybackStarted` 早期切替抑止）、`cache-on-disk` 明示・掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
 | `lib/ui/schedule_form.dart` | 長さ/条件 ID/録画先の 3 欄を `FireTvTextInputField` 化 |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「番組表」→予約表示切替（「赤塗りつぶし」／「赤枠」）、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定、下部バージョン表記を `torne HB FireTV` に統一 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
