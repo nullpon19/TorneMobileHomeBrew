@@ -11,6 +11,7 @@
 /// the shared event detail dialog ([showEpgEventDetail]).
 library;
 
+import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
@@ -34,6 +35,110 @@ import 'widgets.dart';
 
 /// Vertical scale of the grid: pixels per broadcast minute.
 const double _pxPerMinute = 2.4;
+
+/// Computes the vertical pixel offset of the EPG "now" indicator inside
+/// `[dayStart, dayEnd)`, or `null` if [now] falls outside that day.
+double? computeEpgNowOffset({
+  required DateTime now,
+  required DateTime dayStart,
+  required DateTime dayEnd,
+  double pxPerMinute = _pxPerMinute,
+}) {
+  if (now.isBefore(dayStart) || !now.isBefore(dayEnd)) return null;
+  final minutes =
+      now.difference(dayStart).inMilliseconds /
+      Duration.millisecondsPerMinute;
+  return minutes * pxPerMinute;
+}
+
+/// Real-time horizontal red indicator line tracking the current time inside
+/// the EPG grid without triggering full-grid rebuilds or disturbing focus.
+class EpgNowIndicatorLine extends StatefulWidget {
+  const EpgNowIndicatorLine({
+    super.key,
+    required this.dayStart,
+    required this.dayEnd,
+    required this.dayHeight,
+    this.pxPerMinute = _pxPerMinute,
+    this.tickInterval = const Duration(seconds: 15),
+    this.nowProvider,
+  });
+
+  final DateTime dayStart;
+  final DateTime dayEnd;
+  final double dayHeight;
+  final double pxPerMinute;
+  final Duration tickInterval;
+  final DateTime Function()? nowProvider;
+
+  @override
+  State<EpgNowIndicatorLine> createState() => _EpgNowIndicatorLineState();
+}
+
+class _EpgNowIndicatorLineState extends State<EpgNowIndicatorLine>
+    with WidgetsBindingObserver {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _startTimer();
+  }
+
+  void _startTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(widget.tickInterval, (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant EpgNowIndicatorLine oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.tickInterval != widget.tickInterval) {
+      _startTimer();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final now = widget.nowProvider?.call() ?? DateTime.now();
+    final offset = computeEpgNowOffset(
+      now: now,
+      dayStart: widget.dayStart,
+      dayEnd: widget.dayEnd,
+      pxPerMinute: widget.pxPerMinute,
+    );
+    if (offset == null || offset < 0 || offset > widget.dayHeight) {
+      return const SizedBox.shrink();
+    }
+    return Stack(
+      children: [
+        Positioned(
+          top: offset,
+          left: 0,
+          right: 0,
+          child: Container(height: 2, color: Colors.red),
+        ),
+      ],
+    );
+  }
+}
 const double _defaultChannelWidth = 172;
 const double _minFitChannelWidth = 156;
 const double _maxFitChannelWidth = 210;
@@ -1068,12 +1173,6 @@ class _DayGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dayHeight = 24 * 60 * _pxPerMinute;
-    final isToday =
-        _EpgScreenState._jstDateOf(DateTime.now()) ==
-        _EpgScreenState._jstDateOf(dayStart);
-    final nowOffset = isToday
-        ? DateTime.now().difference(dayStart).inMinutes * _pxPerMinute
-        : null;
     return SingleChildScrollView(
       controller: controller,
       child: SizedBox(
@@ -1129,13 +1228,15 @@ class _DayGrid extends StatelessWidget {
                   ),
               ],
             ),
-            if (nowOffset != null && nowOffset >= 0 && nowOffset <= dayHeight)
-              Positioned(
-                top: nowOffset,
-                left: 0,
-                right: 0,
-                child: Container(height: 2, color: Colors.red),
+            Positioned.fill(
+              child: IgnorePointer(
+                child: EpgNowIndicatorLine(
+                  dayStart: dayStart,
+                  dayEnd: dayEnd,
+                  dayHeight: dayHeight,
+                ),
               ),
+            ),
           ],
         ),
       ),

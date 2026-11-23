@@ -3773,6 +3773,220 @@ void main() {
         expect(fakeEngine.attempts, ['ch2:mobile', 'ch2:dr']);
       },
     );
+
+    test(
+      'shouldSuppressPlayerInterruption suppresses background banners after recording conflict',
+      () {
+        expect(
+          shouldSuppressPlayerInterruption(
+            completed: false,
+            conflictHandled: false,
+            switchingChannel: false,
+          ),
+          isFalse,
+        );
+        expect(
+          shouldSuppressPlayerInterruption(
+            completed: false,
+            conflictHandled: true,
+            switchingChannel: false,
+          ),
+          isTrue,
+        );
+        expect(
+          shouldSuppressPlayerInterruption(
+            completed: false,
+            conflictHandled: false,
+            switchingChannel: true,
+          ),
+          isTrue,
+        );
+        expect(
+          shouldSuppressPlayerInterruption(
+            completed: true,
+            conflictHandled: false,
+            switchingChannel: false,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    testWidgets(
+      'showLiveRecordingConflictDialog holds D-pad focus and responds to ArrowLeft + Select over background buttons',
+      (tester) async {
+        bool? dialogResult;
+        final conflict = LiveRecordingConflict(
+          schedule: RecordSchedule(
+            id: 's-ch2-focus',
+            start: DateTime.now().toUtc(),
+            durationSeconds: 1800,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: 2,
+              channelType: 2,
+              serviceId: 0x0408,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7881,0x0010',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+            title: '番組テスト',
+          ),
+          displayTitle: '番組テスト',
+          channelName: 'Eテレ1',
+          liveChannel: ch2,
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Row(
+                  children: [
+                    ElevatedButton(
+                      autofocus: true,
+                      onPressed: () async {
+                        dialogResult = await showLiveRecordingConflictDialog(
+                          context,
+                          conflict: conflict,
+                          midStream: true,
+                        );
+                      },
+                      child: const Text('今すぐ再開'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () {},
+                      child: const Text('閉じる'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('今すぐ再開'));
+        await tester.pumpAndSettle();
+
+        // Focus must stay inside the dialog on '録画中のチャンネルに切り替える', never behind it.
+        final primaryCtx = FocusManager.instance.primaryFocus?.context;
+        expect(primaryCtx, isNotNull);
+        expect(
+          find.ancestor(
+            of: find.byWidget(primaryCtx!.widget),
+            matching: find.byType(AlertDialog),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byWidget(primaryCtx.widget),
+            matching: find.text('録画中のチャンネルに切り替える'),
+          ),
+          findsOneWidget,
+        );
+
+        // ArrowLeft + Select chooses '視聴を終了する' (false) cleanly via keyboard.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        final exitCtx = FocusManager.instance.primaryFocus?.context;
+        expect(
+          find.descendant(
+            of: find.byWidget(exitCtx!.widget),
+            matching: find.text('視聴を終了する'),
+          ),
+          findsOneWidget,
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(dialogResult, isFalse);
+      },
+    );
+
+    test(
+      'computeEpgNowOffset calculates fractional minutes and clips outside [dayStart, dayEnd)',
+      () {
+        final dayStart = DateTime.utc(2026, 11, 22, 15, 0);
+        final dayEnd = dayStart.add(const Duration(days: 1));
+        expect(
+          computeEpgNowOffset(
+            now: dayStart.subtract(const Duration(seconds: 1)),
+            dayStart: dayStart,
+            dayEnd: dayEnd,
+          ),
+          isNull,
+        );
+        expect(
+          computeEpgNowOffset(
+            now: dayStart,
+            dayStart: dayStart,
+            dayEnd: dayEnd,
+          ),
+          0.0,
+        );
+        expect(
+          computeEpgNowOffset(
+            now: dayStart.add(const Duration(minutes: 10, seconds: 30)),
+            dayStart: dayStart,
+            dayEnd: dayEnd,
+          ),
+          closeTo(10.5 * 2.4, 1e-6),
+        );
+        expect(
+          computeEpgNowOffset(
+            now: dayEnd,
+            dayStart: dayStart,
+            dayEnd: dayEnd,
+          ),
+          isNull,
+        );
+      },
+    );
+
+    testWidgets(
+      'EpgNowIndicatorLine updates position periodically and hides after dayEnd',
+      (tester) async {
+        final dayStart = DateTime.utc(2026, 11, 22, 15, 0);
+        final dayEnd = dayStart.add(const Duration(days: 1));
+        var current = dayStart.add(const Duration(minutes: 20));
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 200,
+                height: 24 * 60 * 2.4,
+                child: EpgNowIndicatorLine(
+                  dayStart: dayStart,
+                  dayEnd: dayEnd,
+                  dayHeight: 24 * 60 * 2.4,
+                  tickInterval: const Duration(seconds: 15),
+                  nowProvider: () => current,
+                ),
+              ),
+            ),
+          ),
+        );
+
+        Positioned positionedLine() =>
+            tester.widget<Positioned>(find.byType(Positioned));
+
+        expect(positionedLine().top, closeTo(20 * 2.4, 1e-6));
+
+        // Advance clock by 10 minutes and trigger periodic tick.
+        current = current.add(const Duration(minutes: 10));
+        await tester.pump(const Duration(seconds: 15));
+        expect(positionedLine().top, closeTo(30 * 2.4, 1e-6));
+
+        // Advance past dayEnd and confirm the red line disappears.
+        current = dayEnd.add(const Duration(minutes: 1));
+        await tester.pump(const Duration(seconds: 15));
+        expect(find.byType(Positioned), findsNothing);
+      },
+    );
   });
 }
 

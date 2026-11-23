@@ -414,6 +414,15 @@ PlayerBackOutcome resolvePlayerBackOutcome({
   return PlayerBackOutcome.confirmExit;
 }
 
+/// Returns whether player interruption notices, auto-resume scheduling, and
+/// background error banners must be suppressed (on completion or active
+/// recording-conflict preemption / channel switch).
+bool shouldSuppressPlayerInterruption({
+  required bool completed,
+  required bool conflictHandled,
+  required bool switchingChannel,
+}) => completed || conflictHandled || switchingChannel;
+
 /// Prompts for confirmation before stopping active playback via Back, with the
 /// default focus placed on keeping playback running so accidental presses cancel.
 Future<bool> showPlayerExitConfirmDialog(BuildContext context) async {
@@ -1179,6 +1188,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _watchdog = Timer(startTimeout, _onStartTimeout);
     _subscriptions.add(
       _player.stream.playing.listen((playing) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: playing=$playing');
         _wakelockSession.setPlaying(playing);
         final wasPlaying = _playingNow;
@@ -1218,6 +1228,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.buffering.listen((buffering) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: buffering=$buffering');
         if (_playingNow) {
           // Buffering while mpv is trying to play is the
@@ -1369,6 +1380,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.error.listen((error) {
+        if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: error: $error');
         if (!playerErrorIsFatal(
           error,
@@ -1488,12 +1500,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
   }
 
-  void _setStartError(String error) {
+  void _setStartError(String error, {bool allowAfterConflict = false}) {
     _stopPreBufferPoller();
     if (!mounted) return;
+    if (!allowAfterConflict && (_conflictHandled || _switchingChannel)) return;
     setState(() => _error = error);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _error != null && _errorBackFocusNode.canRequestFocus) {
+      if (mounted &&
+          _error != null &&
+          (allowAfterConflict || (!_conflictHandled && !_switchingChannel)) &&
+          _errorBackFocusNode.canRequestFocus) {
         _errorBackFocusNode.requestFocus();
       }
     });
@@ -1501,10 +1517,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _enterInterruptedState(String? detail) {
     _stopPreBufferPoller();
-    if (!mounted || _completed) return;
-    if (widget.live &&
-        widget.onCheckRecordingConflict != null &&
-        !_conflictHandled) {
+    if (!mounted ||
+        shouldSuppressPlayerInterruption(
+          completed: _completed,
+          conflictHandled: _conflictHandled,
+          switchingChannel: _switchingChannel,
+        )) {
+      return;
+    }
+    if (widget.live && widget.onCheckRecordingConflict != null) {
       unawaited(_handlePossibleLiveRecordingConflict());
     }
     setState(() {
@@ -1515,6 +1536,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted &&
           _interrupted &&
+          !_conflictHandled &&
+          !_switchingChannel &&
           _resumeButtonFocusNode.canRequestFocus) {
         _resumeButtonFocusNode.requestFocus();
       }
@@ -1523,7 +1546,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _scheduleAutoResume() {
     _autoResumeTimer?.cancel();
-    if (_autoResumeDisabled || !_interrupted || !mounted) return;
+    if (_autoResumeDisabled ||
+        !_interrupted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        !mounted) {
+      return;
+    }
     final delaySec = _autoResumeBackoffSeconds[
         math.min(_autoResumeAttempts, _autoResumeBackoffSeconds.length - 1)];
     _autoResumeAttempts++;
@@ -1533,7 +1562,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: scheduling auto-resume attempt $_autoResumeAttempts in ${delaySec}s',
     );
     _autoResumeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted || !_interrupted || _autoResumeDisabled) {
+      if (!mounted ||
+          !_interrupted ||
+          _autoResumeDisabled ||
+          _conflictHandled ||
+          _switchingChannel) {
         timer.cancel();
         return;
       }
@@ -1550,10 +1583,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _onStartTimeout() {
-    if (!mounted || _playing || _error != null) return;
-    if (widget.live &&
-        widget.onCheckRecordingConflict != null &&
-        !_conflictHandled) {
+    if (!mounted ||
+        _playing ||
+        _error != null ||
+        _conflictHandled ||
+        _switchingChannel) {
+      return;
+    }
+    if (widget.live && widget.onCheckRecordingConflict != null) {
       unawaited(_handlePossibleLiveRecordingConflict());
     }
     final timeoutSec = _bufferPlan?.startTimeoutSeconds ?? startTimeout.inSeconds;
@@ -1647,6 +1684,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (conflict == null || _conflictHandled || !mounted) return;
 
     _conflictHandled = true;
+    _autoResumeDisabled = true;
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
     _watchdog?.cancel();
@@ -1655,18 +1693,32 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _resumeWatchdogTimer?.cancel();
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
+    _osdTimer?.cancel();
+    _hudTimer?.cancel();
+
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel());
+    }
+    _subscriptions.clear();
 
     setState(() {
       _interrupted = false;
+      _interruptDetail = null;
       _autoResumeCountdown = 0;
+      _osdOpen = false;
+      _detailOpen = false;
+      _hudText = null;
       _cornerRecordingNotice = null;
     });
 
-    unawaited(_player.pause().catchError((_) {}));
+    await _player.stop().timeout(
+      const Duration(seconds: 2),
+      onTimeout: () {},
+    ).catchError((_) {});
     await widget.session.stop().timeout(
       const Duration(seconds: 3),
       onTimeout: () {},
-    );
+    ).catchError((_) {});
     if (!mounted) return;
 
     final shouldSwitch = await showLiveRecordingConflictDialog(
@@ -1696,7 +1748,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         );
         if (!mounted) return;
         setState(() => _switchingChannel = false);
-        _setStartError('録画中のチャンネルへの切り替えに失敗しました。録画終了後に再度お試しください。');
+        _setStartError(
+          '録画中のチャンネルへの切り替えに失敗しました。録画終了後に再度お試しください。',
+          allowAfterConflict: true,
+        );
       }
       return;
     }
@@ -1710,6 +1765,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// grace period to recover on its own before surfacing
   /// anything.
   void _onPlaybackStopped() {
+    if (_conflictHandled || _switchingChannel) return;
     if (!playbackStoppedEarly(
       alreadyPlaying: _playing,
       completed: _completed,
@@ -1732,7 +1788,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _onStallTimeout() {
-    if (!mounted || _playingNow || _completed || _error != null) {
+    if (!mounted ||
+        _playingNow ||
+        _completed ||
+        _error != null ||
+        _conflictHandled ||
+        _switchingChannel) {
       return;
     }
     if (!widget.live && _isEffectivelyCompleted) {
@@ -1748,6 +1809,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   Future<void> _resume() async {
+    if (!mounted || _conflictHandled || _switchingChannel) return;
     _diag(
       DiagCategory.playback,
       'player: resuming after an interruption at '
@@ -1775,12 +1837,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _startPreBufferPoller();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _rootFocusNode.canRequestFocus) {
+      if (mounted &&
+          !_conflictHandled &&
+          !_switchingChannel &&
+          _rootFocusNode.canRequestFocus) {
         _rootFocusNode.requestFocus();
       }
     });
     _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
-      if (!mounted || _playingNow || _completed || _interrupted || _error != null) {
+      if (!mounted ||
+          _playingNow ||
+          _completed ||
+          _interrupted ||
+          _error != null ||
+          _conflictHandled ||
+          _switchingChannel) {
         return;
       }
       if (!widget.live && _isEffectivelyCompleted) {
@@ -1791,6 +1862,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
     try {
       await _player.setVolume(100.0);
+      if (!mounted || _conflictHandled || _switchingChannel) return;
       await _player.open(
         Media(
           widget.session.mediaUri.toString(),
@@ -1799,9 +1871,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               : null,
         ),
       );
+      if (!mounted || _conflictHandled || _switchingChannel) return;
       await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
+      if (!mounted || _conflictHandled || _switchingChannel) return;
       _diag(DiagCategory.playback, 'player: resume failed: $e');
       _resumeWatchdogTimer?.cancel();
       _enterInterruptedState('$e');
@@ -2770,8 +2844,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         controller: _videoController,
                         controls: NoVideoControls,
                       ),
-                      if (loadingLabel != null ||
-                          (!_interrupted && _isPreBuffering))
+                      if (!_conflictHandled &&
+                          (loadingLabel != null ||
+                              (!_interrupted && _isPreBuffering)))
                         _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
                       if (_hudText != null && !_osdOpen) _buildStatusHud(),
                       if (_cornerRecordingNotice != null &&
@@ -2799,7 +2874,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                             onScrollDelta: _scrollDetailBy,
                           ),
                         ),
-                      if (_interrupted) _buildInterruptionBanner(),
+                      if (_interrupted && !_conflictHandled && !_switchingChannel)
+                        _buildInterruptionBanner(),
                     ],
                   ),
                 ),
