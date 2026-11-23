@@ -118,7 +118,7 @@
    - `SectionCard` に `margin`・`focusable`・`scrollController` 対応を追加し、ホーム画面の全 6 セクションカードをフォーカス可能化（ライト時黒枠 3px / ダーク時 `amberAccent` 3px、レイアウトズレなし、エラー時「再試行」ボタンへのフォーカス移動も両立）。
    - `_StatusList` の `ListView` に `ScrollController` と `scrollCacheExtent: ScrollCacheExtent.pixels(2000)` を設定し、全カード常時探索可能にしたうえでフォーカス追従 (`Scrollable.ensureVisible`)、画面縦幅超えカードの段階スクロール、および最下段到達時の最下部スクロールを実装。
 
-### 第11弾: OSD 戻るキー修正＆「メニューを閉じる」化・プリセット廃止＆Download 権限対応・SegmentedButton 個別強調・EPG 上部バー統合（本コミット）
+### 第11弾: OSD 戻るキー修正＆「メニューを閉じる」化・プリセット廃止＆Download 権限対応・SegmentedButton 個別強調・EPG 上部バー統合 (`341cc5b`)
 1. **再生中 OSD の戻るキー挙動修正＆「メニューを閉じる」変更 (`lib/ui/player_screen.dart`)**:
    - `PopScope(canPop: false)` ＋ `resolvePlayerBackOutcome`（詳細パネル／OSD クローズ直後の `450ms` 二重発火抑止）を導入し、OSD や番組詳細表示中にリモコンの戻るキーを押しても再生終了せず **`番組詳細のみ閉じる → OSD のみ閉じる → 再生終了`** の順に動作するよう修正。
    - OSD 右端ボタンのラベルを `'閉じる'` から **`'メニューを閉じる'`**（`playerOsdCloseMenuLabel`）へ変更し、OSD メニューを閉じるボタンであることを明確化。
@@ -131,6 +131,10 @@
    - 横幅 `epgInlineBandBreakpoint` (`600dp`) 以上では `AppBar` 内に `[地デジ | BS]` セレクタと検索・更新アイコンを横 1 列に統合（タイトル横に `'戻る / メニューで上部へ'` ヒントを表示）。
    - `AppShell` に `tabBackHandlersProvider` を追加し、番組グリッド閲覧中に戻るキーまたはリモコンのメニュー (`contextMenu` / `info`) キーを押すと 0 時台まで上スクロールせず一発で上部バー（`地デジ`/`BS`）へフォーカス復帰（上部バー上での戻るキーで従来どおり終了確認ダイアログを表示）。
 
+### 第12弾: Fire OS 8「すべてのファイル」権限付与時の設定画面クラッシュ修正（本コミット）
+- **事象・原因 (`android/app/src/main/AndroidManifest.xml`)**: Fire OS 8 実機で「ファイルとメディア → すべてのファイル」を選んだ際、OS 設定アプリ (`ManageAppPermissionsActivity.grantStoragePermissionV2`) が内部で `READ_EXTERNAL_STORAGE` に続けて `WRITE_EXTERNAL_STORAGE` を付与しようとし、マニフェスト未宣言による `SecurityException` で設定アプリ自体がクラッシュして `MANAGE_EXTERNAL_STORAGE` が付与されない問題を実機ログから特定。
+- **対策**: `AndroidManifest.xml` に `<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>` を追加宣言。
+
 ---
 
 ## 3. 全変更・追加ファイル一覧 (vs アップストリーム `78d74a8`)
@@ -140,7 +144,7 @@
 | `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順 |
 | `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順） |
 | `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv` に変更 |
-| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner` / `READ_EXTERNAL_STORAGE` + `MANAGE_EXTERNAL_STORAGE` 宣言 |
+| `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner` / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
 | `android/app/src/main/res/drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
 | `android/app/src/main/cpp/CMakeLists.txt` | `tmhb_aes.c` (`-O3`) のビルド対象追加 |
 | `android/app/src/main/cpp/tmhb_aes.c` | ネイティブ C T-table AES-128-CBC 復号実装 (`tmhb_aes128_cbc_decrypt` 等) |
@@ -192,7 +196,7 @@
 3. **Fire TV 固有の入力・フォーカス・OS 制約への配慮**:
    - **露出 `TextField` と `FireTVIME` フォーカス閉じ込め**: Fire OS では D-pad でフォーカスが `TextField` に当たっただけで IME キーボードが自動起動し、さらに矢印キーが IME 側に吸われて抜け出せなくなる挙動があります。入力欄を通常時は表示用ボックス (`FireTvTextInputField`) にし、決定キー押下時だけ `AlertDialog` 内の `TextField` を開くことで完全に回避できました。
    - **番組表 (EPG) タイルの選択視認性**: 番組タイルがジャンル別に色分けされているため、`focusColor` による薄い背景オーバーレイでは選択位置が非常に見づらくなります。`focusColor: Colors.transparent`＋前面 `DecoratedBox` の太枠線が有効でした。
-   - **ファイル選択**: Fire OS は標準 `DocumentsUI` を持たない機種が多く、通常のファイルピッカー Intent が失敗します。アプリ内候補スキャンが有効でした。
+   - **ファイル選択**: Fire OS は標準 `DocumentsUI` を持たない機種が多く、通常のファイルピッカー Intent が失敗します。アプリ内候補スキャンが有効でした。なお Fire OS 8 の「すべてのファイル」設定画面 (`ManageAppPermissionsActivity.grantStoragePermissionV2`) は `READ_EXTERNAL_STORAGE` と併せて `WRITE_EXTERNAL_STORAGE` も付与しようとするため、`MANAGE_EXTERNAL_STORAGE` 単独宣言では設定アプリ側が `SecurityException` でクラッシュします（`maxSdkVersion="32"` 付きで両方宣言することで回避）。
    - **中断バナー・エラー画面の `FocusNode` 喪失**: 再生中断バナーやエラー画面が出現した際、明示的に `FocusNode.requestFocus()` を行わないとリモコンで「再開」「戻る」が押せなくなります。
    - **車載・不安定回線とストレージ保護**: `libmpv.so` が `cache-on-disk` / `demuxer-cache-dir` に対応しているため、空き容量の少ない Fire TV Stick でも `StatFs` で `512 MiB` 以上の空きを死守しつつ長時間先読みを確保できます。また不安定回線での途中切断に備え、プロキシ側の自動再接続（AKE 再認証含む）＋ Live 再オープン許容が有効です。
 
