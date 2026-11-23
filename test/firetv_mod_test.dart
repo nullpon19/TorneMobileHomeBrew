@@ -2272,6 +2272,178 @@ void main() {
       },
     );
   });
+
+  group('Phase 16: Live pre-buffer fallback & initial playback latch', () {
+    test('parseDemuxerCacheStateDuration parses valid cache-duration values', () {
+      expect(parseDemuxerCacheStateDuration(''), isNull);
+      expect(parseDemuxerCacheStateDuration('not-json'), isNull);
+      expect(parseDemuxerCacheStateDuration('[]'), isNull);
+      expect(parseDemuxerCacheStateDuration('{"fw-bytes":1234}'), isNull);
+      expect(
+        parseDemuxerCacheStateDuration('{"cache-duration":-1.5}'),
+        isNull,
+      );
+      expect(
+        parseDemuxerCacheStateDuration('{"cache-duration": 7}'),
+        7.0,
+      );
+      expect(
+        parseDemuxerCacheStateDuration('{"cache-duration": 12.34, "fw-bytes": 99}'),
+        closeTo(12.34, 1e-6),
+      );
+      expect(
+        parseDemuxerCacheStateDuration('{"cache-duration": "4.5"}'),
+        closeTo(4.5, 1e-6),
+      );
+    });
+
+    test('computePreBufferSeconds uses liveTransferSeconds only as zero-signal fallback', () {
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 15,
+          demuxerCacheDuration: 0,
+          bufferingPercentage: 0,
+          bufferDeltaSeconds: 0,
+          liveTransferSeconds: 6.4,
+        ),
+        6,
+      );
+      // Real mpv signals strictly override liveTransferSeconds fallback.
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 15,
+          demuxerCacheDuration: 3.2,
+          bufferingPercentage: 0,
+          bufferDeltaSeconds: 0,
+          liveTransferSeconds: 9.0,
+        ),
+        3,
+      );
+      expect(
+        computePreBufferSeconds(
+          targetSeconds: 15,
+          demuxerCacheDuration: 0,
+          bufferingPercentage: 0,
+          bufferDeltaSeconds: 0,
+          liveTransferSeconds: 22.0,
+        ),
+        15,
+      );
+    });
+
+    test('advanceLiveTransferSeconds tracks flowing bytes and freezes during stalls', () {
+      final t0 = DateTime.utc(2026, 11, 23, 6, 0, 0);
+      // Before any byte is served to the player, stays at 0.
+      var state = advanceLiveTransferSeconds(
+        currentAccumulatedSeconds: 0.0,
+        previousServedBytes: 0,
+        previousTickAt: null,
+        servedBytes: 0,
+        firstByteServedAt: null,
+        lastByteServedAt: null,
+        now: t0,
+      );
+      expect(state.accumulatedSeconds, 0.0);
+      expect(state.lastTickAt, isNull);
+
+      // First chunk served at t0, polled 500ms later.
+      final t1 = t0.add(const Duration(milliseconds: 500));
+      state = advanceLiveTransferSeconds(
+        currentAccumulatedSeconds: state.accumulatedSeconds,
+        previousServedBytes: state.lastServedBytes,
+        previousTickAt: state.lastTickAt,
+        servedBytes: 65536,
+        firstByteServedAt: t0,
+        lastByteServedAt: t1,
+        now: t1,
+      );
+      expect(state.accumulatedSeconds, closeTo(0.5, 1e-6));
+
+      // Continuous flow for another 500ms -> 1.0s.
+      final t2 = t1.add(const Duration(milliseconds: 500));
+      state = advanceLiveTransferSeconds(
+        currentAccumulatedSeconds: state.accumulatedSeconds,
+        previousServedBytes: state.lastServedBytes,
+        previousTickAt: state.lastTickAt,
+        servedBytes: 131072,
+        firstByteServedAt: t0,
+        lastByteServedAt: t2,
+        now: t2,
+      );
+      expect(state.accumulatedSeconds, closeTo(1.0, 1e-6));
+
+      // Upstream stalls for 4 seconds with no new bytes -> stays frozen at 1.0s.
+      final t3 = t2.add(const Duration(seconds: 4));
+      state = advanceLiveTransferSeconds(
+        currentAccumulatedSeconds: state.accumulatedSeconds,
+        previousServedBytes: state.lastServedBytes,
+        previousTickAt: state.lastTickAt,
+        servedBytes: 131072,
+        firstByteServedAt: t0,
+        lastByteServedAt: t2,
+        now: t3,
+      );
+      expect(state.accumulatedSeconds, closeTo(1.0, 1e-6));
+
+      // Stream resumes 500ms later -> advances only by 0.5s, never across stall gap.
+      final t4 = t3.add(const Duration(milliseconds: 500));
+      state = advanceLiveTransferSeconds(
+        currentAccumulatedSeconds: state.accumulatedSeconds,
+        previousServedBytes: state.lastServedBytes,
+        previousTickAt: state.lastTickAt,
+        servedBytes: 196608,
+        firstByteServedAt: t0,
+        lastByteServedAt: t4,
+        now: t4,
+      );
+      expect(state.accumulatedSeconds, closeTo(1.5, 1e-6));
+    });
+
+    test('shouldLatchInitialPlaybackStarted holds during pre-buffer pause even after width arrives', () {
+      expect(
+        shouldLatchInitialPlaybackStarted(
+          hasVideoFrame: false,
+          playingNow: true,
+          buffering: false,
+        ),
+        isFalse,
+      );
+      // Key regression case: first video frame dimensions arrive while mpv is
+      // still in cache-pause-initial (buffering=true, pos unchanged).
+      expect(
+        shouldLatchInitialPlaybackStarted(
+          hasVideoFrame: true,
+          playingNow: true,
+          buffering: true,
+          positionAtFirstFrame: Duration.zero,
+          currentPosition: Duration.zero,
+        ),
+        isFalse,
+      );
+      // Once buffering clears while playing and video frame is ready -> true.
+      expect(
+        shouldLatchInitialPlaybackStarted(
+          hasVideoFrame: true,
+          playingNow: true,
+          buffering: false,
+          positionAtFirstFrame: Duration.zero,
+          currentPosition: Duration.zero,
+        ),
+        isTrue,
+      );
+      // Safety net: if playback position advances >= 1s even if buffering stays sticky.
+      expect(
+        shouldLatchInitialPlaybackStarted(
+          hasVideoFrame: true,
+          playingNow: true,
+          buffering: true,
+          positionAtFirstFrame: const Duration(milliseconds: 200),
+          currentPosition: const Duration(milliseconds: 1200),
+        ),
+        isTrue,
+      );
+    });
+  });
 }
 
 class _FixedTitlesNotifier extends TitlesNotifier {

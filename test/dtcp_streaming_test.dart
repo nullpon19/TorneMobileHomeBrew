@@ -262,9 +262,12 @@ void main() {
         );
         try {
           // No player request yet: the prefetch must already be
-          // pulling the content.
+          // pulling the content, with zero bytes served downstream.
           await Future<void>.delayed(const Duration(milliseconds: 500));
           expect(getCount, 1);
+          expect(proxy.servedBytes, 0);
+          expect(proxy.firstByteServedAt, isNull);
+          expect(proxy.lastByteServedAt, isNull);
           // And the prefetched plaintext is what the player gets.
           final client = HttpClient();
           final request = await client.getUrl(proxy.uri);
@@ -278,6 +281,9 @@ void main() {
               .then((builder) => builder.takeBytes());
           client.close();
           expect(Uint8List.fromList(received), plain);
+          expect(proxy.servedBytes, plain.length);
+          expect(proxy.firstByteServedAt, isNotNull);
+          expect(proxy.lastByteServedAt, isNotNull);
         } finally {
           await proxy.stop();
           fetcher.close();

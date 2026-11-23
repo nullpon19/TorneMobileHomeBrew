@@ -279,7 +279,7 @@ class DtcpPlaybackEngine implements PlaybackEngine {
   }
 }
 
-class _DtcpPlaybackSession implements PlaybackSession {
+class _DtcpPlaybackSession implements PlaybackSession, StreamTransferMetrics {
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
 
   final DtcpProxy _proxy;
@@ -289,6 +289,15 @@ class _DtcpPlaybackSession implements PlaybackSession {
 
   @override
   Uri get mediaUri => _proxy.uri;
+
+  @override
+  int get servedBytes => _proxy.servedBytes;
+
+  @override
+  DateTime? get firstByteServedAt => _proxy.firstByteServedAt;
+
+  @override
+  DateTime? get lastByteServedAt => _proxy.lastByteServedAt;
 
   @override
   Future<void> stop() async {

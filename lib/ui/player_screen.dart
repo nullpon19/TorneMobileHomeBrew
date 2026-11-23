@@ -171,6 +171,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert' show jsonDecode;
 import 'dart:io' show Directory, Platform;
 import 'dart:math' as math;
 
@@ -264,15 +265,103 @@ ButtonStyle osdButtonStyle() {
 /// Label for the OSD button that dismisses only the OSD menu bar.
 const String playerOsdCloseMenuLabel = 'メニューを閉じる';
 
+/// Extracts `cache-duration` (in seconds) from mpv's JSON `demuxer-cache-state`
+/// property, or returns `null` when unavailable or unparseable.
+double? parseDemuxerCacheStateDuration(String raw) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return null;
+  try {
+    final decoded = jsonDecode(trimmed);
+    if (decoded is! Map) return null;
+    final rawDur = decoded['cache-duration'];
+    final double? value;
+    if (rawDur is num) {
+      value = rawDur.toDouble();
+    } else if (rawDur is String) {
+      value = double.tryParse(rawDur);
+    } else {
+      value = null;
+    }
+    if (value == null || !value.isFinite || value < 0) return null;
+    return value;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Returns `true` only once the initial playback has genuinely started and
+/// exited mpv's initial pre-buffer pause.
+bool shouldLatchInitialPlaybackStarted({
+  required bool hasVideoFrame,
+  required bool playingNow,
+  required bool buffering,
+  Duration? positionAtFirstFrame,
+  Duration currentPosition = Duration.zero,
+}) {
+  if (!hasVideoFrame || !playingNow) return false;
+  if (!buffering) return true;
+  if (positionAtFirstFrame != null &&
+      currentPosition - positionAtFirstFrame >= const Duration(seconds: 1)) {
+    return true;
+  }
+  return false;
+}
+
+double _clampedStepSeconds(DateTime from, DateTime to) {
+  final raw = to.difference(from).inMilliseconds / 1000.0;
+  if (!raw.isFinite || raw <= 0) return 0.0;
+  return raw > 2.0 ? 2.0 : raw;
+}
+
+/// Advances the fallback pre-buffer elapsed counter for unseekable live TS
+/// streams only while decrypted bytes are actively flowing from the proxy.
+({double accumulatedSeconds, int lastServedBytes, DateTime? lastTickAt})
+advanceLiveTransferSeconds({
+  required double currentAccumulatedSeconds,
+  required int previousServedBytes,
+  required DateTime? previousTickAt,
+  required int servedBytes,
+  required DateTime? firstByteServedAt,
+  required DateTime? lastByteServedAt,
+  required DateTime now,
+  Duration stallGrace = const Duration(milliseconds: 2500),
+}) {
+  if (firstByteServedAt == null || servedBytes <= 0) {
+    return (
+      accumulatedSeconds: currentAccumulatedSeconds,
+      lastServedBytes: servedBytes,
+      lastTickAt: null,
+    );
+  }
+  final bytesGrew = servedBytes > previousServedBytes;
+  final recentlyActive =
+      lastByteServedAt != null && now.difference(lastByteServedAt) <= stallGrace;
+  if (!bytesGrew && !recentlyActive) {
+    return (
+      accumulatedSeconds: currentAccumulatedSeconds,
+      lastServedBytes: servedBytes,
+      lastTickAt: now,
+    );
+  }
+  final stepSec = previousTickAt == null
+      ? _clampedStepSeconds(firstByteServedAt, now)
+      : _clampedStepSeconds(previousTickAt, now);
+  return (
+    accumulatedSeconds: currentAccumulatedSeconds + stepSec,
+    lastServedBytes: servedBytes,
+    lastTickAt: now,
+  );
+}
+
 /// Computes accumulated pre-buffer seconds (clamped to `[0, targetSeconds]`)
-/// from all available mpv cache signals. During live `cache-pause-initial`,
-/// mpv may leave `demuxer-cache-duration` unemitted while updating
-/// `cache-buffering-state` (`bufferingPercentage`) and/or `demuxer-cache-time`.
+/// from all available mpv cache signals, falling back to [liveTransferSeconds]
+/// when mpv leaves all cache properties at zero on unseekable live TS streams.
 int computePreBufferSeconds({
   required int targetSeconds,
   required double demuxerCacheDuration,
   required double bufferingPercentage,
   required double bufferDeltaSeconds,
+  double liveTransferSeconds = 0.0,
 }) {
   if (targetSeconds <= 0) return 0;
   final fromDuration =
@@ -286,7 +375,11 @@ int computePreBufferSeconds({
   final fromDelta = bufferDeltaSeconds.isFinite && bufferDeltaSeconds > 0
       ? bufferDeltaSeconds
       : 0.0;
-  final best = math.max(fromDuration, math.max(fromPercent, fromDelta));
+  final mpvBest = math.max(fromDuration, math.max(fromPercent, fromDelta));
+  final fallback = liveTransferSeconds.isFinite && liveTransferSeconds > 0
+      ? liveTransferSeconds
+      : 0.0;
+  final best = mpvBest > 0 ? mpvBest : fallback;
   return best.clamp(0.0, targetSeconds.toDouble()).floor();
 }
 
@@ -814,13 +907,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Directory? _usedDiskCacheDir;
   Timer? _preBufferPollTimer;
   bool _pollingBufferProps = false;
+  bool _initialPlaybackStarted = false;
+  Duration? _positionAtFirstFrame;
+  int _lastObservedServedBytes = 0;
+  DateTime? _lastLiveTransferTickAt;
+  double _liveTransferAccumulatedSeconds = 0.0;
 
   bool get _isPreBuffering {
     final plan = _bufferPlan;
     return plan != null &&
         plan.cachePauseInitial &&
         plan.cachePauseWaitSeconds > 0 &&
-        (!_hasVideoFrame || !_playing);
+        !_initialPlaybackStarted;
+  }
+
+  bool _maybeLatchInitialPlaybackStarted() {
+    if (_initialPlaybackStarted) return false;
+    final ready = shouldLatchInitialPlaybackStarted(
+      hasVideoFrame: _hasVideoFrame,
+      playingNow: _playingNow,
+      buffering: _buffering,
+      positionAtFirstFrame: _positionAtFirstFrame,
+      currentPosition: _lastPosition,
+    );
+    if (!ready) return false;
+    _initialPlaybackStarted = true;
+    _stopPreBufferPoller();
+    return true;
   }
 
   double get _bufferDeltaSeconds {
@@ -838,6 +951,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     demuxerCacheDuration: _bufferedAheadSeconds,
     bufferingPercentage: _bufferingPercentage,
     bufferDeltaSeconds: _bufferDeltaSeconds,
+    liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
   );
 
   void _startPreBufferPoller() {
@@ -862,25 +976,52 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Future<void> _pollMpvBufferProperties() async {
     if (_pollingBufferProps || !mounted) return;
     final platform = _player.platform;
-    if (platform is! NativePlayer) return;
     _pollingBufferProps = true;
     final prevPreSec = _effectivePreBufferSeconds;
     final prevAheadFloor = _bufferedAheadSeconds.floor();
     try {
-      try {
-        final rawDur = await platform.getProperty('demuxer-cache-duration');
-        final parsed = double.tryParse(rawDur);
-        if (parsed != null && parsed.isFinite && parsed >= 0) {
-          _bufferedAheadSeconds = parsed;
+      if (platform is NativePlayer) {
+        var parsedCacheDuration = 0.0;
+        try {
+          final rawDur = await platform.getProperty('demuxer-cache-duration');
+          final parsed = double.tryParse(rawDur);
+          if (parsed != null && parsed.isFinite && parsed >= 0) {
+            parsedCacheDuration = parsed;
+            _bufferedAheadSeconds = parsed;
+          }
+        } catch (_) {}
+        try {
+          final rawState = await platform.getProperty('demuxer-cache-state');
+          final parsed = parseDemuxerCacheStateDuration(rawState);
+          if (parsed != null &&
+              (parsed > _bufferedAheadSeconds || parsedCacheDuration <= 0)) {
+            _bufferedAheadSeconds = parsed;
+          }
+        } catch (_) {}
+        try {
+          final rawPct = await platform.getProperty('cache-buffering-state');
+          final parsed = double.tryParse(rawPct);
+          if (parsed != null && parsed.isFinite) {
+            _bufferingPercentage = parsed.clamp(0.0, 100.0).toDouble();
+          }
+        } catch (_) {}
+      }
+      if (widget.live && _isPreBuffering) {
+        if (widget.session case final StreamTransferMetrics metrics) {
+          final next = advanceLiveTransferSeconds(
+            currentAccumulatedSeconds: _liveTransferAccumulatedSeconds,
+            previousServedBytes: _lastObservedServedBytes,
+            previousTickAt: _lastLiveTransferTickAt,
+            servedBytes: metrics.servedBytes,
+            firstByteServedAt: metrics.firstByteServedAt,
+            lastByteServedAt: metrics.lastByteServedAt,
+            now: DateTime.now(),
+          );
+          _liveTransferAccumulatedSeconds = next.accumulatedSeconds;
+          _lastObservedServedBytes = next.lastServedBytes;
+          _lastLiveTransferTickAt = next.lastTickAt;
         }
-      } catch (_) {}
-      try {
-        final rawPct = await platform.getProperty('cache-buffering-state');
-        final parsed = double.tryParse(rawPct);
-        if (parsed != null && parsed.isFinite) {
-          _bufferingPercentage = parsed.clamp(0.0, 100.0).toDouble();
-        }
-      } catch (_) {}
+      }
       if (!mounted) return;
       final nextPreSec = _effectivePreBufferSeconds;
       if ((_isPreBuffering && nextPreSec != prevPreSec) ||
@@ -904,7 +1045,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         r.width > 0 &&
         r.height > 0 &&
         mounted) {
-      setState(() => _hasVideoFrame = true);
+      setState(() {
+        _hasVideoFrame = true;
+        _positionAtFirstFrame ??= _lastPosition;
+        _maybeLatchInitialPlaybackStarted();
+      });
     }
   }
 
@@ -936,10 +1081,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               _interrupted = false;
               _interruptDetail = null;
             }
+            _maybeLatchInitialPlaybackStarted();
           });
         } else {
           _playingNow = playing;
           if (playing) _playing = true;
+          _maybeLatchInitialPlaybackStarted();
         }
         if (playing) {
           _watchdog?.cancel();
@@ -973,17 +1120,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         if (!buffering && _playingNow) {
           _autoResumeAttempts = 0;
         }
-        if (mounted && _buffering != buffering) {
-          setState(() => _buffering = buffering);
-        } else {
-          _buffering = buffering;
+        final changed = _buffering != buffering;
+        _buffering = buffering;
+        final latched = _maybeLatchInitialPlaybackStarted();
+        if (mounted && (changed || latched)) {
+          setState(() {});
         }
       }),
     );
     _subscriptions.add(
       _player.stream.width.listen((width) {
         if (!_hasVideoFrame && width != null && width > 0 && mounted) {
-          setState(() => _hasVideoFrame = true);
+          setState(() {
+            _hasVideoFrame = true;
+            _positionAtFirstFrame ??= _lastPosition;
+            _maybeLatchInitialPlaybackStarted();
+          });
         }
       }),
     );
@@ -999,13 +1151,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _subscriptions.add(
       _player.stream.position.listen((position) {
         _lastPosition = position;
+        var shouldRebuild = false;
+        if (!_initialPlaybackStarted &&
+            _hasVideoFrame &&
+            _maybeLatchInitialPlaybackStarted()) {
+          shouldRebuild = true;
+        }
         final committed = _committedSeekTarget;
         if (committed != null &&
             (position - committed).abs() <= const Duration(seconds: 2)) {
           _committedSeekTarget = null;
           _committedSeekHoldTimer?.cancel();
-          if (_seekHudVisible && mounted) setState(() {});
+          if (_seekHudVisible) shouldRebuild = true;
         }
+        if (shouldRebuild && mounted) setState(() {});
       }),
     );
     _subscriptions.add(
@@ -1301,6 +1460,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _bufferedAheadSeconds = 0.0;
       _bufferEndPosition = Duration.zero;
       _initialBufferPosition = null;
+      _positionAtFirstFrame = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
     });
     if (_isPreBuffering) {
       _startPreBufferPoller();
@@ -1545,6 +1708,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       );
       if (!mounted) return;
       _bufferPlan = plan;
+      _initialPlaybackStarted = false;
+      _positionAtFirstFrame = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
       _bufferingPercentage = 0.0;
       _bufferedAheadSeconds = 0.0;
       _bufferEndPosition = Duration.zero;
@@ -1591,6 +1759,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           if (plan.useDiskCache && plan.cacheDirPath != null) {
             await platform.setProperty('cache-on-disk', 'yes');
             await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
+          } else {
+            await platform.setProperty('cache-on-disk', 'no');
           }
         }
         _diag(
@@ -2266,7 +2436,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         controller: _videoController,
                         controls: NoVideoControls,
                       ),
-                      if (loadingLabel != null) _buildLoadingOverlay(loadingLabel),
+                      if (loadingLabel != null ||
+                          (!_interrupted && _isPreBuffering))
+                        _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
                       if (_hudText != null && !_osdOpen) _buildStatusHud(),
                       if (_seekHudVisible && !_osdOpen && !widget.live)
                         _buildSeekHud(),

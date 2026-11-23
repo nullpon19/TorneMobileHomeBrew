@@ -381,7 +381,20 @@ class DtcpProxy {
   bool _legacyPumpActive = false;
   int _cipherBytes = 0;
   int _servedBytes = 0;
+  DateTime? _firstServedAt;
+  DateTime? _lastServedAt;
   int _requestCount = 0;
+
+  /// Total plaintext bytes written to the downstream player so far.
+  int get servedBytes => _servedBytes;
+
+  /// Wall-clock time when the first plaintext byte was sent on the active
+  /// legacy stream, or `null` if nothing has been served yet.
+  DateTime? get firstByteServedAt => _firstServedAt;
+
+  /// Wall-clock time of the most recent plaintext chunk sent on the active
+  /// legacy stream, or `null` if nothing has been served yet.
+  DateTime? get lastByteServedAt => _lastServedAt;
   bool _claimed = false;
   bool _stopRequested = false;
   bool _downstreamGone = false;
@@ -729,6 +742,8 @@ class DtcpProxy {
       return;
     }
     final gen = ++_legacyGeneration;
+    _firstServedAt = null;
+    _lastServedAt = null;
     _queue.notify();
     _claimed = true;
     _downstreamGone = false;
@@ -767,6 +782,11 @@ class DtcpProxy {
         if (chunk == null) break;
         if (gen != _legacyGeneration || _stopRequested) break;
         _servedBytes += chunk.length;
+        if (chunk.isNotEmpty) {
+          final now = DateTime.now();
+          _firstServedAt ??= now;
+          _lastServedAt = now;
+        }
         response.add(chunk);
         await response.flush();
       }
