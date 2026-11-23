@@ -21,7 +21,7 @@ ls -la ~/Library/Android/sdk/platforms ~/Library/Android/sdk/ndk ~/Library/Andro
 ```
 
 ## 4. ソースコード作業ディレクトリの削除（APK だけ残す場合）
-完成した APK は `/Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk` に保存済みのため、ソース一式が不要になれば以下で削除できます。
+完成した APK を別フォルダ（例：`../TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk`）へ退避済みであれば、ソース一式が不要になった際に作業ディレクトリを削除できます。
 ```bash
-rm -rf /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew-FireTV
+rm -rf <repo-dir>
 ```

@@ -1,3 +1,13 @@
+# torne HB FireTV（非公式 Fire TV 対応フォーク）
+
+> [!NOTE]
+> 本リポジトリは [mar1mo-41414/TorneMobileHomeBrew](https://github.com/mar1mo-41414/TorneMobileHomeBrew)（v1.5.0 / MIT License）をベースに、**Fire TV / Android TV リモコン操作・大画面 UI 向けに調整した非公式フォーク（`applicationId: com.markun.tmhb.firetv`）** です。
+> - 公式版 (`com.markun.tmhb`) と別アプリ識別子のため共存インストールが可能です。
+> - **DTCP-IP 資格情報（証明書・秘密鍵）は一切同梱していません。** ご自身の資格情報を取り込んでご利用ください。
+> - Fire TV 向け改修の詳細は [FIRETV_MOD_LOG.md](FIRETV_MOD_LOG.md)、ライセンスは [LICENSE](LICENSE)（MIT License）を参照してください。
+
+---
+
 # torne mobile HomeBrew エディション
 
 Sony のサポート終了後も、公式ファームウェアの nasne をスマートフォンから操作し続けるための、非公式・個人開発のクライアントアプリです。iOS / Android / Mac / Windows / Linux に対応しています。

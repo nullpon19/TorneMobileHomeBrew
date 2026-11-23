@@ -163,11 +163,26 @@
 2. **Activity レベルの TV バナー宣言補強 (`android/app/src/main/AndroidManifest.xml`, `android/app/src/main/res/drawable/tv_banner.png`, `392bbc6`)**:
    - `<application>` だけでなく `<activity android:name=".MainActivity">` にも `android:banner="@drawable/tv_banner"` を明記し、汎用 `res/drawable/tv_banner.png` も配置して Android TV / カスタムランチャー互換を強化。
 
-### 第17弾: 番組表の整数局幅フィット化＆右端スナップバウンス修正（本コミット）
+### 第17弾: 番組表の整数局幅フィット化＆右端スナップバウンス修正 (`3016574`)
 1. **表示幅に応じた整数列フィット幅の算出 (`lib/ui/epg_screen.dart`)**:
    - `_GuideView` のグリッド領域を `LayoutBuilder` で計測し、`resolveEpgChannelWidth`（156〜210dp の範囲で表示幅を整数等分）で 1 局あたりの列幅を自動決定するよう変更（Fire TV `960dp` 環境の 5 局地域では 5 列きっちり `maxScrollExtent == 0` に収まり、5 局目の右端切れを解消）。
 2. **`_ChannelSnapPhysics` の動的列幅追従＆右端非バウンス化 (`lib/ui/epg_screen.dart`)**:
    - `_ChannelSnapPhysics` に実際の `channelWidth` を渡し、さらに `resolveEpgSnapTarget` で `maxScrollExtent` を有効な吸着先として扱うよう修正。最右列での上下スクロール時に 0 側へ押し戻される横バウンスを根本解消。
+
+### 第18弾: 公開前仕上げ（タイトル統一・ホーム初期フォーカス・EPG赤塗り＆時刻バー・Live 録画競合＆OSD通知）(`89d8f42`)
+1. **タイトル統一 (`lib/ui/home_screen.dart`, `lib/ui/settings_screen.dart`, `test/widget_test.dart`)**:
+   - ホーム画面の AppBar タイトルおよび設定画面最下部のバージョン表記を `torne HB FireTV` に統一。
+2. **ホーム起動・読み込み時の左メニューフォーカス固定 (`lib/ui/app_shell.dart`)**:
+   - 起動直後に左 `NavigationRail`（`ホーム`）へフォーカスを当て、`OrderedTraversalPolicy`・非表示タブへの `ExcludeFocus`・`registrationsProvider` / `selectedRegistrationProvider` 完了時ガードにより、右キーまたはポインタ操作で右ペインへ移らない限り左メニューにフォーカスを残すよう制御。
+3. **番組表の録画予約済み表示切替＆時刻列赤太ボーダー (`lib/app/providers.dart`, `lib/ui/settings_screen.dart`, `lib/ui/epg_screen.dart`)**:
+   - `epgReservedStyleProvider`（`firetv_epg_reserved_style`）を追加し、設定画面「番組表」セクションから `赤塗りつぶし`（既定・ダーク／ライト共通 `#C62828` 背景＋白文字・白ドット）と `赤枠` を切り替え可能化。
+   - 時刻列 `_TimeRuler` 右端に、地デジ・BS・CS すべての予約および取得済み `recordingFlag` 番組を合算マージ (`buildEpgRulerReservedSpans`) した `4dp` 幅の赤太ボーダーを表示。
+4. **Live 視聴中の他チャンネル録画競合検知・TV視聴表示・OSD／右上5秒通知 (`lib/ui/live_recording_policy.dart`, `lib/core/services/interfaces.dart`, `lib/core/dtcp/dtcp_proxy.dart`, `lib/core/services/dtcp_playback.dart`, `lib/ui/live_screen.dart`, `lib/ui/player_screen.dart`)**:
+   - `StreamTransferMetrics` / `DtcpProxy` に連続再接続エラー数 (`consecutiveReconnectErrors`) を追加。
+   - Live 再生中に別チャンネルの録画（90 秒前リード含む）が始まって停止／再接続失敗した際、無駄な無限リトライを即座に止めて `showLiveRecordingConflictDialog` を表示し、決定キー 1 回で録画中チャンネル（品質自動フォールバック付き）へ切り替えられるよう実装。
+   - TV視聴一覧・詳細画面およびプレイヤー OSD 上部（`LIVE` 横）へ赤い `● 録画中` バッジを表示し、視聴中の同一チャンネルで録画が始まった／終了したタイミングで画面右上に 5 秒間の `録画中` / `録画終了` 通知を表示。
+5. **テスト＆ビルド整備 (`test/epg_test.dart`, `test/firetv_mod_test.dart`, `FIRETV_MOD_LOG.md`, `CLEANUP_BUILD_ENV.md`, `README.md`)**:
+   - 全 633 テスト全パス・`dart analyze` 問題ゼロを確認し、公開ブランチ用にドキュメント内のローカルパス表現を汎用表記へ清掃。
 
 ---
 
@@ -175,9 +190,10 @@
 
 | 種別 / ファイル | 主な変更・追加内容 |
 | :--- | :--- |
+| `README.md` | 非公式 Fire TV フォークの明記・MIT ライセンス／共存注記を追加 |
 | `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順 |
 | `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順） |
-| `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv` に変更 |
+| `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv`、`versionName` を `-firetv` に変更 |
 | `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner`（`<application>` ＋ `<activity>` 双方） / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
 | `android/app/src/main/res/drawable/tv_banner.png` / `drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
 | `android/app/src/main/cpp/CMakeLists.txt` | `tmhb_aes.c` (`-O3`) のビルド対象追加 |
@@ -185,24 +201,25 @@
 | `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・`MANAGE_EXTERNAL_STORAGE` 判定/設定誘導＋ファイルスキャン・`StatFs` 残容量 `getCacheAvailableBytes`） |
 | `lib/app/bootstrap.dart` | `fileStoreContainer` に `mpvCacheDirectory` オプション引数を追加 |
 | `lib/app/firetv_helper.dart` | Fire TV 向け Platform Channel ラッパー（`getCacheAvailableBytes()` ほか） |
-| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`NightModeNotifier` / `nightModeProvider`、`GroupTitlesNotifier` / `groupTitlesProvider`（既定 ON）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
+| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`NightModeNotifier` / `nightModeProvider`、`GroupTitlesNotifier` / `groupTitlesProvider`（既定 ON）、`EpgReservedStyleNotifier` / `epgReservedStyleProvider`（既定 `fill`）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
 | `lib/core/dtcp/native_aes.dart` | `libtmhb_fcntl.so` の Dart FFI バインディング |
 | `lib/core/dtcp/dtcp_crypto.dart` | Android でのネイティブ AES 復号優先パス |
-| `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止）、`isLive` 限定 EOF 再接続、Seekable 正常 EOF 打ち切り & `_eofByte` 416、転送カウンタ (`servedBytes` / `firstByteServedAt` / `lastByteServedAt`) 公開 |
+| `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止）、`isLive` 限定 EOF 再接続、Seekable 正常 EOF 打ち切り & `_eofByte` 416、転送カウンタ (`servedBytes` / `firstByteServedAt` / `lastByteServedAt` / `consecutiveReconnectErrors`) 公開 |
 | `lib/core/services/dtcp_playback.dart` | `PlaybackKeySource.forceReauthenticate()`、`DtcpPlaybackEngine(autoReconnect: ...)`、`isLive` 伝播、`_DtcpPlaybackSession` の `StreamTransferMetrics` 実装 |
 | `lib/core/services/interfaces.dart` | 任意実装の再生転送メトリクス境界 `StreamTransferMetrics` を追加 |
 | `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠・`SegmentedButton` 個別セグメント反転強調テーマ |
-| `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`tabBackHandlersProvider`・右画面「戻る」時の左メニュー該当項目復帰・左メニュー上ルート `PopScope` アプリ終了確認ダイアログ |
+| `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`OrderedTraversalPolicy` + `ExcludeFocus` による起動／ホーム初回読み込み時左メニューフォーカス固定、`tabBackHandlersProvider`・右画面「戻る」時の左メニュー該当項目復帰・左メニュー上ルート `PopScope` アプリ終了確認ダイアログ |
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー（プリセット復元 UI は削除） |
-| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、整数局幅フィット (`resolveEpgChannelWidth`) ＋右端吸着修正 (`resolveEpgSnapTarget`)、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤枠・赤ドット表示＆ `'予約を編集'` 切替 |
+| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、整数局幅フィット (`resolveEpgChannelWidth`) ＋右端吸着修正 (`resolveEpgSnapTarget`)、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤塗りつぶし (`#C62828`)／赤枠切替・赤ドット表示＆ `'予約を編集'` 切替、時刻列 `_TimeRuler` 右端の予約／録画中赤太ボーダー |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力）、検索結果の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
-| `lib/ui/home_screen.dart` | 横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
-| `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、OSD「番組詳細」データ引き渡し |
+| `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
+| `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice`) ポリシー |
+| `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、`● 録画中` バッジ表示、視聴前他チャンネル録画競合案内＆切替（画質フォールバック付き）、OSD「番組詳細」＆競合判定データ引き渡し |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
 | `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'メニューを閉じる'` 化・`'番組詳細'` 半画面スクロール表示・戻るキー二重発火抑止含む）、再生終了確認ダイアログ (`showPlayerExitConfirmDialog` / `confirmExit`)、事前バッファ蓄積表示（`computePreBufferSeconds` ＋ `demuxer-cache-state` / `bufferingPercentage` / `buffer` 増分 / `StreamTransferMetrics` 実測フォールバック / `_initialPlaybackStarted` 早期切替抑止）、`cache-on-disk` 明示・掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`PlayerOsdButtonBar` 循環フォーカストラップ＆反転強調・`'メニューを閉じる'` 化・`'番組詳細'` 半画面スクロール表示・戻るキー二重発火抑止・`LIVE` 横 `● 録画中` バッジ含む）、画面右上 5 秒間 `録画中`／`録画終了` 通知、Live 中断時の他チャンネル録画競合検知 (`showLiveRecordingConflictDialog`) ＆ 1 操作切替、再生終了確認ダイアログ (`showPlayerExitConfirmDialog` / `confirmExit`)、事前バッファ蓄積表示（`computePreBufferSeconds` ＋ `demuxer-cache-state` / `bufferingPercentage` / `buffer` 増分 / `StreamTransferMetrics` 実測フォールバック / `_initialPlaybackStarted` 早期切替抑止）、`cache-on-disk` 明示・掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
 | `lib/ui/schedule_form.dart` | 長さ/条件 ID/録画先の 3 欄を `FireTvTextInputField` 化 |
-| `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定 |
+| `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「番組表」→予約表示切替（「赤塗りつぶし」／「赤枠」）、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定、下部バージョン表記を `torne HB FireTV` に統一 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
 | `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、`knownDuration` 引き渡し、OSD「番組詳細」データ引き渡し、検索欄 `FireTvTextInputField` 化、`'番組まとめ'` `FilterChip`・シリーズ折りたたみフォルダ `_TitleGroupTile`・展開インデント表示を追加 |
@@ -210,11 +227,12 @@
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/dtcp_streaming_test.dart` | `DtcpProxy` の `servedBytes` / `firstByteServedAt` / `lastByteServedAt` 転送カウンタ検証を追加 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計＆事前蓄積算出／`demuxer-cache-state`／Live転送経過／早期切替抑止ラッチ・設定・ナイトモード・`SegmentedButton` 個別強調・10秒シーク・EPG上部バー統合/一発遷移/2段階戻る/左メニュー復帰/整数局フィット＆右端スナップ/黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・右画面戻る→左メニュー＆終了確認・終端ガード・OSD戻るキー/「メニューを閉じる」/再生終了確認/詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
+| `test/epg_test.dart` | `resolveEpgChannelWidth` 導入後の動的列幅境界スナップ検証へ追従 |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton`・10秒シーク・EPG全般/赤塗り/時刻バー・録画まとめ・戻る導線・録画競合検知＆通知・Home 2カラム＆初期フォーカス固定）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |
-| `test/widget_test.dart` | アプリタイトル/初期化更新への追従 |
+| `test/widget_test.dart` | `torne HB FireTV` タイトル統一への追従 |
 
 ---
 
@@ -254,19 +272,21 @@
 
 ```bash
 export PATH="$HOME/development/flutter/bin:$PATH"
-export JAVA_HOME="/Users/nullpon/development/jdk-21/Contents/Home"
+export JAVA_HOME="$HOME/development/jdk-21/Contents/Home"
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
+# リリース署名を使う場合のみ設定（未設定時は debug 鍵で署名）
+export TMHB_KEY_PROPERTIES="$HOME/.android/tmhb-firetv-key.properties"
 
-cd /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew-FireTV
+cd <repo-dir>
 flutter build apk --release
 
-# 出力 APK を親フォルダへ配置し Fire TV へインストール
+# 出力 APK を任意の場所へコピーして Fire TV へインストール
 cp build/app/outputs/flutter-apk/app-release.apk \
-   /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk
+   ../TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk
 "$ANDROID_HOME/platform-tools/adb" connect <FIRETV_IP>:5555
 "$ANDROID_HOME/platform-tools/adb" -s <FIRETV_IP>:5555 install -r \
-   /Users/nullpon/Documents/Git/nasne/TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk
+   ../TorneMobileHomeBrew/TorneMobileHomeBrew-1.5.0-firetv.apk
 
 # 必要に応じて資格情報ファイルを Fire TV の Download フォルダへ転送（取込後は端末から削除推奨）
 "$ANDROID_HOME/platform-tools/adb" -s <FIRETV_IP>:5555 push \
