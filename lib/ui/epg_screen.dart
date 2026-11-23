@@ -835,7 +835,7 @@ class _DayGrid extends StatelessWidget {
   }
 }
 
-class _EventTile extends StatelessWidget {
+class _EventTile extends StatefulWidget {
   const _EventTile({
     super.key,
     required this.event,
@@ -865,10 +865,25 @@ class _EventTile extends StatelessWidget {
   final VoidCallback onWatch;
 
   @override
+  State<_EventTile> createState() => _EventTileState();
+}
+
+class _EventTileState extends State<_EventTile> {
+  bool _focused = false;
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final startMin = math.max(0, event.start.difference(dayStart).inMinutes);
-    final endMin = math.min(24 * 60, event.end.difference(dayStart).inMinutes);
+    final isDark = theme.brightness == Brightness.dark;
+    final event = widget.event;
+    final startMin = math.max(
+      0,
+      event.start.difference(widget.dayStart).inMinutes,
+    );
+    final endMin = math.min(
+      24 * 60,
+      event.end.difference(widget.dayStart).inMinutes,
+    );
     final top = startMin * _pxPerMinute;
     final height = math.max(10, (endMin - startMin) * _pxPerMinute - 1);
     final title = event.title;
@@ -881,91 +896,107 @@ class _EventTile extends StatelessWidget {
     // about 16px at the labelSmall size and a title line about
     // 17px, with 2px of vertical padding at each edge.
     final maxTitleLines = ((height - 4 - 16) / 17).floor();
+    final focusBorderColor = isDark
+        ? Colors.amberAccent
+        : const Color(0xFFFF6F00);
     return Positioned(
       top: top,
       left: 1,
       right: 1,
       height: height.toDouble(),
-      child: Material(
-        // Tiles are tinted by the event's genre (plan 86,
-        // plan 85 item 10); events without a known genre
-        // keep the neutral colour they have always had.
-        // A suppressed genre (plan 95) paints the plain
-        // surface instead, with no text below.
-        color: suppressed
-            ? theme.colorScheme.surface
-            : epgGenreTileColor(
-                genreLevel1: event.genreLevel1,
-                surface: theme.colorScheme.surface,
-                fallback: theme.colorScheme.surfaceContainerHighest,
-              ),
-        borderRadius: BorderRadius.circular(3),
-        // Tiles too short for their text must not paint outside
-        // their box: spilled glyphs used to bleed into the tile
-        // below and get half-covered there (plan 22).
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(3),
-          onTap: () => showEpgEventDetail(
-            context,
-            reg: reg,
-            channel: channel,
-            channelName: channelName,
-            event: event,
-            onWatch: onWatch,
-          ),
-          child: suppressed
-              ? const SizedBox.expand()
-              : maxTitleLines >= 1
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                    vertical: 2,
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(timeText, style: timeStyle),
-                      if (title != null)
-                        Expanded(
-                          child: Text(
-                            title,
-                            style: theme.textTheme.bodySmall,
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: maxTitleLines.clamp(1, 4),
-                          ),
-                        ),
-                    ],
-                  ),
-                )
-              : Padding(
-                  // Compact form for tiles too short for two lines:
-                  // time and title share one small line.
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Text(
-                        timeText,
-                        style: timeStyle?.copyWith(fontSize: 10, height: 1.1),
-                      ),
-                      if (title != null) ...[
-                        const SizedBox(width: 4),
-                        Expanded(
-                          child: Text(
-                            title,
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              fontSize: 10,
-                              height: 1.1,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
+      child: DecoratedBox(
+        position: DecorationPosition.foreground,
+        decoration: _focused
+            ? BoxDecoration(
+                borderRadius: BorderRadius.circular(3),
+                border: Border.all(color: focusBorderColor, width: 3),
+              )
+            : const BoxDecoration(),
+        child: Material(
+          // Tiles are tinted by the event's genre (plan 86,
+          // plan 85 item 10); events without a known genre
+          // keep the neutral colour they have always had.
+          // A suppressed genre (plan 95) paints the plain
+          // surface instead, with no text below.
+          color: widget.suppressed
+              ? theme.colorScheme.surface
+              : epgGenreTileColor(
+                  genreLevel1: event.genreLevel1,
+                  surface: theme.colorScheme.surface,
+                  fallback: theme.colorScheme.surfaceContainerHighest,
                 ),
+          borderRadius: BorderRadius.circular(3),
+          // Tiles too short for their text must not paint outside
+          // their box: spilled glyphs used to bleed into the tile
+          // below and get half-covered there (plan 22).
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(3),
+            focusColor: Colors.transparent,
+            onFocusChange: (focused) {
+              if (_focused != focused) setState(() => _focused = focused);
+            },
+            onTap: () => showEpgEventDetail(
+              context,
+              reg: widget.reg,
+              channel: widget.channel,
+              channelName: widget.channelName,
+              event: event,
+              onWatch: widget.onWatch,
+            ),
+            child: widget.suppressed
+                ? const SizedBox.expand()
+                : maxTitleLines >= 1
+                ? Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(timeText, style: timeStyle),
+                        if (title != null)
+                          Expanded(
+                            child: Text(
+                              title,
+                              style: theme.textTheme.bodySmall,
+                              overflow: TextOverflow.ellipsis,
+                              maxLines: maxTitleLines.clamp(1, 4),
+                            ),
+                          ),
+                      ],
+                    ),
+                  )
+                : Padding(
+                    // Compact form for tiles too short for two lines:
+                    // time and title share one small line.
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Text(
+                          timeText,
+                          style: timeStyle?.copyWith(fontSize: 10, height: 1.1),
+                        ),
+                        if (title != null) ...[
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              title,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                fontSize: 10,
+                                height: 1.1,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+          ),
         ),
       ),
     );

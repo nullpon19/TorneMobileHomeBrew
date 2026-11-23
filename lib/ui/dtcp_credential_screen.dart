@@ -33,6 +33,7 @@ import '../app/firetv_helper.dart';
 import '../app/firetv_preset.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
+import 'widgets.dart';
 
 class DtcpCredentialScreen extends ConsumerStatefulWidget {
   const DtcpCredentialScreen({super.key});
@@ -415,16 +416,16 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
             ),
           )
         else
-          TextField(
+          FireTvTextInputField(
             controller: controller,
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-              hintText: '内容をそのまま貼り付け',
-            ),
+            labelText: label,
+            hintText: '決定キーで入力（内容を貼り付け）',
+            dialogTitle: '$label を入力',
             minLines: 2,
             maxLines: 3,
             autocorrect: false,
             enableSuggestions: false,
+            showClearButton: true,
           ),
       ],
     );

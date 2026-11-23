@@ -17,11 +17,13 @@ import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
 import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
+import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/titles_screen.dart';
+import 'package:tmhb/ui/widgets.dart';
 
 import 'dtcp_kat.dart';
 
@@ -115,7 +117,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final fields = find.byType(TextField);
+      // Raw TextField must not be exposed directly so FireTVIME never traps D-pad.
+      expect(find.byType(TextField), findsNothing);
+      final fields = find.byType(FireTvTextInputField);
       expect(fields, findsNWidgets(2));
       final certRect = tester.getRect(fields.first);
       final keyRect = tester.getRect(fields.last);
@@ -130,6 +134,16 @@ void main() {
       final saveBtnRect = tester.getRect(find.text('検証して保存'));
       expect(envBtnRect.bottom, lessThan(certRect.top));
       expect(saveBtnRect.bottom, lessThan(certRect.top));
+
+      // Explicit tap opens the input dialog and saves back on 決定.
+      await tester.tap(fields.first);
+      await tester.pumpAndSettle();
+      expect(find.byType(TextField), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'deadbeef');
+      await tester.tap(find.text('決定'));
+      await tester.pumpAndSettle();
+      expect(find.byType(TextField), findsNothing);
+      expect(find.text('deadbeef'), findsOneWidget);
     });
 
     testWidgets('in-app Fire TV file picker imports credentials.env', (
@@ -588,59 +602,186 @@ void main() {
       expect(liveThreeMin.startTimeoutSeconds, 225);
     });
 
-    testWidgets('TmhbApp forces ja-JP locale to avoid Chinese glyph fallback', (
-      tester,
-    ) async {
-      tester.view.physicalSize = const Size(1280, 720);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
+    testWidgets(
+      'TmhbApp forces ja-JP locale and switches ThemeMode with nightModeProvider',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
 
-      await tester.pumpWidget(const ProviderScope(child: TmhbApp()));
-      await tester.pumpAndSettle();
+        final kv = InMemoryKeyValueStore();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+            child: const TmhbApp(),
+          ),
+        );
+        await tester.pumpAndSettle();
 
-      final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
-      expect(app.locale, const Locale('ja', 'JP'));
-      expect(app.supportedLocales, contains(const Locale('ja', 'JP')));
+        var app = tester.widget<MaterialApp>(find.byType(MaterialApp));
+        expect(app.locale, const Locale('ja', 'JP'));
+        expect(app.supportedLocales, contains(const Locale('ja', 'JP')));
+        expect(app.themeMode, ThemeMode.light);
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MaterialApp)),
+        );
+        await container.read(nightModeProvider.notifier).set(true);
+        await tester.pumpAndSettle();
+
+        app = tester.widget<MaterialApp>(find.byType(MaterialApp));
+        expect(app.themeMode, ThemeMode.dark);
+        expect(await kv.read('firetv_night_mode'), 'true');
+      },
+    );
+
+    testWidgets(
+      'SettingsScreen hides raw TextField, toggles night mode, and puts Live '
+      'buffer above Recorded without extra promo copy',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final kv = InMemoryKeyValueStore();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Raw TextField stays hidden until manual IP field is tapped.
+        expect(find.byType(TextField), findsNothing);
+        expect(find.byType(FireTvTextInputField), findsOneWidget);
+
+        await tester.scrollUntilVisible(
+          find.text('ナイトモード'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.tap(find.text('ナイトモード'));
+        await tester.pumpAndSettle();
+        expect(await kv.read('firetv_night_mode'), 'true');
+
+        await tester.scrollUntilVisible(
+          find.text('録画のバッファ時間（先読み）'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        final liveRect = tester.getRect(find.text('Live のバッファ時間（遅延再生）'));
+        final recRect = tester.getRect(find.text('録画のバッファ時間（先読み）'));
+        expect(liveRect.top, lessThan(recRect.top));
+        expect(find.textContaining('ギガ消費'), findsNothing);
+
+        expect(find.text('5分'), findsOneWidget);
+        await tester.tap(find.text('録画のバッファ時間（先読み）'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('車載おすすめ'), findsNothing);
+        await tester.tap(find.text('60分'));
+        await tester.pumpAndSettle();
+        expect(await kv.read('firetv_recorded_buffer_seconds'), '3600');
+
+        await tester.scrollUntilVisible(
+          find.text('Live のバッファ時間（遅延再生）'),
+          -200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.tap(find.text('Live のバッファ時間（遅延再生）'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('3分'));
+        await tester.pumpAndSettle();
+        expect(await kv.read('firetv_live_buffer_seconds'), '180');
+      },
+    );
+
+    test('PlayerScreen D-pad seek steps are both 10 seconds', () {
+      expect(PlayerScreen.rewindStep, const Duration(seconds: -10));
+      expect(PlayerScreen.forwardStep, const Duration(seconds: 10));
     });
 
-    testWidgets('SettingsScreen updates and persists recorded & live buffers', (
-      tester,
-    ) async {
-      tester.view.physicalSize = const Size(1280, 800);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
+    testWidgets(
+      'EpgScreen event tile shows a crisp foreground focus border without tinting '
+      'the background',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 800);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
 
-      final kv = InMemoryKeyValueStore();
-      await tester.pumpWidget(
-        ProviderScope(
-          overrides: [keyValueStoreProvider.overrideWithValue(kv)],
-          child: const MaterialApp(home: SettingsScreen()),
-        ),
-      );
-      await tester.pumpAndSettle();
+        const reg = RegisteredNasne(
+          host: '192.0.2.1',
+          udn: 'uuid:epg-focus-test',
+          friendlyName: 'nasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const channel = Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2222,
+          serviceId: 0x3333,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト放送',
+        );
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            EpgServiceGuide(
+              channel: channel,
+              events: [
+                EpgEvent(
+                  eventId: 42,
+                  start: DateTime.now().toUtc(),
+                  duration: const Duration(hours: 2),
+                  title: 'フォーカス確認番組',
+                  genreLevel1: 3,
+                ),
+              ],
+            ),
+          ],
+        );
 
-      await tester.scrollUntilVisible(
-        find.text('録画のバッファ時間（先読み）'),
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      expect(find.text('5分'), findsOneWidget);
-      await tester.tap(find.text('録画のバッファ時間（先読み）'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('60分'));
-      await tester.pumpAndSettle();
-      expect(await kv.read('firetv_recorded_buffer_seconds'), '3600');
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: EpgScreen()),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
 
-      await tester.scrollUntilVisible(
-        find.text('Live のバッファ時間（遅延再生）'),
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.tap(find.text('Live のバッファ時間（遅延再生）'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('3分'));
-      await tester.pumpAndSettle();
-      expect(await kv.read('firetv_live_buffer_seconds'), '180');
-    });
+        final tileInkWellFinder = find.ancestor(
+          of: find.text('フォーカス確認番組'),
+          matching: find.byType(InkWell),
+        );
+        expect(tileInkWellFinder, findsOneWidget);
+        final inkWell = tester.widget<InkWell>(tileInkWellFinder);
+        expect(inkWell.focusColor, Colors.transparent);
+
+        final decoratedFinder = find.ancestor(
+          of: tileInkWellFinder,
+          matching: find.byType(DecoratedBox),
+        );
+        expect(decoratedFinder, findsWidgets);
+        // Trigger focus on the tile InkWell.
+        inkWell.onFocusChange?.call(true);
+        await tester.pump();
+
+        final decorated = tester.widget<DecoratedBox>(decoratedFinder.first);
+        expect(decorated.position, DecorationPosition.foreground);
+        final box = decorated.decoration as BoxDecoration;
+        expect(box.border, isNotNull);
+        expect(box.border!.top.width, 3);
+      },
+    );
   });
 }

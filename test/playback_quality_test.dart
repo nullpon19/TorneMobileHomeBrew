@@ -1,4 +1,8 @@
-/// Fire TV provisional build: playback quality is fixed to mobile (true).
+/// Fire TV unlocked playback quality tests:
+/// - Defaults to original quality (`元画質`, false)
+/// - Ignores legacy `playback_use_mobile` and persists `firetv_default_use_mobile`
+/// - Settings updates the saved default via `SegmentedButton<bool>`
+/// - Detail screens allow per-visit override without overwriting the default
 library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -23,7 +27,7 @@ const _reg = RegisteredNasne(
 );
 
 void main() {
-  group('PlaybackQualityNotifier Fire TV mobile-fixed', () {
+  group('PlaybackQualityNotifier default & persistence', () {
     late InMemoryKeyValueStore keyValues;
 
     setUp(() {
@@ -38,29 +42,32 @@ void main() {
       return container;
     }
 
-    test('nothing stored defaults to mobile (true)', () async {
+    test('nothing stored defaults to original quality (false)', () async {
       final container = makeContainer();
-      expect(container.read(playbackQualityProvider), isTrue);
+      expect(container.read(playbackQualityProvider), isFalse);
       await flush();
-      expect(container.read(playbackQualityProvider), isTrue);
-      expect(await keyValues.read('playback_use_mobile'), 'true');
+      expect(container.read(playbackQualityProvider), isFalse);
     });
 
-    test('a stored false is overridden to mobile (true)', () async {
-      await keyValues.write('playback_use_mobile', 'false');
+    test('legacy playback_use_mobile=true resets once to original (false)', () async {
+      await keyValues.write('playback_use_mobile', 'true');
       final container = makeContainer();
       container.read(playbackQualityProvider);
       await flush();
-      expect(container.read(playbackQualityProvider), isTrue);
-      expect(await keyValues.read('playback_use_mobile'), 'true');
+      expect(container.read(playbackQualityProvider), isFalse);
     });
 
-    test('set keeps quality fixed to mobile (true)', () async {
+    test('set updates and persists firetv_default_use_mobile', () async {
       final container = makeContainer();
       final notifier = container.read(playbackQualityProvider.notifier);
-      await notifier.set(false);
+      await notifier.set(true);
       expect(container.read(playbackQualityProvider), isTrue);
-      expect(await keyValues.read('playback_use_mobile'), 'true');
+      expect(await keyValues.read('firetv_default_use_mobile'), 'true');
+
+      final container2 = makeContainer();
+      container2.read(playbackQualityProvider);
+      await flush();
+      expect(container2.read(playbackQualityProvider), isTrue);
     });
   });
 
@@ -69,7 +76,7 @@ void main() {
       WidgetTester tester,
       InMemoryKeyValueStore keyValues,
     ) async {
-      tester.view.physicalSize = const Size(390, 844);
+      tester.view.physicalSize = const Size(800, 1200);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.reset);
       await tester.pumpWidget(
@@ -83,19 +90,26 @@ void main() {
           child: const MaterialApp(home: SettingsScreen()),
         ),
       );
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.ensureVisible(find.text('再生画質: モバイル固定'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('デフォルト再生画質'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
       await tester.pump();
     }
 
-    testWidgets('settings shows mobile-fixed indicator without selector', (
+    testWidgets('settings shows quality selector and persists toggle', (
       tester,
     ) async {
       final keyValues = InMemoryKeyValueStore();
       await pumpSettings(tester, keyValues);
-      expect(find.text('再生画質: モバイル固定'), findsOneWidget);
-      expect(find.byType(SegmentedButton<bool>), findsNothing);
+      expect(find.text('デフォルト再生画質'), findsOneWidget);
+      expect(find.byType(SegmentedButton<bool>), findsOneWidget);
+
+      await tester.tap(find.text('モバイル'));
+      await tester.pumpAndSettle();
+      expect(await keyValues.read('firetv_default_use_mobile'), 'true');
     });
   });
 
@@ -121,16 +135,22 @@ void main() {
       ],
     );
 
-    Future<void> pumpDetail(
-      WidgetTester tester,
-      InMemoryKeyValueStore keyValues,
+    testWidgets('per-visit selector does not overwrite saved default', (
+      tester,
     ) async {
       tester.view.physicalSize = const Size(390, 844);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.reset);
+
+      final kv = InMemoryKeyValueStore();
+      final container = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container.dispose);
+
       await tester.pumpWidget(
-        ProviderScope(
-          overrides: [keyValueStoreProvider.overrideWithValue(keyValues)],
+        UncontrolledProviderScope(
+          container: container,
           child: const MaterialApp(
             home: Scaffold(
               body: LiveChannelDetailView(reg: _reg, channel: channel),
@@ -138,17 +158,20 @@ void main() {
           ),
         ),
       );
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.pump();
-    }
+      await tester.pumpAndSettle();
 
-    testWidgets('shows mobile-fixed text and no quality segmented button', (
-      tester,
-    ) async {
-      await pumpDetail(tester, InMemoryKeyValueStore());
-      expect(find.text('画質: モバイル固定'), findsOneWidget);
-      expect(find.byType(SegmentedButton<bool>), findsNothing);
+      expect(find.byType(SegmentedButton<bool>), findsOneWidget);
+      expect(container.read(playbackQualityProvider), isFalse);
+
+      await tester.tap(find.text('モバイル'));
+      await tester.pumpAndSettle();
+      // Per-visit UI updates without persisting back to global default.
+      final button = tester.widget<SegmentedButton<bool>>(
+        find.byType(SegmentedButton<bool>),
+      );
+      expect(button.selected, {true});
+      expect(container.read(playbackQualityProvider), isFalse);
+      expect(await kv.read('firetv_default_use_mobile'), isNull);
     });
   });
 }

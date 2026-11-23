@@ -276,6 +276,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// must not delay or fail it.
   final Future<List<Duration>> Function()? loadChapters;
 
+  static const Duration rewindStep = Duration(seconds: -10);
+  static const Duration forwardStep = Duration(seconds: 10);
+
   @override
   ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
 }
@@ -422,8 +425,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   MpvBufferPlan? _bufferPlan;
   Directory? _usedDiskCacheDir;
 
-  static const Duration _rewindStep = Duration(seconds: -10);
-  static const Duration _forwardStep = Duration(seconds: 30);
+  static const Duration _rewindStep = PlayerScreen.rewindStep;
+  static const Duration _forwardStep = PlayerScreen.forwardStep;
   static const List<int> _autoResumeBackoffSeconds = [3, 5, 8, 10];
 
   void _onVideoRectChanged() {
@@ -1360,7 +1363,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _seekBasePosition ??= _committedSeekTarget ?? _player.state.position;
     _pendingSeekOffset += delta;
     _showSeekHud(
-      _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_30,
+      _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_10,
       _formatSeekDelta(_pendingSeekOffset.inSeconds),
     );
     _seekDebounceTimer?.cancel();
@@ -2042,8 +2045,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       },
                     ),
                     _osdButton(
-                      icon: Icons.forward_30,
-                      label: '+30秒',
+                      icon: Icons.forward_10,
+                      label: '+10秒',
                       onPressed: () {
                         _queueRelativeSeek(_forwardStep);
                         _resetOsdTimer();

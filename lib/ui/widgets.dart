@@ -301,3 +301,300 @@ class KeyboardDismissOnTap extends StatelessWidget {
     );
   }
 }
+
+/// Fire TV D-pad friendly text input box that avoids exposing a raw
+/// [TextField] directly on screen (which causes FireTVIME to pop up and trap
+/// D-pad focus on hover). Opens a dedicated input dialog only on explicit
+/// activation (Select / Enter / tap).
+class FireTvTextInputField extends StatefulWidget {
+  const FireTvTextInputField({
+    super.key,
+    required this.controller,
+    this.labelText,
+    this.hintText,
+    this.dialogTitle,
+    this.prefixIcon,
+    this.suffixText,
+    this.keyboardType,
+    this.textInputAction = TextInputAction.done,
+    this.minLines = 1,
+    this.maxLines = 1,
+    this.autocorrect = true,
+    this.enableSuggestions = true,
+    this.showClearButton = false,
+    this.onChanged,
+    this.onSubmitted,
+  });
+
+  final TextEditingController controller;
+  final String? labelText;
+  final String? hintText;
+  final String? dialogTitle;
+  final IconData? prefixIcon;
+  final String? suffixText;
+  final TextInputType? keyboardType;
+  final TextInputAction textInputAction;
+  final int minLines;
+  final int maxLines;
+  final bool autocorrect;
+  final bool enableSuggestions;
+  final bool showClearButton;
+  final ValueChanged<String>? onChanged;
+  final ValueChanged<String>? onSubmitted;
+
+  @override
+  State<FireTvTextInputField> createState() => _FireTvTextInputFieldState();
+}
+
+class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'fireTvTextInput');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onControllerChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant FireTvTextInputField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onControllerChanged);
+      widget.controller.addListener(_onControllerChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openInputDialog() async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => _FireTvTextInputDialog(
+        title:
+            widget.dialogTitle ?? widget.labelText ?? widget.hintText ?? '入力',
+        initialValue: widget.controller.text,
+        hintText: widget.hintText,
+        suffixText: widget.suffixText,
+        keyboardType: widget.keyboardType,
+        textInputAction: widget.textInputAction,
+        minLines: widget.minLines,
+        maxLines: widget.maxLines,
+        autocorrect: widget.autocorrect,
+        enableSuggestions: widget.enableSuggestions,
+      ),
+    );
+    if (!mounted) return;
+    if (result != null) {
+      widget.controller.value = TextEditingValue(
+        text: result,
+        selection: TextSelection.collapsed(offset: result.length),
+      );
+      widget.onChanged?.call(result);
+      widget.onSubmitted?.call(result);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
+  }
+
+  void _clear() {
+    widget.controller.clear();
+    widget.onChanged?.call('');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final text = widget.controller.text;
+    final hasText = text.isNotEmpty;
+    final borderColor = _focused
+        ? (isDark ? Colors.amberAccent : Colors.amber)
+        : theme.colorScheme.outlineVariant;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: InkWell(
+            focusNode: _focusNode,
+            onFocusChange: (focused) {
+              if (_focused != focused) setState(() => _focused = focused);
+            },
+            borderRadius: BorderRadius.circular(8),
+            onTap: _openInputDialog,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerLow,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: borderColor,
+                  width: _focused ? 3 : 1,
+                ),
+              ),
+              child: Row(
+                children: [
+                  if (widget.prefixIcon != null) ...[
+                    Icon(
+                      widget.prefixIcon,
+                      size: 20,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (widget.labelText != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 2),
+                            child: Text(
+                              widget.labelText!,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        Text(
+                          hasText ? text : (widget.hintText ?? '決定キーで入力'),
+                          maxLines: widget.maxLines > 1 ? 2 : 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: hasText
+                                ? theme.colorScheme.onSurface
+                                : theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (widget.suffixText != null && hasText) ...[
+                    const SizedBox(width: 4),
+                    Text(
+                      widget.suffixText!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 8),
+                  Icon(
+                    Icons.edit_outlined,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (widget.showClearButton && hasText) ...[
+          const SizedBox(width: 4),
+          IconButton(
+            icon: const Icon(Icons.clear),
+            tooltip: 'クリア',
+            onPressed: _clear,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _FireTvTextInputDialog extends StatefulWidget {
+  const _FireTvTextInputDialog({
+    required this.title,
+    required this.initialValue,
+    this.hintText,
+    this.suffixText,
+    this.keyboardType,
+    this.textInputAction = TextInputAction.done,
+    this.minLines = 1,
+    this.maxLines = 1,
+    this.autocorrect = true,
+    this.enableSuggestions = true,
+  });
+
+  final String title;
+  final String initialValue;
+  final String? hintText;
+  final String? suffixText;
+  final TextInputType? keyboardType;
+  final TextInputAction textInputAction;
+  final int minLines;
+  final int maxLines;
+  final bool autocorrect;
+  final bool enableSuggestions;
+
+  @override
+  State<_FireTvTextInputDialog> createState() => _FireTvTextInputDialogState();
+}
+
+class _FireTvTextInputDialogState extends State<_FireTvTextInputDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialValue);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: SingleChildScrollView(
+        child: TextField(
+          controller: _controller,
+          autofocus: true,
+          keyboardType: widget.keyboardType,
+          textInputAction: widget.textInputAction,
+          minLines: widget.minLines,
+          maxLines: widget.maxLines,
+          autocorrect: widget.autocorrect,
+          enableSuggestions: widget.enableSuggestions,
+          decoration: InputDecoration(
+            border: const OutlineInputBorder(),
+            hintText: widget.hintText,
+            suffixText: widget.suffixText,
+          ),
+          onSubmitted: widget.maxLines == 1
+              ? (value) => Navigator.of(context).pop(value)
+              : null,
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _controller.clear,
+          child: const Text('クリア'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(null),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_controller.text),
+          child: const Text('決定'),
+        ),
+      ],
+    );
+  }
+}

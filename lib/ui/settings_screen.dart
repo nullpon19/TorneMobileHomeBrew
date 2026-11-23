@@ -168,15 +168,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                TextField(
+                FireTvTextInputField(
                   controller: _manualHost,
-                  decoration: const InputDecoration(
-                    labelText: 'IP アドレス / ホスト名',
-                    hintText: '192.168.11.129',
-                  ),
+                  labelText: 'IP アドレス / ホスト名',
+                  hintText: '192.168.11.129',
+                  dialogTitle: 'IP アドレス / ホスト名',
                   keyboardType: TextInputType.url,
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => FocusScope.of(context).unfocus(),
                 ),
                 const SizedBox(height: 8),
                 FilledButton.icon(
@@ -186,6 +183,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
               ],
             ),
+          ),
+          const Divider(),
+          _sectionTitle(context, '表示'),
+          SwitchListTile(
+            title: const Text('ナイトモード'),
+            subtitle: const Text('暗い背景のダークテーマに切り替えます'),
+            value: ref.watch(nightModeProvider),
+            onChanged: (value) =>
+                ref.read(nightModeProvider.notifier).set(value),
           ),
           const Divider(),
           _sectionTitle(context, '番組表'),
@@ -215,48 +221,30 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '再生画質: モバイル固定',
+                  'デフォルト再生画質',
                   style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<bool>(
+                  segments: const [
+                    ButtonSegment(value: false, label: Text('元画質 (DR)')),
+                    ButtonSegment(value: true, label: Text('モバイル')),
+                  ],
+                  selected: {ref.watch(playbackQualityProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(playbackQualityProvider.notifier)
+                      .set(selection.first),
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'Fire TV 版では安定再生のため、TV 視聴・録画再生ともに常にモバイル画質を使用します'
-                  '（モバイル画質が存在しない番組のみ元画質にフォールバックします）。',
+                  'TV 視聴・録画再生で個別に画質を選ばなかったときに使われる既定の画質です'
+                  '（モバイル画質がない番組は元画質で再生します）。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
             ),
           ),
           const SizedBox(height: 8),
-          ListTile(
-            title: const Text('録画のバッファ時間（先読み）'),
-            subtitle: Text(
-              '設定: ${formatBufferDurationLabel(recordedBufferSeconds)} '
-              '（1分以上は内蔵ストレージ一時キャッシュを使用・最大60分。'
-              '30〜60分はモバイル回線のギガ消費にご注意ください）',
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  formatBufferDurationLabel(recordedBufferSeconds),
-                  style: Theme.of(context).textTheme.labelLarge,
-                ),
-                const SizedBox(width: 4),
-                const Icon(Icons.chevron_right),
-              ],
-            ),
-            onTap: () => _pickBufferDuration(
-              title: '録画のバッファ時間（先読み）',
-              description:
-                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低512MB空き残存）。',
-              options: recordedBufferOptionsSeconds,
-              current: recordedBufferSeconds,
-              recommendedSeconds: defaultRecordedBufferSeconds,
-              onSelected: (value) =>
-                  ref.read(recordedBufferSecondsProvider.notifier).set(value),
-            ),
-          ),
           ListTile(
             title: const Text('Live のバッファ時間（遅延再生）'),
             subtitle: Text(
@@ -283,6 +271,33 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               current: liveBufferSeconds,
               onSelected: (value) =>
                   ref.read(liveBufferSecondsProvider.notifier).set(value),
+            ),
+          ),
+          ListTile(
+            title: const Text('録画のバッファ時間（先読み）'),
+            subtitle: Text(
+              '設定: ${formatBufferDurationLabel(recordedBufferSeconds)} '
+              '（1分以上は内蔵ストレージ一時キャッシュを使用・最大60分）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  formatBufferDurationLabel(recordedBufferSeconds),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickBufferDuration(
+              title: '録画のバッファ時間（先読み）',
+              description:
+                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低512MB空き残存）。',
+              options: recordedBufferOptionsSeconds,
+              current: recordedBufferSeconds,
+              onSelected: (value) =>
+                  ref.read(recordedBufferSecondsProvider.notifier).set(value),
             ),
           ),
           const Divider(),
@@ -522,7 +537,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     required String description,
     required List<int> options,
     required int current,
-    int? recommendedSeconds,
     required Future<void> Function(int value) onSelected,
   }) async {
     final chosen = await showDialog<int>(
@@ -546,10 +560,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   builder: (focusContext) {
                     final focused = Focus.of(focusContext).hasFocus;
                     final label = formatBufferDurationLabel(opt);
-                    final suffix =
-                        recommendedSeconds != null && opt == recommendedSeconds
-                        ? '（車載おすすめ）'
-                        : '';
                     return Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 8,
@@ -570,7 +580,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                             size: 20,
                           ),
                           const SizedBox(width: 12),
-                          Expanded(child: Text('$label$suffix')),
+                          Expanded(child: Text(label)),
                         ],
                       ),
                     );

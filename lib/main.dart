@@ -63,15 +63,29 @@ Future<void> main() async {
   );
 }
 
-class TmhbApp extends StatelessWidget {
+class TmhbApp extends ConsumerWidget {
   const TmhbApp({super.key});
 
-  static ThemeData _buildTheme() {
-    final scheme = ColorScheme.fromSeed(seedColor: Colors.indigo);
-    const focusBorder = BorderSide(color: Colors.amber, width: 3);
+  static ThemeData _buildTheme(Brightness brightness) {
+    final isDark = brightness == Brightness.dark;
+    final scheme = isDark
+        ? ColorScheme.fromSeed(
+            seedColor: Colors.indigo,
+            brightness: Brightness.dark,
+            surface: const Color(0xFF121418),
+          )
+        : ColorScheme.fromSeed(seedColor: Colors.indigo);
+    final focusBorder = BorderSide(
+      color: isDark ? Colors.amberAccent : Colors.amber,
+      width: 3,
+    );
     return ThemeData(
+      brightness: brightness,
       colorScheme: scheme,
-      focusColor: Colors.amber.withValues(alpha: 0.28),
+      scaffoldBackgroundColor: isDark ? const Color(0xFF0E1014) : null,
+      focusColor: (isDark ? Colors.amberAccent : Colors.amber).withValues(
+        alpha: 0.28,
+      ),
       listTileTheme: ListTileThemeData(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
@@ -111,11 +125,21 @@ class TmhbApp extends StatelessWidget {
           ),
         ),
       ),
+      segmentedButtonTheme: SegmentedButtonThemeData(
+        style: ButtonStyle(
+          side: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.focused)
+                ? focusBorder
+                : BorderSide(color: scheme.outline),
+          ),
+        ),
+      ),
     );
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final nightMode = ref.watch(nightModeProvider);
     return MaterialApp(
       title: 'torne HB FireTV',
       // Force Japanese locale so Fire OS fonts.xml picks NotoSansCJK JP
@@ -129,7 +153,9 @@ class TmhbApp extends StatelessWidget {
         style: const TextStyle(locale: Locale('ja', 'JP')),
         child: KeyboardDismissOnTap(child: child ?? const SizedBox.shrink()),
       ),
-      theme: _buildTheme(),
+      theme: _buildTheme(Brightness.light),
+      darkTheme: _buildTheme(Brightness.dark),
+      themeMode: nightMode ? ThemeMode.dark : ThemeMode.light,
       home: const AppShell(),
     );
   }

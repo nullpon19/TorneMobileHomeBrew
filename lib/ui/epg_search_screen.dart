@@ -45,7 +45,6 @@ class EpgSearchScreen extends ConsumerStatefulWidget {
 
 class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   final _queryController = TextEditingController();
-  String _query = '';
 
   /// The query the results actually reflect (plan 98):
   /// keystrokes land here only once typing settles for
@@ -72,7 +71,6 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   }
 
   void _onQueryChanged(String value) {
-    setState(() => _query = value);
     _debounce?.cancel();
     _debounce = Timer(queryDebounce, () {
       if (mounted) setState(() => _appliedQuery = value);
@@ -82,10 +80,7 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
   void _clearQuery() {
     _debounce?.cancel();
     _queryController.clear();
-    setState(() {
-      _query = '';
-      _appliedQuery = '';
-    });
+    setState(() => _appliedQuery = '');
   }
 
   EpgSearchIndex _indexFor(EpgGuide? terrestrial, EpgGuide? bs) {
@@ -122,23 +117,14 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: TextField(
+            child: FireTvTextInputField(
               controller: _queryController,
-              autofocus: true,
-              decoration: InputDecoration(
-                labelText: 'キーワード',
-                hintText: '番組名・内容・出演者など',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        tooltip: 'クリア',
-                        onPressed: _clearQuery,
-                      ),
-                border: const OutlineInputBorder(),
-              ),
-              onChanged: _onQueryChanged,
+              labelText: 'キーワード',
+              hintText: '番組名・内容・出演者など',
+              dialogTitle: 'キーワードを入力',
+              prefixIcon: Icons.search,
+              showClearButton: true,
+              onChanged: (v) => v.isEmpty ? _clearQuery() : _onQueryChanged(v),
             ),
           ),
           Padding(

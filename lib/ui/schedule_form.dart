@@ -309,15 +309,12 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           ],
         ),
         const SizedBox(height: 8),
-        TextField(
+        FireTvTextInputField(
           controller: _durationMinutes,
-          decoration: const InputDecoration(
-            labelText: '長さ (分)',
-            suffixText: '分',
-          ),
+          labelText: '長さ (分)',
+          hintText: '分数を入力',
+          suffixText: '分',
           keyboardType: TextInputType.number,
-          textInputAction: TextInputAction.done,
-          onSubmitted: (_) => FocusScope.of(context).unfocus(),
         ),
         const SizedBox(height: 16),
         _qualityField(),
@@ -572,18 +569,16 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           value: _priority,
           onChanged: (v) => setState(() => _priority = v),
         ),
-        TextField(
+        FireTvTextInputField(
           controller: _condition,
-          decoration: const InputDecoration(labelText: '条件 ID'),
-          textInputAction: TextInputAction.done,
-          onSubmitted: (_) => FocusScope.of(context).unfocus(),
+          labelText: '条件 ID',
+          hintText: '決定キーで入力',
         ),
         const SizedBox(height: 16),
-        TextField(
+        FireTvTextInputField(
           controller: _destination,
-          decoration: const InputDecoration(labelText: '録画先'),
-          textInputAction: TextInputAction.done,
-          onSubmitted: (_) => FocusScope.of(context).unfocus(),
+          labelText: '録画先',
+          hintText: '決定キーで入力',
         ),
         const SizedBox(height: 24),
         FilledButton(

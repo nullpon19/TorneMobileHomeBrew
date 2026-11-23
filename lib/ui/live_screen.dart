@@ -366,6 +366,11 @@ class LiveChannelDetailView extends ConsumerStatefulWidget {
 }
 
 class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
+  /// Optional per-visit quality override (`false` = original, `true` = mobile).
+  /// Null until changed on this detail screen; falls back to the saved
+  /// settings default without overwriting it.
+  bool? _useMobileChoice;
+
   /// A viewing start is in flight (plan 35 guard, shared with
   /// recordings): while set, the button is disabled and _watch
   /// is re-entrancy-guarded.
@@ -375,9 +380,23 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
   LiveChannel get channel => widget.channel;
 
   @override
+  void didUpdateWidget(covariant LiveChannelDetailView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.channel.id != widget.channel.id) {
+      _useMobileChoice = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final ch = channel;
     final mobileRes = ch.mobileRes;
+    final originalRes = ch.originalRes;
+    final bool useMobile =
+        _useMobileChoice ?? ref.watch(playbackQualityProvider);
+    final originalLabel = originalRes?.quality == null
+        ? '元画質'
+        : '元画質 (${resQualityLabel(originalRes!.quality)})';
     final start = ch.programStart;
     final end = ch.programEnd;
     return ListView(
@@ -413,9 +432,14 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
               label: const Text('視聴'),
             ),
             if (mobileRes != null)
-              Text(
-                '画質: モバイル固定',
-                style: Theme.of(context).textTheme.bodySmall,
+              SegmentedButton<bool>(
+                segments: [
+                  ButtonSegment(value: false, label: Text(originalLabel)),
+                  const ButtonSegment(value: true, label: Text('モバイル')),
+                ],
+                selected: {useMobile},
+                onSelectionChanged: (selection) =>
+                    setState(() => _useMobileChoice = selection.first),
               ),
           ],
         ),
@@ -452,7 +476,11 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
       showSnack(context, '視聴可能なコンテンツがありません');
       return;
     }
-    final res = channel.mobileRes ?? channel.originalRes ?? channel.res.first;
+    final bool useMobile =
+        _useMobileChoice ?? ref.read(playbackQualityProvider);
+    final res = useMobile
+        ? (channel.mobileRes ?? channel.originalRes ?? channel.res.first)
+        : (channel.originalRes ?? channel.mobileRes ?? channel.res.first);
     setState(() => _starting = true);
     try {
       await startPlaybackAndShowPlayer(

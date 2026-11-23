@@ -200,27 +200,34 @@ final hiddenEpgGenresProvider =
       HiddenEpgGenresNotifier.new,
     );
 
-/// Fire TV provisional build fixes playback quality to mobile
-/// (true = mobile transcode) to avoid 32-bit Fire TV hardware
-/// decode stalls on DR streams.
+/// Default playback quality preference: `false` = original quality (`元画質`),
+/// `true` = mobile transcode (`モバイル`). Per-title / per-channel choices on
+/// the detail screens override only that playback session without mutating
+/// this default.
 class PlaybackQualityNotifier extends Notifier<bool> {
-  static const _key = 'playback_use_mobile';
+  static const _key = 'firetv_default_use_mobile';
+  bool _dirty = false;
 
   @override
   bool build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
-      if (value != 'true') {
-        await store.write(_key, 'true');
+      if (_dirty) return;
+      if (value == 'true' && !state) {
+        state = true;
+      } else if (value == 'false' && state) {
+        state = false;
       }
     });
-    return true;
+    return false;
   }
 
   Future<void> set(bool useMobile) async {
-    state = true;
-    await ref.read(keyValueStoreProvider).write(_key, 'true');
+    _dirty = true;
+    state = useMobile;
+    await ref.read(keyValueStoreProvider).write(_key, '$useMobile');
   }
 }
 
@@ -298,6 +305,38 @@ final liveBufferSecondsProvider =
     NotifierProvider<LiveBufferSecondsNotifier, int>(
       LiveBufferSecondsNotifier.new,
     );
+
+/// Persisted night mode preference (dark theme toggle, default off = light).
+class NightModeNotifier extends Notifier<bool> {
+  static const _key = 'firetv_night_mode';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      if (raw == 'true' && !state) {
+        state = true;
+      } else if (raw == 'false' && state) {
+        state = false;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final nightModeProvider = NotifierProvider<NightModeNotifier, bool>(
+  NightModeNotifier.new,
+);
 
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.

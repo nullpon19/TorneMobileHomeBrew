@@ -442,23 +442,12 @@ class _TitleListState extends ConsumerState<_TitleList> {
           ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: TextField(
+          child: FireTvTextInputField(
             controller: _searchController,
-            decoration: InputDecoration(
-              prefixIcon: const Icon(Icons.search),
-              hintText: 'タイトルで検索',
-              suffixIcon: _query.isEmpty
-                  ? null
-                  : IconButton(
-                      icon: const Icon(Icons.clear),
-                      tooltip: '検索をクリア',
-                      onPressed: () => setState(() {
-                        _searchController.clear();
-                        _query = '';
-                      }),
-                    ),
-            ),
-            textInputAction: TextInputAction.search,
+            prefixIcon: Icons.search,
+            hintText: 'タイトルで検索',
+            dialogTitle: 'タイトルで検索',
+            showClearButton: true,
             onChanged: (value) => setState(() => _query = value),
           ),
         ),
@@ -830,8 +819,8 @@ class TitleDetailPage extends ConsumerWidget {
 /// The title detail optimized for Fire TV D-pad navigation:
 /// 1/4-width thumbnail + 3/4-width title & key metadata on top,
 /// action buttons immediately underneath, and long programme text
-/// truncated so buttons never scroll off-screen. Playback quality is
-/// fixed to mobile (falling back when a title has no mobile res).
+/// truncated so buttons never scroll off-screen. Defaults to the
+/// saved playback quality setting and allows per-visit override.
 class TitleDetailView extends ConsumerStatefulWidget {
   const TitleDetailView({
     super.key,
@@ -858,6 +847,11 @@ class TitleDetailView extends ConsumerStatefulWidget {
 }
 
 class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
+  /// Optional per-visit quality override (`false` = original, `true` = mobile).
+  /// Null until changed on this detail screen; falls back to the saved
+  /// settings default without overwriting it.
+  bool? _useMobileChoice;
+
   /// A playback start is in flight (plan 35). Starting takes a
   /// second or more (credentials -> HEAD -> AKE -> proxy); the
   /// build-13 field log showed a second tap in that window
@@ -875,6 +869,14 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
 
   RegisteredNasne get reg => widget.reg;
   RecordedTitle get title => widget.title;
+
+  @override
+  void didUpdateWidget(covariant TitleDetailView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.title.id != widget.title.id) {
+      _useMobileChoice = null;
+    }
+  }
 
   Future<void> _toggleProtection(bool protect) async {
     setState(() => _protectBusy = true);
@@ -900,6 +902,12 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
     final credentialsMissing =
         credentialSummary.hasValue && credentialSummary.value == null;
     final mobileRes = t.mobileRes;
+    final originalRes = t.originalRes;
+    final bool useMobile =
+        _useMobileChoice ?? ref.watch(playbackQualityProvider);
+    final originalLabel = originalRes?.quality == null
+        ? '元画質'
+        : '元画質 (${resQualityLabel(originalRes!.quality)})';
     final channelText = t.channelName ?? channelDisplayName(channels, t.channel);
     final metaParts = <String>[
       if (t.scheduledStart != null)
@@ -994,9 +1002,14 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
               ),
             ),
             if (mobileRes != null)
-              Text(
-                '画質: モバイル固定',
-                style: Theme.of(context).textTheme.bodySmall,
+              SegmentedButton<bool>(
+                segments: [
+                  ButtonSegment(value: false, label: Text(originalLabel)),
+                  const ButtonSegment(value: true, label: Text('モバイル')),
+                ],
+                selected: {useMobile},
+                onSelectionChanged: (selection) =>
+                    setState(() => _useMobileChoice = selection.first),
               ),
           ],
         ),
@@ -1028,8 +1041,11 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
       showSnack(context, '再生可能なコンテンツがありません');
       return;
     }
-    // Always prefer mobile quality on Fire TV.
-    final res = title.mobileRes ?? title.originalRes ?? title.res.first;
+    final bool useMobile =
+        _useMobileChoice ?? ref.read(playbackQualityProvider);
+    final res = useMobile
+        ? (title.mobileRes ?? title.originalRes ?? title.res.first)
+        : (title.originalRes ?? title.mobileRes ?? title.res.first);
     // Resume (plan 86): a title the viewer stopped midway offers
     // its recorded position. Ask before starting — beginning a
     // session is the expensive step, and the choice belongs
