@@ -171,7 +171,8 @@
 library;
 
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show Directory, Platform;
+import 'dart:math' as math;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -213,6 +214,7 @@ class PlayerScreen extends ConsumerStatefulWidget {
     required this.session,
     this.live = false,
     this.initialStart,
+    this.knownDuration,
     this.onResumePosition,
     this.loadChapters,
   });
@@ -235,6 +237,10 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// so the proxy's time-seek path establishes the stream at
   /// that position from the first byte.
   final Duration? initialStart;
+
+  /// Total programme duration from nasne metadata, used as a fallback when
+  /// mpv has not yet settled [PlayerState.duration] on stream start.
+  final Duration? knownDuration;
 
   /// Where the position a recording was stopped at goes when
   /// this screen closes (plan 102): the unit is told, so its
@@ -292,6 +298,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _interrupted = false;
   String? _interruptDetail;
   Timer? _stallTimer;
+  Timer? _autoResumeTimer;
+  Timer? _resumeWatchdogTimer;
+  int _autoResumeAttempts = 0;
+  int _autoResumeCountdown = 0;
+  bool _autoResumeDisabled = false;
 
   /// The latest value of the playing stream (unlike
   /// [_playing], which latches once playback has started),
@@ -367,11 +378,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// error normally surfaces first and this stays a backstop.
   static const Duration startTimeout = Duration(seconds: 45);
 
-  /// mpv's network timeout, set before opening (plan 30). The
-  /// factory default of 5 s is shorter than a slow path's time to
-  /// first byte even with the streaming proxy.
-  static const int mpvNetworkTimeoutSeconds = 30;
-
   /// The diagnostics log and Fire TV helper, captured in [initState]
   /// (plan 104): dispose and the teardown it drives read no
   /// provider through ref — Riverpod 3 throws once the
@@ -382,6 +388,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
   final FocusNode _osdFirstFocusNode = FocusNode(debugLabel: 'playerOsdFirst');
+  final FocusNode _resumeButtonFocusNode = FocusNode(
+    debugLabel: 'playerResumeButton',
+  );
+  final FocusNode _closeBannerFocusNode = FocusNode(
+    debugLabel: 'playerCloseBannerButton',
+  );
+  final FocusNode _errorBackFocusNode = FocusNode(
+    debugLabel: 'playerErrorBack',
+  );
 
   bool _osdOpen = false;
   Timer? _osdTimer;
@@ -390,12 +405,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   String? _hudText;
   Timer? _hudTimer;
 
+  bool _seekHudVisible = false;
+  IconData? _seekHudIcon;
+  String? _seekHudActionLabel;
+  Timer? _seekHudTimer;
+
   Timer? _seekDebounceTimer;
   Duration _pendingSeekOffset = Duration.zero;
   Duration? _seekBasePosition;
+  Duration? _committedSeekTarget;
+  Timer? _committedSeekHoldTimer;
+
+  Duration _duration = Duration.zero;
+  Duration _bufferEndPosition = Duration.zero;
+  double _bufferedAheadSeconds = 0.0;
+  MpvBufferPlan? _bufferPlan;
+  Directory? _usedDiskCacheDir;
 
   static const Duration _rewindStep = Duration(seconds: -10);
   static const Duration _forwardStep = Duration(seconds: 30);
+  static const List<int> _autoResumeBackoffSeconds = [3, 5, 8, 10];
 
   void _onVideoRectChanged() {
     final r = _videoController.rect.value;
@@ -443,6 +472,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         }
         if (playing) {
           _watchdog?.cancel();
+          _resumeWatchdogTimer?.cancel();
+          _autoResumeTimer?.cancel();
+          _autoResumeCountdown = 0;
+          _autoResumeDisabled = false;
+          if (!_buffering) {
+            _autoResumeAttempts = 0;
+          }
           // A (re)start clears any interruption state
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
@@ -462,6 +498,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           // mpv stopped (plan 80); buffering clearing again
           // while playing is a recovery and clears it.
           _bufferingSincePlaying = buffering;
+        }
+        if (!buffering && _playingNow) {
+          _autoResumeAttempts = 0;
         }
         if (mounted && _buffering != buffering) {
           setState(() => _buffering = buffering);
@@ -486,6 +525,31 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _subscriptions.add(
       _player.stream.position.listen((position) {
         _lastPosition = position;
+        final committed = _committedSeekTarget;
+        if (committed != null &&
+            (position - committed).abs() <= const Duration(seconds: 2)) {
+          _committedSeekTarget = null;
+          _committedSeekHoldTimer?.cancel();
+          if (_seekHudVisible && mounted) setState(() {});
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.duration.listen((duration) {
+        if (duration > Duration.zero && duration != _duration) {
+          if (mounted) {
+            setState(() => _duration = duration);
+          } else {
+            _duration = duration;
+          }
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.buffer.listen((bufferEnd) {
+        if (bufferEnd != _bufferEndPosition) {
+          _bufferEndPosition = bufferEnd;
+        }
       }),
     );
     _subscriptions.add(
@@ -556,31 +620,82 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           // Keep the frozen frame and offer the in-place
           // resume instead of replacing the screen with the
           // start-failure message.
-          setState(() {
-            _interrupted = true;
-            _interruptDetail = error;
-          });
+          _enterInterruptedState(error);
         } else if (_error == null) {
-          setState(() => _error = error);
+          _setStartError(error);
         }
       }),
     );
     _observeSeekable();
+    _observeCacheDuration();
     _open();
     _loadChapters();
   }
 
-  void _onStartTimeout() {
-    if (!mounted || _playing || _error != null) return;
+  void _setStartError(String error) {
+    if (!mounted) return;
+    setState(() => _error = error);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _error != null && _errorBackFocusNode.canRequestFocus) {
+        _errorBackFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _enterInterruptedState(String? detail) {
+    if (!mounted) return;
+    setState(() {
+      _interrupted = true;
+      if (detail != null) _interruptDetail = detail;
+    });
+    _scheduleAutoResume();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          _interrupted &&
+          _resumeButtonFocusNode.canRequestFocus) {
+        _resumeButtonFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _scheduleAutoResume() {
+    _autoResumeTimer?.cancel();
+    if (_autoResumeDisabled || !_interrupted || !mounted) return;
+    final delaySec = _autoResumeBackoffSeconds[
+        math.min(_autoResumeAttempts, _autoResumeBackoffSeconds.length - 1)];
+    _autoResumeAttempts++;
+    setState(() => _autoResumeCountdown = delaySec);
     _diag(
       DiagCategory.playback,
-      'player: no playback within ${startTimeout.inSeconds} seconds; '
+      'player: scheduling auto-resume attempt $_autoResumeAttempts in ${delaySec}s',
+    );
+    _autoResumeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || !_interrupted || _autoResumeDisabled) {
+        timer.cancel();
+        return;
+      }
+      if (_autoResumeCountdown <= 1) {
+        timer.cancel();
+        if (mounted) {
+          setState(() => _autoResumeCountdown = 0);
+        }
+        unawaited(_resume());
+      } else {
+        setState(() => _autoResumeCountdown--);
+      }
+    });
+  }
+
+  void _onStartTimeout() {
+    if (!mounted || _playing || _error != null) return;
+    final timeoutSec = _bufferPlan?.startTimeoutSeconds ?? startTimeout.inSeconds;
+    _diag(
+      DiagCategory.playback,
+      'player: no playback within $timeoutSec seconds; '
       'showing a timeout error',
     );
-    setState(
-      () => _error =
-          '再生が開始できませんでした (${startTimeout.inSeconds} 秒以内に'
-          '映像が届きませんでした)。',
+    _setStartError(
+      '再生が開始できませんでした ($timeoutSec 秒以内に映像が届きませんでした)。',
     );
   }
 
@@ -615,20 +730,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: playback did not recover; showing the '
       'interruption notice (plan 80)',
     );
-    setState(() => _interrupted = true);
+    _enterInterruptedState(null);
   }
 
-  /// Re-establishes playback after an interruption, in
-  /// place (plan 80): the session — authentication, the
-  /// loopback proxy and all — is still alive (only leaving
-  /// the screen stops it), so resuming re-opens the same
-  /// stream URL on the same player and, for a recording,
-  /// starts from the last observed position. The title is
-  /// never re-opened from the list, and nothing is
-  /// re-asked. The player's properties (cache mode, sid)
-  /// persist across the re-open; the track listener
-  /// re-applies the caption selection when the new track
-  /// list settles, exactly as at the first open.
   Future<void> _resume() async {
     _diag(
       DiagCategory.playback,
@@ -636,10 +740,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       '${_lastPosition.inSeconds}s (live=${widget.live})',
     );
     _stallTimer?.cancel();
+    _autoResumeTimer?.cancel();
+    _resumeWatchdogTimer?.cancel();
     setState(() {
+      _autoResumeDisabled = false;
+      _autoResumeCountdown = 0;
       _interrupted = false;
       _interruptDetail = null;
       _buffering = true;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _rootFocusNode.canRequestFocus) {
+        _rootFocusNode.requestFocus();
+      }
+    });
+    _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
+      if (!mounted || _playingNow || _completed || _interrupted || _error != null) {
+        return;
+      }
+      _enterInterruptedState('再接続がタイムアウトしました。電波状況を確認して再試行します。');
     });
     try {
       await _player.setVolume(100.0);
@@ -655,12 +774,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
       _diag(DiagCategory.playback, 'player: resume failed: $e');
-      if (mounted) {
-        setState(() {
-          _interrupted = true;
-          _interruptDetail = '$e';
-        });
-      }
+      _resumeWatchdogTimer?.cancel();
+      _enterInterruptedState('$e');
     }
   }
 
@@ -759,6 +874,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
+  Future<void> _observeCacheDuration() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      await platform.observeProperty('demuxer-cache-duration', (value) async {
+        final parsed = double.tryParse(value);
+        if (parsed == null || parsed.isNaN || parsed.isInfinite) return;
+        final clamped = math.max(0.0, parsed);
+        final prevFloor = _bufferedAheadSeconds.floor();
+        _bufferedAheadSeconds = clamped;
+        final waitingForInitial =
+            (_bufferPlan?.cachePauseInitial ?? false) &&
+            (!_hasVideoFrame || _buffering || !_playing);
+        if (mounted &&
+            clamped.floor() != prevFloor &&
+            (_osdOpen || _seekHudVisible || waitingForInitial)) {
+          setState(() {});
+        }
+      });
+    } catch (e) {
+      _diag(
+        DiagCategory.playback,
+        'player: demuxer-cache-duration observation failed: $e',
+      );
+    }
+  }
+
   /// Loads the recording's chapter points once (plan
   /// 112). Runs beside the open, not before it: playback
   /// starts without waiting, and the chapter controls
@@ -807,6 +949,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: chapter seek ${forward ? 'next' : 'previous'} '
       'to ${target.inSeconds}s (plan 112)',
     );
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (_seekHudVisible && mounted) setState(() {});
+    });
+    _showSeekHud(
+      forward ? Icons.fast_forward : Icons.fast_rewind,
+      forward ? '次チャプター' : '前チャプター',
+    );
     try {
       await _player.seek(target);
     } catch (e) {
@@ -817,49 +969,73 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Future<void> _open() async {
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
     try {
+      final bufferSeconds = !widget.live
+          ? ref.read(recordedBufferSecondsProvider)
+          : ref.read(liveBufferSecondsProvider);
+      final cacheDir = ref.read(mpvCacheDirectoryProvider);
+      final availableDiskBytes =
+          (bufferSeconds >= 60 && Platform.isAndroid)
+          ? await _fireTvHelper.getCacheAvailableBytes()
+          : null;
+      final plan = computeMpvBufferPlan(
+        live: widget.live,
+        bufferSeconds: bufferSeconds,
+        isAndroid: Platform.isAndroid,
+        availableDiskBytes: availableDiskBytes,
+        cacheDirPath: cacheDir?.path,
+      );
+      if (!mounted) return;
+      _bufferPlan = plan;
+      _usedDiskCacheDir = plan.useDiskCache ? cacheDir : null;
+      _watchdog?.cancel();
+      _watchdog = Timer(
+        Duration(seconds: plan.startTimeoutSeconds),
+        _onStartTimeout,
+      );
+
       final platform = _player.platform;
       if (platform is NativePlayer) {
         await platform.setProperty(
           'network-timeout',
-          '$mpvNetworkTimeoutSeconds',
+          '${plan.networkTimeoutSeconds}',
         );
-        _diag(
-          DiagCategory.playback,
-          'player: mpv network-timeout set to '
-          '${mpvNetworkTimeoutSeconds}s',
-        );
-        // Captions default to off (plan 53): pin the subtitle
-        // selection to "no track" before the stream opens, so
-        // mpv's auto-selection never gets a say. The tracks
-        // listener re-applies the resolution once the demuxer's
-        // track list settles.
         await platform.setProperty('sid', 'no');
-        _diag(DiagCategory.playback, 'player: mpv sid pinned to no (default)');
-        // mpv's cache follows the playback kind (plans 54
-        // and 80; see player_cache_policy). Live keeps it
-        // off: with the demuxer cache on, an audio track
-        // switch on the unseekable live stream never
-        // re-engages decoding (measured 30 s and counting),
-        // and the proxy's prefetch queue is the jitter
-        // buffer. Recordings turn it on, sized by the two
-        // demuxer limits, so the demuxer's probe and seek
-        // re-reads (plan 78.1) are absorbed locally instead
-        // of round-tripping the proxy per hop.
-        final cacheMode = mpvCacheMode(live: widget.live);
-        await platform.setProperty('cache', cacheMode);
-        if (!widget.live) {
+        await platform.setProperty('cache', plan.useCache ? 'yes' : 'no');
+        if (plan.useCache) {
           await platform.setProperty(
             'demuxer-max-bytes',
-            '${effectiveRecordingDemuxerMaxBytes(isAndroid: Platform.isAndroid)}',
+            '${plan.demuxerMaxBytes}',
           );
           await platform.setProperty(
             'demuxer-max-back-bytes',
-            '${effectiveRecordingDemuxerMaxBackBytes(isAndroid: Platform.isAndroid)}',
+            '${plan.demuxerMaxBackBytes}',
           );
+          await platform.setProperty(
+            'demuxer-readahead-secs',
+            '${plan.readaheadSeconds}',
+          );
+          await platform.setProperty('cache-pause', 'yes');
+          await platform.setProperty(
+            'cache-pause-initial',
+            plan.cachePauseInitial ? 'yes' : 'no',
+          );
+          if (plan.cachePauseWaitSeconds > 0) {
+            await platform.setProperty(
+              'cache-pause-wait',
+              '${plan.cachePauseWaitSeconds}',
+            );
+          }
+          if (plan.useDiskCache && plan.cacheDirPath != null) {
+            await platform.setProperty('cache-on-disk', 'yes');
+            await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
+          }
         }
         _diag(
           DiagCategory.playback,
-          'player: mpv cache=$cacheMode (live=${widget.live})',
+          'player: mpv buffer plan: target=${plan.configuredSeconds}s '
+          'cache=${plan.useCache} disk=${plan.useDiskCache} '
+          'maxBytes=${plan.demuxerMaxBytes} back=${plan.demuxerMaxBackBytes} '
+          'wait=${plan.cachePauseWaitSeconds}s netTimeout=${plan.networkTimeoutSeconds}s',
         );
       }
       final start =
@@ -894,7 +1070,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         return;
       }
       _watchdog?.cancel();
-      if (mounted) setState(() => _error = '$e');
+      _setStartError('$e');
     }
   }
 
@@ -961,6 +1137,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dispose on leaving failed: $e');
     }
+    final cacheDir = _usedDiskCacheDir;
+    if (cacheDir != null) {
+      try {
+        if (await cacheDir.exists()) {
+          await for (final entry in cacheDir.list()) {
+            await entry.delete(recursive: true);
+          }
+        }
+      } catch (_) {}
+    }
   }
 
   /// Stops the playback session (plan 104): closes the
@@ -992,14 +1178,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
+        (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
+        (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
+        (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
         (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
+        (
+          name: 'seek hold timer',
+          run: () => _committedSeekHoldTimer?.cancel(),
+        ),
         (
           name: 'focus nodes',
           run: () {
             _rootFocusNode.dispose();
             _osdFirstFocusNode.dispose();
+            _resumeButtonFocusNode.dispose();
+            _closeBannerFocusNode.dispose();
+            _errorBackFocusNode.dispose();
           },
         ),
         (
@@ -1101,33 +1297,71 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
   }
 
+  Duration get _effectiveDuration =>
+      _duration > Duration.zero ? _duration : (widget.knownDuration ?? Duration.zero);
+
+  Duration? get _seekHudPositionOverride {
+    if (_seekBasePosition != null) {
+      return skipSeekTarget(
+        position: _seekBasePosition!,
+        offset: _pendingSeekOffset,
+        duration: _effectiveDuration,
+      );
+    }
+    return _committedSeekTarget;
+  }
+
+  String _formatSeekDelta(int totalSec) {
+    final sign = totalSec >= 0 ? '+' : '-';
+    final absSec = totalSec.abs();
+    final min = absSec ~/ 60;
+    final sec = absSec % 60;
+    if (min > 0 && sec > 0) return '$sign$min分$sec秒';
+    if (min > 0) return '$sign$min分';
+    return '$sign$absSec秒';
+  }
+
+  void _showSeekHud(IconData icon, String actionLabel) {
+    _seekHudTimer?.cancel();
+    setState(() {
+      _seekHudVisible = true;
+      _seekHudIcon = icon;
+      _seekHudActionLabel = actionLabel;
+    });
+    _seekHudTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _seekHudVisible = false;
+          _seekHudIcon = null;
+          _seekHudActionLabel = null;
+        });
+      }
+    });
+  }
+
   void _togglePlayPauseWithHud() {
     final willPlay = !_playingNow;
     unawaited(_player.playOrPause());
-    _showHudMessage(
-      willPlay ? Icons.play_arrow : Icons.pause,
-      willPlay ? '再生' : '一時停止',
-    );
+    if (widget.live) {
+      _showHudMessage(
+        willPlay ? Icons.play_arrow : Icons.pause,
+        willPlay ? '再生' : '一時停止',
+      );
+    } else {
+      _showSeekHud(
+        willPlay ? Icons.play_arrow : Icons.pause,
+        willPlay ? '再生' : '一時停止',
+      );
+    }
   }
 
   void _queueRelativeSeek(Duration delta) {
     if (widget.live) return;
-    _seekBasePosition ??= _player.state.position;
+    _seekBasePosition ??= _committedSeekTarget ?? _player.state.position;
     _pendingSeekOffset += delta;
-    final duration = _player.state.duration;
-    final preview = skipSeekTarget(
-      position: _seekBasePosition!,
-      offset: _pendingSeekOffset,
-      duration: duration,
-    );
-    final totalSec = _pendingSeekOffset.inSeconds;
-    final sign = totalSec >= 0 ? '+' : '';
-    final timeInfo = duration > Duration.zero
-        ? '${_formatClock(preview)} / ${_formatClock(duration)}'
-        : _formatClock(preview);
-    _showHudMessage(
-      totalSec < 0 ? Icons.replay_10 : Icons.forward_30,
-      '$sign$totalSec秒 ($timeInfo)',
+    _showSeekHud(
+      _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_30,
+      _formatSeekDelta(_pendingSeekOffset.inSeconds),
     );
     _seekDebounceTimer?.cancel();
     _seekDebounceTimer = Timer(const Duration(milliseconds: 250), () {
@@ -1144,8 +1378,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     final target = skipSeekTarget(
       position: base,
       offset: offset,
-      duration: _player.state.duration,
+      duration: _effectiveDuration,
     );
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (_seekHudVisible && mounted) setState(() {});
+    });
     _diag(
       DiagCategory.playback,
       'player: dpad seek by ${offset.inSeconds}s to ${target.inSeconds}s',
@@ -1176,10 +1416,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
+    final key = event.logicalKey;
     if (_interrupted) {
+      if (event is KeyDownEvent &&
+          (key == LogicalKeyboardKey.select ||
+              key == LogicalKeyboardKey.enter ||
+              key == LogicalKeyboardKey.numpadEnter ||
+              key == LogicalKeyboardKey.gameButtonA ||
+              key == LogicalKeyboardKey.mediaPlayPause)) {
+        if (!_closeBannerFocusNode.hasFocus) {
+          unawaited(_resume());
+          return KeyEventResult.handled;
+        }
+      }
       return KeyEventResult.ignored;
     }
-    final key = event.logicalKey;
     if (_osdOpen) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
         _closeOsd();
@@ -1224,12 +1475,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
     if (key == LogicalKeyboardKey.mediaPlay) {
       unawaited(_player.play());
-      _showHudMessage(Icons.play_arrow, '再生');
+      if (widget.live) {
+        _showHudMessage(Icons.play_arrow, '再生');
+      } else {
+        _showSeekHud(Icons.play_arrow, '再生');
+      }
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.mediaPause) {
       unawaited(_player.pause());
-      _showHudMessage(Icons.pause, '一時停止');
+      if (widget.live) {
+        _showHudMessage(Icons.pause, '一時停止');
+      } else {
+        _showSeekHud(Icons.pause, '一時停止');
+      }
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.arrowUp ||
@@ -1289,6 +1548,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         ),
                         const SizedBox(height: 16),
                         FilledButton.icon(
+                          focusNode: _errorBackFocusNode,
                           autofocus: true,
                           onPressed: () => Navigator.of(context).pop(),
                           icon: const Icon(Icons.arrow_back),
@@ -1329,52 +1589,315 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         controller: _videoController,
                         controls: NoVideoControls,
                       ),
-                      if (loadingLabel != null)
-                        IgnorePointer(
-                          child: Center(
-                            child: DecoratedBox(
-                              decoration: const BoxDecoration(
-                                color: Colors.black54,
-                                borderRadius: BorderRadius.all(
-                                  Radius.circular(12),
-                                ),
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 20,
-                                  vertical: 14,
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Text(
-                                      loadingLabel,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
+                      if (loadingLabel != null) _buildLoadingOverlay(loadingLabel),
                       if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                      if (_seekHudVisible && !_osdOpen && !widget.live)
+                        _buildSeekHud(),
                       if (_osdOpen) _buildRemoteOsd(),
                       if (_interrupted) _buildInterruptionBanner(),
                     ],
                   ),
                 ),
               ),
+      ),
+    );
+  }
+
+  String _formatShortDurationSeconds(int seconds) {
+    if (seconds <= 0) return '0秒';
+    final min = seconds ~/ 60;
+    final sec = seconds % 60;
+    if (min > 0 && sec > 0) return '$min分$sec秒';
+    if (min > 0) return '$min分';
+    return '$sec秒';
+  }
+
+  Widget _buildLoadingOverlay(String fallbackLabel) {
+    final plan = _bufferPlan;
+    final showPreBuffer =
+        plan != null &&
+        plan.cachePauseInitial &&
+        plan.cachePauseWaitSeconds > 0 &&
+        (!_hasVideoFrame || !_playing);
+    final targetSec = showPreBuffer ? plan.cachePauseWaitSeconds : 0;
+    final curSec = showPreBuffer
+        ? _bufferedAheadSeconds.clamp(0.0, targetSec.toDouble()).floor()
+        : 0;
+    final progress = showPreBuffer && targetSec > 0
+        ? (curSec / targetSec).clamp(0.0, 1.0)
+        : null;
+    final caption = showPreBuffer
+        ? 'バッファ蓄積中… ${_formatShortDurationSeconds(curSec)} / ${_formatShortDurationSeconds(targetSec)}'
+        : fallbackLabel;
+    return IgnorePointer(
+      child: Center(
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            color: Colors.black87,
+            borderRadius: BorderRadius.all(Radius.circular(12)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      caption,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ],
+                ),
+                if (progress != null) ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: 220,
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      backgroundColor: Colors.white24,
+                      color: Colors.lightBlueAccent,
+                      minHeight: 5,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBufferBadge() {
+    final plan = _bufferPlan;
+    final aheadSec = _bufferedAheadSeconds.floor();
+    final targetSec = plan?.configuredSeconds ?? 0;
+    if (aheadSec <= 0 && targetSec <= 0) return const SizedBox.shrink();
+    final text = targetSec > 0
+        ? 'バッファ: ${_formatShortDurationSeconds(aheadSec)} / 設定 ${_formatShortDurationSeconds(targetSec)}'
+        : 'バッファ: ${_formatShortDurationSeconds(aheadSec)}';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.white12,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(color: Colors.white70, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _buildSeekBarSection({required bool isSeekingPreview}) {
+    return StreamBuilder<Duration>(
+      stream: _player.stream.position,
+      initialData: _lastPosition,
+      builder: (context, snapshot) {
+        final dur = _effectiveDuration;
+        final pos = _seekHudPositionOverride ?? (snapshot.data ?? _lastPosition);
+        final clampedPos = dur > Duration.zero && pos > dur
+            ? dur
+            : (pos.isNegative ? Duration.zero : pos);
+        final posFraction = dur > Duration.zero
+            ? (clampedPos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
+            : 0.0;
+        final aheadMillis =
+            _lastPosition.inMilliseconds +
+            (_bufferedAheadSeconds * 1000).round();
+        final maxBufferMillis = math.max(
+          _bufferEndPosition.inMilliseconds,
+          aheadMillis,
+        );
+        final bufferFraction = dur > Duration.zero
+            ? (maxBufferMillis / dur.inMilliseconds).clamp(posFraction, 1.0)
+            : posFraction;
+        final ticks = chapterTickFractions(chapters: _chapters, duration: dur);
+        final remaining = dur > clampedPos ? dur - clampedPos : Duration.zero;
+        final barColor = isSeekingPreview || _seekHudPositionOverride != null
+            ? Colors.amberAccent
+            : Colors.lightBlueAccent;
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SizedBox(
+              height: 18,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final width = constraints.maxWidth;
+                  final thumbLeft = (width * posFraction - 7)
+                      .clamp(0.0, math.max(0.0, width - 14))
+                      .toDouble();
+                  return Stack(
+                    alignment: Alignment.centerLeft,
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width,
+                          color: Colors.white24,
+                        ),
+                      ),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width * bufferFraction,
+                          color: Colors.white54,
+                        ),
+                      ),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          height: 8,
+                          width: width * posFraction,
+                          color: barColor,
+                        ),
+                      ),
+                      for (final tick in ticks)
+                        Positioned(
+                          left: (width * tick - 1)
+                              .clamp(0.0, math.max(0.0, width - 2))
+                              .toDouble(),
+                          top: 3,
+                          width: 2,
+                          height: 12,
+                          child: const ColoredBox(color: Colors.white70),
+                        ),
+                      Positioned(
+                        left: thumbLeft,
+                        top: 2,
+                        child: Container(
+                          width: 14,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.white,
+                            border: Border.all(color: barColor, width: 2.5),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Text(
+                  dur > Duration.zero
+                      ? '${_formatClock(clampedPos)} / ${_formatClock(dur)}'
+                      : _formatClock(clampedPos),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                if (dur > Duration.zero)
+                  Text(
+                    '残り -${_formatClock(remaining)}',
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSeekHud() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(28, 22, 28, 24),
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Colors.transparent, Colors.black87, Colors.black],
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.amberAccent),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_seekHudIcon != null) ...[
+                          Icon(
+                            _seekHudIcon,
+                            color: Colors.amberAccent,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 6),
+                        ],
+                        Text(
+                          _seekHudActionLabel ?? '',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  _buildBufferBadge(),
+                ],
+              ),
+              const SizedBox(height: 10),
+              _buildSeekBarSection(isSeekingPreview: true),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1466,6 +1989,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                   ),
                 ),
                 const SizedBox(width: 12),
+                _buildBufferBadge(),
+                const SizedBox(width: 8),
                 if (widget.live)
                   Container(
                     padding: const EdgeInsets.symmetric(
@@ -1484,46 +2009,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                  )
-                else
-                  StreamBuilder<Duration>(
-                    stream: _player.stream.position,
-                    initialData: _player.state.position,
-                    builder: (context, snapshot) {
-                      final pos = snapshot.data ?? Duration.zero;
-                      final dur = _player.state.duration;
-                      return Text(
-                        dur > Duration.zero
-                            ? '${_formatClock(pos)} / ${_formatClock(dur)}'
-                            : _formatClock(pos),
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                        ),
-                      );
-                    },
                   ),
               ],
             ),
             if (!widget.live) ...[
               const SizedBox(height: 8),
-              StreamBuilder<Duration>(
-                stream: _player.stream.position,
-                initialData: _player.state.position,
-                builder: (context, snapshot) {
-                  final pos = snapshot.data ?? Duration.zero;
-                  final dur = _player.state.duration;
-                  final value = dur > Duration.zero
-                      ? (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
-                      : 0.0;
-                  return LinearProgressIndicator(
-                    value: value,
-                    backgroundColor: Colors.white24,
-                    color: Colors.lightBlueAccent,
-                    minHeight: 6,
-                  );
-                },
-              ),
+              _buildSeekBarSection(isSeekingPreview: false),
             ],
             const SizedBox(height: 12),
             FocusTraversalGroup(
@@ -1641,16 +2132,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// (see [_resume]); the close button dismisses the notice
   /// and leaves the stopped frame as it is.
   Widget _buildInterruptionBanner() {
+    final countdownText = !_autoResumeDisabled && _autoResumeCountdown > 0
+        ? 'あと $_autoResumeCountdown 秒で自動再接続します…（$_autoResumeAttempts回目）'
+        : '電波復帰を待っています…（決定キーで今すぐ再開）';
     return Positioned(
       left: 0,
       right: 0,
       bottom: 0,
       child: Container(
         color: Colors.black87,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         child: Row(
           children: [
-            const Icon(Icons.error_outline, color: Colors.white),
+            const Icon(Icons.wifi_off, color: Colors.amberAccent),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -1662,6 +2156,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     style: TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    countdownText,
+                    style: const TextStyle(
+                      color: Colors.amberAccent,
+                      fontSize: 13,
                     ),
                   ),
                   if (_interruptDetail != null)
@@ -1678,15 +2180,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               ),
             ),
             const SizedBox(width: 12),
-            FilledButton(
-              autofocus: true,
-              onPressed: _resume,
-              child: const Text('再開'),
-            ),
-            IconButton(
-              tooltip: '閉じる',
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => setState(() => _interrupted = false),
+            FocusTraversalGroup(
+              child: Wrap(
+                spacing: 10,
+                children: [
+                  FilledButton.icon(
+                    focusNode: _resumeButtonFocusNode,
+                    autofocus: true,
+                    onPressed: _resume,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('今すぐ再開'),
+                  ),
+                  OutlinedButton.icon(
+                    focusNode: _closeBannerFocusNode,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                    onPressed: () {
+                      _autoResumeTimer?.cancel();
+                      setState(() {
+                        _autoResumeDisabled = true;
+                        _autoResumeCountdown = 0;
+                        _interrupted = false;
+                      });
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted && _rootFocusNode.canRequestFocus) {
+                          _rootFocusNode.requestFocus();
+                        }
+                      });
+                    },
+                    icon: const Icon(Icons.close, size: 18),
+                    label: const Text('閉じる'),
+                  ),
+                ],
+              ),
             ),
           ],
         ),

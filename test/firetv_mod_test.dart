@@ -15,9 +15,11 @@ import 'package:tmhb/app/firetv_preset.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
+import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/player_cache_policy.dart';
 import 'package:tmhb/ui/player_screen.dart';
+import 'package:tmhb/ui/settings_screen.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/titles_screen.dart';
 
@@ -497,6 +499,148 @@ void main() {
         androidProxyWindowCapBytes,
         lessThan(DtcpProxy.windowCapBytes),
       );
+    });
+  });
+
+  group('computeMpvBufferPlan & Settings buffer UI', () {
+    test('plans recorded RAM and disk cache up to 60 min safely', () {
+      final off = computeMpvBufferPlan(
+        live: false,
+        bufferSeconds: 0,
+        isAndroid: true,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(off.useCache, isTrue);
+      expect(off.useDiskCache, isFalse);
+      expect(off.demuxerMaxBytes, androidRecordingDemuxerMaxBytes);
+      expect(off.cachePauseInitial, isFalse);
+
+      final fiveMin = computeMpvBufferPlan(
+        live: false,
+        bufferSeconds: 300,
+        isAndroid: true,
+        availableDiskBytes: 6 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(fiveMin.useDiskCache, isTrue);
+      expect(fiveMin.cacheDirPath, '/tmp/mpv_cache');
+      expect(fiveMin.cachePauseInitial, isTrue);
+      expect(fiveMin.cachePauseWaitSeconds, 5);
+      expect(fiveMin.demuxerMaxBytes, 105 * 1024 * 1024);
+
+      final hour = computeMpvBufferPlan(
+        live: false,
+        bufferSeconds: 3600,
+        isAndroid: true,
+        availableDiskBytes: 6 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(hour.useDiskCache, isTrue);
+      expect(hour.demuxerMaxBytes, maxDiskCacheBytes);
+      expect(hour.demuxerMaxBackBytes, maxDiskBackCacheBytes);
+      expect(hour.networkTimeoutSeconds, 600);
+
+      // Clamps when available disk is tight, leaving >= 512 MiB free.
+      final tight = computeMpvBufferPlan(
+        live: false,
+        bufferSeconds: 3600,
+        isAndroid: true,
+        availableDiskBytes: 800 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(tight.useDiskCache, isTrue);
+      expect(tight.demuxerMaxBytes, 288 * 1024 * 1024);
+
+      // Falls back to RAM when free storage is below reserve + 16 MiB.
+      final tiny = computeMpvBufferPlan(
+        live: false,
+        bufferSeconds: 3600,
+        isAndroid: true,
+        availableDiskBytes: 400 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(tiny.useDiskCache, isFalse);
+      expect(tiny.demuxerMaxBytes, lessThanOrEqualTo(24 * 1024 * 1024));
+    });
+
+    test('plans live radiko-style initial buffering and timeouts', () {
+      final liveOff = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 0,
+        isAndroid: true,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(liveOff.useCache, isFalse);
+      expect(liveOff.cachePauseInitial, isFalse);
+
+      final liveThreeMin = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 180,
+        isAndroid: true,
+        availableDiskBytes: 4 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(liveThreeMin.useCache, isTrue);
+      expect(liveThreeMin.useDiskCache, isTrue);
+      expect(liveThreeMin.cachePauseInitial, isTrue);
+      expect(liveThreeMin.cachePauseWaitSeconds, 180);
+      expect(liveThreeMin.networkTimeoutSeconds, 210);
+      expect(liveThreeMin.startTimeoutSeconds, 225);
+    });
+
+    testWidgets('TmhbApp forces ja-JP locale to avoid Chinese glyph fallback', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(const ProviderScope(child: TmhbApp()));
+      await tester.pumpAndSettle();
+
+      final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
+      expect(app.locale, const Locale('ja', 'JP'));
+      expect(app.supportedLocales, contains(const Locale('ja', 'JP')));
+    });
+
+    testWidgets('SettingsScreen updates and persists recorded & live buffers', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final kv = InMemoryKeyValueStore();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          child: const MaterialApp(home: SettingsScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.scrollUntilVisible(
+        find.text('録画のバッファ時間（先読み）'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.text('5分'), findsOneWidget);
+      await tester.tap(find.text('録画のバッファ時間（先読み）'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('60分'));
+      await tester.pumpAndSettle();
+      expect(await kv.read('firetv_recorded_buffer_seconds'), '3600');
+
+      await tester.scrollUntilVisible(
+        find.text('Live のバッファ時間（遅延再生）'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.text('Live のバッファ時間（遅延再生）'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('3分'));
+      await tester.pumpAndSettle();
+      expect(await kv.read('firetv_live_buffer_seconds'), '180');
     });
   });
 }

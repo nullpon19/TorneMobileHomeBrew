@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
 import android.view.WindowManager
 import android.system.ErrnoException
 import android.system.Os
@@ -138,6 +139,14 @@ class MainActivity : FlutterActivity() {
                     "hasStoragePermission" -> result.success(hasStoragePermission())
                     "requestStoragePermission" -> requestStoragePermission(result)
                     "getAppFilesDirPath" -> result.success(getExternalFilesDir(null)?.absolutePath)
+                    "getCacheAvailableBytes" -> {
+                        val avail = try {
+                            StatFs(cacheDir.absolutePath).availableBytes
+                        } catch (_: Exception) {
+                            null
+                        }
+                        result.success(avail)
+                    }
                     "listCredentialCandidateFiles" -> {
                         akeExecutor.execute {
                             val list = listCredentialCandidateFiles()

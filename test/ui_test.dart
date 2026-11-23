@@ -1160,7 +1160,7 @@ void main() {
 
       // Back on the list, B's row carries the lock too — and
       // the list was never reloaded to learn it.
-      await tester.pageBack();
+      await tester.tap(find.byType(BackButton));
       await tester.pumpAndSettle();
       expect(find.byIcon(Icons.lock), findsNWidgets(2));
       expect(fixture.titlesService.listLoadCount, loadsBefore);
@@ -1174,7 +1174,7 @@ void main() {
         ('202', true),
         ('202', false),
       ]);
-      await tester.pageBack();
+      await tester.tap(find.byType(BackButton));
       await tester.pumpAndSettle();
       expect(find.byIcon(Icons.lock), findsOneWidget);
       expect(fixture.titlesService.listLoadCount, loadsBefore);

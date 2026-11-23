@@ -8,11 +8,14 @@
 /// root (app/providers.dart) and app state (app/state.dart).
 library;
 
+import 'dart:io';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:media_kit/media_kit.dart';
 // Flutter 3.50 deprecates package:flutter/material.dart in favour of
 // package:material_ui/material_ui.dart (the scaffold's own import).
 import 'package:material_ui/material_ui.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'app/bootstrap.dart';
 import 'app/firetv_preset.dart';
@@ -29,7 +32,20 @@ Future<void> main() async {
   // Split the legacy shared key-value file into per-purpose
   // files before anything reads the stores (plan 96).
   await migrateLegacyKeyValueFiles(storeDirectory);
-  final container = fileStoreContainer(storeDirectory);
+  final tempDir = await getTemporaryDirectory();
+  final mpvCacheDir = Directory('${tempDir.path}/mpv_cache');
+  try {
+    if (await mpvCacheDir.exists()) {
+      await mpvCacheDir.delete(recursive: true);
+    }
+    await mpvCacheDir.create(recursive: true);
+  } catch (_) {
+    // Non-fatal: mpv falls back to RAM cache if cache directory creation fails.
+  }
+  final container = fileStoreContainer(
+    storeDirectory,
+    mpvCacheDirectory: mpvCacheDir,
+  );
   await applyFireTvPresetsIfNeeded(
     keyValues: container.read(keyValueStoreProvider),
     credentialStore: container.read(credentialStoreProvider),
@@ -102,10 +118,17 @@ class TmhbApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'torne HB FireTV',
+      // Force Japanese locale so Fire OS fonts.xml picks NotoSansCJK JP
+      // (index 0) instead of zh-Hans (index 2).
+      locale: const Locale('ja', 'JP'),
+      supportedLocales: const [Locale('ja', 'JP')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
       // A tap outside a text field dismisses the keyboard
       // anywhere in the app (plan 54).
-      builder: (context, child) =>
-          KeyboardDismissOnTap(child: child ?? const SizedBox.shrink()),
+      builder: (context, child) => DefaultTextStyle.merge(
+        style: const TextStyle(locale: Locale('ja', 'JP')),
+        child: KeyboardDismissOnTap(child: child ?? const SizedBox.shrink()),
+      ),
       theme: _buildTheme(),
       home: const AppShell(),
     );

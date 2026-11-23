@@ -1053,6 +1053,11 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
           title: title.title,
           session: session,
           initialStart: initialStart,
+          knownDuration:
+              res.duration ??
+              (title.scheduledDurationSeconds != null
+                  ? Duration(seconds: title.scheduledDurationSeconds!)
+                  : null),
           // Leaving the player reports where the viewing
           // stopped (plan 102), so the unit's resume point is
           // there for the next viewing — in this app or in

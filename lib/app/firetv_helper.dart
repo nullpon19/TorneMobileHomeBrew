@@ -129,6 +129,19 @@ class FireTvHelper {
     }
   }
 
+  /// Returns free bytes available on Android's internal cache partition, or
+  /// `null` on non-Android platforms / errors.
+  Future<int?> getCacheAvailableBytes() async {
+    if (!isAndroid) return null;
+    try {
+      return await _channel.invokeMethod<int>('getCacheAvailableBytes');
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
   Future<List<CredentialCandidateFile>> listCredentialCandidateFiles() async {
     if (!isAndroid) return const [];
     try {

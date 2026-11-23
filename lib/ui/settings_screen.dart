@@ -19,6 +19,7 @@ import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'player_cache_policy.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -49,6 +50,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final selected = ref.watch(selectedRegistrationProvider);
     final debugSettings = ref.watch(debugSettingsProvider);
     final storeDir = ref.watch(storeDirectoryProvider);
+    final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
+    final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(
@@ -222,6 +225,64 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            title: const Text('録画のバッファ時間（先読み）'),
+            subtitle: Text(
+              '設定: ${formatBufferDurationLabel(recordedBufferSeconds)} '
+              '（1分以上は内蔵ストレージ一時キャッシュを使用・最大60分。'
+              '30〜60分はモバイル回線のギガ消費にご注意ください）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  formatBufferDurationLabel(recordedBufferSeconds),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickBufferDuration(
+              title: '録画のバッファ時間（先読み）',
+              description:
+                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低512MB空き残存）。',
+              options: recordedBufferOptionsSeconds,
+              current: recordedBufferSeconds,
+              recommendedSeconds: defaultRecordedBufferSeconds,
+              onSelected: (value) =>
+                  ref.read(recordedBufferSecondsProvider.notifier).set(value),
+            ),
+          ),
+          ListTile(
+            title: const Text('Live のバッファ時間（遅延再生）'),
+            subtitle: Text(
+              '設定: ${formatBufferDurationLabel(liveBufferSeconds)} '
+              '（開始前に設定秒数分を蓄積して途切れを防ぎます。'
+              '15秒以上では副音声切替が効きにくくなる場合があります）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  formatBufferDurationLabel(liveBufferSeconds),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickBufferDuration(
+              title: 'Live のバッファ時間（遅延再生）',
+              description:
+                  'radiko のように再生開始前に指定時間分を貯めてから流し、トンネルや短い圏外での途切れを防ぎます。',
+              options: liveBufferOptionsSeconds,
+              current: liveBufferSeconds,
+              onSelected: (value) =>
+                  ref.read(liveBufferSecondsProvider.notifier).set(value),
             ),
           ),
           const Divider(),
@@ -454,6 +515,75 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
     if (!mounted) return;
     await _registerDevice(device);
+  }
+
+  Future<void> _pickBufferDuration({
+    required String title,
+    required String description,
+    required List<int> options,
+    required int current,
+    int? recommendedSeconds,
+    required Future<void> Function(int value) onSelected,
+  }) async {
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text(title),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              description,
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final opt in options)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(opt),
+              child: Focus(
+                autofocus: opt == current,
+                child: Builder(
+                  builder: (focusContext) {
+                    final focused = Focus.of(focusContext).hasFocus;
+                    final label = formatBufferDurationLabel(opt);
+                    final suffix =
+                        recommendedSeconds != null && opt == recommendedSeconds
+                        ? '（車載おすすめ）'
+                        : '';
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(6),
+                        border: focused
+                            ? Border.all(color: Colors.amber, width: 2)
+                            : null,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            opt == current
+                                ? Icons.check_circle
+                                : Icons.radio_button_unchecked,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(child: Text('$label$suffix')),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (chosen != null) {
+      await onSelected(chosen);
+    }
   }
 
   Future<void> _onRegistrationAction(String action, RegisteredNasne reg) async {

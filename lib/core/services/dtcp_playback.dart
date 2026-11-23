@@ -89,6 +89,13 @@ class PlaybackKeySource {
     }
   }
 
+  /// Forces a fresh AKE authentication even when the local key cache is
+  /// populated (used after prolonged cellular outages).
+  Future<void> forceReauthenticate() async {
+    final fresh = await _reauthenticateOnce();
+    await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 20));
+  }
+
   Future<ExchangeKeySession> _reauthenticateOnce() async {
     final inFlight = _reauthInFlight;
     if (inFlight != null) return inFlight;
@@ -115,6 +122,7 @@ class DtcpPlaybackEngine implements PlaybackEngine {
     required this.credentialStore,
     required SrmStore srmStore,
     this.diag = const DiagLog.none(),
+    this.autoReconnect = false,
     AkeConnectionFactory? akeConnectionFactory,
     AkeClient Function(DeviceCredentials credentials)? clientFactory,
     DtcpMediaFetcher Function()? fetcherFactory,
@@ -138,6 +146,9 @@ class DtcpPlaybackEngine implements PlaybackEngine {
 
   /// Diagnostics sink (plan 28), categories playback/network/ake.
   final DiagLog diag;
+
+  /// Enables unlimited background reconnects inside the loopback proxy.
+  final bool autoReconnect;
   final AkeClient Function(DeviceCredentials credentials) _clientFactory;
   final DtcpMediaFetcher Function() _fetcherFactory;
 
@@ -248,6 +259,8 @@ class DtcpPlaybackEngine implements PlaybackEngine {
         windowCapBytesOverride: Platform.isAndroid
             ? androidProxyWindowCapBytes
             : null,
+        autoReconnect: autoReconnect,
+        onReauthenticate: autoReconnect ? keySource.forceReauthenticate : null,
       );
       diag(
         DiagCategory.playback,

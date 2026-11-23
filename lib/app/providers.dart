@@ -11,6 +11,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 
 import '../core/core.dart';
+import '../ui/player_cache_policy.dart';
 import 'ake_socket.dart';
 import 'debug_log.dart';
 import 'file_pick.dart';
@@ -233,6 +234,71 @@ final playbackQualityProvider = NotifierProvider<PlaybackQualityNotifier, bool>(
 /// tests / headless contexts (debug logging then stays off).
 final storeDirectoryProvider = Provider<Directory?>((ref) => null);
 
+/// Directory reserved for mpv `cache-on-disk` temporary files on Fire TV.
+final mpvCacheDirectoryProvider = Provider<Directory?>((ref) => null);
+
+/// Persisted recorded playback buffer target in seconds (default 5 min).
+class RecordedBufferSecondsNotifier extends Notifier<int> {
+  static const _key = 'firetv_recorded_buffer_seconds';
+
+  @override
+  int build() {
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      final parsed = raw == null ? null : int.tryParse(raw);
+      if (parsed != null &&
+          recordedBufferOptionsSeconds.contains(parsed) &&
+          parsed != state) {
+        state = parsed;
+      }
+    });
+    return defaultRecordedBufferSeconds;
+  }
+
+  Future<void> set(int seconds) async {
+    if (!recordedBufferOptionsSeconds.contains(seconds)) return;
+    state = seconds;
+    await ref.read(keyValueStoreProvider).write(_key, '$seconds');
+  }
+}
+
+final recordedBufferSecondsProvider =
+    NotifierProvider<RecordedBufferSecondsNotifier, int>(
+      RecordedBufferSecondsNotifier.new,
+    );
+
+/// Persisted live playback initial buffer target in seconds (default 0 = off).
+class LiveBufferSecondsNotifier extends Notifier<int> {
+  static const _key = 'firetv_live_buffer_seconds';
+
+  @override
+  int build() {
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      final parsed = raw == null ? null : int.tryParse(raw);
+      if (parsed != null &&
+          liveBufferOptionsSeconds.contains(parsed) &&
+          parsed != state) {
+        state = parsed;
+      }
+    });
+    return defaultLiveBufferSeconds;
+  }
+
+  Future<void> set(int seconds) async {
+    if (!liveBufferOptionsSeconds.contains(seconds)) return;
+    state = seconds;
+    await ref.read(keyValueStoreProvider).write(_key, '$seconds');
+  }
+}
+
+final liveBufferSecondsProvider =
+    NotifierProvider<LiveBufferSecondsNotifier, int>(
+      LiveBufferSecondsNotifier.new,
+    );
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {
@@ -333,6 +399,7 @@ final playbackEngineProvider = Provider<PlaybackEngine>(
     credentialStore: ref.watch(credentialStoreProvider),
     srmStore: ref.watch(srmStoreProvider),
     diag: ref.watch(diagLogProvider),
+    autoReconnect: Platform.isAndroid,
     akeConnectionFactory: (host, port) =>
         nativeAkeConnectionFactory(host, port, diag: ref.read(diagLogProvider)),
   ),
@@ -370,6 +437,7 @@ DeviceServices assembleDeviceServices(
   CredentialStore? credentialStore,
   SrmStore? srmStore,
   DiagLog? diagLog,
+  bool? autoReconnect,
 }) {
   final device = describedDevice ?? NasneDevice.direct(reg.host);
   final plain = WebApiTransport(reg.host, client: client);
@@ -423,6 +491,7 @@ DeviceServices assembleDeviceServices(
           srmStore ??
           KeyValueSrmStore(srmKeyValueStore ?? InMemoryKeyValueStore()),
       diag: diagLog ?? const DiagLog.none(),
+      autoReconnect: autoReconnect ?? Platform.isAndroid,
       akeConnectionFactory: (host, port) => nativeAkeConnectionFactory(
         host,
         port,

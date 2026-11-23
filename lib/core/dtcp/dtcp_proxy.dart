@@ -84,10 +84,14 @@ class DtcpMediaFetcher {
       _client ??= _clientFactory()
         ..connectionTimeout = const Duration(seconds: 15);
 
-  void close() {
+  /// Closes any pooled sockets so reconnects after a network drop open fresh
+  /// TCP connections rather than reusing half-open ones.
+  void resetClient() {
     _client?.close(force: true);
     _client = null;
   }
+
+  void close() => resetClient();
 
   /// Issues the HEAD request that reveals the AKE endpoint
   /// (DTCP1HOST / DTCP1PORT content features).
@@ -320,6 +324,14 @@ class DtcpProxy {
     int? totalBytes,
     Duration? totalDuration,
     int? windowCapBytesOverride,
+    bool autoReconnect = false,
+    Future<void> Function()? onReauthenticate,
+    List<Duration> reconnectBackoff = const [
+      Duration(seconds: 3),
+      Duration(seconds: 5),
+      Duration(seconds: 8),
+      Duration(seconds: 10),
+    ],
   }) : _window = _WindowCache(
          capBytes: windowCapBytesOverride ?? windowCapBytes,
        ),
@@ -328,7 +340,10 @@ class DtcpProxy {
        _fetcher = fetcher, // ignore: prefer_initializing_formals
        _diag = diag, // ignore: prefer_initializing_formals
        _totalBytes = totalBytes, // ignore: prefer_initializing_formals
-       _totalDuration = totalDuration; // ignore: prefer_initializing_formals
+       _totalDuration = totalDuration, // ignore: prefer_initializing_formals
+       _autoReconnect = autoReconnect, // ignore: prefer_initializing_formals
+       _onReauthenticate = onReauthenticate, // ignore: prefer_initializing_formals
+       _reconnectBackoff = reconnectBackoff; // ignore: prefer_initializing_formals
 
   final HttpServer _server;
 
@@ -339,6 +354,9 @@ class DtcpProxy {
   final Future<Uint8List> Function(int label) _keyForLabel;
   final DtcpMediaFetcher _fetcher;
   final DiagLog _diag;
+  final bool _autoReconnect;
+  final Future<void> Function()? _onReauthenticate;
+  final List<Duration> _reconnectBackoff;
 
   /// Total plaintext size in bytes (recorded content only).
   final int? _totalBytes;
@@ -355,7 +373,9 @@ class DtcpProxy {
       _totalDuration != null &&
       _totalDuration > Duration.zero;
 
-  final _PlaintextQueue _queue = _PlaintextQueue();
+  _PlaintextQueue _queue = _PlaintextQueue();
+  int _legacyGeneration = 0;
+  bool _legacyPumpActive = false;
   int _cipherBytes = 0;
   int _servedBytes = 0;
   int _requestCount = 0;
@@ -430,6 +450,14 @@ class DtcpProxy {
     int? totalBytes,
     Duration? totalDuration,
     int? windowCapBytesOverride,
+    bool autoReconnect = false,
+    Future<void> Function()? onReauthenticate,
+    List<Duration> reconnectBackoff = const [
+      Duration(seconds: 3),
+      Duration(seconds: 5),
+      Duration(seconds: 8),
+      Duration(seconds: 10),
+    ],
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final proxy = DtcpProxy._(
@@ -442,6 +470,9 @@ class DtcpProxy {
       totalBytes: totalBytes,
       totalDuration: totalDuration,
       windowCapBytesOverride: windowCapBytesOverride,
+      autoReconnect: autoReconnect,
+      onReauthenticate: onReauthenticate,
+      reconnectBackoff: reconnectBackoff,
     );
     server.listen(proxy._handle);
     if (proxy._seekable) {
@@ -463,102 +494,192 @@ class DtcpProxy {
     return proxy;
   }
 
+  static bool _shouldReauthenticate(Object? error, int consecutiveErrors) {
+    if (consecutiveErrors >= 2) return true;
+    if (error is NasneError && error.category == NasneErrorCategory.http) {
+      return const {'401', '403', '500', '503', '512'}.contains(error.code);
+    }
+    return false;
+  }
+
+  static bool _isTransientReconnectError(NasneError error) {
+    if (error.category == NasneErrorCategory.unreachable) return true;
+    if (error.category == NasneErrorCategory.http) {
+      return const {
+        '401',
+        '403',
+        '408',
+        '500',
+        '502',
+        '503',
+        '504',
+      }.contains(error.code);
+    }
+    return false;
+  }
+
+  Duration _backoffForAttempt(int attempt) {
+    if (_reconnectBackoff.isEmpty) return Duration.zero;
+    return _reconnectBackoff[min(attempt, _reconnectBackoff.length - 1)];
+  }
+
   /// Pulls the content, decrypts it incrementally and queues the
-  /// plaintext for the player. Runs from [start] until the
-  /// upstream ends, fails, or the session is stopped.
+  /// plaintext for the player. When [_autoReconnect] is enabled, transient
+  /// upstream drops retry indefinitely with backoff until [_stopRequested].
   Future<void> _pump() async {
     final stopwatch = Stopwatch()..start();
     var packets = 0;
     var plainBytes = 0;
     var lastMilestone = 0;
     var firstPlainLogged = false;
-    String endKind;
+    var consecutiveErrors = 0;
+    _legacyPumpActive = true;
     try {
-      _diag(
-        DiagCategory.playback,
-        'proxy: prefetch started, content GET started',
-      );
-      final response = await _fetcher.openContent(_contentUrl);
-      final decryptor = PcpDecryptor(keyForLabel: _keyForLabel);
-      final timed = response.timeout(
-        stallTimeout,
-        onTimeout: (sink) {
-          sink.addError(
-            NasneError.unreachable(
-              'dtcp:proxy',
-              cause:
-                  'the content stream stalled for '
-                  '${stallTimeout.inSeconds} seconds',
-            ),
+      while (!_stopRequested && !_downstreamGone) {
+        Object? attemptError;
+        var unexpectedEof = false;
+        try {
+          _diag(
+            DiagCategory.playback,
+            'proxy: prefetch started, content GET started',
           );
-          sink.close();
-        },
-      );
-      final iterator = StreamIterator<List<int>>(timed);
-      _iterator = iterator;
-      final yieldWatch = Stopwatch()..start();
-      try {
-        while (!_stopRequested) {
-          if (_queue.bufferedBytes >= prefetchCapBytes) {
-            await _waitForDrain();
-            continue;
-          }
-          if (!await iterator.moveNext()) break;
-          final chunk = iterator.current;
-          _cipherBytes += chunk.length;
-          final pieces = await decryptor.add(chunk);
-          packets = decryptor.packetsDecrypted;
-          plainBytes = decryptor.plaintextBytes;
-          for (final piece in pieces) {
-            if (!firstPlainLogged) {
-              firstPlainLogged = true;
-              _diag(
-                DiagCategory.playback,
-                'proxy: first plaintext out, ${piece.length} bytes, '
-                '${stopwatch.elapsedMilliseconds} ms after the '
-                'content GET',
+          final response = await _fetcher.openContent(_contentUrl);
+          final decryptor = PcpDecryptor(keyForLabel: _keyForLabel);
+          final timed = response.timeout(
+            stallTimeout,
+            onTimeout: (sink) {
+              sink.addError(
+                NasneError.unreachable(
+                  'dtcp:proxy',
+                  cause:
+                      'the content stream stalled for '
+                      '${stallTimeout.inSeconds} seconds',
+                ),
               );
+              sink.close();
+            },
+          );
+          final iterator = StreamIterator<List<int>>(timed);
+          _iterator = iterator;
+          final yieldWatch = Stopwatch()..start();
+          try {
+            while (!_stopRequested && !_downstreamGone) {
+              if (_queue.bufferedBytes >= prefetchCapBytes) {
+                await _waitForDrain();
+                continue;
+              }
+              if (!await iterator.moveNext()) {
+                if (_autoReconnect && !_stopRequested && !_downstreamGone) {
+                  unexpectedEof = true;
+                }
+                break;
+              }
+              final chunk = iterator.current;
+              _cipherBytes += chunk.length;
+              final pieces = await decryptor.add(chunk);
+              packets = decryptor.packetsDecrypted;
+              plainBytes = decryptor.plaintextBytes;
+              for (final piece in pieces) {
+                consecutiveErrors = 0;
+                if (!firstPlainLogged) {
+                  firstPlainLogged = true;
+                  _diag(
+                    DiagCategory.playback,
+                    'proxy: first plaintext out, ${piece.length} bytes, '
+                    '${stopwatch.elapsedMilliseconds} ms after the '
+                    'content GET',
+                  );
+                }
+                _queue.add(piece);
+              }
+              if (packets > lastMilestone &&
+                  (packets == 1 || packets % 50 == 0)) {
+                lastMilestone = packets;
+                _diag(
+                  DiagCategory.playback,
+                  'proxy: $packets packets, $plainBytes bytes decrypted '
+                  'so far',
+                );
+              }
+              if (yieldWatch.elapsedMilliseconds >= 4) {
+                await Future<void>.delayed(Duration.zero);
+                yieldWatch.reset();
+              }
             }
-            _queue.add(piece);
+          } finally {
+            await iterator.cancel();
+            _iterator = null;
           }
-          if (packets > lastMilestone && (packets == 1 || packets % 50 == 0)) {
-            lastMilestone = packets;
+        } catch (e) {
+          attemptError = e;
+        }
+
+        if (!_autoReconnect) {
+          if (attemptError != null) {
+            _queue.close(attemptError);
             _diag(
               DiagCategory.playback,
-              'proxy: $packets packets, $plainBytes bytes decrypted '
-              'so far',
+              'proxy: upstream closed with an error after $_cipherBytes '
+              'bytes received, $plainBytes bytes decrypted in $packets '
+              'packets, ${stopwatch.elapsedMilliseconds} ms after the '
+              'content GET: $attemptError',
+            );
+            return;
+          }
+          final endKind = _downstreamGone
+              ? 'stopped (the player went away)'
+              : _stopRequested
+              ? 'stopped (session end)'
+              : 'the upstream ended the stream';
+          _queue.close();
+          _diag(
+            DiagCategory.playback,
+            'proxy: stream ended: $endKind; received $_cipherBytes '
+            'bytes, decrypted $plainBytes bytes in $packets packets, '
+            '${stopwatch.elapsedMilliseconds} ms after the content GET, '
+            'player ${_claimed ? 'attached' : 'never connected'}',
+          );
+          return;
+        }
+
+        if (_stopRequested || _downstreamGone) {
+          _queue.close();
+          return;
+        }
+        if (attemptError == null && !unexpectedEof) {
+          _queue.close();
+          return;
+        }
+        final delay = _backoffForAttempt(consecutiveErrors);
+        consecutiveErrors++;
+        _diag(
+          DiagCategory.playback,
+          'proxy: live reconnect attempt $consecutiveErrors after '
+          '${delay.inMilliseconds} ms '
+          '(${attemptError ?? 'unexpected upstream end'})',
+        );
+        if (delay > Duration.zero) {
+          await Future<void>.delayed(delay);
+        }
+        if (_stopRequested || _downstreamGone) {
+          _queue.close();
+          return;
+        }
+        _fetcher.resetClient();
+        if (_shouldReauthenticate(attemptError, consecutiveErrors)) {
+          try {
+            await _onReauthenticate?.call();
+          } catch (e) {
+            _diag(
+              DiagCategory.playback,
+              'proxy: live reauth attempt failed: $e',
             );
           }
-          if (yieldWatch.elapsedMilliseconds >= 4) {
-            await Future<void>.delayed(Duration.zero);
-            yieldWatch.reset();
-          }
         }
-      } finally {
-        await iterator.cancel();
       }
-      endKind = _downstreamGone
-          ? 'stopped (the player went away)'
-          : _stopRequested
-          ? 'stopped (session end)'
-          : 'the upstream ended the stream';
       _queue.close();
-      _diag(
-        DiagCategory.playback,
-        'proxy: stream ended: $endKind; received $_cipherBytes '
-        'bytes, decrypted $plainBytes bytes in $packets packets, '
-        '${stopwatch.elapsedMilliseconds} ms after the content GET, '
-        'player ${_claimed ? 'attached' : 'never connected'}',
-      );
-    } catch (e) {
-      _queue.close(e);
-      _diag(
-        DiagCategory.playback,
-        'proxy: upstream closed with an error after $_cipherBytes '
-        'bytes received, $plainBytes bytes decrypted in $packets '
-        'packets, ${stopwatch.elapsedMilliseconds} ms after the '
-        'content GET: $e',
-      );
+    } finally {
+      _legacyPumpActive = false;
     }
   }
 
@@ -588,7 +709,7 @@ class DtcpProxy {
   Future<void> _handleLegacy(HttpRequest request) async {
     _requestCount++;
     final requestNo = _requestCount;
-    if (_claimed) {
+    if (!_autoReconnect && _claimed) {
       _diag(
         DiagCategory.playback,
         'proxy: request #$requestNo rejected; the stream is '
@@ -598,12 +719,23 @@ class DtcpProxy {
       await request.response.close();
       return;
     }
+    final gen = ++_legacyGeneration;
+    _queue.notify();
     _claimed = true;
+    _downstreamGone = false;
+    if (_autoReconnect && (_queue.isClosed || !_legacyPumpActive)) {
+      await _iterator?.cancel();
+      _iterator = null;
+      _queue = _PlaintextQueue();
+      _pumpFuture = _pump();
+    }
+    final queue = _queue;
     _diag(DiagCategory.playback, 'proxy: request #$requestNo from the player');
     final response = request.response;
+    response.bufferOutput = false;
     // The pump already failed before producing anything: fail
     // fast instead of opening a stream that only errors later.
-    if (_queue.isClosed && _queue.bufferedBytes == 0 && _queue.hasError) {
+    if (queue.isClosed && queue.bufferedBytes == 0 && queue.hasError) {
       _diag(
         DiagCategory.playback,
         'proxy: the content fetch had already failed; answering 502',
@@ -619,9 +751,12 @@ class DtcpProxy {
       // Headers go out immediately; the first plaintext follows
       // as soon as the pump produces it (prefetched or live).
       await response.flush();
-      while (true) {
-        final chunk = await _queue.read();
+      while (gen == _legacyGeneration && !_stopRequested) {
+        final chunk = await queue.read(
+          isSuperseded: () => gen != _legacyGeneration || _stopRequested,
+        );
         if (chunk == null) break;
+        if (gen != _legacyGeneration || _stopRequested) break;
         _servedBytes += chunk.length;
         response.add(chunk);
         await response.flush();
@@ -637,12 +772,14 @@ class DtcpProxy {
         'proxy: serving ended with an error after $_servedBytes '
         'bytes served: $e',
       );
-      // The player is gone (or the upstream failed through the
-      // queue): stop pulling the content.
-      _downstreamGone = true;
-      _stopRequested = true;
-      _queue.close();
-      await _iterator?.cancel();
+      if (!_autoReconnect) {
+        // The player is gone (or the upstream failed through the
+        // queue): stop pulling the content.
+        _downstreamGone = true;
+        _stopRequested = true;
+        queue.close();
+        await _iterator?.cancel();
+      }
       try {
         await response.close();
       } catch (_) {}
@@ -796,6 +933,9 @@ class DtcpProxy {
               'a time seek',
             );
           } on NasneError catch (e) {
+            if (_autoReconnect && _isTransientReconnectError(e)) {
+              rethrow;
+            }
             // A source that refuses the time seek still serves
             // the plain stream; fetch-and-discard from 0 is slow
             // but correct, and keeps playback working.
@@ -1079,6 +1219,7 @@ class DtcpProxy {
     var pos = serveStart;
     var servedHere = 0;
     var stalledRestarts = 0;
+    var consecutiveReconnectErrors = 0;
     var lastEnd = _window.end;
     var retriedProducerError = false;
     var completed = false;
@@ -1095,6 +1236,8 @@ class DtcpProxy {
         _window.setPin(pos, generation);
         final chunk = _window.readChunk(pos, 1024 * 1024);
         if (chunk != null) {
+          consecutiveReconnectErrors = 0;
+          stalledRestarts = 0;
           final take = min(chunk.length, reqEnd - pos + 1);
           response.add(
             take == chunk.length
@@ -1122,6 +1265,56 @@ class DtcpProxy {
         }
         final error = producer?.error;
         if (error != null) {
+          if (_autoReconnect) {
+            Object? lastError = error;
+            var reconnected = false;
+            while (!_stopRequested && generation == _serveGeneration) {
+              final delay = _backoffForAttempt(consecutiveReconnectErrors);
+              consecutiveReconnectErrors++;
+              _diag(
+                DiagCategory.playback,
+                'proxy: request #$requestNo: reconnecting at byte $pos '
+                'after ${delay.inMilliseconds} ms '
+                '(attempt $consecutiveReconnectErrors, err=$lastError)',
+              );
+              if (delay > Duration.zero) {
+                await Future<void>.delayed(delay);
+              }
+              if (_stopRequested || generation != _serveGeneration) break;
+              _fetcher.resetClient();
+              if (_shouldReauthenticate(
+                lastError,
+                consecutiveReconnectErrors,
+              )) {
+                try {
+                  await _onReauthenticate?.call();
+                } catch (e) {
+                  _diag(
+                    DiagCategory.playback,
+                    'proxy: reauth attempt failed: $e',
+                  );
+                }
+              }
+              if (_stopRequested || generation != _serveGeneration) break;
+              _cancelProducer();
+              final retry = _startProducer(pos);
+              try {
+                final actual = await retry.established.future.timeout(
+                  seekEstablishTimeout,
+                );
+                if (actual <= pos) {
+                  reconnected = true;
+                  break;
+                }
+                lastError = StateError('overshoot past $pos ($actual)');
+                break;
+              } catch (e) {
+                lastError = e;
+              }
+            }
+            if (reconnected) continue;
+            break;
+          }
           // One fresh attempt when nothing has been served yet
           // (e.g. the primer failed before the player connected);
           // a failure mid-stream just ends the response.
@@ -1162,7 +1355,29 @@ class DtcpProxy {
         // against a source that keeps ending at the same byte.
         if (_window.end == lastEnd) {
           stalledRestarts++;
-          if (stalledRestarts >= 3) {
+          if (_autoReconnect) {
+            final delay = _backoffForAttempt(stalledRestarts - 1);
+            _diag(
+              DiagCategory.playback,
+              'proxy: request #$requestNo: upstream ended early at '
+              'byte ${_window.end}; retrying in ${delay.inMilliseconds} ms',
+            );
+            if (delay > Duration.zero) {
+              await Future<void>.delayed(delay);
+            }
+            if (_stopRequested || generation != _serveGeneration) break;
+            _fetcher.resetClient();
+            if (stalledRestarts >= 2) {
+              try {
+                await _onReauthenticate?.call();
+              } catch (e) {
+                _diag(
+                  DiagCategory.playback,
+                  'proxy: reauth attempt failed: $e',
+                );
+              }
+            }
+          } else if (stalledRestarts >= 3) {
             _diag(
               DiagCategory.playback,
               'proxy: request #$requestNo: the upstream keeps '
@@ -1475,10 +1690,14 @@ class _PlaintextQueue {
     _notify();
   }
 
-  /// The next plaintext chunk, or null at a clean end of stream.
-  /// Throws the pump's error once, after the buffer has drained.
-  Future<Uint8List?> read() async {
+  void notify() => _notify();
+
+  /// The next plaintext chunk, or null at a clean end of stream or when
+  /// [isSuperseded] returns true. Throws the pump's error once, after the
+  /// buffer has drained.
+  Future<Uint8List?> read({bool Function()? isSuperseded}) async {
     while (true) {
+      if (isSuperseded?.call() ?? false) return null;
       if (_chunks.isNotEmpty) {
         final piece = _chunks.removeAt(0);
         _bufferedBytes -= piece.length;

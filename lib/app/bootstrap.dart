@@ -32,7 +32,10 @@ const debugLogsDirectoryName = 'debug_logs';
 /// different volatility never share a file (plan 96). Existing
 /// installs are migrated by [migrateLegacyKeyValueFiles], which
 /// [main] runs before building this container.
-ProviderContainer fileStoreContainer(Directory storeDirectory) {
+ProviderContainer fileStoreContainer(
+  Directory storeDirectory, {
+  Directory? mpvCacheDirectory,
+}) {
   File file(String name) => File('${storeDirectory.path}/$name');
   return ProviderContainer(
     overrides: [
@@ -52,6 +55,8 @@ ProviderContainer fileStoreContainer(Directory storeDirectory) {
         JsonFileKeyValueStore(file(srmFileName)),
       ),
       storeDirectoryProvider.overrideWithValue(storeDirectory),
+      if (mpvCacheDirectory != null)
+        mpvCacheDirectoryProvider.overrideWithValue(mpvCacheDirectory),
     ],
   );
 }
