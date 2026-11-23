@@ -2847,6 +2847,241 @@ void main() {
       },
     );
   });
+
+  group('Phase 19: EPG integer-column fitting & right-edge snap', () {
+    test('resolveEpgChannelWidth fits integer columns cleanly without overflow', () {
+      final fireTvWidth = resolveEpgChannelWidth(838.0);
+      expect(fireTvWidth, closeTo(167.6, 0.01));
+      expect(fireTvWidth * 5, lessThanOrEqualTo(838.0));
+
+      final largeWidth = resolveEpgChannelWidth(1158.0);
+      expect(largeWidth * 7, lessThanOrEqualTo(1158.0));
+      expect(largeWidth, inInclusiveRange(156.0, 210.0));
+
+      // Narrow or invalid viewports fall back to default 172dp.
+      expect(resolveEpgChannelWidth(279.0), 172.0);
+      expect(resolveEpgChannelWidth(0), 172.0);
+      expect(resolveEpgChannelWidth(-50), 172.0);
+      expect(resolveEpgChannelWidth(double.nan), 172.0);
+      expect(resolveEpgChannelWidth(double.infinity), 172.0);
+    });
+
+    test('resolveEpgSnapTarget stops at maxScrollExtent instead of bouncing left', () {
+      // Previously 22dp overshoot with 172dp column width snapped back to 0.
+      expect(
+        resolveEpgSnapTarget(
+          pixels: 22.0,
+          channelWidth: 172.0,
+          minScrollExtent: 0.0,
+          maxScrollExtent: 22.0,
+        ),
+        22.0,
+      );
+      // Multi-column remainder near right end snaps to maxScrollExtent.
+      expect(
+        resolveEpgSnapTarget(
+          pixels: 1735.0,
+          channelWidth: 167.6,
+          minScrollExtent: 0.0,
+          maxScrollExtent: 1742.0,
+        ),
+        1742.0,
+      );
+      // Interior offset snaps normally to nearest column boundary.
+      expect(
+        resolveEpgSnapTarget(
+          pixels: 160.0,
+          channelWidth: 167.6,
+          minScrollExtent: 0.0,
+          maxScrollExtent: 1742.0,
+        ),
+        closeTo(167.6, 1e-6),
+      );
+    });
+
+    testWidgets(
+      '5 terrestrial channels on 960dp Fire TV fit without clipping or horizontal bounce',
+      (tester) async {
+        tester.view.physicalSize = const Size(960, 540);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.10',
+          udn: 'uuid:epg-5ch-fit',
+          friendlyName: 'テストnasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        Channel makeCh(int idx, String name) => Channel(
+          broadcastingType: 2,
+          networkId: 0x1111,
+          transportStreamId: 0x2220 + idx,
+          serviceId: 0x3330 + idx,
+          serviceType: 1,
+          channelNumber: idx + 1,
+          serviceName: name,
+        );
+        final channels = [
+          makeCh(0, 'NHK総合1・秋田'),
+          makeCh(1, 'NHKEテレ1秋田'),
+          makeCh(2, 'ABS秋田放送1'),
+          makeCh(3, 'AKT秋田テレビ1'),
+          makeCh(4, '秋田朝日放送'),
+        ];
+
+        final jstNow = DateTime.now().toUtc().add(const Duration(hours: 9));
+        final dayStart = DateTime.utc(
+          jstNow.year,
+          jstNow.month,
+          jstNow.day + 1,
+        ).subtract(const Duration(hours: 9));
+        final guide = EpgGuide(
+          broadcastingType: 2,
+          services: [
+            for (var i = 0; i < channels.length; i++)
+              EpgServiceGuide(
+                channel: channels[i],
+                events: i < 4
+                    ? [
+                        EpgEvent(
+                          eventId: 100 + i,
+                          start: dayStart.add(const Duration(minutes: 30)),
+                          duration: const Duration(minutes: 60),
+                          title: '局$i番組',
+                          genreLevel1: 3,
+                        ),
+                      ]
+                    : [
+                        EpgEvent(
+                          eventId: 501,
+                          start: dayStart.add(const Duration(minutes: 30)),
+                          duration: const Duration(minutes: 60),
+                          title: '５局目番組Ａ',
+                          genreLevel1: 3,
+                        ),
+                        EpgEvent(
+                          eventId: 502,
+                          start: dayStart.add(const Duration(minutes: 90)),
+                          duration: const Duration(minutes: 60),
+                          title: '５局目番組Ｂ',
+                          genreLevel1: 3,
+                        ),
+                      ],
+              ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(
+                _FakeFireTvHelper(reachable: true),
+              ),
+              credentialSummaryProvider.overrideWith((ref) async => null),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const DeviceInfo(name: 'テストnasne', softwareVersion: '0260'),
+              ),
+              hddDetailsProvider.overrideWith(
+                (ref, r) async => const <HddDetail>[],
+              ),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              recNgProvider.overrideWith(
+                (ref, r) async => const <RecNgItem>[],
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async => const NetworkInfo(
+                  macAddr: '00:11:22:33:44:55',
+                  ipv4Addr: '192.0.2.10',
+                  dhcpEnabled: true,
+                ),
+              ),
+              bcasInfoProvider.overrideWith(
+                (ref, r) async => const BcasInfo(),
+              ),
+              liveChannelsProvider.overrideWith(
+                (ref, r) async => const <LiveBand>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => channels),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              titlesProvider(reg).overrideWith(
+                () => _FixedTitlesNotifier(reg, const []),
+              ),
+              titleCountsProvider.overrideWith(
+                (ref, r) async => const TitleCounts(0, 1000),
+              ),
+              epgGuideProvider.overrideWith((ref, r) async => guide),
+              channelLogosProvider.overrideWith(
+                (ref, r) async => const <int, List<int>>{},
+              ),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(AppShell)),
+        );
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+
+        final horizontalScrollable = tester
+            .stateList<ScrollableState>(
+              find.descendant(
+                of: find.byType(EpgScreen),
+                matching: find.byType(Scrollable),
+              ),
+            )
+            .firstWhere((s) => s.widget.axisDirection == AxisDirection.right);
+        expect(horizontalScrollable.position.maxScrollExtent, 0.0);
+
+        final tileAFinder = find
+            .ancestor(
+              of: find.text('５局目番組Ａ'),
+              matching: find.byType(InkWell),
+            )
+            .first;
+        final rectA = tester.getRect(tileAFinder);
+        expect(rectA.right, lessThanOrEqualTo(960.0 + 0.5));
+
+        Focus.of(tester.element(find.text('５局目番組Ａ'))).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pumpAndSettle();
+
+        expect(horizontalScrollable.position.pixels, 0.0);
+        final tileBFinder = find
+            .ancestor(
+              of: find.text('５局目番組Ｂ'),
+              matching: find.byType(InkWell),
+            )
+            .first;
+        final rectB = tester.getRect(tileBFinder);
+        expect(rectB.right, lessThanOrEqualTo(960.0 + 0.5));
+        final focusedCtx = FocusManager.instance.primaryFocus?.context;
+        expect(focusedCtx, isNotNull);
+        expect(
+          find.descendant(
+            of: find.byWidget(focusedCtx!.widget),
+            matching: find.text('５局目番組Ｂ'),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+  });
 }
 
 class _FixedTitlesNotifier extends TitlesNotifier {

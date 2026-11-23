@@ -34,21 +34,65 @@ import 'widgets.dart';
 
 /// Vertical scale of the grid: pixels per broadcast minute.
 const double _pxPerMinute = 2.4;
-const double _channelWidth = 172;
+const double _defaultChannelWidth = 172;
+const double _minFitChannelWidth = 156;
+const double _maxFitChannelWidth = 210;
 const double _rulerWidth = 40;
 const double _headerHeight = 54;
 
+/// Computes the per-channel column width for an EPG grid of [viewportWidth].
+/// Chooses an exact divisor of [viewportWidth] near 172dp (down to 156dp)
+/// so an integer number of columns fills the viewport edge-to-edge without
+/// clipping the rightmost column (e.g., 5 full columns on Fire TV 960dp).
+double resolveEpgChannelWidth(double viewportWidth) {
+  if (!viewportWidth.isFinite || viewportWidth <= 0) {
+    return _defaultChannelWidth;
+  }
+  final cols = (viewportWidth / _minFitChannelWidth).floor();
+  if (cols >= 2) {
+    final candidate = viewportWidth / cols;
+    if (candidate <= _maxFitChannelWidth) {
+      return candidate * cols > viewportWidth
+          ? (viewportWidth - 0.001) / cols
+          : candidate;
+    }
+  }
+  return _defaultChannelWidth;
+}
+
+/// Resolves the horizontal snap target for [pixels] given [channelWidth] and
+/// bounds `[minScrollExtent, maxScrollExtent]`, treating [maxScrollExtent]
+/// as a valid snap stop so right-edge remainders never bounce back left.
+double resolveEpgSnapTarget({
+  required double pixels,
+  required double channelWidth,
+  required double minScrollExtent,
+  required double maxScrollExtent,
+}) {
+  final gridSnap = ((pixels / channelWidth).round() * channelWidth).clamp(
+    minScrollExtent,
+    maxScrollExtent,
+  );
+  if ((maxScrollExtent - pixels).abs() <= (gridSnap - pixels).abs()) {
+    return maxScrollExtent;
+  }
+  return gridSnap;
+}
+
 /// Scroll physics that always settles with the grid aligned to a
-/// channel-column boundary. Without it the horizontal scroll can
-/// rest a few pixels into a column, leaving the leftmost visible
-/// column clipped by the viewport edge (its start-time labels lose
-/// their first glyph, plan 22).
+/// channel-column boundary (or [ScrollMetrics.maxScrollExtent] at the right
+/// end). Without it the horizontal scroll can rest a few pixels into a column,
+/// leaving the leftmost visible column clipped by the viewport edge (plan 22).
 class _ChannelSnapPhysics extends ScrollPhysics {
-  const _ChannelSnapPhysics({super.parent});
+  const _ChannelSnapPhysics({required this.channelWidth, super.parent});
+
+  final double channelWidth;
 
   @override
-  _ChannelSnapPhysics applyTo(ScrollPhysics? ancestor) =>
-      _ChannelSnapPhysics(parent: buildParent(ancestor));
+  _ChannelSnapPhysics applyTo(ScrollPhysics? ancestor) => _ChannelSnapPhysics(
+    channelWidth: channelWidth,
+    parent: buildParent(ancestor),
+  );
 
   @override
   Simulation? createBallisticSimulation(
@@ -60,11 +104,12 @@ class _ChannelSnapPhysics extends ScrollPhysics {
       return super.createBallisticSimulation(position, velocity);
     }
     final tolerance = toleranceFor(position);
-    final double nearest =
-        ((position.pixels / _channelWidth).round() * _channelWidth).clamp(
-          position.minScrollExtent,
-          position.maxScrollExtent,
-        );
+    final double nearest = resolveEpgSnapTarget(
+      pixels: position.pixels,
+      channelWidth: channelWidth,
+      minScrollExtent: position.minScrollExtent,
+      maxScrollExtent: position.maxScrollExtent,
+    );
     if (velocity.abs() < tolerance.velocity &&
         (position.pixels - nearest).abs() < tolerance.distance) {
       // Already at rest on a boundary: defer to the parent physics,
@@ -88,8 +133,8 @@ class _ChannelSnapPhysics extends ScrollPhysics {
     }
     // Fling: continue to the next boundary in the fling direction.
     final double target = velocity > 0
-        ? (position.pixels / _channelWidth).ceil() * _channelWidth
-        : (position.pixels / _channelWidth).floor() * _channelWidth;
+        ? (position.pixels / channelWidth).ceil() * channelWidth
+        : (position.pixels / channelWidth).floor() * channelWidth;
     if (target == position.pixels) {
       return super.createBallisticSimulation(position, velocity);
     }
@@ -165,6 +210,7 @@ class _GuideGridScroll extends StatefulWidget {
   const _GuideGridScroll({
     required this.gridController,
     required this.bodyController,
+    required this.channelWidth,
     required this.child,
   });
 
@@ -173,6 +219,9 @@ class _GuideGridScroll extends StatefulWidget {
 
   /// Vertical (time axis) scroll of the day grid.
   final ScrollController bodyController;
+
+  /// Resolved width of a single channel column.
+  final double channelWidth;
 
   final Widget child;
 
@@ -314,7 +363,7 @@ class _GuideGridScrollState extends State<_GuideGridScroll> {
         child: SingleChildScrollView(
           controller: widget.gridController,
           scrollDirection: Axis.horizontal,
-          physics: const _ChannelSnapPhysics(),
+          physics: _ChannelSnapPhysics(channelWidth: widget.channelWidth),
           child: widget.child,
         ),
       ),
@@ -702,29 +751,42 @@ class _GuideView extends StatelessWidget {
                     }
                     return KeyEventResult.ignored;
                   },
-                  child: _GuideGridScroll(
-                    gridController: gridController,
-                    bodyController: bodyController,
-                    child: SizedBox(
-                      width: _channelWidth * guide.services.length,
-                      child: Column(
-                        children: [
-                          _ChannelHeader(services: guide.services, logos: logos),
-                          Expanded(
-                            child: _DayGrid(
-                              reg: reg,
-                              services: guide.services,
-                              schedules: schedules,
-                              hiddenGenres: hiddenGenres,
-                              onWatchEvent: onWatchEvent,
-                              dayStart: dayStart,
-                              dayEnd: dayEnd,
-                              controller: bodyController,
-                            ),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final channelWidth = resolveEpgChannelWidth(
+                        constraints.maxWidth,
+                      );
+                      return _GuideGridScroll(
+                        gridController: gridController,
+                        bodyController: bodyController,
+                        channelWidth: channelWidth,
+                        child: SizedBox(
+                          width: channelWidth * guide.services.length,
+                          child: Column(
+                            children: [
+                              _ChannelHeader(
+                                services: guide.services,
+                                logos: logos,
+                                channelWidth: channelWidth,
+                              ),
+                              Expanded(
+                                child: _DayGrid(
+                                  reg: reg,
+                                  services: guide.services,
+                                  schedules: schedules,
+                                  hiddenGenres: hiddenGenres,
+                                  onWatchEvent: onWatchEvent,
+                                  dayStart: dayStart,
+                                  dayEnd: dayEnd,
+                                  controller: bodyController,
+                                  channelWidth: channelWidth,
+                                ),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                    ),
+                        ),
+                      );
+                    },
                   ),
                 ),
               ),
@@ -776,10 +838,15 @@ class _DaySelector extends StatelessWidget {
 }
 
 class _ChannelHeader extends StatelessWidget {
-  const _ChannelHeader({required this.services, required this.logos});
+  const _ChannelHeader({
+    required this.services,
+    required this.logos,
+    required this.channelWidth,
+  });
 
   final List<EpgServiceGuide> services;
   final Map<int, List<int>> logos;
+  final double channelWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -790,7 +857,7 @@ class _ChannelHeader extends StatelessWidget {
         children: [
           for (final service in services)
             SizedBox(
-              width: _channelWidth,
+              width: channelWidth,
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 child: Column(
@@ -864,6 +931,7 @@ class _DayGrid extends StatelessWidget {
     required this.dayStart,
     required this.dayEnd,
     required this.controller,
+    required this.channelWidth,
   });
 
   final RegisteredNasne reg;
@@ -874,6 +942,7 @@ class _DayGrid extends StatelessWidget {
   final DateTime dayStart;
   final DateTime dayEnd;
   final ScrollController controller;
+  final double channelWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -903,7 +972,7 @@ class _DayGrid extends StatelessWidget {
               children: [
                 for (var i = 0; i < services.length; i++)
                   SizedBox(
-                    width: _channelWidth,
+                    width: channelWidth,
                     height: dayHeight,
                     child: Stack(
                       children: [

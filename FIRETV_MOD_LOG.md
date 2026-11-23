@@ -157,11 +157,17 @@
    - `resolvePlayerBackOutcome` に `confirmExit`（`errorOpen` / `exitConfirmOpen` 引数）と `showPlayerExitConfirmDialog` を追加。
    - 番組詳細表示中・OSD 表示中は従来どおり確認なしで閉じ、通常再生中（プリバッファ／中断バナー表示中を含む）に戻るを押したときのみ **`'再生を終了しますか？'`** ダイアログを表示（初期フォーカス `'再生を続ける'`・`'終了する'` 選択時のみ `pop`・キャンセル時はプレイヤー側へフォーカス復帰）。開始エラー画面 (`_error != null`) は確認なしで即終了。
 
-### 第16弾: `radiko` 表記削除＆`<activity android:banner>` 明記 (`f6630bd` / 本コミット)
+### 第16弾: `radiko` 表記削除＆`<activity android:banner>` 明記 (`f6630bd`, `392bbc6`)
 1. **Live バッファ設定説明などからの `radiko` 表記削除 (`lib/ui/settings_screen.dart`, `lib/ui/player_cache_policy.dart`, `test/firetv_mod_test.dart`, `f6630bd`)**:
    - 設定画面 Live バッファ選択ダイアログの説明文・コードコメント・テスト名から `radiko` 表記を削除。
-2. **Activity レベルの TV バナー宣言補強 (`android/app/src/main/AndroidManifest.xml`, `android/app/src/main/res/drawable/tv_banner.png`, 本コミット)**:
+2. **Activity レベルの TV バナー宣言補強 (`android/app/src/main/AndroidManifest.xml`, `android/app/src/main/res/drawable/tv_banner.png`, `392bbc6`)**:
    - `<application>` だけでなく `<activity android:name=".MainActivity">` にも `android:banner="@drawable/tv_banner"` を明記し、汎用 `res/drawable/tv_banner.png` も配置して Android TV / カスタムランチャー互換を強化。
+
+### 第17弾: 番組表の整数局幅フィット化＆右端スナップバウンス修正（本コミット）
+1. **表示幅に応じた整数列フィット幅の算出 (`lib/ui/epg_screen.dart`)**:
+   - `_GuideView` のグリッド領域を `LayoutBuilder` で計測し、`resolveEpgChannelWidth`（156〜210dp の範囲で表示幅を整数等分）で 1 局あたりの列幅を自動決定するよう変更（Fire TV `960dp` 環境の 5 局地域では 5 列きっちり `maxScrollExtent == 0` に収まり、5 局目の右端切れを解消）。
+2. **`_ChannelSnapPhysics` の動的列幅追従＆右端非バウンス化 (`lib/ui/epg_screen.dart`)**:
+   - `_ChannelSnapPhysics` に実際の `channelWidth` を渡し、さらに `resolveEpgSnapTarget` で `maxScrollExtent` を有効な吸着先として扱うよう修正。最右列での上下スクロール時に 0 側へ押し戻される横バウンスを根本解消。
 
 ---
 
@@ -188,7 +194,7 @@
 | `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠・`SegmentedButton` 個別セグメント反転強調テーマ |
 | `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`tabBackHandlersProvider`・右画面「戻る」時の左メニュー該当項目復帰・左メニュー上ルート `PopScope` アプリ終了確認ダイアログ |
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー（プリセット復元 UI は削除） |
-| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤枠・赤ドット表示＆ `'予約を編集'` 切替 |
+| `lib/ui/epg_screen.dart` | 広幅画面で `地デジ/BS` を `AppBar` 1 列統合・戻る/メニューで上部バーへ一発遷移＆グリッドから左キーで左メニュー復帰維持、整数局幅フィット (`resolveEpgChannelWidth`) ＋右端吸着修正 (`resolveEpgSnapTarget`)、`_EventTile` 3px 前面フォーカス枠（ライト時黒枠 `Colors.black` / ナイト時 `amberAccent`）、予約済み赤枠・赤ドット表示＆ `'予約を編集'` 切替 |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力）、検索結果の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
 | `lib/ui/home_screen.dart` | 横幅 `600dp` 以上で「本体情報」+「HDD」「ネットワーク」+「B-CAS」を `IntrinsicHeight` 高揃え 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` による最下部スクロール対応 |
 | `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、OSD「番組詳細」データ引き渡し |
@@ -204,7 +210,7 @@
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/dtcp_streaming_test.dart` | `DtcpProxy` の `servedBytes` / `firstByteServedAt` / `lastByteServedAt` 転送カウンタ検証を追加 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計＆事前蓄積算出／`demuxer-cache-state`／Live転送経過／早期切替抑止ラッチ・設定・ナイトモード・`SegmentedButton` 個別強調・10秒シーク・EPG上部バー統合/一発遷移/2段階戻る/左メニュー復帰/黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・右画面戻る→左メニュー＆終了確認・終端ガード・OSD戻るキー/「メニューを閉じる」/再生終了確認/詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計＆事前蓄積算出／`demuxer-cache-state`／Live転送経過／早期切替抑止ラッチ・設定・ナイトモード・`SegmentedButton` 個別強調・10秒シーク・EPG上部バー統合/一発遷移/2段階戻る/左メニュー復帰/整数局フィット＆右端スナップ/黒/予約赤枠＆編集導線・ロケール・番組自動まとめ・右画面戻る→左メニュー＆終了確認・終端ガード・OSD戻るキー/「メニューを閉じる」/再生終了確認/詳細パネル＆循環フォーカス・Home 2カラム＆D-padスクロール）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |
