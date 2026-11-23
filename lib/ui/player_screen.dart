@@ -207,6 +207,182 @@ String? playerLoadingLabel({
   return null;
 }
 
+/// Combines [description] and [longDescription] for the in-player OSD detail
+/// viewer, deduplicating identical or prefix-contained text.
+String? formatProgramDetailBody({
+  String? description,
+  String? longDescription,
+}) {
+  final short = description?.trim() ?? '';
+  final long = longDescription?.trim() ?? '';
+  if (short.isEmpty && long.isEmpty) return null;
+  if (short.isEmpty) return long;
+  if (long.isEmpty) return short;
+  if (long == short || long.startsWith(short)) return long;
+  if (short.startsWith(long)) return short;
+  return '$short\n\n$long';
+}
+
+/// Translucent upper-half overlay panel displaying full programme metadata and
+/// descriptions during playback, with Fire TV D-pad scroll and close support.
+class ProgramDetailOverlayPanel extends StatelessWidget {
+  const ProgramDetailOverlayPanel({
+    super.key,
+    required this.title,
+    this.meta,
+    required this.body,
+    required this.scrollController,
+    required this.focusNode,
+    required this.onClose,
+    required this.onScrollDelta,
+  });
+
+  final String title;
+  final String? meta;
+  final String body;
+  final ScrollController scrollController;
+  final FocusNode focusNode;
+  final VoidCallback onClose;
+  final void Function(double delta) onScrollDelta;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxHeight = MediaQuery.sizeOf(context).height * 0.45;
+    return GestureDetector(
+      onTap: () {},
+      child: Focus(
+        focusNode: focusNode,
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+            return KeyEventResult.ignored;
+          }
+          final key = event.logicalKey;
+          if (key == LogicalKeyboardKey.arrowDown) {
+            onScrollDelta(88);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.arrowUp) {
+            onScrollDelta(-88);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.pageDown) {
+            onScrollDelta(220);
+            return KeyEventResult.handled;
+          }
+          if (key == LogicalKeyboardKey.pageUp) {
+            onScrollDelta(-220);
+            return KeyEventResult.handled;
+          }
+          if (event is KeyDownEvent &&
+              (key == LogicalKeyboardKey.escape ||
+                  key == LogicalKeyboardKey.goBack ||
+                  key == LogicalKeyboardKey.select ||
+                  key == LogicalKeyboardKey.enter ||
+                  key == LogicalKeyboardKey.numpadEnter ||
+                  key == LogicalKeyboardKey.gameButtonA)) {
+            onClose();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.handled;
+        },
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: Container(
+            key: const ValueKey('player_program_detail_panel'),
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 16),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.88),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: Colors.amberAccent.withValues(alpha: 0.85),
+                width: 1.5,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          if (meta != null && meta!.isNotEmpty) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              meta!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    ExcludeFocus(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Colors.white38),
+                        ),
+                        onPressed: onClose,
+                        icon: const Icon(Icons.close, size: 18),
+                        label: const Text('閉じる'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '上下キーでスクロール ／ 決定・戻るキーで閉じる',
+                  style: TextStyle(color: Colors.amberAccent, fontSize: 11),
+                ),
+                const Divider(color: Colors.white24, height: 14),
+                Flexible(
+                  child: Scrollbar(
+                    controller: scrollController,
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: scrollController,
+                      padding: const EdgeInsets.only(right: 12),
+                      child: Text(
+                        body,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          height: 1.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({
     super.key,
@@ -217,6 +393,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.knownDuration,
     this.onResumePosition,
     this.loadChapters,
+    this.programDetailTitle,
+    this.programDetailMeta,
+    this.programDetailBody,
   });
 
   /// Display heading: a recording's title, or a live channel's
@@ -275,6 +454,15 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// logged and dropped: chapters decorate playback and
   /// must not delay or fail it.
   final Future<List<Duration>> Function()? loadChapters;
+
+  /// Full programme heading shown in the OSD detail viewer (defaults to [title]).
+  final String? programDetailTitle;
+
+  /// Single-line metadata (broadcast time, channel, genre) shown above [programDetailBody].
+  final String? programDetailMeta;
+
+  /// Combined full programme description body shown when opening "番組詳細" in the OSD.
+  final String? programDetailBody;
 
   static const Duration rewindStep = Duration(seconds: -10);
   static const Duration forwardStep = Duration(seconds: 10);
@@ -392,6 +580,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
   final FocusNode _osdFirstFocusNode = FocusNode(debugLabel: 'playerOsdFirst');
+  final FocusNode _osdDetailButtonFocusNode = FocusNode(
+    debugLabel: 'playerOsdDetailButton',
+  );
+  final FocusNode _detailFocusNode = FocusNode(debugLabel: 'playerDetail');
   final FocusNode _resumeButtonFocusNode = FocusNode(
     debugLabel: 'playerResumeButton',
   );
@@ -404,6 +596,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   bool _osdOpen = false;
   Timer? _osdTimer;
+  bool _detailOpen = false;
+  final ScrollController _detailScrollController = ScrollController();
 
   IconData? _hudIcon;
   String? _hudText;
@@ -1250,6 +1444,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           run: () {
             _rootFocusNode.dispose();
             _osdFirstFocusNode.dispose();
+            _osdDetailButtonFocusNode.dispose();
+            _detailFocusNode.dispose();
+            _detailScrollController.dispose();
             _resumeButtonFocusNode.dispose();
             _closeBannerFocusNode.dispose();
             _errorBackFocusNode.dispose();
@@ -1318,6 +1515,62 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     });
   }
 
+  bool get _hasProgramDetail =>
+      (widget.programDetailBody?.trim().isNotEmpty ?? false);
+
+  void _openDetail() {
+    if (!_hasProgramDetail) return;
+    _osdTimer?.cancel();
+    setState(() => _detailOpen = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_detailOpen) return;
+      if (_detailScrollController.hasClients) {
+        _detailScrollController.jumpTo(0);
+      }
+      if (_detailFocusNode.canRequestFocus) {
+        _detailFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _closeDetail() {
+    if (!_detailOpen) return;
+    setState(() => _detailOpen = false);
+    if (_osdOpen) {
+      _resetOsdTimer();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_osdOpen) return;
+        if (_osdDetailButtonFocusNode.canRequestFocus) {
+          _osdDetailButtonFocusNode.requestFocus();
+        } else if (_osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+      });
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _rootFocusNode.canRequestFocus) {
+          _rootFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _scrollDetailBy(double delta) {
+    if (!_detailScrollController.hasClients) return;
+    final pos = _detailScrollController.position;
+    final target = (pos.pixels + delta)
+        .clamp(pos.minScrollExtent, pos.maxScrollExtent)
+        .toDouble();
+    if (target == pos.pixels) return;
+    unawaited(
+      _detailScrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 90),
+        curve: Curves.easeOut,
+      ),
+    );
+  }
+
   void _openOsd() {
     setState(() => _osdOpen = true);
     _resetOsdTimer();
@@ -1330,8 +1583,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _closeOsd() {
     _osdTimer?.cancel();
-    if (!_osdOpen) return;
-    setState(() => _osdOpen = false);
+    if (!_osdOpen && !_detailOpen) return;
+    setState(() {
+      _osdOpen = false;
+      _detailOpen = false;
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _rootFocusNode.canRequestFocus) {
         _rootFocusNode.requestFocus();
@@ -1350,7 +1606,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   void _resetOsdTimer() {
     _osdTimer?.cancel();
     _osdTimer = Timer(const Duration(seconds: 5), () {
-      if (mounted && _osdOpen) _closeOsd();
+      if (mounted && _osdOpen && !_detailOpen) _closeOsd();
     });
   }
 
@@ -1488,6 +1744,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       }
       return KeyEventResult.ignored;
     }
+    if (_detailOpen) {
+      if (event is KeyDownEvent &&
+          (key == LogicalKeyboardKey.escape ||
+              key == LogicalKeyboardKey.goBack)) {
+        _closeDetail();
+      }
+      return KeyEventResult.handled;
+    }
     if (_osdOpen) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
         _closeOsd();
@@ -1568,9 +1832,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       buffering: _buffering,
     );
     return PopScope(
-      canPop: !_osdOpen,
+      canPop: !_osdOpen && !_detailOpen,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _osdOpen) {
+        if (didPop) return;
+        if (_detailOpen) {
+          _closeDetail();
+        } else if (_osdOpen) {
           _closeOsd();
         }
       },
@@ -1651,6 +1918,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       if (_seekHudVisible && !_osdOpen && !widget.live)
                         _buildSeekHud(),
                       if (_osdOpen) _buildRemoteOsd(),
+                      if (_detailOpen && _hasProgramDetail)
+                        Positioned(
+                          top: 20,
+                          left: 28,
+                          right: 28,
+                          child: ProgramDetailOverlayPanel(
+                            title: widget.programDetailTitle ?? widget.title,
+                            meta: widget.programDetailMeta,
+                            body: widget.programDetailBody!,
+                            scrollController: _detailScrollController,
+                            focusNode: _detailFocusNode,
+                            onClose: _closeDetail,
+                            onScrollDelta: _scrollDetailBy,
+                          ),
+                        ),
                       if (_interrupted) _buildInterruptionBanner(),
                     ],
                   ),
@@ -2147,6 +2429,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         _toggleSubtitles();
                         _resetOsdTimer();
                       },
+                    ),
+                  if (_hasProgramDetail)
+                    _osdButton(
+                      focusNode: _osdDetailButtonFocusNode,
+                      icon: Icons.info_outline,
+                      label: _detailOpen ? '詳細を閉じる' : '番組詳細',
+                      onPressed: () =>
+                          _detailOpen ? _closeDetail() : _openDetail(),
                     ),
                   _osdButton(
                     icon: Icons.close,

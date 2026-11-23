@@ -5,8 +5,8 @@
 library;
 
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
@@ -1164,6 +1164,119 @@ void main() {
         isFalse,
       );
     });
+  });
+
+  group('OSD program detail overlay & formatting', () {
+    test('formatProgramDetailBody combines descriptions without duplication', () {
+      expect(formatProgramDetailBody(), isNull);
+      expect(
+        formatProgramDetailBody(description: '  ', longDescription: '\n'),
+        isNull,
+      );
+      expect(
+        formatProgramDetailBody(description: '番組概要のみ'),
+        '番組概要のみ',
+      );
+      expect(
+        formatProgramDetailBody(longDescription: '詳細本文のみ'),
+        '詳細本文のみ',
+      );
+      expect(
+        formatProgramDetailBody(
+          description: '短い導入文',
+          longDescription: '短い導入文\n出演者: テスト太郎',
+        ),
+        '短い導入文\n出演者: テスト太郎',
+      );
+      expect(
+        formatProgramDetailBody(
+          description: '冒頭の紹介文。',
+          longDescription: '詳細な解説やゲスト情報など。',
+        ),
+        '冒頭の紹介文。\n\n詳細な解説やゲスト情報など。',
+      );
+    });
+
+    testWidgets(
+      'ProgramDetailOverlayPanel fits within half screen height, scrolls on Up/Down, and closes on Back/Select',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final scrollController = ScrollController();
+        final focusNode = FocusNode();
+        addTearDown(scrollController.dispose);
+        addTearDown(focusNode.dispose);
+
+        var closeCount = 0;
+        final longBody = List.generate(
+          30,
+          (i) => '番組詳細テスト行 ${i + 1}: 出演者や見どころ・あらすじなどを長文で表示します。',
+        ).join('\n');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  Positioned(
+                    top: 20,
+                    left: 28,
+                    right: 28,
+                    child: ProgramDetailOverlayPanel(
+                      title: '詳細表示テスト番組タイトル',
+                      meta: '2026/11/23 (月) 13:00 ・ 30分 ・ テスト放送 ・ アニメ',
+                      body: longBody,
+                      scrollController: scrollController,
+                      focusNode: focusNode,
+                      onClose: () => closeCount++,
+                      onScrollDelta: (delta) {
+                        if (!scrollController.hasClients) return;
+                        final pos = scrollController.position;
+                        final next = (pos.pixels + delta)
+                            .clamp(pos.minScrollExtent, pos.maxScrollExtent)
+                            .toDouble();
+                        scrollController.jumpTo(next);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final panelSize = tester.getSize(
+          find.byKey(const ValueKey('player_program_detail_panel')),
+        );
+        expect(panelSize.height, lessThanOrEqualTo(720 / 2));
+        expect(scrollController.position.maxScrollExtent, greaterThan(0));
+        expect(scrollController.offset, 0);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pumpAndSettle();
+        final afterDown = scrollController.offset;
+        expect(afterDown, greaterThan(0));
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pumpAndSettle();
+        expect(scrollController.offset, lessThan(afterDown));
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+        await tester.pumpAndSettle();
+        expect(closeCount, 1);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(closeCount, 2);
+
+        await tester.tap(find.text('閉じる'));
+        await tester.pumpAndSettle();
+        expect(closeCount, 3);
+      },
+    );
   });
 }
 

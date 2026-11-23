@@ -86,13 +86,20 @@
 3. **戻るボタンによるアプリ終了確認ダイアログ (`lib/ui/app_shell.dart`)**:
    - `AppShell` を `ConsumerStatefulWidget` 化し、ルートを `PopScope(canPop: false)` で保護。子画面・ダイアログが開いていないルート状態で戻るキーを押した場合に `'アプリを終了しますか？'`（初期フォーカス `'キャンセル'`／`'終了する'` で `SystemNavigator.pop()`）を表示し、多重オープンは `_exitDialogOpen` で抑止。
 
-### 第7弾: 録画終端での誤再接続修正と再生完了時自動復帰（本コミット）
+### 第7弾: 録画終端での誤再接続修正と再生完了時自動復帰 (`dd60d62`)
 1. **録画正常終了 (EOF) 時のプロキシ無制限再接続防止 (`lib/core/services/dtcp_playback.dart`, `lib/core/dtcp/dtcp_proxy.dart`)**:
    - `DtcpPlaybackEngine._start` から `isLive` を `DtcpProxy.start` へ伝播し、非 Seekable 経路（モバイル画質などサイズ・尺欠如時）でエラー無しの正常 EOF を再接続対象とするのを Live 視聴限定に修正（通信エラー発生時の無制限再接続は維持）。
    - Seekable 録画経路でエラー無し (`producer.error == null`) のまま宣言サイズ (`totalBytes`) 未満でストリームが終わった場合、末尾付近（残り 2 MiB または 2% 以内）の1回確認または 2 回一致で実 EOF バイト (`_eofByte`) を確定して応答を正常クローズするよう修正（以降 `_eofByte` 以降の Range 要求は即 416 を返却）。
 2. **プレイヤー終端ガードと再生完了時の自動一覧/詳細復帰 (`lib/ui/player_error_policy.dart`, `lib/ui/player_screen.dart`)**:
    - `isNearRecordedEnd`（録画で残り 8 秒以内、30 秒以下の短尺は 2 秒以内）を追加。
    - `mpv` の `completed=true` 通知時、および終端付近でのバッファ後停止／ストールタイムアウト／末尾エラー時にすべての自動再接続／ストール監視タイマーを止めて正常終了扱いとし、再生画面を閉じて録画一覧／詳細画面へ自動で戻るよう変更（通常のレジューム位置ゼロ報告は従来通り動作、終端での手動一時停止時は停止状態を維持）。
+
+### 第8弾: 再生中 OSD からの番組詳細（半画面スクロール）表示（本コミット）
+1. **OSD「番組詳細」ボタンと上半分スクロールオーバーレイ (`lib/ui/player_screen.dart`)**:
+   - 番組の `description` と `longDescription` を重複なく結合する `formatProgramDetailBody` と、画面縦幅 45% 以内（上半分）にタイトル・メタ情報・全文を表示する `ProgramDetailOverlayPanel` を追加。
+   - 詳細本文が存在する番組のみ OSD の「閉じる」手前に `'番組詳細'` ボタンを表示し、表示中は OSD 自動消灯タイマーを一時停止。Fire TV リモコンの上下キー（長押し連続スクロール対応）で全文スクロールでき、決定キー・戻るキー（またはパネル内「閉じる」）で再生画面を閉じずに詳細エリアのみ閉じて OSD ボタンへフォーカスを戻します。
+2. **録画・TV視聴詳細画面からのメタデータ引き渡し (`lib/ui/titles_screen.dart`, `lib/ui/live_screen.dart`)**:
+   - 録画済み詳細画面・Live 視聴詳細画面の双方で、番組タイトル・放送日時／チャンネル／ジャンル・詳細文（詳細画面上で 2 行省略または省略していた内容）を `PlayerScreen` へ渡すように拡張。
 
 ---
 
@@ -121,19 +128,19 @@
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー・プリセット復元ボタン |
 | `lib/ui/epg_screen.dart` | `_EventTile` の `focusColor` 無効化＋3px 前面フォーカス枠線描画（ライト時 `#D32F2F` / ナイト時 `amberAccent`） |
 | `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` 化（`autofocus` 解除・決定キーで検索語入力） |
-| `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊） |
+| `lib/ui/live_screen.dart` | Fire TV 操作調整、デフォルト画質追従＋詳細画面都度切替（既定値非破壊）、OSD「番組詳細」データ引き渡し |
 | `lib/ui/player_cache_policy.dart` | Android 軽量既定値、録画(0〜60分)/Live(0〜5分) バッファ選択肢、`computeMpvBufferPlan`（ディスクキャッシュ上限 & 512 MiB 保護） |
 | `lib/ui/player_error_policy.dart` | 録画終端付近の正常完了判定 (`isNearRecordedEnd`) を追加 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（左右 ±10 秒統一）、シークバー HUD、OSD（`'番組詳細'` 半画面スクロール表示含む）、事前バッファ蓄積表示、ディスクキャッシュ適用/掃除、無制限自動再開、中断バナー/エラー画面フォーカス修正、録画終了時の自動復帰・終端誤再接続抑止 |
 | `lib/ui/schedule_form.dart` | 長さ/条件 ID/録画先の 3 欄を `FireTvTextInputField` 化 |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、「表示」→ナイトモードスイッチ、「再生」→デフォルト画質切替＆Live 上・録画下バッファ設定 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
-| `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、`knownDuration` 引き渡し、検索欄 `FireTvTextInputField` 化、`'番組まとめ'` `FilterChip`・シリーズ折りたたみフォルダ `_TitleGroupTile`・展開インデント表示を追加 |
+| `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、`knownDuration` 引き渡し、OSD「番組詳細」データ引き渡し、検索欄 `FireTvTextInputField` 化、`'番組まとめ'` `FilterChip`・シリーズ折りたたみフォルダ `_TitleGroupTile`・展開インデント表示を追加 |
 | `lib/ui/widgets.dart` | 決定キーでダイアログ入力を開く共通 `FireTvTextInputField` / `_FireTvTextInputDialog` 追加 |
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG枠フォーカス・ロケール・番組自動まとめ・終了確認ダイアログ・録画終端ガード）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・プリセット・ネイティブAES・バッファ設計・設定・ナイトモード・10秒シーク・EPG枠フォーカス・ロケール・番組自動まとめ・終了確認ダイアログ・録画終端ガード・OSD番組詳細パネル）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |

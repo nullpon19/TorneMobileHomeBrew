@@ -1120,6 +1120,22 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
       // the context rewind of resumeRewind (plan 98 / 102).
       initialStart = resume ? resumePlaybackStartOf(title) : null;
     }
+    final detailMetaParts = <String>[
+      if (title.scheduledStart != null)
+        formatDateTimeWithWeekdayJst(title.scheduledStart!),
+      if (title.scheduledDurationSeconds != null)
+        formatDurationSeconds(title.scheduledDurationSeconds!),
+      if (title.channelName != null && title.channelName!.isNotEmpty)
+        title.channelName!,
+      if (title.genre != null && title.genre!.isNotEmpty) title.genre!,
+    ];
+    final detailMeta = detailMetaParts.isEmpty
+        ? null
+        : detailMetaParts.join(' ・ ');
+    final detailBody = formatProgramDetailBody(
+      description: title.description,
+      longDescription: title.longDescription,
+    );
     setState(() => _starting = true);
     try {
       await startPlaybackAndShowPlayer(
@@ -1135,6 +1151,9 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
               (title.scheduledDurationSeconds != null
                   ? Duration(seconds: title.scheduledDurationSeconds!)
                   : null),
+          programDetailTitle: title.title,
+          programDetailMeta: detailMeta,
+          programDetailBody: detailBody,
           // Leaving the player reports where the viewing
           // stopped (plan 102), so the unit's resume point is
           // there for the next viewing — in this app or in

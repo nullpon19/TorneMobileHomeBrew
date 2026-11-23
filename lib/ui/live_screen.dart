@@ -481,6 +481,22 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
     final res = useMobile
         ? (channel.mobileRes ?? channel.originalRes ?? channel.res.first)
         : (channel.originalRes ?? channel.mobileRes ?? channel.res.first);
+    final start = channel.programStart;
+    final end = channel.programEnd;
+    final detailMetaParts = <String>[
+      if (channel.channelName != null && channel.channelName!.isNotEmpty)
+        channel.channelName!,
+      if (start != null && end != null)
+        '${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}',
+      if (channel.genre != null && channel.genre!.isNotEmpty) channel.genre!,
+    ];
+    final detailMeta = detailMetaParts.isEmpty
+        ? null
+        : detailMetaParts.join(' ・ ');
+    final detailBody = formatProgramDetailBody(
+      description: channel.description,
+      longDescription: channel.longDescription,
+    );
     setState(() => _starting = true);
     try {
       await startPlaybackAndShowPlayer(
@@ -491,6 +507,9 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
           title: channel.channelName ?? channel.programTitle,
           session: session,
           live: true,
+          programDetailTitle: channel.programTitle,
+          programDetailMeta: detailMeta,
+          programDetailBody: detailBody,
         ),
         unsupportedSubject: 'TV視聴',
         startFailureMessage: '視聴を開始できませんでした',
