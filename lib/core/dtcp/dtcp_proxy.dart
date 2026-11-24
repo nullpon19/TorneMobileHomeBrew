@@ -776,6 +776,15 @@ class DtcpProxy {
     }
   }
 
+  static final RegExp _rangeStartPattern = RegExp(r'^bytes=(\d+)-');
+
+  static int? _parseRangeStart(String? header) {
+    if (header == null) return null;
+    final match = _rangeStartPattern.firstMatch(header.trim());
+    if (match == null) return null;
+    return int.tryParse(match.group(1)!);
+  }
+
   Future<void> _handleLegacy(HttpRequest request) async {
     if (request.method == 'HEAD') {
       final response = request.response;
@@ -786,7 +795,10 @@ class DtcpProxy {
       await response.close();
       return;
     }
-    if (request.headers.value(HttpHeaders.rangeHeader) != null) {
+    final rangeStart = _parseRangeStart(
+      request.headers.value(HttpHeaders.rangeHeader),
+    );
+    if (rangeStart != null && rangeStart > 0) {
       final response = request.response;
       response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
       response.headers.set('Accept-Ranges', 'none');

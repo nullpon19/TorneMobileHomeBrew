@@ -428,8 +428,9 @@ void main() {
         final client = HttpClient();
         addTearDown(() => client.close(force: true));
 
-        // 1. Primary GET begins streaming stalePart.
+        // 1. Primary GET (with FFmpeg's default `Range: bytes=0-`) begins streaming stalePart as 200 OK.
         final req1 = await client.getUrl(proxy.uri);
+        req1.headers.set('Range', 'bytes=0-');
         final resp1 = await req1.close();
         expect(resp1.statusCode, HttpStatus.ok);
         expect(resp1.headers.value('accept-ranges'), 'none');
@@ -457,7 +458,7 @@ void main() {
         await firstGot.future.timeout(const Duration(seconds: 5));
         expect(streamBytes.sublist(0, stalePart.length), stalePart);
 
-        // 2. Concurrent HEAD & Range probe (mpv probe behaviour) must return
+        // 2. Concurrent HEAD & non-zero Range seek probe must return
         //    Accept-Ranges: none / 416 WITHOUT terminating resp1 or reopening upstream!
         final headReq = await client.headUrl(proxy.uri);
         final headResp = await headReq.close();
@@ -466,7 +467,7 @@ void main() {
         expect(headResp.headers.value('accept-ranges'), 'none');
 
         final rangeReq = await client.getUrl(proxy.uri);
-        rangeReq.headers.set('Range', 'bytes=0-1023');
+        rangeReq.headers.set('Range', 'bytes=1024-2047');
         final rangeResp = await rangeReq.close();
         await rangeResp.drain<void>();
         expect(rangeResp.statusCode, HttpStatus.requestedRangeNotSatisfiable);
