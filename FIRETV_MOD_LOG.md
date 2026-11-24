@@ -251,7 +251,7 @@
    - `titles_screen.dart` では `_buildRecordedPlayerScreen` と `ProviderContainer` ベースの `_reportResumePositionWithContainer` を切り出し、`pushReplacement` 後も途中再生位置（`initialStart`）とレジューム保存・チャプター取得が安全に維持されるよう配線。
 3. **Live 一時停止〜未追いつき限定「追いかけ再生」UI・現在位置へ・可変倍速自動追いつき (`lib/ui/player_cache_policy.dart`, `lib/ui/player_screen.dart`)**:
    - `computeMpvBufferPlan` に `liveUseMobile` と `MpvBufferPlan.cachePause` を追加し、Live バッファ `0 秒` でも `cache=yes` / `cache-on-disk=yes` / `readaheadSeconds >= 300`（モバイル `21 MiB/分`・DR `110 MiB/分`、空き `512 MiB` 保護クランプ）＋ `cache-pause-initial=no` / `cache-pause=no` で起動待ちゼロのまま最大 5 分の一時停止蓄積に対応（`test/player_cache_policy_test.dart` 保護のため `mpvCacheMode` は不変）。
-   - `liveCatchUpSpeedForLagSeconds`（`>120秒: 2倍`, `>30秒: 1.5倍`, `>1.5秒: 1.25倍`, 下りヒステリシス付き）と `osdLiveStatusBadgeSpec`（`LIVE` 赤 vs `追いかけ再生` / `追いかけ再生 X倍` `#EF6C00`）を追加。
+   - `liveCatchUpSpeedForLagSeconds`（`>120秒: 2倍`, `>30秒: 1.5倍`, `>1.5秒: 1.25倍`, 下りヒステリシス付き）と `osdLiveStatusBadgeSpec`（`LIVE` 赤 vs 一時停止中 `一時停止` / 再生中 `追いかけ再生` / `追いかけ再生 X倍` `#EF6C00`）を追加。
    - `PlayerScreen` に一時停止検知 `_markLivePaused`・500ms 追従タイマー `_liveCatchUpTimer`・自動変速 `_updateLiveCatchUpSpeed`（Live 設定バッファ分を差し引いた超過バッファ＋推定ラグで判定）・`等速に戻す`/`倍速追いかけ` トグル `_toggleLiveAutoCatchUp`・自動追いつき完了時 OSD フォーカス保護 `_finishLiveCatchUp` を実装し、`現在位置へ` ボタンおよび `追いかけ再生` バッジを一時停止後〜追いつき完了までの間のみ表示するよう改善。
 4. **検証 (`test/firetv_mod_test.dart`)**:
    - `plans live initial buffering and timeouts`（DR 時の 512 MiB 保護クランプ含む）および `LiveChannelSwitchPreviewCard` テスト（枠線なし・画面端接地・Light 白背景）を更新し、Phase 25 ポリシーテストを追加して `dart analyze` (`No issues found!`) および全 659 テスト合格を確認。
@@ -294,7 +294,7 @@
 | `lib/ui/multi_nasne_policy.dart` | 複数台 nasne 統合用ポリシー（サービス統合・空きチューナー優先選択・予約統合＆HDD 空き容量優先自動振り分け・`recNgList` 複合キー＆統合フィルタ・複合キー分離） |
 | `lib/ui/playback_launcher.dart` | エラー／資格情報案内／未実装ダイアログの初期ボタン `autofocus` 対応 |
 | `lib/ui/player_cache_policy.dart` | Android 向けデマクサバッファ削減設定、Live/録画別長時間バッファ・ディスクキャッシュ配分ポリシー (`MpvBufferPlan` / `computeMpvBufferPlan`：Live バッファ 0 秒時も起動待ちゼロのまま裏タイムシフト 5 分＋空き 512 MiB 保護)、可変倍速追いかけ判定 (`liveCatchUpSpeedForLagSeconds`)、Live MPEG-TS 初期プローブ短縮定数 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階「コの字」枠線なし＆ライト白背景 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（Live 一時停止時限定 `追いかけ再生` オレンジバッジ・`現在位置へ`・`等速に戻す`/`倍速追いかけ` 自動追いつき制御・Live/録画両対応 `画質: 元画質/モバイル` 即時切替・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階「コの字」枠線なし＆ライト白背景 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（Live 一時停止時限定 `一時停止` / `追いかけ再生` オレンジバッジ・`現在位置へ`・`等速に戻す`/`倍速追いかけ` 自動追いつき制御・Live/録画両対応 `画質: 元画質/モバイル` 即時切替・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
 | `lib/ui/schedule_form.dart` | `FireTvTextInputField` 化、`FireTvTimePickerDialog`（D-pad 時刻設定）、デフォルト録画画質連動、競合警告キャンセル `autofocus`、2 台以上登録時の「録画する nasne」指定／空き容量＆競合考慮の自動振り分け |
 | `lib/ui/schedules_screen.dart` | `新規予約` の `AppBar` 上部移動（FAB 廃止）、詳細 `autofocusEdit`、複数台 nasne 予約時刻順統合一覧＆複合キー管理、「予約一覧 / 録画失敗」管理（詳細・個別削除・すべて削除） |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、登録済み nasne 行タップメニュー（切替/検証/解除）、単一フォーカス `_BufferOptionTile`、ナイトモード・番組表予約表示設定・デフォルト録画画質・デフォルト再生画質切替・Live/録画バッファ設定・バージョン表記統一 |

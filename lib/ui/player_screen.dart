@@ -267,13 +267,17 @@ Widget buildPlayerOsdStatusBadge({
 }
 
 /// Returns the OSD header live status badge label and color for real-time vs
-/// delayed chase playback after pausing.
+/// paused / delayed chase playback after pausing.
 ({String label, Color color}) osdLiveStatusBadgeSpec({
   required bool liveDelayedByPause,
   required double liveCatchUpRate,
+  bool isPaused = false,
 }) {
   if (!liveDelayedByPause) {
     return (label: 'LIVE', color: Colors.redAccent);
+  }
+  if (isPaused) {
+    return (label: '一時停止', color: const Color(0xFFEF6C00));
   }
   if (liveCatchUpRate > 1.0) {
     return (
@@ -4536,6 +4540,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       final spec = osdLiveStatusBadgeSpec(
                         liveDelayedByPause: _liveDelayedByPause,
                         liveCatchUpRate: _liveCatchUpRate,
+                        isPaused: !_playingNow || _livePausedAt != null,
                       );
                       return buildPlayerOsdStatusBadge(
                         label: spec.label,

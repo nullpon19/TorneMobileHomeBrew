@@ -6399,6 +6399,14 @@ void main() {
         expect(realtimeBadge.label, 'LIVE');
         expect(realtimeBadge.color, Colors.redAccent);
 
+        final delayedPausedBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.5,
+          isPaused: true,
+        );
+        expect(delayedPausedBadge.label, '一時停止');
+        expect(delayedPausedBadge.color, const Color(0xFFEF6C00));
+
         final delayedNormalBadge = osdLiveStatusBadgeSpec(
           liveDelayedByPause: true,
           liveCatchUpRate: 1.0,
