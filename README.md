@@ -4,7 +4,7 @@
 > 本リポジトリは [mar1mo-41414/TorneMobileHomeBrew](https://github.com/mar1mo-41414/TorneMobileHomeBrew)（v1.5.0 / MIT License）をベースに、**Fire TV / Android TV リモコン操作・大画面 UI 向けに調整した非公式フォーク（`applicationId: com.markun.tmhb.firetv`）** です。
 > - 公式版 (`com.markun.tmhb`) と別アプリ識別子のため共存インストールが可能です。
 > - **複数台の nasne を登録した場合、自動で統合モード**（全 nasne 横断の予約・録画済み統合、TV視聴の空きチューナー自動選択＆視聴中自動フェイルオーバー、録画予約の空き容量優先自動振り分け）として動作します（1 台のみ登録時は従来どおり動作します）。
-> - **対応 OS**: Android 7.0（API 24）/ Fire OS 6・7・8 以降（実機動作確認は **Fire TV Stick 4K Max 第2世代 / Fire OS 8** のみ。Fire OS 5 以前および Vega OS 搭載機は非対応）。世代別の対応目安は [FIRETV_CHANGES.md](FIRETV_CHANGES.md) を参照してください。
+> - **対応 OS**: Android 7.0（API 24）/ Fire OS 6・7・8 以降（実機動作確認済み：**Fire TV Stick 4K Max 第2世代 / Fire OS 8**、**Fire TV Stick 4K Max 第1世代 / Fire OS 7**〔※DR 再生は設定「映像デコード方式 → MPEG-2 のみSW」で動作確認済み〕。Fire OS 5 以前および Vega OS 搭載機は非対応）。世代別の対応目安は [FIRETV_CHANGES.md](FIRETV_CHANGES.md) を参照してください。
 > - **DTCP-IP 資格情報（証明書・秘密鍵）は一切同梱していません。** ご自身の資格情報を取り込んでご利用ください。
 > - 公式 v1.5.0 からの変更点・追加機能の詳細は [FIRETV_CHANGES.md](FIRETV_CHANGES.md) を参照してください。
 > - ライセンスは [LICENSE](LICENSE)（MIT License）を参照してください。
