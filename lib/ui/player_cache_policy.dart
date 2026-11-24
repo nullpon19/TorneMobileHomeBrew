@@ -343,8 +343,12 @@ MpvBufferPlan computeMpvBufferPlan({
       cacheDirPath.isNotEmpty;
 
   final int demuxerMaxBytes;
+  int demuxerMaxBackBytes;
   if (effectiveTargetSeconds == 0) {
     demuxerMaxBytes = effectiveRecordingDemuxerMaxBytes(isAndroid: isAndroid);
+    demuxerMaxBackBytes = effectiveRecordingDemuxerMaxBackBytes(
+      isAndroid: isAndroid,
+    );
   } else {
     // Mobile TS bitrate is ~11-15 MiB/min (headroom 21 MiB/min); DR is ~90-100
     // Mbps (headroom 110 MiB/min for 5-minute background live pause timeshift).
@@ -358,45 +362,70 @@ MpvBufferPlan computeMpvBufferPlan({
       math.max(minFloor, scaled),
       maxDiskCacheBytes,
     );
+    final rawBackTarget = live
+        ? math.min(
+            math.max(
+              14 * 1024 * 1024,
+              ((livePauseTimeshiftSeconds * mibPerMinute) ~/ 60) * 1024 * 1024,
+            ),
+            maxDiskCacheBytes,
+          )
+        : 0;
     if (useDiskCache && availableDiskBytes != null) {
       final safeLimit = availableDiskBytes - minFreeDiskReserveBytes;
       if (safeLimit <= 20 * 1024 * 1024) {
         // Low storage fallback: disable disk cache and keep a small RAM budget.
         useDiskCache = false;
         demuxerMaxBytes = math.min(rawTarget, 24 * 1024 * 1024);
-      } else {
-        final int backBudget;
-        if (live) {
-          backBudget = 2 * 1024 * 1024;
+        demuxerMaxBackBytes = live
+            ? (isAndroid ? 8 * 1024 * 1024 : 16 * 1024 * 1024)
+            : effectiveRecordingDemuxerMaxBackBytes(isAndroid: isAndroid);
+      } else if (live) {
+        if (rawTarget + rawBackTarget <= safeLimit) {
+          demuxerMaxBytes = rawTarget;
+          demuxerMaxBackBytes = rawBackTarget;
         } else {
-          backBudget = math.max(
-            4 * 1024 * 1024,
-            math.min(math.min(rawTarget, safeLimit) ~/ 5, maxDiskBackCacheBytes),
+          final half = safeLimit ~/ 2;
+          demuxerMaxBackBytes = math.min(rawBackTarget, half);
+          demuxerMaxBytes = math.min(
+            rawTarget,
+            math.max(14 * 1024 * 1024, safeLimit - demuxerMaxBackBytes),
           );
+          if (demuxerMaxBytes + demuxerMaxBackBytes > safeLimit) {
+            demuxerMaxBackBytes = math.max(0, safeLimit - demuxerMaxBytes);
+          }
         }
+      } else {
+        final backBudget = math.max(
+          4 * 1024 * 1024,
+          math.min(math.min(rawTarget, safeLimit) ~/ 5, maxDiskBackCacheBytes),
+        );
         final forwardCap = math.max(14 * 1024 * 1024, safeLimit - backBudget);
         demuxerMaxBytes = math.min(rawTarget, forwardCap);
+        demuxerMaxBackBytes = math.max(
+          4 * 1024 * 1024,
+          math.min(demuxerMaxBytes ~/ 4, maxDiskBackCacheBytes),
+        );
       }
     } else if (!useDiskCache) {
-      demuxerMaxBytes = math.min(rawTarget, 48 * 1024 * 1024);
+      demuxerMaxBytes = math.min(
+        rawTarget,
+        (live && availableDiskBytes != null)
+            ? 24 * 1024 * 1024
+            : 48 * 1024 * 1024,
+      );
+      demuxerMaxBackBytes = live
+          ? (isAndroid ? 8 * 1024 * 1024 : 16 * 1024 * 1024)
+          : effectiveRecordingDemuxerMaxBackBytes(isAndroid: isAndroid);
     } else {
       demuxerMaxBytes = rawTarget;
+      demuxerMaxBackBytes = live
+          ? rawBackTarget
+          : math.max(
+              4 * 1024 * 1024,
+              math.min(demuxerMaxBytes ~/ 4, maxDiskBackCacheBytes),
+            );
     }
-  }
-
-  final int demuxerMaxBackBytes;
-  if (live) {
-    demuxerMaxBackBytes = 2 * 1024 * 1024;
-  } else if (useDiskCache) {
-    final quarter = demuxerMaxBytes ~/ 4;
-    demuxerMaxBackBytes = math.max(
-      4 * 1024 * 1024,
-      math.min(quarter, maxDiskBackCacheBytes),
-    );
-  } else {
-    demuxerMaxBackBytes = effectiveRecordingDemuxerMaxBackBytes(
-      isAndroid: isAndroid,
-    );
   }
 
   final readaheadSeconds = live

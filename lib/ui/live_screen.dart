@@ -214,7 +214,113 @@ String _mergedBandTabLabel(MergedLiveBand band) => switch (band.kind) {
 String _mergedBandTabKey(MergedLiveBand band) =>
     band.kind == LiveBandKind.other ? band.containerId : 'kind:${band.kind.name}';
 
-class _LiveList extends ConsumerWidget {
+class _LiveChannelListTile extends StatelessWidget {
+  const _LiveChannelListTile({
+    required this.channel,
+    required this.display,
+    required this.selected,
+    required this.isRecording,
+    required this.onTap,
+  });
+
+  final LiveChannel channel;
+  final ResolvedLiveChannelDisplay display;
+  final bool selected;
+  final bool isRecording;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final subtitleStyle = theme.textTheme.bodyMedium?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+    );
+    final metaStyle = theme.textTheme.bodySmall?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    final nextTitle = display.nextProgramTitle?.trim() ?? '';
+    final nextRange = display.nextTimeRange;
+    return ListTile(
+      selected: selected,
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: 16,
+        vertical: 8,
+      ),
+      leading: const Icon(Icons.live_tv_outlined),
+      title: Text(
+        channel.channelName ?? display.programTitle,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            _channelSubtitleFromDisplay(channel, display),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: subtitleStyle,
+          ),
+          if (display.progress != null) ...[
+            const SizedBox(height: 5),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: LinearProgressIndicator(
+                value: display.progress,
+                minHeight: 4,
+                color: Colors.lightBlueAccent,
+                backgroundColor: theme.colorScheme.surfaceContainerHighest,
+              ),
+            ),
+          ],
+          if (nextTitle.isNotEmpty) ...[
+            const SizedBox(height: 5),
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 1,
+                  ),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    '次',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                if (nextRange != null) ...[
+                  Text(nextRange, style: metaStyle),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: Text(
+                    nextTitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: metaStyle,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+      trailing: isRecording ? const _LiveRecordingBadge() : null,
+      onTap: onTap,
+    );
+  }
+}
+
+class _LiveList extends ConsumerStatefulWidget {
   const _LiveList({
     required this.reg,
     required this.activeRegs,
@@ -242,15 +348,168 @@ class _LiveList extends ConsumerWidget {
   onSelect;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_LiveList> createState() => _LiveListState();
+}
+
+class _LiveListState extends ConsumerState<_LiveList>
+    with WidgetsBindingObserver {
+  Timer? _refreshTimer;
+  DateTime? _scheduledTargetAt;
+  bool _scheduledIsBoundary = false;
+  DateTime? _lastBoundaryInvalidateAt;
+  bool _appResumed = true;
+  int _clockTick = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final nextResumed = state == AppLifecycleState.resumed;
+    if (_appResumed != nextResumed) {
+      _appResumed = nextResumed;
+      if (!nextResumed) {
+        _cancelRefreshTimer();
+      } else if (mounted) {
+        setState(() => _clockTick++);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cancelRefreshTimer();
+    super.dispose();
+  }
+
+  void _cancelRefreshTimer() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _scheduledTargetAt = null;
+  }
+
+  void _scheduleAutoRefresh({
+    required List<({LiveChannel channel, ResolvedLiveChannelDisplay display})>
+    items,
+    required DateTime now,
+    required bool enabled,
+  }) {
+    if (!enabled || items.isEmpty) {
+      _cancelRefreshTimer();
+      return;
+    }
+    final next = computeNextLiveListRefresh(
+      programEnds: [for (final item in items) item.display.programEnd],
+      now: now,
+    );
+    final targetAt = now.add(next.delay);
+    final existing = _refreshTimer;
+    final existingTarget = _scheduledTargetAt;
+    if (existing != null &&
+        existing.isActive &&
+        existingTarget != null &&
+        _scheduledIsBoundary == next.isBoundary &&
+        existingTarget.difference(targetAt).abs() <
+            const Duration(seconds: 2)) {
+      return;
+    }
+    _cancelRefreshTimer();
+    _scheduledTargetAt = targetAt;
+    _scheduledIsBoundary = next.isBoundary;
+    final bandTypes = <int>{};
+    if (next.isBoundary) {
+      for (final item in items) {
+        final bandType = broadcastingTypeForLiveBandId(item.channel.bandId);
+        if (bandType == terrestrialBroadcastingType ||
+            bandType == bsBroadcastingType) {
+          bandTypes.add(bandType!);
+        }
+      }
+    }
+    _refreshTimer = Timer(next.delay, () {
+      _refreshTimer = null;
+      _scheduledTargetAt = null;
+      if (!mounted || !_appResumed || !TickerMode.valuesOf(context).enabled) {
+        return;
+      }
+      final fireNow = DateTime.now();
+      if (next.isBoundary &&
+          (_lastBoundaryInvalidateAt == null ||
+              fireNow.difference(_lastBoundaryInvalidateAt!) >=
+                  const Duration(seconds: 5))) {
+        _lastBoundaryInvalidateAt = fireNow;
+        for (final r in widget.activeRegs) {
+          final liveAsync = ref.read(liveChannelsProvider(r));
+          if (liveAsync.hasValue && !liveAsync.isLoading) {
+            ref.invalidate(liveChannelsProvider(r));
+          }
+          final schedAsync = ref.read(schedulesProvider(r));
+          if (schedAsync.hasValue && !schedAsync.isLoading) {
+            ref.invalidate(schedulesProvider(r));
+          }
+          if (bandTypes.contains(terrestrialBroadcastingType)) {
+            final epg = ref.read(epgGuideProvider(r)).value;
+            final epgTo = epg?.to;
+            if (epg == null || (epgTo != null && !epgTo.isAfter(fireNow))) {
+              ref.invalidate(epgGuideProvider(r));
+            }
+          }
+          if (bandTypes.contains(bsBroadcastingType)) {
+            final bsEpg = ref.read(bsEpgGuideProvider(r)).value;
+            final bsTo = bsEpg?.to;
+            if (bsEpg == null || (bsTo != null && !bsTo.isAfter(fireNow))) {
+              ref.invalidate(bsEpgGuideProvider(r));
+            }
+          }
+        }
+      }
+      setState(() => _clockTick++);
+    });
+  }
+
+  ({ResolvedLiveChannelDisplay display, bool isRecording}) _resolveRowState({
+    required RegisteredNasne ownerReg,
+    required LiveChannel channel,
+    required List<OwnedLiveChannel> candidates,
+    required Map<String, List<RecordSchedule>> schedulesByHost,
+    required DateTime now,
+  }) {
+    final display = resolveLiveChannelDisplay(
+      channel: channel,
+      guideEvents: _watchedGuideEventsForChannel(ref, ownerReg, channel),
+      now: now,
+    );
+    final activeSched = _firstActiveScheduleForCandidates(
+      candidates,
+      schedulesByHost,
+      now: now,
+    );
+    final isRecording = isProgramMatchingActiveRecording(
+      activeSchedule: activeSched,
+      programStart: display.programStart,
+      programEnd: display.programEnd,
+      now: now,
+    );
+    return (display: display, isRecording: isRecording);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final _ = _clockTick;
     final showSubchannels = ref.watch(showSubchannelsProvider);
     final now = DateTime.now();
+    final tickerEnabled = TickerMode.valuesOf(context).enabled && _appResumed;
 
-    if (activeRegs.length <= 1) {
-      final bands = ref.watch(liveChannelsProvider(reg));
+    if (widget.activeRegs.length <= 1) {
+      final bands = ref.watch(liveChannelsProvider(widget.reg));
       final schedulesByHost = <String, List<RecordSchedule>>{
-        reg.host:
-            ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[],
+        widget.reg.host:
+            ref.watch(schedulesProvider(widget.reg)).value ??
+            const <RecordSchedule>[],
       };
       return asyncSection(
         bands,
@@ -261,6 +520,7 @@ class _LiveList extends ConsumerWidget {
           );
           final channels = [for (final band in visibleBands) ...band.channels];
           if (channels.isEmpty) {
+            _cancelRefreshTimer();
             return const Center(child: Text('視聴可能なチャンネルがありません'));
           }
           final tabBands = [
@@ -268,63 +528,52 @@ class _LiveList extends ConsumerWidget {
               if (band.channels.isNotEmpty) band,
           ];
           final selectedBand = tabBands.firstWhere(
-            (band) => band.containerId == selectedBandId,
+            (band) => band.containerId == widget.selectedBandId,
             orElse: () => tabBands.first,
+          );
+          final rows = [
+            for (final channel in selectedBand.channels)
+              () {
+                final state = _resolveRowState(
+                  ownerReg: widget.reg,
+                  channel: channel,
+                  candidates: [
+                    OwnedLiveChannel(reg: widget.reg, channel: channel),
+                  ],
+                  schedulesByHost: schedulesByHost,
+                  now: now,
+                );
+                return (
+                  channel: channel,
+                  display: state.display,
+                  isRecording: state.isRecording,
+                );
+              }(),
+          ];
+          _scheduleAutoRefresh(
+            items: [
+              for (final r in rows) (channel: r.channel, display: r.display),
+            ],
+            now: now,
+            enabled: tickerEnabled,
           );
           return LayoutBuilder(
             builder: (context, constraints) {
               final twoPane = constraints.maxWidth >= twoPaneBreakpoint;
               final listView = ListView(
                 children: [
-                  for (final channel in selectedBand.channels)
-                    Builder(
-                      builder: (context) {
-                        final display = resolveLiveChannelDisplay(
-                          channel: channel,
-                          guideEvents: _watchedGuideEventsForChannel(
-                            ref,
-                            reg,
-                            channel,
-                          ),
-                          now: now,
-                        );
-                        final activeSched = _firstActiveScheduleForCandidates(
-                          [OwnedLiveChannel(reg: reg, channel: channel)],
-                          schedulesByHost,
-                          now: now,
-                        );
-                        final isRecording = isProgramMatchingActiveRecording(
-                          activeSchedule: activeSched,
-                          programStart: display.programStart,
-                          programEnd: display.programEnd,
-                          now: now,
-                        );
-                        return ListTile(
-                          selected: channel.id == selectedId,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 8,
-                          ),
-                          leading: const Icon(Icons.live_tv_outlined),
-                          title: Text(
-                            channel.channelName ?? display.programTitle,
-                          ),
-                          subtitle: Text(
-                            _channelSubtitleFromDisplay(channel, display),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          trailing: isRecording
-                              ? const _LiveRecordingBadge()
-                              : null,
-                          onTap: () => onSelect(
-                            channel.id,
-                            channel,
-                            null,
-                            twoPane,
-                          ),
-                        );
-                      },
+                  for (final row in rows)
+                    _LiveChannelListTile(
+                      channel: row.channel,
+                      display: row.display,
+                      selected: row.channel.id == widget.selectedId,
+                      isRecording: row.isRecording,
+                      onTap: () => widget.onSelect(
+                        row.channel.id,
+                        row.channel,
+                        null,
+                        twoPane,
+                      ),
                     ),
                 ],
               );
@@ -346,7 +595,7 @@ class _LiveList extends ConsumerWidget {
                         ],
                         selected: {selectedBand.containerId},
                         onSelectionChanged: (selection) =>
-                            onSelectBand(selection.first),
+                            widget.onSelectBand(selection.first),
                       ),
                     ),
                   Expanded(child: listView),
@@ -355,7 +604,7 @@ class _LiveList extends ConsumerWidget {
               if (!twoPane) return content;
               LiveChannel? selected;
               for (final channel in channels) {
-                if (channel.id == selectedId) selected = channel;
+                if (channel.id == widget.selectedId) selected = channel;
               }
               return Row(
                 children: [
@@ -366,10 +615,10 @@ class _LiveList extends ConsumerWidget {
                     child: selected == null
                         ? const Center(child: Text('チャンネルを選択してください'))
                         : LiveChannelDetailView(
-                            reg: reg,
+                            reg: widget.reg,
                             channel: selected,
-                            watchFocusNode: detailWatchFocusNode,
-                            onLivePlaybackReturned: onPlaybackReturned,
+                            watchFocusNode: widget.detailWatchFocusNode,
+                            onLivePlaybackReturned: widget.onPlaybackReturned,
                           ),
                   ),
                 ],
@@ -378,7 +627,7 @@ class _LiveList extends ConsumerWidget {
           );
         },
         skipLoadingOnReload: true,
-        onRetry: () => ref.invalidate(liveChannelsProvider(reg)),
+        onRetry: () => ref.invalidate(liveChannelsProvider(widget.reg)),
       );
     }
 
@@ -390,7 +639,7 @@ class _LiveList extends ConsumerWidget {
     Object? firstError;
     final schedulesByHost = <String, List<RecordSchedule>>{};
 
-    for (final r in activeRegs) {
+    for (final r in widget.activeRegs) {
       schedulesByHost[r.host] =
           ref.watch(schedulesProvider(r)).value ?? const <RecordSchedule>[];
       final async = ref.watch(liveChannelsProvider(r));
@@ -409,13 +658,14 @@ class _LiveList extends ConsumerWidget {
     }
 
     if (loadedSources.isEmpty) {
+      _cancelRefreshTimer();
       if (anyLoading) return const LoadingView();
       return ErrorView(
         message: firstError != null
             ? userMessageForError(firstError)
             : '視聴可能なチャンネルを取得できませんでした',
         onRetry: () {
-          for (final r in activeRegs) {
+          for (final r in widget.activeRegs) {
             ref.invalidate(liveChannelsProvider(r));
             ref.invalidate(schedulesProvider(r));
           }
@@ -423,74 +673,66 @@ class _LiveList extends ConsumerWidget {
       );
     }
 
-    final mergedBands = mergeLiveBands(loadedSources, preferredReg: reg);
+    final mergedBands = mergeLiveBands(loadedSources, preferredReg: widget.reg);
     final tabBands = [
       for (final band in mergedBands)
         if (band.channels.isNotEmpty) band,
     ];
     if (tabBands.isEmpty) {
+      _cancelRefreshTimer();
       return const Center(child: Text('視聴可能なチャンネルがありません'));
     }
     final allChannels = [for (final band in tabBands) ...band.channels];
     final selectedBand = tabBands.firstWhere(
       (band) =>
-          _mergedBandTabKey(band) == selectedBandId ||
-          band.containerId == selectedBandId,
+          _mergedBandTabKey(band) == widget.selectedBandId ||
+          band.containerId == widget.selectedBandId,
       orElse: () => tabBands.first,
     );
     final selectedBandKey = _mergedBandTabKey(selectedBand);
+    final mergedRows = [
+      for (final merged in selectedBand.channels)
+        () {
+          final state = _resolveRowState(
+            ownerReg: merged.primaryReg,
+            channel: merged.primary,
+            candidates: merged.candidates,
+            schedulesByHost: schedulesByHost,
+            now: now,
+          );
+          return (
+            merged: merged,
+            display: state.display,
+            isRecording: state.isRecording,
+          );
+        }(),
+    ];
+    _scheduleAutoRefresh(
+      items: [
+        for (final r in mergedRows)
+          (channel: r.merged.primary, display: r.display),
+      ],
+      now: now,
+      enabled: tickerEnabled,
+    );
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final twoPane = constraints.maxWidth >= twoPaneBreakpoint;
         final listView = ListView(
           children: [
-            for (final merged in selectedBand.channels)
-              Builder(
-                builder: (context) {
-                  final ch = merged.primary;
-                  final display = resolveLiveChannelDisplay(
-                    channel: ch,
-                    guideEvents: _watchedGuideEventsForChannel(
-                      ref,
-                      merged.primaryReg,
-                      ch,
-                    ),
-                    now: now,
-                  );
-                  final activeSched = _firstActiveScheduleForCandidates(
-                    merged.candidates,
-                    schedulesByHost,
-                    now: now,
-                  );
-                  final isRecording = isProgramMatchingActiveRecording(
-                    activeSchedule: activeSched,
-                    programStart: display.programStart,
-                    programEnd: display.programEnd,
-                    now: now,
-                  );
-                  return ListTile(
-                    selected: merged.serviceKey == selectedId,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    leading: const Icon(Icons.live_tv_outlined),
-                    title: Text(ch.channelName ?? display.programTitle),
-                    subtitle: Text(
-                      _channelSubtitleFromDisplay(ch, display),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: isRecording ? const _LiveRecordingBadge() : null,
-                    onTap: () => onSelect(
-                      merged.serviceKey,
-                      merged.primary,
-                      merged.candidates,
-                      twoPane,
-                    ),
-                  );
-                },
+            for (final row in mergedRows)
+              _LiveChannelListTile(
+                channel: row.merged.primary,
+                display: row.display,
+                selected: row.merged.serviceKey == widget.selectedId,
+                isRecording: row.isRecording,
+                onTap: () => widget.onSelect(
+                  row.merged.serviceKey,
+                  row.merged.primary,
+                  row.merged.candidates,
+                  twoPane,
+                ),
               ),
           ],
         );
@@ -525,7 +767,7 @@ class _LiveList extends ConsumerWidget {
                   ],
                   selected: {selectedBandKey},
                   onSelectionChanged: (selection) =>
-                      onSelectBand(selection.first),
+                      widget.onSelectBand(selection.first),
                 ),
               ),
             Expanded(child: listView),
@@ -534,7 +776,7 @@ class _LiveList extends ConsumerWidget {
         if (!twoPane) return content;
         MergedLiveChannel? selected;
         for (final m in allChannels) {
-          if (m.serviceKey == selectedId) selected = m;
+          if (m.serviceKey == widget.selectedId) selected = m;
         }
         return Row(
           children: [
@@ -548,8 +790,8 @@ class _LiveList extends ConsumerWidget {
                       reg: selected.primaryReg,
                       channel: selected.primary,
                       candidates: selected.candidates,
-                      watchFocusNode: detailWatchFocusNode,
-                      onLivePlaybackReturned: onPlaybackReturned,
+                      watchFocusNode: widget.detailWatchFocusNode,
+                      onLivePlaybackReturned: widget.onPlaybackReturned,
                     ),
             ),
           ],
@@ -587,6 +829,10 @@ class ResolvedLiveChannelDisplay {
     this.genre,
     this.shortDescription,
     this.longDescription,
+    this.progress,
+    this.nextProgramTitle,
+    this.nextProgramStart,
+    this.nextProgramEnd,
   });
 
   final String programTitle;
@@ -595,6 +841,55 @@ class ResolvedLiveChannelDisplay {
   final String? genre;
   final String? shortDescription;
   final String? longDescription;
+  final double? progress;
+  final String? nextProgramTitle;
+  final DateTime? nextProgramStart;
+  final DateTime? nextProgramEnd;
+
+  String? get nextTimeRange =>
+      (nextProgramStart != null && nextProgramEnd != null)
+      ? '${formatTimeJst(nextProgramStart!)}–${formatTimeJst(nextProgramEnd!)}'
+      : null;
+}
+
+double? _computeProgramProgress(
+  DateTime? start,
+  DateTime? end,
+  DateTime now,
+) {
+  if (start == null || end == null || !end.isAfter(start)) return null;
+  final totalMs = end.difference(start).inMilliseconds;
+  if (totalMs <= 0) return null;
+  final elapsedMs = now.difference(start).inMilliseconds;
+  return (elapsedMs / totalMs).clamp(0.0, 1.0).toDouble();
+}
+
+/// Computes the next scheduled refresh delay for [_LiveList] from visible
+/// programme end times so progress bars advance every [progressInterval] and
+/// boundaries across any channel trigger immediately upon programme rollover.
+({Duration delay, bool isBoundary}) computeNextLiveListRefresh({
+  required Iterable<DateTime?> programEnds,
+  required DateTime now,
+  Duration progressInterval = const Duration(seconds: 30),
+  Duration boundaryMargin = const Duration(seconds: 1),
+}) {
+  DateTime? earliestEnd;
+  for (final end in programEnds) {
+    if (end == null || !end.isAfter(now)) continue;
+    if (earliestEnd == null || end.isBefore(earliestEnd)) {
+      earliestEnd = end;
+    }
+  }
+  if (earliestEnd != null) {
+    final remaining = earliestEnd.difference(now) + boundaryMargin;
+    if (remaining <= progressInterval) {
+      final clamped = remaining < const Duration(seconds: 1)
+          ? const Duration(seconds: 1)
+          : remaining;
+      return (delay: clamped, isBoundary: true);
+    }
+  }
+  return (delay: progressInterval, isBoundary: false);
 }
 
 /// Resolves the currently broadcasting programme metadata for [channel] at
@@ -619,6 +914,14 @@ ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
       genre: channel.genre,
       shortDescription: channel.description,
       longDescription: channel.longDescription,
+      progress: _computeProgramProgress(
+        channel.programStart,
+        channel.programEnd,
+        now,
+      ),
+      nextProgramTitle: info.nextTitle,
+      nextProgramStart: info.nextStart,
+      nextProgramEnd: info.nextEnd,
     );
   }
   final hasChannelTimes =
@@ -656,12 +959,14 @@ ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
   }
 
   if (preserveChannelFields) {
+    final resolvedStart = channel.programStart ?? ev.start;
+    final resolvedEnd = channel.programEnd ?? ev.end;
     return ResolvedLiveChannelDisplay(
       programTitle: channel.programTitle.trim().isNotEmpty
           ? channel.programTitle
           : (evTitle.isNotEmpty ? evTitle : info.currentTitle),
-      programStart: channel.programStart ?? ev.start,
-      programEnd: channel.programEnd ?? ev.end,
+      programStart: resolvedStart,
+      programEnd: resolvedEnd,
       genre: (channel.genre != null && channel.genre!.trim().isNotEmpty)
           ? channel.genre
           : evGenre,
@@ -675,6 +980,10 @@ ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
               channel.longDescription!.trim().isNotEmpty)
           ? channel.longDescription
           : evLongDescription,
+      progress: _computeProgramProgress(resolvedStart, resolvedEnd, now),
+      nextProgramTitle: info.nextTitle,
+      nextProgramStart: info.nextStart,
+      nextProgramEnd: info.nextEnd,
     );
   }
 
@@ -685,6 +994,10 @@ ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
     genre: evGenre,
     shortDescription: evShortDescription,
     longDescription: evLongDescription,
+    progress: _computeProgramProgress(ev.start, ev.end, now),
+    nextProgramTitle: info.nextTitle,
+    nextProgramStart: info.nextStart,
+    nextProgramEnd: info.nextEnd,
   );
 }
 
