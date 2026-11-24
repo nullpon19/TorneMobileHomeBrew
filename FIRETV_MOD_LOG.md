@@ -281,6 +281,20 @@
 4. **検証 (`test/firetv_mod_test.dart`)**:
    - `AribTsCaptionTap`（188B/192B、`SDP`+`SS3 0x60` 座標、副言語 `data_group_id=2` 除外、DTS/PTS ラップアラウンド、デコーダ自動リセット条件、途中切れ ASS 除去）、行分割ピル描画、字幕 ON/OFF 永続化、`liveLoadingOverlaySpec` / 早期ラッチ抑止、`AppShell` 左メニュー→右ペインフォーカス遷移のテストを追加し、`dart analyze` (`No issues found!`) および全 673 テスト合格を確認。
 
+### 第26弾（Phase 28：字幕色復帰＆表示ブレ根絶、左右話者分離、`LINE Seed JP 太字`・影 2 種・16:9 プレビュー、Live 0 秒表示整理、TV 風 Live OSD）
+
+1. **字幕の色保持・表示ブレ根絶・左右話者ブロック分離 (`lib/ui/subtitle_style_policy.dart`, `lib/ui/subtitle_overlay.dart`, `lib/ui/player_screen.dart`)**:
+   - `_player.stream.subtitle` が `sub-text-ass` / `sub-start` より先に届いた際の白文字先行登録＆ `SubtitleCue.dedupeKey` 同一判定による色付き ASS 破棄バグを修正：`SubtitleActiveWindowTracker` で同一テキストの色付き ASS 到着時に色・スタイルをインプレース昇格させ、`player_screen.dart` では `Future.wait` による 5 プロパティ一括同時取得と最大 2 回（45ms）の不整合・`sub-start` 据え置き待避ガードにより、表示直後の座標・幅ブレと白文字化を同時に解消。
+   - `resolveRawSubtitleCues(atomicSnapshot: true)` による柔軟な ASS/プレーン照合、`findMatchingAribLayoutEvent` の将来先行 TS イベント誤マッチ抑止（`preferredMaxFutureSeconds: 0.6`）、および `PlayerSubtitleOverlay._clusterSubtitleBlocks` の横位置（`xThreshold = 0.14`）分離により、左右の別話者が 1 ブロックへ合体しないよう改善。
+2. **フォント追加・表記整理・サイズ微調整・影 2 種・16:9 等比率プレビュー (`assets/fonts/LINESeedJP-Bold.ttf`, `pubspec.yaml`, `lib/ui/subtitle_style_policy.dart`, `lib/ui/subtitle_settings_screen.dart`)**:
+   - `LINESeedJP-Bold.ttf`（SIL OFL 1.1）を同梱・登録し、`LINE Seed JP（太字）` を追加（`丸ゴシック` の表記も簡潔化）。サイズ倍率を `小 (4.2%)` / `中（標準）(5.2%)` / `大 (6.4%)` へ微調整。
+   - `SubtitleEdgeStyle` に排他 5 択（`なし` / `縁取り（細め）` / `縁取り（太め）` / `影（右下）` / `影（ズレなし・厚め）`）＋ `resolveSubtitleTextShadows` を導入し、設定画面を `ChoiceChip` 選択および仮想 `960×540` `FittedBox` 内蔵の **16:9 比率プレビュー** へ刷新（`小` と `中` の下限張り付きを解消）。
+3. **Live 0 秒待機表示の整理 & TV 風 Live OSD (`lib/ui/player_screen.dart`, `lib/ui/live_screen.dart`)**:
+   - `liveLoadingOverlaySpec` / `_shouldPollLiveBuffering` を更新し、Live バッファ `0 秒` 設定時は `'読み込み中…'`（秒数・バーなし）、`>= 5 秒` 設定時のみ `'バッファ蓄積中… X秒 / Y秒'`＋進捗バーに統一。
+   - `PlayerOsdClockOverlay`（OSD 表示中の左上 `HH:mm` 時刻）、`LiveOsdProgramInfo` / `resolveLiveOsdProgramInfo`、`LiveOsdProgramSection`（現番組名・放送予定時間・残り分数・進行グラフバー・次番組名＆放送時間）を実装し、`live_screen.dart` `_buildLivePlayerScreen` から既存 EPG キャッシュ＆バックグラウンド取得を配線。
+4. **検証 (`test/firetv_mod_test.dart`)**:
+   - 色昇格・先行イベント除外・左右話者分離・影 2 種描画・16:9 プレビュー拡大縮小・TV 風 Live OSD（番組切替跨ぎ含む）および `0 秒` 時 `'読み込み中…'` の単体／ウィジェットテストを更新・追加し、`dart analyze` (`No issues found!`) および全 676 テスト合格を確認。
+
 ---
 
 ## 3. 全変更・追加ファイル一覧 (vs アップストリーム `78d74a8`)
@@ -291,8 +305,8 @@
 | `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順（ローカル用） |
 | `FIRETV_CHANGES.md` | 公式 v1.5.0 からの現在の変更仕様まとめ＋追加機能別枠ドキュメント（ローカル専用） |
 | `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順・ローカル専用） |
-| `assets/fonts/` (`LINESeedJP-Regular.ttf`, `KosugiMaru-Regular.ttf` ほかライセンス) | 字幕選択用フォント（LINE Seed JP Regular / Kosugi Maru）のバンドルアセット |
-| `pubspec.yaml` | `LINESeedJP` / `KosugiMaru` フォントファミリーのアセット登録を追加 |
+| `assets/fonts/` (`LINESeedJP-Regular.ttf`, `LINESeedJP-Bold.ttf`, `KosugiMaru-Regular.ttf` ほかライセンス) | 字幕選択用フォント（LINE Seed JP Regular/Bold・Kosugi Maru）のバンドルアセット |
+| `pubspec.yaml` | `LINESeedJP` (Regular 400 / Bold 700) / `KosugiMaru` フォントファミリーのアセット登録を追加 |
 | `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv`、`versionName` を `-firetv` に変更 |
 | `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner`（`<application>` ＋ `<activity>` 双方） / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
 | `android/app/src/main/res/drawable/tv_banner.png` / `drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
@@ -318,17 +332,17 @@
 | `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、2 台以上登録時の上端 nasne 切替バー、600dp 以上 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` 最下部スクロール対応、録画失敗カードのアプリ内削除同期 |
 | `lib/ui/live_channel_switch_policy.dart` | Live 視聴中の左右 2 段階チャンネル切替モデル・インデックス計算 (`LiveChannelSwitchEntry`, `ChannelSwitchDirection`, `adjacentLiveChannelIndex`) |
 | `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice` / 30 秒)・複数台フェイルオーバー候補保持・即時録画作成・停止直後除外/合成ヘルパー (`schedulesWithoutId` / `schedulesExcludingIds` / `ensureSchedulePresent`)・録画実行中判定 |
-| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー、4 秒予約取得タイムアウト、OSD 即時録画／録画停止配線、バンド内チャンネル切替コンテキスト解決＆事前競合チェック付き切替コールバック、OSD 画質切替（競合フォールバック・左右 CH 引き継ぎ付き）、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示 |
+| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー、4 秒予約取得タイムアウト、OSD 即時録画／録画停止配線、Live OSD 用現/次番組 EPG キャッシュ＋裏取得配線 (`_serviceEventsFromGuide`)、バンド内チャンネル切替コンテキスト解決＆事前競合チェック付き切替コールバック、OSD 画質切替（競合フォールバック・左右 CH 引き継ぎ付き）、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示 |
 | `lib/ui/multi_nasne_policy.dart` | 複数台 nasne 統合用ポリシー（サービス統合・空きチューナー優先選択・予約統合＆HDD 空き容量優先自動振り分け・`recNgList` 複合キー＆統合フィルタ・複合キー分離） |
 | `lib/ui/playback_launcher.dart` | エラー／資格情報案内／未実装ダイアログの初期ボタン `autofocus` 対応 |
 | `lib/ui/player_cache_policy.dart` | Android 向けデマクサバッファ削減設定、Live/録画別長時間バッファ・ディスクキャッシュ配分ポリシー (`MpvBufferPlan` / `computeMpvBufferPlan`：Live バッファ 0 秒時も起動待ちゼロのまま裏タイムシフト 5 分＋空き 512 MiB 保護)、可変倍速追いかけ判定 (`liveCatchUpSpeedForLagSeconds`)、Live MPEG-TS 初期プローブ短縮定数 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階「コの字」枠線なし＆ライト白背景 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（Live 一時停止時限定 `一時停止` / `追いかけ再生` オレンジバッジ・`現在位置へ`・`等速に戻す`/`倍速追いかけ` 自動追いつき制御・Live/録画両対応 `画質: 元画質/モバイル` 即時切替・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、独自 `PlayerSubtitleOverlay`（既定 `SubtitleView` 無効化・`sub-fix-timing=no`・`sub-text-ass`/`sub-ass-extradata` 解析・常時 250ms 同期ポーリング・`shouldResetAribSubtitleDecoder` 自動再初期化・`AribCaptionLayoutSource` 座標/消去照合・`subtitlesEnabledProvider` ON/OFF 永続化・`SubtitleActiveWindowTracker` 滞留防止）、統一 Live バッファリング表示 (`shouldLatchInitialPlaybackStarted` / `liveLoadingOverlaySpec`)、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階「コの字」枠線なし＆ライト白背景 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（右上時刻連携ではなく左上 `PlayerOsdClockOverlay` `HH:mm`、Live 現番組/時間/進行バー/次番組 `LiveOsdProgramSection`、Live 一時停止時限定 `一時停止` / `追いかけ再生` オレンジバッジ・`現在位置へ`・`等速に戻す`/`倍速追いかけ` 自動追いつき制御・Live/録画両対応 `画質: 元画質/モバイル` 即時切替・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、独自 `PlayerSubtitleOverlay`（既定 `SubtitleView` 無効化・`sub-fix-timing=no`・一括同時同期取得＋不整合リトライ・`sub-text-ass`/`sub-ass-extradata` 解析・常時 250ms 同期ポーリング・`shouldResetAribSubtitleDecoder` 自動再初期化・`AribCaptionLayoutSource` 座標/消去照合・`subtitlesEnabledProvider` ON/OFF 永続化・`SubtitleActiveWindowTracker` 滞留防止＆色昇格）、Live 0 秒 `'読み込み中…'` / `>=5秒` `'バッファ蓄積中… X秒 / Y秒'` ＋進捗バー統一 (`shouldLatchInitialPlaybackStarted` / `liveLoadingOverlaySpec`)、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
 | `lib/ui/schedule_form.dart` | `FireTvTextInputField` 化、`FireTvTimePickerDialog`（D-pad 時刻設定）、デフォルト録画画質連動、競合警告キャンセル `autofocus`、2 台以上登録時の「録画する nasne」指定／空き容量＆競合考慮の自動振り分け |
 | `lib/ui/schedules_screen.dart` | `新規予約` の `AppBar` 上部移動（FAB 廃止）、詳細 `autofocusEdit`、複数台 nasne 予約時刻順統合一覧＆複合キー管理、「予約一覧 / 録画失敗」管理（詳細・個別削除・すべて削除） |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、登録済み nasne 行タップメニュー（切替/検証/解除）、単一フォーカス `_BufferOptionTile`、ナイトモード・番組表予約表示設定・デフォルト録画画質・デフォルト再生画質切替・Live/録画バッファ設定・`字幕表示設定` エントリ・バージョン表記統一 |
-| `lib/ui/subtitle_overlay.dart` | ARIB 字幕用独自オーバーレイ `PlayerSubtitleOverlay`（1 行ごと個別角丸ピル背景・左寄せ・上下/X 放送局座標追従、`StrutStyle(forceStrutHeight: true)`、縁取り＋塗り `Stack`） |
-| `lib/ui/subtitle_settings_screen.dart` | 上部常時ライブプレビュー（1 行ごとピル背景・左寄せ）＋先頭 `字幕表示（再生時の既定）` スイッチ付き `SubtitleSettingsScreen`（サイズ 3 段階・書体 5 種・縁取り 3 段階・背景色 3 種・透明度 5 段階・初期設定リセット） |
-| `lib/ui/subtitle_style_policy.dart` | 字幕プリセット定義（`0.038`/`0.048`/`0.060` 再調整）、`SubtitleSettings`、`normalizeAribSubtitleSymbols`、`parseAssPlayRes` / `parseAribAssSubtitle`（途切れ末尾 ASS 除去含む）、`splitSubtitleCueLines`、`resolveRawSubtitleCues`、`SubtitleActiveWindowTracker`、TS 照合・デコーダリセット判定 (`wrapAwareAribPtsDelta` / `shouldResetAribSubtitleDecoder` / `resolveAribPtsOffset` / `findMatchingAribLayoutEvent` / `hasAribClearSinceCaption` / `applyAribLayoutToCues`) |
+| `lib/ui/subtitle_overlay.dart` | ARIB 字幕用独自オーバーレイ `PlayerSubtitleOverlay`（1 行ごと個別角丸ピル背景・X 座標差による話者ブロック分離・左寄せ・上下/X 放送局座標追従、`StrutStyle(forceStrutHeight: true)`、縁取り 2 種＋影 2 種描画） |
+| `lib/ui/subtitle_settings_screen.dart` | 16:9 比率（仮想 `960×540` `FittedBox`）上部常時ライブプレビュー＋先頭 `字幕表示（再生時の既定）` スイッチ付き `SubtitleSettingsScreen`（サイズ 3 段階・書体 6 種・縁取り/影 5 種・背景色 3 種・透明度 5 段階・初期設定リセット） |
+| `lib/ui/subtitle_style_policy.dart` | 字幕プリセット定義（`0.042`/`0.052`/`0.064`・`LINE Seed JP 太字`・`影（右下）`/`影（ズレなし・厚め）`＋`resolveSubtitleTextShadows`）、`SubtitleSettings`、`normalizeAribSubtitleSymbols`、`parseAssPlayRes` / `parseAribAssSubtitle`、`splitSubtitleCueLines`、`subtitleTextMatchesAss`、`resolveRawSubtitleCues`、`SubtitleActiveWindowTracker`（色昇格維持）、TS 照合・デコーダリセット判定 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード（複数台時はいずれか到達で待機抑止） |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
 | `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、再生中 OSD 画質切替向け `_buildRecordedPlayerScreen` ＆ `ProviderContainer` レジューム報告、保護行 `_ProtectionRow` の単一フォーカス＆黄枠強調、削除不能ダイアログ `autofocus`、検索欄 `FireTvTextInputField`、`'番組まとめ'` フォルダ化、2 台以上登録時の複数台横断一覧＆nasne フィルタ（ID 重複安全分離） |
@@ -337,7 +351,7 @@
 | `test/dtcp_streaming_test.dart` | `DtcpProxy` の `servedBytes` / `firstByteServedAt` / `lastByteServedAt` 転送カウンタ検証を追加 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
 | `test/epg_test.dart` | `resolveEpgChannelWidth` 導入後の動的列幅境界スナップ検証へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton`・10秒シーク・EPG全般/赤塗り/時刻バー/検索更新D-pad移動・録画まとめ・戻る導線・録画競合検知＆通知・Home 2カラム＆初期フォーカス固定・全画面フォーカス総点検・自動更新・複数台 nasne 統合・Live停止即時反映/通知修正/左右枠なしコの字CH切替カード/OSD画質切替/追いかけ再生可変倍速追いつき/Phase 26〜27 字幕カスタマイズ＆生 TS ARIB 解析・自動リセット・ON/OFF永続化・統一Liveバッファ表示・左メニュー右ペインフォーカス遷移）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton`・10秒シーク・EPG全般/赤塗り/時刻バー/検索更新D-pad移動・録画まとめ・戻る導線・録画競合検知＆通知・Home 2カラム＆初期フォーカス固定・全画面フォーカス総点検・自動更新・複数台 nasne 統合・Live停止即時反映/通知修正/左右枠なしコの字CH切替カード/OSD画質切替/追いかけ再生可変倍速追いつき/Phase 26〜28 字幕カスタマイズ・生 TS ARIB 解析・色昇格＆話者分離・影 2 種・16:9 プレビュー・Live 0秒表示・TV 風 Live OSD・左メニュー右ペインフォーカス遷移）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・`HEAD`/`Range` 非切断 & `resetToLiveEdge`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |

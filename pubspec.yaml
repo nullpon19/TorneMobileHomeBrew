@@ -38,6 +38,9 @@ flutter:
     - family: LINESeedJP
       fonts:
         - asset: assets/fonts/LINESeedJP-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/LINESeedJP-Bold.ttf
+          weight: 700
     - family: KosugiMaru
       fonts:
         - asset: assets/fonts/KosugiMaru-Regular.ttf

@@ -29,14 +29,14 @@ double resolveSubtitleFontSize(
       ? viewportHeight
       : 540.0;
   final factor = switch (preset) {
-    SubtitleSizePreset.small => 0.038,
-    SubtitleSizePreset.medium => 0.048,
-    SubtitleSizePreset.large => 0.060,
+    SubtitleSizePreset.small => 0.042,
+    SubtitleSizePreset.medium => 0.052,
+    SubtitleSizePreset.large => 0.064,
   };
   return (safeHeight * factor).clamp(minSize, 64.0).toDouble();
 }
 
-/// Five selectable font families combining Fire TV OS fonts and bundled fonts.
+/// Six selectable font families combining Fire TV OS fonts and bundled fonts.
 enum SubtitleFontFamily {
   gothic(
     label: 'ゴシック体',
@@ -56,8 +56,14 @@ enum SubtitleFontFamily {
     fontWeight: FontWeight.w400,
     fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
   ),
+  lineSeedJpBold(
+    label: 'LINE Seed JP（太字）',
+    fontFamily: 'LINESeedJP',
+    fontWeight: FontWeight.w700,
+    fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
+  ),
   kosugiMaru(
-    label: '丸ゴシック (Kosugi Maru)',
+    label: '丸ゴシック',
     fontFamily: 'KosugiMaru',
     fontWeight: FontWeight.w400,
     fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
@@ -82,11 +88,13 @@ enum SubtitleFontFamily {
   final List<String> fontFamilyFallback;
 }
 
-/// Text outline thickness choices for subtitles over video.
+/// Mutually exclusive text outline and shadow choices for subtitles over video.
 enum SubtitleEdgeStyle {
   none('なし'),
-  thin('細め（標準）'),
-  thick('太め');
+  thin('縁取り（細め）'),
+  thick('縁取り（太め）'),
+  dropShadow('影（右下）'),
+  thickShadow('影（ズレなし・厚め）');
 
   const SubtitleEdgeStyle(this.label);
   final String label;
@@ -96,11 +104,59 @@ enum SubtitleEdgeStyle {
 double resolveSubtitleEdgeWidth(SubtitleEdgeStyle edge, double fontSize) {
   switch (edge) {
     case SubtitleEdgeStyle.none:
+    case SubtitleEdgeStyle.dropShadow:
+    case SubtitleEdgeStyle.thickShadow:
       return 0.0;
     case SubtitleEdgeStyle.thin:
       return (fontSize * 0.11).clamp(2.0, 5.0).toDouble();
     case SubtitleEdgeStyle.thick:
       return (fontSize * 0.18).clamp(3.5, 8.5).toDouble();
+  }
+}
+
+/// Computes text shadows for non-stroke shadow modes of [SubtitleEdgeStyle].
+List<Shadow> resolveSubtitleTextShadows(
+  SubtitleEdgeStyle edge,
+  double fontSize,
+) {
+  switch (edge) {
+    case SubtitleEdgeStyle.dropShadow:
+      final offset = (fontSize * 0.085).clamp(1.8, 4.5).toDouble();
+      final softOffset = (fontSize * 0.105).clamp(2.2, 5.5).toDouble();
+      return [
+        Shadow(
+          color: Colors.black,
+          offset: Offset(offset, offset),
+          blurRadius: (fontSize * 0.04).clamp(0.8, 2.0).toDouble(),
+        ),
+        Shadow(
+          color: const Color(0xCC000000),
+          offset: Offset(softOffset, softOffset),
+          blurRadius: (fontSize * 0.12).clamp(2.0, 6.0).toDouble(),
+        ),
+      ];
+    case SubtitleEdgeStyle.thickShadow:
+      return [
+        Shadow(
+          color: Colors.black,
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.10).clamp(2.0, 5.0).toDouble(),
+        ),
+        Shadow(
+          color: Colors.black,
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.20).clamp(4.0, 10.0).toDouble(),
+        ),
+        Shadow(
+          color: const Color(0xDD000000),
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.30).clamp(6.0, 14.0).toDouble(),
+        ),
+      ];
+    case SubtitleEdgeStyle.none:
+    case SubtitleEdgeStyle.thin:
+    case SubtitleEdgeStyle.thick:
+      return const [];
   }
 }
 
@@ -163,9 +219,11 @@ class SubtitleSettings {
     return backgroundColor.color.withValues(alpha: alpha);
   }
 
-  String get summaryLabel =>
-      '${size.label}・${font.label}・縁取り${edge.label}・'
-      '背景${backgroundColor.label}(${subtitleBackgroundOpacityLabel(backgroundOpacityPercent)})';
+  String get summaryLabel {
+    final edgePart = edge == SubtitleEdgeStyle.none ? '縁取りなし' : edge.label;
+    return '${size.label}・${font.label}・$edgePart・'
+        '背景${backgroundColor.label}(${subtitleBackgroundOpacityLabel(backgroundOpacityPercent)})';
+  }
 
   SubtitleSettings copyWith({
     SubtitleSizePreset? size,
@@ -411,11 +469,28 @@ class SubtitleCue {
 
   String get plainText => [for (final s in spans) s.text].join();
 
+  bool get hasNonDefaultColor => spans.any((s) => s.color != Colors.white);
+
   String get dedupeKey {
     final posKey =
         '${normalizedX?.toStringAsFixed(2) ?? '-'},${normalizedY?.toStringAsFixed(2) ?? '-'},$alignment';
     return '$posKey|${plainText.trim()}';
   }
+}
+
+bool _spansVisuallyEqual(
+  List<SubtitleStyledSpan> a,
+  List<SubtitleStyledSpan> b,
+) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i].text != b[i].text ||
+        a[i].color != b[i].color ||
+        a[i].scale != b[i].scale) {
+      return false;
+    }
+  }
+  return true;
 }
 
 final RegExp _assPosPattern = RegExp(
@@ -631,6 +706,55 @@ List<SubtitleCue> parseAribAssSubtitle(
 String _compactCompareText(String text) =>
     text.replaceAll(RegExp(r'[\s\u00A0]+'), '');
 
+bool _hasSignificantTextOverlap(String a, String b) {
+  if (a.isEmpty || b.isEmpty) return false;
+  if (a == b || a.contains(b) || b.contains(a)) return true;
+  final runesA = a.runes.toList();
+  final runesB = b.runes.toList();
+  if (runesA.length < 2 || runesB.length < 2) return false;
+  final shorter = runesA.length <= runesB.length ? runesA : runesB;
+  final longer = runesA.length <= runesB.length ? runesB : runesA;
+  final counts = <int, int>{};
+  for (final r in longer) {
+    counts[r] = (counts[r] ?? 0) + 1;
+  }
+  var overlap = 0;
+  for (final r in shorter) {
+    final left = counts[r] ?? 0;
+    if (left > 0) {
+      counts[r] = left - 1;
+      overlap++;
+    }
+  }
+  return (overlap / shorter.length) >= 0.40;
+}
+
+/// Checks whether [rawAss] represents the same broadcast utterance as [plainLines].
+bool subtitleTextMatchesAss({
+  required String rawAss,
+  required List<String> plainLines,
+  double playResWidth = 960.0,
+  double playResHeight = 540.0,
+}) {
+  final cleanedPlain = [
+    for (final raw in plainLines)
+      if (normalizeAribSubtitleSymbols(raw).trim().isNotEmpty)
+        normalizeAribSubtitleSymbols(raw).trim(),
+  ];
+  if (cleanedPlain.isEmpty || rawAss.trim().isEmpty) return false;
+  final parsedAss = parseAribAssSubtitle(
+    rawAss,
+    playResWidth: playResWidth,
+    playResHeight: playResHeight,
+  );
+  if (parsedAss.isEmpty) return false;
+  final assCompact = _compactCompareText(
+    [for (final c in parsedAss) c.plainText].join(),
+  );
+  final plainCompact = _compactCompareText(cleanedPlain.join());
+  return _hasSignificantTextOverlap(assCompact, plainCompact);
+}
+
 /// Splits any [cue] containing explicit `\n` breaks into individual single-line
 /// cues while preserving span colors/scales and coordinates.
 List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
@@ -697,13 +821,16 @@ List<SubtitleCue> resolveRawSubtitleCues({
   required List<String> plainLines,
   double playResWidth = 960.0,
   double playResHeight = 540.0,
+  bool atomicSnapshot = false,
 }) {
   final cleanedPlain = [
     for (final raw in plainLines)
       if (normalizeAribSubtitleSymbols(raw).trim().isNotEmpty)
         normalizeAribSubtitleSymbols(raw).trim(),
   ];
-  if (cleanedPlain.isEmpty) return const [];
+  if (cleanedPlain.isEmpty && (!atomicSnapshot || rawAss.trim().isEmpty)) {
+    return const [];
+  }
 
   if (rawAss.trim().isNotEmpty) {
     final parsedAss = parseAribAssSubtitle(
@@ -712,15 +839,24 @@ List<SubtitleCue> resolveRawSubtitleCues({
       playResHeight: playResHeight,
     );
     if (parsedAss.isNotEmpty) {
+      if (cleanedPlain.isEmpty && atomicSnapshot) {
+        return [
+          for (final cue in parsedAss) ...splitSubtitleCueLines(cue),
+        ];
+      }
       final assCompact = _compactCompareText(
         [for (final c in parsedAss) c.plainText].join(),
       );
       final plainCompact = _compactCompareText(cleanedPlain.join());
-      if (assCompact.isNotEmpty &&
+      final matches =
+          assCompact.isNotEmpty &&
           plainCompact.isNotEmpty &&
           (assCompact == plainCompact ||
               assCompact.contains(plainCompact) ||
-              plainCompact.contains(assCompact))) {
+              plainCompact.contains(assCompact) ||
+              (atomicSnapshot &&
+                  _hasSignificantTextOverlap(assCompact, plainCompact)));
+      if (matches) {
         return [
           for (final cue in parsedAss) ...splitSubtitleCueLines(cue),
         ];
@@ -775,8 +911,11 @@ class SubtitleActiveWindowTracker {
     }
 
     final incomingCounts = <String, int>{};
+    final incomingByKey = <String, List<SubtitleCue>>{};
     for (final cue in incomingCues) {
-      incomingCounts[cue.dedupeKey] = (incomingCounts[cue.dedupeKey] ?? 0) + 1;
+      final key = cue.dedupeKey;
+      incomingCounts[key] = (incomingCounts[key] ?? 0) + 1;
+      (incomingByKey[key] ??= <SubtitleCue>[]).add(cue);
     }
 
     if (!_initialized) {
@@ -815,7 +954,7 @@ class SubtitleActiveWindowTracker {
         _activeCues = List<SubtitleCue>.of(newCues);
       } else {
         // Combine multi-cue burst packets from the same utterance while
-        // replacing any progressive prefix lines superseded by [newCues].
+        // replacing any progressive prefix lines or plain->colored upgrades.
         final merged = <SubtitleCue>[];
         for (final existing in _activeCues) {
           if ((incomingCounts[existing.dedupeKey] ?? 0) <= 0) continue;
@@ -825,8 +964,9 @@ class SubtitleActiveWindowTracker {
             return (newText.length > existingText.length &&
                     newText.startsWith(existingText)) ||
                 (newText == existingText &&
-                    existing.normalizedY == null &&
-                    n.normalizedY != null);
+                    ((existing.normalizedY == null && n.normalizedY != null) ||
+                        (!existing.hasNonDefaultColor &&
+                            n.hasNonDefaultColor)));
           });
           if (!superseded) {
             merged.add(existing);
@@ -845,14 +985,19 @@ class SubtitleActiveWindowTracker {
       }
       _activeExpiryDuration = computeSubtitleAutoClearDuration(_activeCues);
     } else if (_activeCues.isNotEmpty) {
-      final remainingCounts = Map<String, int>.of(incomingCounts);
       final kept = <SubtitleCue>[];
       for (final existing in _activeCues) {
-        final key = existing.dedupeKey;
-        final available = remainingCounts[key] ?? 0;
-        if (available > 0) {
-          remainingCounts[key] = available - 1;
-          kept.add(existing);
+        final queue = incomingByKey[existing.dedupeKey];
+        if (queue != null && queue.isNotEmpty) {
+          final candidate = queue.removeAt(0);
+          // Upgrade white plain cues in-place once colored ASS spans arrive
+          // for the same key without resetting the auto-clear clock.
+          if (!_spansVisuallyEqual(existing.spans, candidate.spans) &&
+              (candidate.hasNonDefaultColor || !existing.hasNonDefaultColor)) {
+            kept.add(candidate);
+          } else {
+            kept.add(existing);
+          }
         }
       }
       _activeCues = kept;
@@ -947,26 +1092,38 @@ double? resolveAribPtsOffset({
   return currentOffset;
 }
 
-/// Finds the non-clear ARIB TS layout event closest to [mpvSubStartSeconds].
+/// Finds the non-clear ARIB TS layout event closest to [mpvSubStartSeconds],
+/// preferring already-due events over buffered future events.
 AribCaptionLayoutEvent? findMatchingAribLayoutEvent({
   required List<AribCaptionLayoutEvent> events,
   required double mpvSubStartSeconds,
   required double ptsOffset,
+  double? preferredMaxFutureSeconds = 0.6,
 }) {
-  AribCaptionLayoutEvent? best;
-  var bestAbs = 1.5;
+  AribCaptionLayoutEvent? bestNonFuture;
+  var bestNonFutureAbs = 1.5;
+  AribCaptionLayoutEvent? bestAny;
+  var bestAnyAbs = 1.5;
   for (final e in events) {
     if (e.isClearOnly) continue;
-    final diff = wrapAwareAribPtsDelta(
+    final delta = wrapAwareAribPtsDelta(
       e.ptsSeconds + ptsOffset,
       mpvSubStartSeconds,
-    ).abs();
-    if (diff <= bestAbs) {
-      bestAbs = diff;
-      best = e;
+    );
+    final absDiff = delta.abs();
+    if (absDiff > 1.5) continue;
+    if ((preferredMaxFutureSeconds == null ||
+            delta <= preferredMaxFutureSeconds) &&
+        absDiff <= bestNonFutureAbs) {
+      bestNonFutureAbs = absDiff;
+      bestNonFuture = e;
+    }
+    if (absDiff <= bestAnyAbs) {
+      bestAnyAbs = absDiff;
+      bestAny = e;
     }
   }
-  return best;
+  return bestNonFuture ?? bestAny;
 }
 
 /// Returns `true` when broadcast `TIME+CS` or a standalone ARIB clear (`CS`)

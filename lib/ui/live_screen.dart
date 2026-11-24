@@ -1040,6 +1040,18 @@ Future<
   return (entries: const <LiveChannelSwitchEntry>[], currentIndex: -1);
 }
 
+List<EpgEvent> _serviceEventsFromGuide(EpgGuide? guide, LiveChannel channel) {
+  if (guide == null || channel.serviceId == null) return const [];
+  for (final svc in guide.services) {
+    if (svc.channel.serviceId == channel.serviceId &&
+        (channel.networkId == null ||
+            svc.channel.networkId == channel.networkId)) {
+      return svc.events;
+    }
+  }
+  return const [];
+}
+
 Widget _buildLivePlayerScreen({
   required ProviderContainer container,
   required RegisteredNasne reg,
@@ -1074,11 +1086,30 @@ Widget _buildLivePlayerScreen({
       channel.originalRes != null &&
       channel.mobileRes != null &&
       channel.originalRes != channel.mobileRes;
+  final bandType = broadcastingTypeForLiveBandId(channel.bandId);
+  final isBs = bandType == bsBroadcastingType;
+  final cachedGuide = isBs
+      ? container.read(bsEpgGuideProvider(reg)).value
+      : container.read(epgGuideProvider(reg)).value;
+  final initialLiveGuideEvents = _serviceEventsFromGuide(cachedGuide, channel);
   return PlayerScreen(
     title: channel.channelName ?? channel.programTitle,
     session: session,
     live: true,
     liveUseMobile: useMobile,
+    initialLiveGuideEvents: initialLiveGuideEvents,
+    loadLiveGuideEvents: () async {
+      try {
+        final guide = await container
+            .read(
+              (isBs ? bsEpgGuideProvider(reg) : epgGuideProvider(reg)).future,
+            )
+            .timeout(const Duration(seconds: 10));
+        return _serviceEventsFromGuide(guide, channel);
+      } catch (_) {
+        return const [];
+      }
+    },
     canSwitchQuality: canSwitchQuality,
     currentUseMobile: useMobile,
     programDetailTitle: channel.programTitle,

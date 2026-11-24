@@ -6486,15 +6486,15 @@ void main() {
           // 540dp Fire TV viewport yields TV-sized glyphs across 3 presets.
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.small, 540),
-            closeTo(20.52, 0.05),
+            closeTo(22.68, 0.05),
           );
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
-            closeTo(25.92, 0.05),
+            closeTo(28.08, 0.05),
           );
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
-            closeTo(32.40, 0.05),
+            closeTo(34.56, 0.05),
           );
           expect(
             resolveSubtitleFontSize(
@@ -6507,6 +6507,14 @@ void main() {
 
           expect(resolveSubtitleEdgeWidth(SubtitleEdgeStyle.none, 36), 0.0);
           expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.dropShadow, 36),
+            0.0,
+          );
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thickShadow, 36),
+            0.0,
+          );
+          expect(
             resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thin, 36),
             closeTo(3.96, 0.01),
           );
@@ -6514,10 +6522,30 @@ void main() {
             resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thick, 36),
             closeTo(6.48, 0.01),
           );
+          expect(
+            resolveSubtitleTextShadows(SubtitleEdgeStyle.none, 36),
+            isEmpty,
+          );
+          expect(
+            resolveSubtitleTextShadows(SubtitleEdgeStyle.dropShadow, 36),
+            hasLength(2),
+          );
+          final thickShadows = resolveSubtitleTextShadows(
+            SubtitleEdgeStyle.thickShadow,
+            36,
+          );
+          expect(thickShadows, hasLength(3));
+          expect(
+            thickShadows.every((s) => s.offset == Offset.zero),
+            isTrue,
+          );
           expect(subtitleBackgroundOpacityLabel(0), 'なし (0%)');
           expect(subtitleBackgroundOpacityLabel(65), '標準 (65%)');
           expect(SubtitleFontFamily.lineSeedJp.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.lineSeedJpBold.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.lineSeedJpBold.fontWeight, FontWeight.w700);
           expect(SubtitleFontFamily.kosugiMaru.fontFamily, 'KosugiMaru');
+          expect(SubtitleFontFamily.kosugiMaru.label, '丸ゴシック');
         },
       );
 
@@ -6801,7 +6829,11 @@ void main() {
           await tester.tap(find.text('字幕表示設定'));
           await tester.pumpAndSettle();
           expect(find.byType(SubtitleSettingsScreen), findsOneWidget);
-          expect(find.text('プレビュー'), findsOneWidget);
+          expect(find.text('プレビュー (16:9)'), findsOneWidget);
+          expect(
+            tester.widget<AspectRatio>(find.byType(AspectRatio)).aspectRatio,
+            closeTo(16 / 9, 0.001),
+          );
           expect(
             find.textContaining('テレビ並みに見やすい字幕 →'),
             findsAtLeastNWidgets(1),
@@ -6809,7 +6841,7 @@ void main() {
 
           await tester.tap(find.text('LINE Seed JP'));
           await tester.pumpAndSettle();
-          await tester.tap(find.text('丸ゴシック (Kosugi Maru)'));
+          await tester.tap(find.text('丸ゴシック'));
           await tester.pumpAndSettle();
           await tester.scrollUntilVisible(
             find.text('大'),
@@ -6820,12 +6852,12 @@ void main() {
           await tester.tap(find.text('大'));
           await tester.pumpAndSettle();
           await tester.scrollUntilVisible(
-            find.text('太め'),
+            find.text('縁取り（太め）'),
             150,
             scrollable: find.byType(Scrollable).first,
           );
           await tester.pumpAndSettle();
-          await tester.tap(find.text('太め'));
+          await tester.tap(find.text('縁取り（太め）'));
           await tester.pumpAndSettle();
 
           await tester.scrollUntilVisible(
@@ -7487,12 +7519,12 @@ void main() {
             isPreBuffering: false,
             targetSeconds: 0,
             currentSeconds: 2,
-            bufferingPercentage: 0,
-            fallbackLabel: '読み込み中…',
+            bufferingPercentage: 55,
+            fallbackLabel: 'バッファリング中…',
           );
-          expect(zeroTargetLiveSpec.showProgressBar, isTrue);
+          expect(zeroTargetLiveSpec.showProgressBar, isFalse);
           expect(zeroTargetLiveSpec.progress, isNull);
-          expect(zeroTargetLiveSpec.caption, 'バッファ蓄積中… 2秒');
+          expect(zeroTargetLiveSpec.caption, '読み込み中…');
 
           final rebufferingLiveSpec = liveLoadingOverlaySpec(
             isLive: true,
@@ -7503,8 +7535,8 @@ void main() {
             fallbackLabel: 'バッファリング中…',
           );
           expect(rebufferingLiveSpec.showProgressBar, isTrue);
-          expect(rebufferingLiveSpec.progress, closeTo(0.55, 0.01));
-          expect(rebufferingLiveSpec.caption, 'バッファ蓄積中… 3秒');
+          expect(rebufferingLiveSpec.progress, closeTo(0.3, 0.01));
+          expect(rebufferingLiveSpec.caption, 'バッファ蓄積中… 3秒 / 10秒');
         },
       );
 
@@ -7616,6 +7648,344 @@ void main() {
           );
           await tester.pumpAndSettle();
           expect(primaryInRail(), isFalse);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 28: ARIB color preservation, speaker separation, shadows, 16:9 proportional preview, and TV-style Live OSD',
+    () {
+      test(
+        'SubtitleActiveWindowTracker upgrades white plain cues to colored ASS in place & findMatchingAribLayoutEvent avoids buffered future events',
+        () {
+          final tracker = SubtitleActiveWindowTracker();
+          final initialWhite = tracker.update(
+            const [
+              SubtitleCue(
+                spans: [SubtitleStyledSpan(text: 'ぜったいにわからない。')],
+              ),
+            ],
+            Duration.zero,
+            mpvSubStartSeconds: 10.0,
+          );
+          expect(initialWhite, hasLength(1));
+          expect(initialWhite.single.spans.single.color, Colors.white);
+
+          // Colored ASS arrives shortly after for identical key/text.
+          final upgradedColored = tracker.update(
+            const [
+              SubtitleCue(
+                spans: [
+                  SubtitleStyledSpan(
+                    text: 'ぜったいにわからない。',
+                    color: Color(0xFFFFFF00),
+                  ),
+                ],
+              ),
+            ],
+            const Duration(milliseconds: 50),
+            mpvSubStartSeconds: 10.0,
+          );
+          expect(upgradedColored, hasLength(1));
+          expect(
+            upgradedColored.single.spans.single.color,
+            const Color(0xFFFFFF00),
+          );
+
+          expect(
+            subtitleTextMatchesAss(
+              rawAss: r'{\1c&H80ffff&}あっ\Nそうだ。',
+              plainLines: const ['あっそうだ。'],
+            ),
+            isTrue,
+          );
+          expect(
+            subtitleTextMatchesAss(
+              rawAss: r'{\1c&H80ffff&}全然別の字幕',
+              plainLines: const ['ぜったいにわからない。'],
+            ),
+            isFalse,
+          );
+
+          final atomicColored = resolveRawSubtitleCues(
+            rawAss: r'{\1c&H00ffff&}話者A「そろそろおやつ」',
+            plainLines: const ['話者A そろそろおやつ'],
+            atomicSnapshot: true,
+          );
+          expect(atomicColored, hasLength(1));
+          expect(atomicColored.single.spans.single.color, const Color(0xFFFFFF00));
+
+          const tsEvents = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 100.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.14,
+                  normalizedY: 0.14,
+                  endNormalizedX: 0.50,
+                  charCount: 6,
+                ),
+              ],
+              isClearOnly: false,
+            ),
+            AribCaptionLayoutEvent(
+              ptsSeconds: 101.1,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.50,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.85,
+                  charCount: 8,
+                ),
+              ],
+              isClearOnly: false,
+            ),
+          ];
+          final picked = findMatchingAribLayoutEvent(
+            events: tsEvents,
+            mpvSubStartSeconds: 0.15,
+            ptsOffset: -100.0,
+          );
+          expect(picked, isNotNull);
+          expect(picked!.ptsSeconds, closeTo(100.0, 0.001));
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay separates horizontal speakers, applies dropShadow/thickShadow, and SubtitleSettingsScreen scales preview sizes in 16:9',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(edge: SubtitleEdgeStyle.dropShadow),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.12,
+                        normalizedY: 0.72,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: '左の話者',
+                            color: Color(0xFF80FFFF),
+                          ),
+                        ],
+                      ),
+                      SubtitleCue(
+                        normalizedX: 0.58,
+                        normalizedY: 0.75,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: '右の話者',
+                            color: Color(0xFFFFFF00),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final leftDx = tester.getTopLeft(find.text('左の話者')).dx;
+          final rightDx = tester.getTopLeft(find.text('右の話者')).dx;
+          expect(leftDx, lessThan(220));
+          expect(rightDx, greaterThan(480));
+
+          TextStyle? firstStyledRun(InlineSpan span) {
+            if (span is TextSpan) {
+              if (span.text != null &&
+                  span.text!.isNotEmpty &&
+                  span.style != null) {
+                return span.style;
+              }
+              for (final child in span.children ?? const <InlineSpan>[]) {
+                final found = firstStyledRun(child);
+                if (found != null) return found;
+              }
+            }
+            return null;
+          }
+
+          final dropRichText = tester.widget<RichText>(
+            find.descendant(
+              of: find.byType(PlayerSubtitleOverlay),
+              matching: find.byWidgetPredicate(
+                (w) => w is RichText && w.text.toPlainText().contains('左の話者'),
+              ),
+            ),
+          );
+          final dropStyle = firstStyledRun(dropRichText.text)!;
+          expect(dropStyle.shadows, hasLength(2));
+          expect(dropStyle.shadows!.first.offset.dx, greaterThan(1.0));
+          expect(dropStyle.shadows!.first.offset.dy, greaterThan(1.0));
+
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(
+                      edge: SubtitleEdgeStyle.thickShadow,
+                    ),
+                    cues: [
+                      SubtitleCue(
+                        spans: [SubtitleStyledSpan(text: 'ズレなし厚影')],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          final haloRichText = tester.widget<RichText>(
+            find.descendant(
+              of: find.byType(PlayerSubtitleOverlay),
+              matching: find.byType(RichText),
+            ),
+          );
+          final haloStyle = firstStyledRun(haloRichText.text)!;
+          expect(haloStyle.shadows, hasLength(3));
+          expect(haloStyle.shadows!.every((s) => s.offset == Offset.zero), isTrue);
+
+          // Verify 16:9 preview strictly scales rendered font sizes across 小 / 中 / 大.
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+
+          final kv = InMemoryKeyValueStore();
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+              child: const MaterialApp(home: SubtitleSettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          double readPreviewSampleFontSize() {
+            final rt = tester.widgetList<RichText>(
+              find.descendant(
+                of: find.byType(PlayerSubtitleOverlay),
+                matching: find.byWidgetPredicate(
+                  (w) =>
+                      w is RichText &&
+                      w.text.toPlainText().contains('テレビ並みに見やすい字幕'),
+                ),
+              ),
+            ).last;
+            return firstStyledRun(rt.text)!.fontSize!;
+          }
+
+          final mediumSize = readPreviewSampleFontSize();
+          await tester.tap(find.text('小'));
+          await tester.pumpAndSettle();
+          final smallSize = readPreviewSampleFontSize();
+          await tester.tap(find.text('大'));
+          await tester.pumpAndSettle();
+          final largeSize = readPreviewSampleFontSize();
+
+          expect(smallSize, lessThan(mediumSize));
+          expect(mediumSize, lessThan(largeSize));
+        },
+      );
+
+      testWidgets(
+        'resolveLiveOsdProgramInfo, LiveOsdProgramSection, and PlayerOsdClockOverlay render TV-style live programme progress and clock',
+        (tester) async {
+          DateTime jst(int h, int m) => DateTime.utc(2026, 11, 24, h, m).subtract(
+            const Duration(hours: 9),
+          );
+
+          final channel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            serviceId: 0xde00,
+            channelName: 'ＮＨＫＥテレ',
+            programTitle: '古い番組情報',
+            programStart: jst(15, 30),
+            programEnd: jst(16, 0),
+          );
+          final events = [
+            EpgEvent(
+              eventId: 101,
+              start: jst(16, 0),
+              duration: const Duration(minutes: 30),
+              title: 'サイエンスZERO',
+            ),
+            EpgEvent(
+              eventId: 102,
+              start: jst(16, 30),
+              duration: const Duration(minutes: 30),
+              title: '次のテレビ番組',
+            ),
+          ];
+
+          final at1620 = resolveLiveOsdProgramInfo(
+            channel: channel,
+            guideEvents: events,
+            now: jst(16, 20),
+          );
+          expect(at1620.currentTitle, 'サイエンスZERO');
+          expect(at1620.currentTimeRange, '16:00–16:30');
+          expect(at1620.progress, closeTo(2 / 3, 0.01));
+          expect(at1620.remainingMinutes, 10);
+          expect(at1620.nextTitle, '次のテレビ番組');
+          expect(at1620.nextTimeRange, '16:30–17:00');
+
+          final rolled = resolveLiveOsdProgramInfo(
+            channel: channel,
+            guideEvents: events,
+            now: jst(16, 31),
+          );
+          expect(rolled.currentTitle, '次のテレビ番組');
+          expect(rolled.nextTitle, isNull);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: Stack(
+                    children: [
+                      PlayerOsdClockOverlay(now: jst(16, 20)),
+                      Positioned(
+                        left: 24,
+                        right: 24,
+                        bottom: 24,
+                        child: LiveOsdProgramSection(info: at1620),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(tester.takeException(), isNull);
+          expect(find.text('16:20'), findsOneWidget);
+          expect(find.text('サイエンスZERO'), findsOneWidget);
+          expect(find.text('16:00–16:30（残り 10分）'), findsOneWidget);
+          expect(find.text('次'), findsOneWidget);
+          expect(find.text('16:30–17:00'), findsOneWidget);
+          expect(find.text('次のテレビ番組'), findsOneWidget);
         },
       );
     },

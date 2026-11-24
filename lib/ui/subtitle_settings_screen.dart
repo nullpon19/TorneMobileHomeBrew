@@ -65,61 +65,66 @@ class SubtitleSettingsScreen extends ConsumerWidget {
       body: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
             child: Center(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 520),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: SizedBox(
-                    height: 190,
-                    width: double.infinity,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        // Simulated bright-to-dark TV frame behind preview cues.
-                        const DecoratedBox(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                Color(0xFF5D8AA8),
-                                Color(0xFF3E6B48),
-                                Color(0xFF1F2937),
-                              ],
-                            ),
-                          ),
-                        ),
-                        Positioned(
-                          top: 8,
-                          right: 12,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.black54,
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: const Text(
-                              'プレビュー',
-                              style: TextStyle(
-                                color: Colors.white70,
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
+                constraints: const BoxConstraints(maxHeight: 204),
+                child: AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: SizedBox(
+                        width: 960,
+                        height: 540,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            // Simulated bright-to-dark TV frame behind preview cues.
+                            const DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                  colors: [
+                                    Color(0xFF5D8AA8),
+                                    Color(0xFF3E6B48),
+                                    Color(0xFF1F2937),
+                                  ],
+                                ),
                               ),
                             ),
-                          ),
+                            Positioned(
+                              top: 16,
+                              right: 20,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: const Text(
+                                  'プレビュー (16:9)',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            PlayerSubtitleOverlay(
+                              settings: settings,
+                              cues: _previewSampleCues,
+                              bottomSafePadding: 24.0,
+                            ),
+                          ],
                         ),
-                        PlayerSubtitleOverlay(
-                          settings: settings,
-                          cues: _previewSampleCues,
-                          bottomSafePadding: 14.0,
-                          minFontSize: 10.0,
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
@@ -175,15 +180,21 @@ class SubtitleSettingsScreen extends ConsumerWidget {
                   ],
                 ),
                 const SizedBox(height: 20),
-                _SectionHeader(title: '文字の縁取り', theme: theme),
+                _SectionHeader(title: '文字の縁取り・影', theme: theme),
                 const SizedBox(height: 8),
-                SegmentedButton<SubtitleEdgeStyle>(
-                  segments: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
                     for (final edge in SubtitleEdgeStyle.values)
-                      ButtonSegment(value: edge, label: Text(edge.label)),
+                      ChoiceChip(
+                        label: Text(edge.label),
+                        selected: settings.edge == edge,
+                        onSelected: (selected) {
+                          if (selected) notifier.setEdge(edge);
+                        },
+                      ),
                   ],
-                  selected: {settings.edge},
-                  onSelectionChanged: (sel) => notifier.setEdge(sel.first),
                 ),
                 const SizedBox(height: 20),
                 _SectionHeader(title: '背景色', theme: theme),

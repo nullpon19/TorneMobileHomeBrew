@@ -79,19 +79,32 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     if (positioned.isEmpty) {
       return [unpositioned];
     }
-    positioned.sort((a, b) => a.normalizedY!.compareTo(b.normalizedY!));
+    positioned.sort((a, b) {
+      final yCmp = a.normalizedY!.compareTo(b.normalizedY!);
+      if (yCmp != 0) return yCmp;
+      return (a.normalizedX ?? 0.5).compareTo(b.normalizedX ?? 0.5);
+    });
     final threshold = resolveSubtitleBlockGapThreshold();
+    const xThreshold = 0.14;
     final blocks = <List<SubtitleCue>>[];
     for (final cue in positioned) {
-      if (blocks.isEmpty) {
-        blocks.add([cue]);
-        continue;
+      var targetIdx = -1;
+      for (var b = blocks.length - 1; b >= 0; b--) {
+        final prev = blocks[b].last;
+        final yClose = (cue.normalizedY! - prev.normalizedY!).abs() <= threshold;
+        final xClose =
+            cue.normalizedX == null ||
+            prev.normalizedX == null ||
+            (cue.normalizedX! - prev.normalizedX!).abs() <= xThreshold;
+        if (yClose && xClose) {
+          targetIdx = b;
+          break;
+        }
       }
-      final prevY = blocks.last.last.normalizedY!;
-      if ((cue.normalizedY! - prevY).abs() <= threshold) {
-        blocks.last.add(cue);
-      } else {
+      if (targetIdx < 0) {
         blocks.add([cue]);
+      } else {
+        blocks[targetIdx].add(cue);
       }
     }
     if (unpositioned.isNotEmpty) {
@@ -222,6 +235,8 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       applyHeightToLastDescent: true,
     );
 
+    final textShadows = resolveSubtitleTextShadows(settings.edge, fontSize);
+
     InlineSpan buildSpan({required bool isStroke}) {
       return TextSpan(
         children: [
@@ -251,7 +266,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
                           offset: Offset(0, 1),
                         ),
                       ]
-                    : null,
+                    : (textShadows.isEmpty ? null : textShadows),
               ),
             ),
         ],
