@@ -8,6 +8,7 @@ library;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 import 'format.dart';
@@ -404,6 +405,7 @@ class _RecNgSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final recNg = ref.watch(recNgProvider(reg));
+    final dismissedKeys = ref.watch(dismissedRecNgKeysProvider);
     return SectionCard(
       title: '録画失敗',
       icon: Icons.videocam_off_outlined,
@@ -411,21 +413,27 @@ class _RecNgSection extends ConsumerWidget {
       scrollController: scrollController,
       child: asyncSection(
         recNg,
-        (items) => items.isEmpty
-            ? const Text('録画失敗はありません')
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  for (final item in items)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text(
-                        '${item.startTime != null ? formatDateTimeJst(item.startTime!) : ''}'
-                        ' ${item.title ?? '(タイトルなし)'}',
+        (items) {
+          final visible = [
+            for (final item in items)
+              if (!dismissedKeys.contains(recNgDismissKey(reg, item))) item,
+          ];
+          return visible.isEmpty
+              ? const Text('録画失敗はありません')
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final item in visible)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Text(
+                          '${item.startTime != null ? formatDateTimeJst(item.startTime!) : ''}'
+                          ' ${item.title ?? '(タイトルなし)'}',
+                        ),
                       ),
-                    ),
-                ],
-              ),
+                  ],
+                );
+        },
         onRetry: () => ref.invalidate(recNgProvider(reg)),
       ),
     );

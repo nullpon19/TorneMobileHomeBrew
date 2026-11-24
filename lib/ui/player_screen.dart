@@ -184,8 +184,10 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
+import 'format.dart';
 import 'live_recording_policy.dart';
 import 'multi_nasne_policy.dart';
+import 'widgets.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
 import 'player_error_policy.dart';
@@ -224,6 +226,40 @@ String? formatProgramDetailBody({
   if (long == short || long.startsWith(short)) return long;
   if (short.startsWith(long)) return short;
   return '$short\n\n$long';
+}
+
+/// Unified rectangular status badge used in the player OSD header so `録画中`
+/// matches `LIVE` in corner radius, padding, height, and font size.
+Widget buildPlayerOsdStatusBadge({
+  required String label,
+  required Color color,
+  IconData? icon,
+}) {
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+    decoration: BoxDecoration(
+      color: color,
+      borderRadius: BorderRadius.circular(4),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (icon != null) ...[
+          Icon(icon, size: 10, color: Colors.white),
+          const SizedBox(width: 4),
+        ],
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+            height: 1.2,
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 /// High-contrast button style for [PlayerOsdButtonBar] items so D-pad focus is
@@ -775,6 +811,8 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.onCheckRecordingConflict,
     this.onBuildRecordingChannelPlayer,
     this.onBuildFailoverPlayer,
+    this.onStartCurrentProgramRecording,
+    this.onStopCurrentProgramRecording,
     this.initialCornerNotice,
     this.nowProvider,
   });
@@ -869,6 +907,16 @@ class PlayerScreen extends ConsumerStatefulWidget {
   )?
   onBuildFailoverPlayer;
 
+  /// Starts recording the programme currently playing in live mode.
+  final Future<LiveRecordingActionResult> Function()?
+  onStartCurrentProgramRecording;
+
+  /// Stops an active live-channel recording reservation.
+  final Future<LiveRecordingActionResult> Function(
+    RecordSchedule activeSchedule,
+  )?
+  onStopCurrentProgramRecording;
+
   /// Optional 5-second top-right notice shown right after opening (e.g. after a
   /// multi-nasne auto-failover switch).
   final String? initialCornerNotice;
@@ -909,6 +957,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   /// Live recording tracking (same-channel OSD/corner notice and other-channel
   /// tuner conflict preemption).
+  late List<RecordSchedule> _recordingSchedules;
+  RecordSchedule? _activeSameChannelSchedule;
+  bool _recordingActionBusy = false;
   bool _sameChannelRecording = false;
   bool? _lastSameChannelRecording;
   LiveRecordingCornerNotice? _cornerRecordingNotice;
@@ -1453,13 +1504,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _observeCacheDuration();
     _open();
     _loadChapters();
+    _recordingSchedules = List<RecordSchedule>.of(
+      widget.initialRecordingSchedules,
+    );
     if (widget.initialCornerNotice != null &&
         widget.initialCornerNotice!.isNotEmpty) {
-      _customCornerNoticeText = widget.initialCornerNotice;
-      _customCornerNoticeTimer = Timer(const Duration(seconds: 5), () {
-        if (!mounted) return;
-        setState(() => _customCornerNoticeText = null);
-      });
+      _showCustomCornerNotice(widget.initialCornerNotice!);
     }
     if (widget.live && widget.currentLiveChannel != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1643,21 +1693,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   DateTime _now() => widget.nowProvider?.call() ?? DateTime.now();
 
+  void _showCustomCornerNotice(
+    String text, {
+    Duration duration = const Duration(seconds: 5),
+  }) {
+    if (!mounted || text.isEmpty) return;
+    _customCornerNoticeTimer?.cancel();
+    setState(() => _customCornerNoticeText = text);
+    _customCornerNoticeTimer = Timer(duration, () {
+      if (!mounted) return;
+      setState(() => _customCornerNoticeText = null);
+    });
+  }
+
   void _updateSameChannelRecordingStatus() {
     final channel = widget.currentLiveChannel;
     if (!mounted || !widget.live || channel == null) return;
-    final recordingNow =
-        findActiveSameChannelRecording(
-          widget.initialRecordingSchedules,
-          currentChannel: channel,
-          now: _now(),
-        ) !=
-        null;
+    final active = findActiveSameChannelRecording(
+      _recordingSchedules,
+      currentChannel: channel,
+      now: _now(),
+    );
+    final recordingNow = active != null;
     final notice = resolveLiveRecordingCornerNotice(
       previousRecording: _lastSameChannelRecording,
       currentRecording: recordingNow,
     );
     _lastSameChannelRecording = recordingNow;
+    _activeSameChannelSchedule = active;
     if (_sameChannelRecording != recordingNow || notice != null) {
       setState(() {
         _sameChannelRecording = recordingNow;
@@ -1668,11 +1731,135 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
     if (notice != null) {
       _cornerNoticeTimer?.cancel();
-      _cornerNoticeTimer = Timer(const Duration(seconds: 5), () {
+      _cornerNoticeTimer = Timer(liveRecordingCornerNoticeDuration, () {
         if (!mounted) return;
         setState(() => _cornerRecordingNotice = null);
       });
     }
+  }
+
+  void _restoreFocusAfterDialog() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final target = _osdOpen ? _osdFirstFocusNode : _rootFocusNode;
+      if (target.canRequestFocus) {
+        target.requestFocus();
+      }
+    });
+  }
+
+  Future<void> _confirmAndStartLiveRecording() async {
+    final startCallback = widget.onStartCurrentProgramRecording;
+    if (startCallback == null ||
+        _recordingActionBusy ||
+        !mounted ||
+        _conflictHandled) {
+      return;
+    }
+    _osdTimer?.cancel();
+    final quality = ref.read(defaultRecordingQualityProvider);
+    final titleText = widget.programDetailTitle ?? widget.title;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('この番組を録画しますか？'),
+        content: Text('番組: $titleText\n録画画質: ${qualityModeLabel(quality)}'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            autofocus: true,
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('録画を開始'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    _suppressBackPopUntil = DateTime.now().add(
+      const Duration(milliseconds: 300),
+    );
+    if (confirmed != true) {
+      if (_osdOpen) _resetOsdTimer();
+      _restoreFocusAfterDialog();
+      return;
+    }
+    setState(() => _recordingActionBusy = true);
+    LiveRecordingActionResult result;
+    try {
+      result = await startCallback();
+    } catch (e) {
+      result = LiveRecordingActionResult(
+        success: false,
+        message: '録画を開始できませんでした: $e',
+      );
+    } finally {
+      if (mounted) setState(() => _recordingActionBusy = false);
+    }
+    if (!mounted) return;
+    if (result.updatedSchedules != null) {
+      _recordingSchedules = List<RecordSchedule>.of(result.updatedSchedules!);
+    }
+    final before = _sameChannelRecording;
+    _updateSameChannelRecordingStatus();
+    if (!result.success || _sameChannelRecording == before) {
+      _showCustomCornerNotice(result.message);
+    }
+    if (_osdOpen) _resetOsdTimer();
+    _restoreFocusAfterDialog();
+  }
+
+  Future<void> _confirmAndStopLiveRecording() async {
+    final stopCallback = widget.onStopCurrentProgramRecording;
+    final active = _activeSameChannelSchedule;
+    if (stopCallback == null ||
+        active == null ||
+        _recordingActionBusy ||
+        !mounted ||
+        _conflictHandled) {
+      return;
+    }
+    _osdTimer?.cancel();
+    final confirmed = await confirmDialog(
+      context,
+      title: '録画を停止しますか？',
+      message: '現在の録画を停止します。ここまでに録画された内容は録画済み一覧に残ります。',
+      confirmLabel: '録画を停止',
+    );
+    if (!mounted) return;
+    _suppressBackPopUntil = DateTime.now().add(
+      const Duration(milliseconds: 300),
+    );
+    if (!confirmed) {
+      if (_osdOpen) _resetOsdTimer();
+      _restoreFocusAfterDialog();
+      return;
+    }
+    setState(() => _recordingActionBusy = true);
+    LiveRecordingActionResult result;
+    try {
+      result = await stopCallback(active);
+    } catch (e) {
+      result = LiveRecordingActionResult(
+        success: false,
+        message: '録画を停止できませんでした: $e',
+      );
+    } finally {
+      if (mounted) setState(() => _recordingActionBusy = false);
+    }
+    if (!mounted) return;
+    if (result.updatedSchedules != null) {
+      _recordingSchedules = List<RecordSchedule>.of(result.updatedSchedules!);
+    }
+    final before = _sameChannelRecording;
+    _updateSameChannelRecordingStatus();
+    if (!result.success || _sameChannelRecording == before) {
+      _showCustomCornerNotice(result.message);
+    }
+    if (_osdOpen) _resetOsdTimer();
+    _restoreFocusAfterDialog();
   }
 
   void _startLiveConflictPoller() {
@@ -3426,27 +3613,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 _buildBufferBadge(),
                 if (widget.live && _sameChannelRecording) ...[
                   const SizedBox(width: 8),
-                  _buildRecordingPillBadge(label: '録画中', ended: false),
+                  buildPlayerOsdStatusBadge(
+                    label: '録画中',
+                    color: const Color(0xFFC62828),
+                    icon: Icons.fiber_manual_record,
+                  ),
                 ],
                 const SizedBox(width: 8),
                 if (widget.live)
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.redAccent,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text(
-                      'LIVE',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
+                  buildPlayerOsdStatusBadge(
+                    label: 'LIVE',
+                    color: Colors.redAccent,
                   ),
               ],
             ),
@@ -3529,6 +3706,27 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         _resetOsdTimer();
                       },
                     ),
+                  if (widget.live &&
+                      _sameChannelRecording &&
+                      _activeSameChannelSchedule != null &&
+                      widget.onStopCurrentProgramRecording != null)
+                    _osdButton(
+                      icon: Icons.stop_circle_outlined,
+                      label: '録画を停止',
+                      onPressed: _recordingActionBusy
+                          ? null
+                          : () => unawaited(_confirmAndStopLiveRecording()),
+                    )
+                  else if (widget.live &&
+                      !_sameChannelRecording &&
+                      widget.onStartCurrentProgramRecording != null)
+                    _osdButton(
+                      icon: Icons.fiber_manual_record,
+                      label: 'この番組を録画',
+                      onPressed: _recordingActionBusy
+                          ? null
+                          : () => unawaited(_confirmAndStartLiveRecording()),
+                    ),
                   if (_hasProgramDetail)
                     _osdButton(
                       focusNode: _osdDetailButtonFocusNode,
@@ -3542,7 +3740,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     label: playerOsdCloseMenuLabel,
                     onPressed: _closeOsd,
                   ),
-              ],
+                ],
             ),
           ],
         ),
@@ -3555,7 +3753,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     bool autofocus = false,
     required IconData icon,
     required String label,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
   }) {
     return OutlinedButton.icon(
       focusNode: focusNode,

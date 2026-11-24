@@ -21,6 +21,7 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/bs_epg_providers.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
@@ -980,6 +981,9 @@ Widget _buildLivePlayerScreen({
     description: channel.description,
     longDescription: channel.longDescription,
   );
+  final scheduleOwnerById = <String, RegisteredNasne>{
+    for (final s in initialSchedules) s.id: reg,
+  };
   return PlayerScreen(
     title: channel.channelName ?? channel.programTitle,
     session: session,
@@ -990,6 +994,21 @@ Widget _buildLivePlayerScreen({
     currentLiveChannel: channel,
     initialRecordingSchedules: initialSchedules,
     initialCornerNotice: initialCornerNotice,
+    onStartCurrentProgramRecording: () => _startCurrentLiveRecording(
+      container: container,
+      reg: reg,
+      channel: channel,
+      multiNasneRegs: multiNasneRegs,
+      scheduleOwnerById: scheduleOwnerById,
+    ),
+    onStopCurrentProgramRecording: (activeSchedule) =>
+        _stopCurrentLiveRecording(
+          container: container,
+          defaultReg: reg,
+          activeSchedule: activeSchedule,
+          multiNasneRegs: multiNasneRegs,
+          scheduleOwnerById: scheduleOwnerById,
+        ),
     onCheckRecordingConflict: () => resolveLiveRecordingConflictOrFailover(
       container,
       reg,
@@ -1041,6 +1060,180 @@ Widget _buildLivePlayerScreen({
       );
     },
   );
+}
+
+Future<LiveRecordingActionResult> _startCurrentLiveRecording({
+  required ProviderContainer container,
+  required RegisteredNasne reg,
+  required LiveChannel channel,
+  required List<RegisteredNasne> multiNasneRegs,
+  required Map<String, RegisteredNasne> scheduleOwnerById,
+}) async {
+  final now = DateTime.now();
+  final bandType = broadcastingTypeForLiveBandId(channel.bandId);
+  final isBs = bandType == bsBroadcastingType;
+
+  Future<Channel?> resolveMatchingChannel(RegisteredNasne owner) async {
+    var list = isBs
+        ? (container.read(bsChannelsProvider(owner)).value ?? const <Channel>[])
+        : (container.read(channelsProvider(owner)).value ?? const <Channel>[]);
+    if (list.isEmpty && channel.networkId == null) {
+      try {
+        list = await container.read(
+          (isBs ? bsChannelsProvider(owner) : channelsProvider(owner)).future,
+        );
+      } catch (_) {}
+    }
+    for (final c in list) {
+      if (c.serviceId == channel.serviceId &&
+          (channel.networkId == null || c.networkId == channel.networkId)) {
+        return c;
+      }
+    }
+    return null;
+  }
+
+  final matchingChannel = await resolveMatchingChannel(reg);
+  final guide = isBs
+      ? container.read(bsEpgGuideProvider(reg)).value
+      : container.read(epgGuideProvider(reg)).value;
+  EpgEvent? matchingEvent;
+  if (guide != null && channel.serviceId != null) {
+    for (final svc in guide.services) {
+      if (svc.channel.serviceId != channel.serviceId) continue;
+      for (final ev in svc.events) {
+        if (!now.isBefore(ev.start) && ev.end.isAfter(now)) {
+          matchingEvent = ev;
+          break;
+        }
+      }
+      if (matchingEvent != null) break;
+    }
+  }
+
+  final quality = container.read(defaultRecordingQualityProvider);
+  final candidate = buildImmediateLiveRecordingSchedule(
+    channel: channel,
+    now: now,
+    desiredQualityMode: quality,
+    matchingEpgEvent: matchingEvent,
+    matchingChannel: matchingChannel,
+  );
+  if (candidate == null) {
+    return const LiveRecordingActionResult(
+      success: false,
+      message: 'チャンネル情報を取得できないため録画を開始できません',
+    );
+  }
+
+  var targetReg = reg;
+  try {
+    final currentConflicts = await container
+        .read(deviceServicesProvider(reg))
+        .schedules
+        .checkConflicts(candidate);
+    if (currentConflicts.isNotEmpty) {
+      if (multiNasneRegs.length > 1) {
+        final hasConflictByHost = <String, bool>{reg.host: true};
+        final freeBytesByHost = <String, int>{
+          reg.host: totalFreeBytesForHdds(
+            container.read(hddDetailsProvider(reg)).value,
+          ),
+        };
+        for (final other in multiNasneRegs) {
+          if (other.host == reg.host) continue;
+          freeBytesByHost[other.host] = totalFreeBytesForHdds(
+            container.read(hddDetailsProvider(other)).value,
+          );
+          try {
+            final c = await container
+                .read(deviceServicesProvider(other))
+                .schedules
+                .checkConflicts(candidate);
+            hasConflictByHost[other.host] = c.isNotEmpty;
+          } catch (_) {
+            hasConflictByHost[other.host] = true;
+          }
+        }
+        final alt = selectAutoScheduleNasne(
+          candidates: multiNasneRegs,
+          hasConflictByHost: hasConflictByHost,
+          freeBytesByHost: freeBytesByHost,
+          preferredReg: reg,
+        );
+        if (alt == null) {
+          return const LiveRecordingActionResult(
+            success: false,
+            message: '同じ時間帯に別の録画予約があるため開始できませんでした',
+          );
+        }
+        targetReg = alt;
+      } else {
+        return const LiveRecordingActionResult(
+          success: false,
+          message: '同じ時間帯に別の録画予約があるため開始できませんでした',
+        );
+      }
+    }
+
+    final createdId = await container
+        .read(deviceServicesProvider(targetReg))
+        .schedules
+        .createSchedule(candidate);
+    scheduleOwnerById[createdId] = targetReg;
+    container.invalidate(schedulesProvider(targetReg));
+    final fresh = await _fetchFreshSchedules(container, targetReg);
+    for (final s in fresh) {
+      scheduleOwnerById.putIfAbsent(s.id, () => targetReg);
+    }
+    final merged = [
+      ...fresh,
+      if (targetReg.host != reg.host)
+        ...await _fetchFreshSchedules(container, reg),
+    ];
+    return LiveRecordingActionResult(
+      success: true,
+      message: '録画を開始しました',
+      updatedSchedules: merged,
+    );
+  } catch (e) {
+    return LiveRecordingActionResult(
+      success: false,
+      message: userMessageForError(e),
+    );
+  }
+}
+
+Future<LiveRecordingActionResult> _stopCurrentLiveRecording({
+  required ProviderContainer container,
+  required RegisteredNasne defaultReg,
+  required RecordSchedule activeSchedule,
+  required List<RegisteredNasne> multiNasneRegs,
+  required Map<String, RegisteredNasne> scheduleOwnerById,
+}) async {
+  final ownerReg = scheduleOwnerById[activeSchedule.id] ?? defaultReg;
+  try {
+    await container
+        .read(deviceServicesProvider(ownerReg))
+        .schedules
+        .deleteSchedule(activeSchedule.id);
+    scheduleOwnerById.remove(activeSchedule.id);
+    container.invalidate(schedulesProvider(ownerReg));
+    final freshOwner = await _fetchFreshSchedules(container, ownerReg);
+    final merged = ownerReg.host == defaultReg.host
+        ? freshOwner
+        : [...freshOwner, ...await _fetchFreshSchedules(container, defaultReg)];
+    return LiveRecordingActionResult(
+      success: true,
+      message: '録画を停止しました',
+      updatedSchedules: merged,
+    );
+  } catch (e) {
+    return LiveRecordingActionResult(
+      success: false,
+      message: userMessageForError(e),
+    );
+  }
 }
 
 Future<void> _launchLiveChannel({

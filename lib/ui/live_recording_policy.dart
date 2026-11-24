@@ -147,12 +147,15 @@ class LiveRecordingConflict {
   final LiveChannel? failoverChannel;
 }
 
+/// Duration for which the top-right live recording status badge stays visible.
+const Duration liveRecordingCornerNoticeDuration = Duration(seconds: 30);
+
 /// Short corner notification emitted when the viewed channel starts/ends
 /// recording while live playback is running.
 enum LiveRecordingCornerNotice { recording, ended }
 
 /// Resolves whether a state change `[previousRecording] -> [currentRecording]`
-/// should display the 5-second corner notice.
+/// should display the corner notice.
 LiveRecordingCornerNotice? resolveLiveRecordingCornerNotice({
   required bool? previousRecording,
   required bool currentRecording,
@@ -167,4 +170,77 @@ LiveRecordingCornerNotice? resolveLiveRecordingCornerNotice({
     return LiveRecordingCornerNotice.ended;
   }
   return null;
+}
+
+/// Returns whether [schedule] is actively recording at [now] (`[start, end)`).
+bool isScheduleCurrentlyRecording(RecordSchedule schedule, {DateTime? now}) {
+  if (schedule.durationSeconds <= 0) return false;
+  final current = now ?? DateTime.now();
+  return !current.isBefore(schedule.start) && current.isBefore(schedule.end);
+}
+
+/// Outcome returned by live-OSD recording start/stop callbacks.
+class LiveRecordingActionResult {
+  const LiveRecordingActionResult({
+    required this.success,
+    required this.message,
+    this.updatedSchedules,
+  });
+
+  final bool success;
+  final String message;
+  final List<RecordSchedule>? updatedSchedules;
+}
+
+/// Builds a [NewRecordSchedule] to immediately record the live programme
+/// currently airing on [channel], returning `null` if required broadcast IDs are
+/// missing.
+NewRecordSchedule? buildImmediateLiveRecordingSchedule({
+  required LiveChannel channel,
+  required DateTime now,
+  required int desiredQualityMode,
+  EpgEvent? matchingEpgEvent,
+  Channel? matchingChannel,
+  String recordDestinationId = 'HDD',
+}) {
+  final broadcastingType =
+      matchingChannel?.broadcastingType ??
+      broadcastingTypeForLiveBandId(channel.bandId) ??
+      terrestrialBroadcastingType;
+  final serviceId = matchingChannel?.serviceId ?? channel.serviceId;
+  final networkId = matchingChannel?.networkId ?? channel.networkId;
+  final channelType = broadcastingType;
+  if (serviceId == null || networkId == null) return null;
+
+  final DateTime start;
+  final int durationSeconds;
+  final int eventId;
+  if (matchingEpgEvent != null &&
+      matchingEpgEvent.end.isAfter(now) &&
+      matchingEpgEvent.duration.inSeconds > 0) {
+    start = matchingEpgEvent.start;
+    durationSeconds = matchingEpgEvent.duration.inSeconds;
+    eventId = matchingEpgEvent.eventId;
+  } else {
+    eventId = 0;
+    start = now;
+    final programEnd = channel.programEnd;
+    durationSeconds = (programEnd != null && programEnd.isAfter(now))
+        ? programEnd.difference(now).inSeconds.clamp(60, 12 * 3600)
+        : 3600;
+  }
+
+  return NewRecordSchedule(
+    start: start,
+    durationSeconds: durationSeconds,
+    channel: ScheduleChannel(
+      broadcastingType: broadcastingType,
+      channelType: channelType,
+      serviceId: serviceId,
+    ),
+    networkId: networkId,
+    eventId: eventId,
+    desiredQualityMode: desiredQualityMode,
+    recordDestinationId: recordDestinationId,
+  );
 }

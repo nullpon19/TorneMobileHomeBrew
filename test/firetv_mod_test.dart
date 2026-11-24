@@ -20,6 +20,7 @@ import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
+import 'package:tmhb/ui/format.dart';
 import 'package:tmhb/ui/home_screen.dart';
 import 'package:tmhb/ui/live_recording_policy.dart';
 import 'package:tmhb/ui/live_screen.dart';
@@ -5320,6 +5321,508 @@ void main() {
       },
     );
   });
+
+  group('Phase 22 enhancements', () {
+    test('30s live corner notice constant and immediate schedule builder', () {
+      expect(
+        liveRecordingCornerNoticeDuration,
+        const Duration(seconds: 30),
+      );
+      final now = DateTime.utc(2026, 11, 24, 3, 15);
+      const ch = Channel(
+        broadcastingType: 2,
+        networkId: 30848,
+        transportStreamId: 30848,
+        serviceId: 56832,
+        serviceType: 1,
+        channelNumber: 1,
+        serviceName: 'ＮＨＫ総合',
+      );
+      const liveCh = LiveChannel(
+        id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+        bandId: '0/video/LiveTuner/DTTB',
+        networkId: 30848,
+        transportStreamId: 30848,
+        serviceId: 56832,
+        programTitle: '生放送テスト',
+      );
+      final ev = EpgEvent(
+        eventId: 0x1234,
+        start: DateTime.utc(2026, 11, 24, 3, 0),
+        duration: const Duration(minutes: 45),
+        title: '生放送テスト',
+      );
+
+      final withEpg = buildImmediateLiveRecordingSchedule(
+        channel: liveCh,
+        now: now,
+        desiredQualityMode: recordingQualityX3,
+        matchingEpgEvent: ev,
+        matchingChannel: ch,
+      )!;
+      expect(withEpg.eventId, 0x1234);
+      expect(withEpg.start, ev.start);
+      expect(withEpg.durationSeconds, 2700);
+      expect(withEpg.desiredQualityMode, 230);
+      expect(withEpg.channel.serviceId, 56832);
+      expect(withEpg.networkId, 30848);
+
+      final withoutEpg = buildImmediateLiveRecordingSchedule(
+        channel: LiveChannel(
+          id: liveCh.id,
+          bandId: liveCh.bandId,
+          networkId: 30848,
+          serviceId: 56832,
+          programTitle: '手動枠',
+          programEnd: now.add(const Duration(minutes: 20)),
+        ),
+        now: now,
+        desiredQualityMode: recordingQualityDr,
+      )!;
+      expect(withoutEpg.eventId, 0);
+      expect(withoutEpg.start, now);
+      expect(withoutEpg.durationSeconds, 1200);
+      expect(withoutEpg.desiredQualityMode, 100);
+
+      final active = RecordSchedule(
+        id: 'r1',
+        start: now.subtract(const Duration(minutes: 5)),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 56832,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7880,0x1234',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      expect(isScheduleCurrentlyRecording(active, now: now), isTrue);
+      expect(
+        isScheduleCurrentlyRecording(
+          active,
+          now: now.add(const Duration(minutes: 30)),
+        ),
+        isFalse,
+      );
+    });
+
+    testWidgets('OSD 録画中 and LIVE badges use identical box shape and height', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                buildPlayerOsdStatusBadge(
+                  label: '録画中',
+                  color: const Color(0xFFC62828),
+                  icon: Icons.fiber_manual_record,
+                ),
+                const SizedBox(width: 8),
+                buildPlayerOsdStatusBadge(
+                  label: 'LIVE',
+                  color: Colors.redAccent,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final recBox = tester.getRect(
+        find.ancestor(
+          of: find.text('録画中'),
+          matching: find.byType(Container),
+        ),
+      );
+      final liveBox = tester.getRect(
+        find.ancestor(
+          of: find.text('LIVE'),
+          matching: find.byType(Container),
+        ),
+      );
+      expect((recBox.height - liveBox.height).abs(), lessThan(0.1));
+
+      final containers = tester.widgetList<Container>(find.byType(Container));
+      for (final c in containers) {
+        final dec = c.decoration as BoxDecoration?;
+        expect(dec?.borderRadius, BorderRadius.circular(4));
+      }
+    });
+
+    testWidgets(
+      'Default recording quality persists in Settings and seeds new ScheduleFormPage',
+      (tester) async {
+        final kvStore = InMemoryKeyValueStore();
+        const reg = RegisteredNasne(
+          host: '192.0.2.20',
+          udn: 'uuid:q1',
+          friendlyName: 'nasne-q',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const ch = Channel(
+          broadcastingType: 2,
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 0x1111,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト局',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              debugLogSharerProvider.overrideWithValue(null),
+              debugLogFolderOpenerProvider.overrideWithValue(null),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.scrollUntilVisible(
+          find.text('デフォルト録画画質'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('3倍'));
+        await tester.pumpAndSettle();
+        expect(await kvStore.read('firetv_default_recording_quality'), '230');
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              channelsProvider.overrideWith((ref, r) async => const [ch]),
+              hddDetailsProvider.overrideWith((ref, r) async => const []),
+            ],
+            child: MaterialApp(home: ScheduleFormPage.create(reg)),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('3倍'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'EpgEventDetailDialog offers 録画を停止 only while actively recording and calls deleteSchedule',
+      (tester) async {
+        final deletedIds = <String>[];
+        const reg = RegisteredNasne(
+          host: '192.0.2.30',
+          udn: 'uuid:epg-stop',
+          friendlyName: 'nasne-epg',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const ch = Channel(
+          broadcastingType: 2,
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 0x2222,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト局',
+        );
+        final now = DateTime.now();
+        final activeEvent = EpgEvent(
+          eventId: 77,
+          start: now.subtract(const Duration(minutes: 10)),
+          duration: const Duration(minutes: 40),
+          title: '放送中録画番組',
+        );
+        final activeSchedule = RecordSchedule(
+          id: 'sched-active-77',
+          start: activeEvent.start,
+          durationSeconds: 2400,
+          conditionId: '1',
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x2222,
+          ),
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x0064,0x004d',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '放送中録画番組',
+        );
+        final futureEvent = EpgEvent(
+          eventId: 78,
+          start: now.add(const Duration(hours: 2)),
+          duration: const Duration(minutes: 30),
+          title: '未来の予約番組',
+        );
+        final futureSchedule = RecordSchedule(
+          id: 'sched-future-78',
+          start: futureEvent.start,
+          durationSeconds: 1800,
+          conditionId: '1',
+          channel: activeSchedule.channel,
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x0064,0x004e',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '未来の予約番組',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              deviceServicesProvider.overrideWith(
+                (ref, r) => DeviceServices(
+                  deviceInfo: _StubDeviceInfo(),
+                  settings: _StubSettings(),
+                  schedules: _DeletableScheduleService(
+                    onDelete: deletedIds.add,
+                  ),
+                  titles: _StubTitleCatalog(),
+                  metadata: _StubMetadata(),
+                  live: _StubLiveCatalog(),
+                  playback: _RecordingFallbackLiveEngine(),
+                ),
+              ),
+            ],
+            child: MaterialApp(
+              home: Scaffold(
+                body: Builder(
+                  builder: (context) => Column(
+                    children: [
+                      ElevatedButton(
+                        onPressed: () => showEpgEventDetail(
+                          context,
+                          reg: reg,
+                          channel: ch,
+                          channelName: ch.serviceName,
+                          event: futureEvent,
+                          existingSchedule: futureSchedule,
+                        ),
+                        child: const Text('open_future'),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => showEpgEventDetail(
+                          context,
+                          reg: reg,
+                          channel: ch,
+                          channelName: ch.serviceName,
+                          event: activeEvent,
+                          existingSchedule: activeSchedule,
+                        ),
+                        child: const Text('open_active'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Future reservation shows edit only, not stop.
+        await tester.tap(find.text('open_future'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画を停止'), findsNothing);
+        expect(find.text('予約を編集'), findsOneWidget);
+        await tester.tap(find.text('閉じる'));
+        await tester.pumpAndSettle();
+
+        // Active recording shows 録画を停止 -> confirm -> deleteSchedule.
+        await tester.tap(find.text('open_active'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画中'), findsOneWidget);
+        await tester.tap(find.text('録画を停止'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画を停止しますか？'), findsOneWidget);
+        await tester.tap(find.widgetWithText(FilledButton, '録画を停止'));
+        await tester.pumpAndSettle();
+
+        expect(deletedIds, ['sched-active-77']);
+      },
+    );
+
+    testWidgets(
+      'SchedulesScreen failure management & HomeScreen sync filter dismissed recNg items',
+      (tester) async {
+        const reg = RegisteredNasne(
+          host: '192.0.2.40',
+          udn: 'uuid:recng',
+          friendlyName: 'nasne-ng',
+          macAddr: '00:11:22:33:44:55',
+        );
+        final item1 = RecNgItem.fromJson({
+          'id': '10000000000000000009',
+          'title': '失敗番組A',
+          'scheduledStartDateTime': '2026-11-11T20:30:00+09:00',
+          'scheduledDuration': 900,
+          'scheduledChannelID': 56840,
+          'broadcastingType': 2,
+          'desiredQualityMode': 101,
+          'ngID': 3,
+        });
+        final item2 = RecNgItem.fromJson({
+          'id': '10000000000000000009',
+          'title': '失敗番組B',
+          'scheduledStartDateTime': '2026-11-15T18:45:00+09:00',
+          'scheduledDuration': 1800,
+          'scheduledChannelID': 56832,
+          'broadcastingType': 2,
+          'desiredQualityMode': 100,
+          'ngID': 5,
+        });
+        expect(item1.desiredQualityMode, 101);
+        expect(item1.ngId, 3);
+        expect(recNgQualityModeLabel(101), '3倍');
+        expect(recNgQualityModeLabel(100), 'DR');
+        expect(
+          recNgDismissKey(reg, item1),
+          isNot(recNgDismissKey(reg, item2)),
+        );
+
+        final kvStore = InMemoryKeyValueStore();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const <Channel>[]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: SchedulesScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('録画失敗 (2)'), findsOneWidget);
+        await tester.tap(find.text('録画失敗 (2)'));
+        await tester.pumpAndSettle();
+
+        // Newest failure first ('失敗番組B').
+        expect(find.text('失敗番組B'), findsOneWidget);
+        expect(find.text('失敗番組A'), findsOneWidget);
+        expect(find.text('すべて削除'), findsOneWidget);
+
+        // Dismiss single failure via detail page.
+        await tester.tap(find.text('失敗番組B'));
+        await tester.pumpAndSettle();
+        expect(find.text('ngID=5'), findsOneWidget);
+        await tester.tap(find.text('この履歴を削除'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, '削除'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('失敗番組B'), findsNothing);
+        expect(find.text('失敗番組A'), findsOneWidget);
+        expect(find.text('録画失敗 (1)'), findsOneWidget);
+
+        // Verify HomeScreen stays synchronized with dismissed item.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async => const DeviceInfo(
+                  name: 'nasne-ng',
+                  softwareVersion: '0260',
+                ),
+              ),
+              hddDetailsProvider.overrideWith((ref, r) async => const []),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const NetworkInfo(macAddr: '00:11:22:33:44:55', ipv4Addr: '192.0.2.40'),
+              ),
+              bcasInfoProvider.overrideWith((ref, r) async => const BcasInfo()),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: HomeScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('失敗番組B'), findsNothing);
+        expect(find.textContaining('失敗番組A'), findsOneWidget);
+
+        // Verify 'すべて削除' clears remaining entries.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const <Channel>[]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: SchedulesScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('録画失敗 (1)'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('すべて削除'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'すべて削除'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画失敗はありません'), findsOneWidget);
+      },
+    );
+  });
+}
+
+class _DeletableScheduleService implements ScheduleService {
+  _DeletableScheduleService({required this.onDelete});
+  final void Function(String id) onDelete;
+
+  @override
+  Future<void> deleteSchedule(String id) async {
+    onDelete(id);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _FakeProtectTitleCatalog implements TitleCatalogService {

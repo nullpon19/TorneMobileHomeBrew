@@ -98,6 +98,14 @@ String qualityModeLabel(int mode) => switch (mode) {
   _ => '$mode',
 };
 
+/// Display label for `desiredQualityMode` in WebAPI `recNgListGet`, where
+/// `101` (alongside XSRS `230`) represents 3倍 mode.
+String recNgQualityModeLabel(int mode) => switch (mode) {
+  100 => 'DR',
+  101 || 230 => '3倍',
+  _ => qualityModeLabel(mode),
+};
+
 /// Display label of a DIDL res `quality` value (plan 33): the
 /// `quality` query parameter of a res URL (`dr` / `x3` / `mobile`,
 /// measured in plan 11.8). Unknown values fall back to the raw

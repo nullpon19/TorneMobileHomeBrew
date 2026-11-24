@@ -5,6 +5,7 @@
 /// discovered path) is an override here, never a UI change.
 library;
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -406,6 +407,115 @@ class EpgReservedStyleNotifier extends Notifier<EpgReservedStyle> {
 final epgReservedStyleProvider =
     NotifierProvider<EpgReservedStyleNotifier, EpgReservedStyle>(
       EpgReservedStyleNotifier.new,
+    );
+
+/// Supported default recording quality modes (`desiredQualityMode` in XSRS).
+const int recordingQualityDr = 100;
+const int recordingQualityX3 = 230;
+const List<int> recordingQualityOptions = [
+  recordingQualityDr,
+  recordingQualityX3,
+];
+
+/// Persisted default recording quality mode for new schedules and immediate
+/// live recordings (default `DR` = `100`).
+class DefaultRecordingQualityNotifier extends Notifier<int> {
+  static const _key = 'firetv_default_recording_quality';
+  bool _dirty = false;
+
+  @override
+  int build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty) return;
+      final parsed = raw == null ? null : int.tryParse(raw);
+      if (parsed != null &&
+          recordingQualityOptions.contains(parsed) &&
+          parsed != state) {
+        state = parsed;
+      }
+    });
+    return recordingQualityDr;
+  }
+
+  Future<void> set(int qualityMode) async {
+    if (!recordingQualityOptions.contains(qualityMode)) return;
+    _dirty = true;
+    state = qualityMode;
+    await ref.read(keyValueStoreProvider).write(_key, '$qualityMode');
+  }
+}
+
+final defaultRecordingQualityProvider =
+    NotifierProvider<DefaultRecordingQualityNotifier, int>(
+      DefaultRecordingQualityNotifier.new,
+    );
+
+/// Persisted set of composite `recNgList` entry keys dismissed in the app UI
+/// (individual delete / clear-all). Nasne `recNgListGet` is read-only.
+class DismissedRecNgKeysNotifier extends Notifier<Set<String>> {
+  static const _key = 'firetv_dismissed_rec_ng_keys';
+  bool _dirty = false;
+
+  @override
+  Set<String> build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty || raw == null || raw.isEmpty) return;
+      final restored = _decode(raw);
+      if (restored.isNotEmpty) {
+        state = {...state, ...restored};
+      }
+    });
+    return const {};
+  }
+
+  static Set<String> _decode(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const {};
+      return {
+        for (final entry in decoded)
+          if (entry is String && entry.isNotEmpty) entry,
+      };
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Future<void> _save(Set<String> next) async {
+    final sorted = next.toList()..sort();
+    await ref.read(keyValueStoreProvider).write(_key, jsonEncode(sorted));
+  }
+
+  Future<void> dismiss(String key) async {
+    if (key.isEmpty || state.contains(key)) return;
+    _dirty = true;
+    final next = {...state, key};
+    state = next;
+    await _save(next);
+  }
+
+  Future<void> dismissAll(Iterable<String> keys) async {
+    final next = {...state};
+    var changed = false;
+    for (final k in keys) {
+      if (k.isNotEmpty && next.add(k)) changed = true;
+    }
+    if (!changed) return;
+    _dirty = true;
+    state = next;
+    await _save(next);
+  }
+}
+
+final dismissedRecNgKeysProvider =
+    NotifierProvider<DismissedRecNgKeysNotifier, Set<String>>(
+      DismissedRecNgKeysNotifier.new,
     );
 
 /// Debug mode settings (plan 28): the master switch and the

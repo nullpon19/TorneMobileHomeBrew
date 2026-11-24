@@ -207,6 +207,22 @@
    - **録画済み・番組表・ホーム・Tailscale**: 録画済み一覧を全 nasne 横断統合（「全 nasne / 個別 nasne」フィルタ＆シリーズまとめ対応、`Map.identity` で ID 衝突安全分離）。番組表／検索は全 nasne の予約・録画状態を合算表示。ホーム画面上部に機器切替バーを追加し、Tailscale ガードはいずれかの登録 nasne に到達できれば待機ダイアログを抑止。
    - テスト追加・更新後、`dart analyze` 問題ゼロ＆全 647 テスト合格を確認。
 
+### 第21弾: Live OSD 録画開始／停止・番組表録画停止・右上30秒通知・OSDバッジ統一・デフォルト録画画質・録画失敗管理
+1. **Live 視聴中 OSD の録画開始／停止＆番組表詳細の録画停止 (`lib/ui/live_recording_policy.dart`, `lib/ui/player_screen.dart`, `lib/ui/live_screen.dart`, `lib/ui/epg_screen.dart`)**:
+   - `buildImmediateLiveRecordingSchedule` と `isScheduleCurrentlyRecording` を追加し、Live OSD に未録画時は「この番組を録画」（確認ダイアログで番組名＋既定録画画質を表示→`X_GetConflictList` 衝突検査・EPG 一致時は `eventId` 連携で `X_CreateRecordSchedule`、複数台環境で衝突時は別空き nasne 自動振り分け）、録画中は「録画を停止」（確認ダイアログ→`X_DeleteRecordSchedule`）を追加。
+   - 番組表／検索詳細ダイアログ (`EpgEventDetailDialog` / `showEpgEventDetail`) で、現在録画中の番組に限り「録画中」小バッジと「録画を停止」ボタンを表示。
+2. **Live 右上録画通知の 30 秒延長＆OSD バッジ統一 (`lib/ui/live_recording_policy.dart`, `lib/ui/player_screen.dart`)**:
+   - `liveRecordingCornerNoticeDuration = Duration(seconds: 30)` を定義し、視聴中チャンネルでの録画開始・終了に伴う画面右上通知を 5 秒 → 30 秒に延長。
+   - `buildPlayerOsdStatusBadge` を追加し、OSD ヘッダー内の「録画中」バッジを `LIVE` と同じ角丸 4px 箱・余白・12px 太字フォント・同一高さに統一。
+3. **デフォルト録画画質設定 (`lib/app/providers.dart`, `lib/ui/settings_screen.dart`, `lib/ui/schedule_form.dart`)**:
+   - `defaultRecordingQualityProvider` (`firetv_default_recording_quality`, `DR`=100 / `3倍`=230, 既定 `DR`) を追加し、設定画面「録画・予約」の切替・予約作成フォーム初期値（非同期復元追従＋手動変更時固定ガード）・Live 即時録画へ連動。
+4. **予約画面での「録画失敗 (`recNgList`)」管理＆ホーム画面同期 (`lib/core/models/live_status.dart`, `lib/ui/format.dart`, `lib/ui/multi_nasne_policy.dart`, `lib/app/providers.dart`, `lib/ui/schedules_screen.dart`, `lib/ui/home_screen.dart`)**:
+   - `RecNgItem` へ `desiredQualityMode` / `ngID` 解析と `recNgQualityModeLabel` (`101`/`230` → `3倍`) を追加し、同一 `id` 重複を防ぐ複合キー `recNgDismissKey`・時系列マージ `mergeAndFilterRecNgItems`・永続化 `dismissedRecNgKeysProvider` を実装。
+   - `SchedulesScreen` 上部に「予約一覧 / 録画失敗 (N)」切替、詳細ページ／2 ペイン詳細、個別削除「この履歴を削除」、一括「すべて削除」を追加し、ホーム画面 `_RecNgSection` とも即時同期。
+5. **現状差分ドキュメント作成・テスト強化 (`FIRETV_CHANGES.md`, `test/firetv_mod_test.dart`)**:
+   - 公式 v1.5.0 からの現在の変更仕様一覧＋今回追加機能の別枠解説をまとめたローカル専用資料 `FIRETV_CHANGES.md` を新規作成（公開ブランチ `firetv` には非掲載）。
+   - Phase 22 単体・ウィジェットテスト 5 件を追加し、`dart analyze` 問題ゼロおよび全 652 テスト合格を確認。
+
 ---
 
 ## 3. 全変更・追加ファイル一覧 (vs アップストリーム `78d74a8`)
@@ -214,8 +230,9 @@
 | 種別 / ファイル | 主な変更・追加内容 |
 | :--- | :--- |
 | `README.md` | 非公式 Fire TV フォークの明記・MIT ライセンス／共存注記を追加 |
-| `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順 |
-| `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順） |
+| `CLEANUP_BUILD_ENV.md` | ビルド用に一時導入したツール・キャッシュ・作業ディレクトリの削除手順（ローカル用） |
+| `FIRETV_CHANGES.md` | 公式 v1.5.0 からの現在の変更仕様まとめ＋追加機能別枠ドキュメント（ローカル専用） |
+| `FIRETV_MOD_LOG.md` | 本ドキュメント（Fire TV 改修ログ・技術知見・再ビルド手順・ローカル専用） |
 | `android/app/build.gradle.kts` | `applicationId` を `com.markun.tmhb.firetv`、`versionName` を `-firetv` に変更 |
 | `android/app/src/main/AndroidManifest.xml` | TV 用 `LEANBACK_LAUNCHER` / `tv_banner`（`<application>` ＋ `<activity>` 双方） / `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion="32"`) + `MANAGE_EXTERNAL_STORAGE` 宣言 |
 | `android/app/src/main/res/drawable/tv_banner.png` / `drawable-xhdpi/tv_banner.png` | Fire TV ホーム画面用バナー画像 |
@@ -224,7 +241,8 @@
 | `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・`MANAGE_EXTERNAL_STORAGE` 判定/設定誘導＋ファイルスキャン・`StatFs` 残容量 `getCacheAvailableBytes`） |
 | `lib/app/bootstrap.dart` | `fileStoreContainer` に `mpvCacheDirectory` オプション引数を追加 |
 | `lib/app/firetv_helper.dart` | Fire TV 向け Platform Channel ラッパー（`getCacheAvailableBytes()` ほか） |
-| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`NightModeNotifier` / `nightModeProvider`、`GroupTitlesNotifier` / `groupTitlesProvider`（既定 ON）、`EpgReservedStyleNotifier` / `epgReservedStyleProvider`（既定 `fill`）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
+| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`DefaultRecordingQualityNotifier`（既定 `DR`）、`DismissedRecNgKeysNotifier`、`NightModeNotifier`、`GroupTitlesNotifier`（既定 ON）、`EpgReservedStyleNotifier`（既定 `fill`）、`mpvCacheDirectoryProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
+| `lib/core/models/live_status.dart` | `RecNgItem` へ `desiredQualityMode` / `ngID` 解析を追加 |
 | `lib/core/dtcp/native_aes.dart` | `libtmhb_fcntl.so` の Dart FFI バインディング |
 | `lib/core/dtcp/dtcp_crypto.dart` | Android でのネイティブ AES 復号優先パス |
 | `lib/core/dtcp/dtcp_proxy.dart` | 4ms ループ譲歩、`resetClient()`、`autoReconnect` 無制限バックオフ復帰（一時エラー時のタイムシーク保持）、AKE 再認証、Live 再オープン `409` 回避・旧ハンドラ解放、`bufferOutput = false`（auto-gzip 抑止）、`isLive` 限定 EOF 再接続、Seekable 正常 EOF 打ち切り & `_eofByte` 416、転送カウンタ (`servedBytes` / `firstByteServedAt` / `lastByteServedAt` / `consecutiveReconnectErrors`) 公開 |
@@ -233,17 +251,18 @@
 | `lib/main.dart` | `mpv_cache` 初期化/清掃、`ja-JP` ロケール固定 + `DefaultTextStyle` 補完、ライト/ナイトモード両テーマ + フォーカス枠 (`ChipThemeData` / `InputDecorationTheme` / `FloatingActionButtonThemeData` 含む)・`SegmentedButton` 個別セグメント反転強調テーマ |
 | `lib/ui/app_shell.dart` | Fire TV ナビゲーション/シェル調整、`TailscaleGuard` 統合、`OrderedTraversalPolicy` + `ExcludeFocus` による起動／ホーム初回読み込み時左メニューフォーカス固定、`_rightPaneFocusNode` による右ペイン上キーの `AppBar` 遷移、戻るキーの左メニュー該当項目復帰・ルート終了確認ダイアログ |
 | `lib/ui/dtcp_credential_screen.dart` | 2 カラム入力（`FireTvTextInputField` 化）・上部アクション・アプリ内ファイルピッカー・各ダイアログ `autofocus` 改善 |
-| `lib/ui/epg_screen.dart` | 広幅画面 `AppBar` 1 列統合・スクロール後タイル横取り防止付き上部バー/日付チップ/表示内グリッド明示 D-pad 遷移＆左メニュー復帰維持、表示時/復帰時/帯域切替時シームレス自動更新 (`skipLoadingOnReload`)、整数局幅フィット＋右端吸着修正、`EpgEventDetailDialog` 上下スクロール＆既定ボタン `autofocus`、複数台 nasne 予約・録画合算表示 (`findMatchingOwnedSchedule`)、時刻列 `_TimeRuler` 右端赤太ボーダー、現在時刻赤ライン 15 秒リアルタイム更新 (`EpgNowIndicatorLine`) |
-| `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` (`autofocus` 有効化・決定キー入力)、複数台 nasne 横断の予約済み赤ドット＆詳細 `'予約を編集'` 連動 |
-| `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、2 台以上登録時の上端 nasne 切替バー、600dp 以上 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` 最下部スクロール対応 |
-| `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice`) ・複数台フェイルオーバー候補保持 |
-| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー解決 (`resolveLiveRecordingConflictOrFailover`)、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示、全台競合時の切替案内 |
-| `lib/ui/multi_nasne_policy.dart` | 複数台 nasne 統合用ポリシー（サービス統合・空きチューナー優先選択・予約統合＆HDD 空き容量優先自動振り分け・複合キー分離） |
+| `lib/ui/epg_screen.dart` | 広幅画面 `AppBar` 1 列統合・スクロール後タイル横取り防止付き上部バー/日付チップ/表示内グリッド明示 D-pad 遷移＆左メニュー復帰維持、表示時/復帰時/帯域切替時シームレス自動更新 (`skipLoadingOnReload`)、整数局幅フィット＋右端吸着修正、`EpgEventDetailDialog` 上下スクロール・既定ボタン `autofocus`・録画中「録画を停止」ボタン、複数台 nasne 予約・録画合算表示 (`findMatchingOwnedSchedule`)、時刻列 `_TimeRuler` 右端赤太ボーダー、現在時刻赤ライン 15 秒リアルタイム更新 (`EpgNowIndicatorLine`) |
+| `lib/ui/epg_search_screen.dart` | `FireTvTextInputField` (`autofocus` 有効化・決定キー入力)、複数台 nasne 横断の予約済み赤ドット＆詳細 `'予約を編集'` / `'録画を停止'` 連動 |
+| `lib/ui/format.dart` | WebAPI `recNgListGet` 用の録画画質表記 `recNgQualityModeLabel` を追加 |
+| `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、2 台以上登録時の上端 nasne 切替バー、600dp 以上 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` 最下部スクロール対応、録画失敗カードのアプリ内削除同期 |
+| `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice` / 30 秒)・複数台フェイルオーバー候補保持・即時録画作成ヘルパー (`buildImmediateLiveRecordingSchedule`)・録画実行中判定 (`isScheduleCurrentlyRecording`) |
+| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー解決 (`resolveLiveRecordingConflictOrFailover`)、OSD 即時録画／録画停止配線、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示、全台競合時の切替案内 |
+| `lib/ui/multi_nasne_policy.dart` | 複数台 nasne 統合用ポリシー（サービス統合・空きチューナー優先選択・予約統合＆HDD 空き容量優先自動振り分け・`recNgList` 複合キー＆統合フィルタ・複合キー分離） |
 | `lib/ui/playback_launcher.dart` | エラー／資格情報案内／未実装ダイアログの初期ボタン `autofocus` 対応 |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（±10秒統一）、シークバー HUD、OSD（循環フォーカストラップ＆反転強調・`'メニューを閉じる'`・`'番組詳細'` 半画面スクロール・`LIVE` 横 `● 録画中` バッジ）、画面右上 5 秒通知（`録画中`/`録画終了`/自動フェイルオーバー切替 `buildLiveFailoverNotice`）、Live 競合検知＆背後バナー/フォーカス遮断・1 操作切替、再生終了確認、事前バッファ蓄積表示、`cache-on-disk`、無制限自動再開、録画終了時自動復帰 |
-| `lib/ui/schedule_form.dart` | `FireTvTextInputField` 化、`FireTvTimePickerDialog`（D-pad 時刻設定）、競合警告キャンセル `autofocus`、2 台以上登録時の「録画する nasne」指定／空き容量＆競合考慮の自動振り分け |
-| `lib/ui/schedules_screen.dart` | `新規予約` の `AppBar` 上部移動（FAB 廃止）、詳細 `autofocusEdit`、複数台 nasne 予約時刻順統合一覧＆複合キー管理 |
-| `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、登録済み nasne 行タップメニュー（切替/検証/解除）、単一フォーカス `_BufferOptionTile`、ナイトモード・番組表予約表示設定・デフォルト画質切替・Live/録画バッファ設定・バージョン表記統一 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（±10秒統一）、シークバー HUD、OSD（循環フォーカストラップ＆反転強調・`'メニューを閉じる'`・`'番組詳細'` 半画面スクロール・`'この番組を録画'` / `'録画を停止'`・`LIVE` 統一角丸箱 `録画中` バッジ）、画面右上 30 秒録画状態通知（`録画中`/`録画終了`）＆ 5 秒フェイルオーバー通知、Live 競合検知＆背後バナー/フォーカス遮断・1 操作切替、再生終了確認、事前バッファ蓄積表示、`cache-on-disk`、無制限自動再開、録画終了時自動復帰 |
+| `lib/ui/schedule_form.dart` | `FireTvTextInputField` 化、`FireTvTimePickerDialog`（D-pad 時刻設定）、デフォルト録画画質連動、競合警告キャンセル `autofocus`、2 台以上登録時の「録画する nasne」指定／空き容量＆競合考慮の自動振り分け |
+| `lib/ui/schedules_screen.dart` | `新規予約` の `AppBar` 上部移動（FAB 廃止）、詳細 `autofocusEdit`、複数台 nasne 予約時刻順統合一覧＆複合キー管理、「予約一覧 / 録画失敗」管理（詳細・個別削除・すべて削除） |
+| `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、登録済み nasne 行タップメニュー（切替/検証/解除）、単一フォーカス `_BufferOptionTile`、ナイトモード・番組表予約表示設定・デフォルト録画画質・デフォルト再生画質切替・Live/録画バッファ設定・バージョン表記統一 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード（複数台時はいずれか到達で待機抑止） |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
 | `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、保護行 `_ProtectionRow` の単一フォーカス＆黄枠強調、削除不能ダイアログ `autofocus`、検索欄 `FireTvTextInputField`、`'番組まとめ'` フォルダ化、2 台以上登録時の複数台横断一覧＆nasne フィルタ（ID 重複安全分離） |
