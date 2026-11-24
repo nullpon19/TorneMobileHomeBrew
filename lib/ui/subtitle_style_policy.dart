@@ -124,19 +124,27 @@ List<Shadow> resolveSubtitleTextShadows(
         ),
       ];
     case SubtitleEdgeStyle.thickShadow:
-      final d = (fontSize * 0.038).clamp(0.9, 2.4).toDouble();
-      final tight = (fontSize * 0.10).clamp(2.4, 6.0).toDouble();
-      final mid = (fontSize * 0.20).clamp(4.8, 11.5).toDouble();
-      final wide = (fontSize * 0.32).clamp(7.5, 17.0).toDouble();
       return [
-        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: tight),
-        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: tight),
-        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: mid),
-        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: wide),
-        Shadow(color: Colors.black, offset: Offset(-d, -d), blurRadius: tight),
-        Shadow(color: Colors.black, offset: Offset(d, -d), blurRadius: tight),
-        Shadow(color: Colors.black, offset: Offset(-d, d), blurRadius: tight),
-        Shadow(color: Colors.black, offset: Offset(d, d), blurRadius: tight),
+        Shadow(
+          color: const Color(0xE6000000),
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.14).clamp(3.0, 7.5).toDouble(),
+        ),
+        Shadow(
+          color: const Color(0xCC000000),
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.28).clamp(6.0, 14.0).toDouble(),
+        ),
+        Shadow(
+          color: const Color(0xB3000000),
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.44).clamp(9.5, 22.0).toDouble(),
+        ),
+        Shadow(
+          color: const Color(0x88000000),
+          offset: Offset.zero,
+          blurRadius: (fontSize * 0.62).clamp(13.0, 30.0).toDouble(),
+        ),
       ];
     case SubtitleEdgeStyle.none:
     case SubtitleEdgeStyle.thin:

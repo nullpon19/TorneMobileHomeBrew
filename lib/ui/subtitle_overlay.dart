@@ -5,6 +5,7 @@ library;
 
 import 'dart:math' as math;
 
+import 'package:flutter/rendering.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'subtitle_style_policy.dart';
@@ -122,7 +123,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
 
   StrutStyle _strutStyle(double fontSize) => StrutStyle(
     fontSize: fontSize,
-    height: 1.28,
+    height: 1.20,
     forceStrutHeight: true,
   );
 
@@ -143,7 +144,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
               fontFamilyFallback: settings.font.fontFamilyFallback,
               fontWeight: settings.font.fontWeight,
               fontSize: fontSize * run.scale,
-              height: 1.28,
+              height: 1.20,
               locale: const Locale('ja', 'JP'),
               color: isStroke ? null : run.color,
               foreground: isStroke
@@ -401,7 +402,8 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       bottomPad = bottomSafePadding;
     }
 
-    Widget buildLinePill(SubtitleCue cue) {
+    final vPad = fontSize * 0.12;
+    Widget buildLineWidget(int index, SubtitleCue cue) {
       final textWidget = _buildCueText(
         cue: cue,
         fontSize: fontSize,
@@ -409,29 +411,39 @@ class PlayerSubtitleOverlay extends StatelessWidget {
         strut: strut,
       );
       if (!hasBackground) return textWidget;
-      return Container(
-        padding: EdgeInsets.symmetric(
-          horizontal: fontSize * 0.34,
-          vertical: fontSize * 0.14,
-        ),
-        decoration: BoxDecoration(
-          color: settings.effectiveBackgroundColor,
-          borderRadius: BorderRadius.circular(4),
+      return Padding(
+        padding: EdgeInsets.fromLTRB(
+          hPad,
+          index == 0 ? vPad : 0.0,
+          hPad,
+          index == visualLines.length - 1 ? vPad : 0.0,
         ),
         child: textWidget,
       );
     }
 
-    final content = Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        for (var i = 0; i < visualLines.length; i++) ...[
-          if (i > 0) SizedBox(height: math.max(2.0, fontSize * 0.12)),
-          buildLinePill(visualLines[i]),
+    final Widget content;
+    if (hasBackground) {
+      content = SubtitleUnifiedBackgroundBox(
+        backgroundColor: settings.effectiveBackgroundColor,
+        cornerRadius: 5.0,
+        children: [
+          for (var i = 0; i < visualLines.length; i++)
+            buildLineWidget(i, visualLines[i]),
         ],
-      ],
-    );
+      );
+    } else {
+      content = Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (var i = 0; i < visualLines.length; i++) ...[
+            if (i > 0) SizedBox(height: math.max(1.0, fontSize * 0.04)),
+            buildLineWidget(i, visualLines[i]),
+          ],
+        ],
+      );
+    }
 
     return Positioned.fill(
       child: Padding(
@@ -481,5 +493,258 @@ class PlayerSubtitleOverlay extends StatelessWidget {
         fillText,
       ],
     );
+  }
+}
+
+/// Builds a single clockwise polygon [Path] wrapping vertically contiguous,
+/// left-aligned [lineRects] with smooth rounded outer and concave inner corners
+/// so semi-transparent subtitle backgrounds never show gaps or double-painted seams.
+Path buildUnifiedSubtitlePolygonPath(
+  List<Rect> lineRects, {
+  double radius = 5.0,
+}) {
+  if (lineRects.isEmpty) return Path();
+  if (lineRects.length == 1) {
+    final rect = lineRects.first;
+    final r = radius
+        .clamp(0.0, math.min(rect.width * 0.48, rect.height * 0.48))
+        .toDouble();
+    return Path()..addRRect(RRect.fromRectAndRadius(rect, Radius.circular(r)));
+  }
+
+  final xLeft = lineRects.map((r) => r.left).reduce(math.min);
+  final rights = [for (final r in lineRects) r.right];
+  final minStepDelta = radius * 2.0;
+
+  var changed = true;
+  while (changed) {
+    changed = false;
+    for (var i = 0; i < rights.length - 1; i++) {
+      final diff = (rights[i] - rights[i + 1]).abs();
+      if (diff > 0.001 && diff < minStepDelta) {
+        final merged = math.max(rights[i], rights[i + 1]);
+        if (rights[i] != merged || rights[i + 1] != merged) {
+          rights[i] = merged;
+          rights[i + 1] = merged;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  final runs = <({double top, double bottom, double right})>[];
+  for (var i = 0; i < lineRects.length; i++) {
+    final rect = lineRects[i];
+    final right = rights[i];
+    if (runs.isNotEmpty && (runs.last.right - right).abs() <= 0.001) {
+      final prev = runs.removeLast();
+      runs.add((
+        top: prev.top,
+        bottom: rect.bottom,
+        right: math.max(prev.right, right),
+      ));
+    } else {
+      runs.add((top: rect.top, bottom: rect.bottom, right: right));
+    }
+  }
+
+  final yTop = runs.first.top;
+  final yBottom = runs.last.bottom;
+  if (runs.length == 1) {
+    final rect = Rect.fromLTRB(xLeft, yTop, runs.first.right, yBottom);
+    final r = radius
+        .clamp(0.0, math.min(rect.width * 0.48, rect.height * 0.48))
+        .toDouble();
+    return Path()..addRRect(RRect.fromRectAndRadius(rect, Radius.circular(r)));
+  }
+
+  double cornerClamp(double a, double b) =>
+      radius.clamp(0.0, math.min(a, b) * 0.48);
+
+  final first = runs.first;
+  final last = runs.last;
+  final topL = cornerClamp(yBottom - yTop, first.right - xLeft);
+  final topR = cornerClamp(first.bottom - first.top, first.right - xLeft);
+  final botR = cornerClamp(last.bottom - last.top, last.right - xLeft);
+  final botL = cornerClamp(yBottom - yTop, last.right - xLeft);
+
+  final path = Path()..moveTo(xLeft + topL, yTop);
+  path.lineTo(first.right - topR, yTop);
+  path.quadraticBezierTo(first.right, yTop, first.right, yTop + topR);
+
+  for (var i = 0; i < runs.length - 1; i++) {
+    final curr = runs[i];
+    final next = runs[i + 1];
+    final dx = next.right - curr.right;
+    final sign = dx >= 0 ? 1.0 : -1.0;
+    final stepR = [
+      radius,
+      dx.abs() * 0.48,
+      (curr.bottom - curr.top) * 0.48,
+      (next.bottom - next.top) * 0.48,
+    ].reduce(math.min);
+    final seamY = curr.bottom;
+    path.lineTo(curr.right, seamY - stepR);
+    path.quadraticBezierTo(
+      curr.right,
+      seamY,
+      curr.right + sign * stepR,
+      seamY,
+    );
+    path.lineTo(next.right - sign * stepR, seamY);
+    path.quadraticBezierTo(next.right, seamY, next.right, seamY + stepR);
+  }
+
+  path.lineTo(last.right, yBottom - botR);
+  path.quadraticBezierTo(last.right, yBottom, last.right - botR, yBottom);
+  path.lineTo(xLeft + botL, yBottom);
+  path.quadraticBezierTo(xLeft, yBottom, xLeft, yBottom - botL);
+  path.lineTo(xLeft, yTop + topL);
+  path.quadraticBezierTo(xLeft, yTop, xLeft + topL, yTop);
+  path.close();
+  return path;
+}
+
+class _SubtitleLineParentData extends ContainerBoxParentData<RenderBox> {}
+
+/// Stacks subtitle line widgets vertically and paints one unified stepped
+/// polygon backdrop behind all lines.
+class SubtitleUnifiedBackgroundBox extends MultiChildRenderObjectWidget {
+  const SubtitleUnifiedBackgroundBox({
+    super.key,
+    required this.backgroundColor,
+    this.cornerRadius = 5.0,
+    required super.children,
+  });
+
+  final Color backgroundColor;
+  final double cornerRadius;
+
+  @override
+  RenderSubtitleUnifiedBackgroundBox createRenderObject(BuildContext context) {
+    return RenderSubtitleUnifiedBackgroundBox(
+      backgroundColor: backgroundColor,
+      cornerRadius: cornerRadius,
+    );
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    RenderSubtitleUnifiedBackgroundBox renderObject,
+  ) {
+    renderObject
+      ..backgroundColor = backgroundColor
+      ..cornerRadius = cornerRadius;
+  }
+}
+
+/// RenderObject backing [SubtitleUnifiedBackgroundBox].
+class RenderSubtitleUnifiedBackgroundBox extends RenderBox
+    with
+        ContainerRenderObjectMixin<RenderBox, _SubtitleLineParentData>,
+        RenderBoxContainerDefaultsMixin<RenderBox, _SubtitleLineParentData> {
+  RenderSubtitleUnifiedBackgroundBox({
+    required Color backgroundColor,
+    double cornerRadius = 5.0,
+  }) {
+    _backgroundColor = backgroundColor;
+    _cornerRadius = cornerRadius;
+  }
+
+  late Color _backgroundColor;
+  Color get backgroundColor => _backgroundColor;
+  set backgroundColor(Color value) {
+    if (_backgroundColor == value) return;
+    _backgroundColor = value;
+    markNeedsPaint();
+  }
+
+  late double _cornerRadius;
+  double get cornerRadius => _cornerRadius;
+  set cornerRadius(double value) {
+    if (_cornerRadius == value) return;
+    _cornerRadius = value;
+    markNeedsPaint();
+  }
+
+  List<Rect> _lineRects = const [];
+  List<Rect> get lineRects => List<Rect>.unmodifiable(_lineRects);
+
+  @override
+  void setupParentData(RenderBox child) {
+    if (child.parentData is! _SubtitleLineParentData) {
+      child.parentData = _SubtitleLineParentData();
+    }
+  }
+
+  @override
+  Size computeDryLayout(BoxConstraints constraints) {
+    final childConstraints = BoxConstraints(
+      minWidth: 0,
+      maxWidth: constraints.maxWidth,
+      minHeight: 0,
+      maxHeight: double.infinity,
+    );
+    var y = 0.0;
+    var maxW = 0.0;
+    var child = firstChild;
+    while (child != null) {
+      final childSize = child.getDryLayout(childConstraints);
+      if (childSize.width > maxW) maxW = childSize.width;
+      y += childSize.height;
+      child = childAfter(child);
+    }
+    return constraints.constrain(Size(maxW, y));
+  }
+
+  @override
+  void performLayout() {
+    final childConstraints = BoxConstraints(
+      minWidth: 0,
+      maxWidth: constraints.maxWidth,
+      minHeight: 0,
+      maxHeight: double.infinity,
+    );
+    var y = 0.0;
+    var maxW = 0.0;
+    final rects = <Rect>[];
+    var child = firstChild;
+    while (child != null) {
+      child.layout(childConstraints, parentUsesSize: true);
+      final childParentData = child.parentData! as _SubtitleLineParentData;
+      childParentData.offset = Offset(0.0, y);
+      final w = child.size.width;
+      final h = child.size.height;
+      rects.add(Rect.fromLTWH(0.0, y, w, h));
+      if (w > maxW) maxW = w;
+      y += h;
+      child = childParentData.nextSibling;
+    }
+    _lineRects = rects;
+    size = constraints.constrain(Size(maxW, y));
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    if (_backgroundColor.a > 0 && _lineRects.isNotEmpty) {
+      final path = buildUnifiedSubtitlePolygonPath(
+        _lineRects,
+        radius: _cornerRadius,
+      ).shift(offset);
+      context.canvas.drawPath(
+        path,
+        Paint()
+          ..color = _backgroundColor
+          ..style = PaintingStyle.fill
+          ..isAntiAlias = true,
+      );
+    }
+    defaultPaint(context, offset);
+  }
+
+  @override
+  bool hitTestChildren(BoxHitTestResult result, {required Offset position}) {
+    return defaultHitTestChildren(result, position: position);
   }
 }

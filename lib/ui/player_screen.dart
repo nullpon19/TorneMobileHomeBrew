@@ -594,14 +594,39 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ),
                               ],
                               const SizedBox(height: 8),
-                              Text(
-                                isNext
-                                    ? 'もう一度 ▶ / 決定 で切替'
-                                    : 'もう一度 ◀ / 決定 で切替',
-                                style: TextStyle(
-                                  color: hintColor,
-                                  fontSize: 11,
-                                ),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    'もう一度 ',
+                                    style: TextStyle(
+                                      color: hintColor,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                  if (isNext)
+                                    Icon(
+                                      Icons.play_arrow,
+                                      size: 12,
+                                      color: hintColor,
+                                    )
+                                  else
+                                    Transform.flip(
+                                      flipX: true,
+                                      child: Icon(
+                                        Icons.play_arrow,
+                                        size: 12,
+                                        color: hintColor,
+                                      ),
+                                    ),
+                                  Text(
+                                    ' / 決定 で切替',
+                                    style: TextStyle(
+                                      color: hintColor,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -833,33 +858,75 @@ LiveOsdProgramInfo resolveLiveOsdProgramInfo({
   );
 }
 
+/// Minimum interval between OSD buffer-badge text refreshes while the OSD is open.
+const Duration playerOsdBufferBadgeRefreshInterval = Duration(seconds: 3);
+
+/// Returns whether the OSD buffer badge display should snapshot a new value.
+bool shouldRefreshOsdBufferBadge({
+  required DateTime? lastUpdatedAt,
+  required DateTime now,
+  required int displayedSeconds,
+  required int actualSeconds,
+}) {
+  if (lastUpdatedAt == null) return true;
+  if (displayedSeconds <= 0 && actualSeconds > 0) return true;
+  return now.difference(lastUpdatedAt) >= playerOsdBufferBadgeRefreshInterval;
+}
+
+/// Computes soft wide centered shadows for [PlayerOsdClockOverlay], tuned lighter
+/// and broader than subtitle [SubtitleEdgeStyle.thickShadow].
+List<Shadow> resolveOsdClockTextShadows(double fontSize) {
+  return [
+    Shadow(
+      color: const Color(0xCC000000),
+      offset: Offset.zero,
+      blurRadius: (fontSize * 0.16).clamp(4.0, 9.0).toDouble(),
+    ),
+    Shadow(
+      color: const Color(0xA6000000),
+      offset: Offset.zero,
+      blurRadius: (fontSize * 0.34).clamp(8.0, 18.0).toDouble(),
+    ),
+    Shadow(
+      color: const Color(0x80000000),
+      offset: Offset.zero,
+      blurRadius: (fontSize * 0.58).clamp(14.0, 30.0).toDouble(),
+    ),
+  ];
+}
+
 /// Top-left TV-style clock shown while the OSD is open without details.
 class PlayerOsdClockOverlay extends StatelessWidget {
-  const PlayerOsdClockOverlay({super.key, required this.now});
+  const PlayerOsdClockOverlay({
+    super.key,
+    required this.now,
+    this.opacity,
+  });
 
   final DateTime now;
+  final Animation<double>? opacity;
 
   @override
   Widget build(BuildContext context) {
+    final text = Text(
+      formatTimeJst(now),
+      style: TextStyle(
+        fontFamily: 'GoogleSans',
+        color: Colors.white,
+        fontSize: 44,
+        fontWeight: FontWeight.w500,
+        height: 1.0,
+        fontFeatures: const [FontFeature.tabularFigures()],
+        shadows: resolveOsdClockTextShadows(44),
+      ),
+    );
     return Positioned(
       top: 22,
       left: 28,
       child: IgnorePointer(
-        child: Text(
-          formatTimeJst(now),
-          style: TextStyle(
-            fontFamily: 'GoogleSans',
-            color: Colors.white,
-            fontSize: 44,
-            fontWeight: FontWeight.w600,
-            height: 1.0,
-            fontFeatures: const [FontFeature.tabularFigures()],
-            shadows: resolveSubtitleTextShadows(
-              SubtitleEdgeStyle.thickShadow,
-              44,
-            ),
-          ),
-        ),
+        child: opacity != null
+            ? FadeTransition(opacity: opacity!, child: text)
+            : text,
       ),
     );
   }
@@ -1684,7 +1751,8 @@ class PlayerScreen extends ConsumerStatefulWidget {
   ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends ConsumerState<PlayerScreen> {
+class _PlayerScreenState extends ConsumerState<PlayerScreen>
+    with TickerProviderStateMixin {
   late final Player _player;
   late final VideoController _videoController;
   late final WakelockSession _wakelockSession;
@@ -1869,6 +1937,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   bool _osdOpen = false;
   Timer? _osdTimer;
+  late final AnimationController _osdFadeController;
+  late final Animation<double> _osdFadeAnimation;
+  int _displayedBufferAheadSeconds = 0;
+  DateTime? _lastBufferBadgeUpdatedAt;
   bool _detailOpen = false;
   bool _exitConfirmOpen = false;
   DateTime? _suppressBackPopUntil;
@@ -2058,8 +2130,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       if (latched ||
           (_shouldPollLiveBuffering &&
               (nextLoadSec != prevLoadSec || nextPct != prevPct)) ||
-          ((_osdOpen || _seekHudVisible) &&
-              _bufferedAheadSeconds.floor() != prevAheadFloor)) {
+          (_seekHudVisible && _bufferedAheadSeconds.floor() != prevAheadFloor) ||
+          (_osdOpen && _syncDisplayedBufferBadge())) {
         setState(() {});
       }
     } finally {
@@ -2089,6 +2161,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    _osdFadeController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+      reverseDuration: const Duration(milliseconds: 160),
+    )..addStatusListener((status) {
+      if ((status == AnimationStatus.dismissed ||
+              status == AnimationStatus.completed) &&
+          mounted) {
+        setState(() {});
+      }
+    });
+    _osdFadeAnimation = CurvedAnimation(
+      parent: _osdFadeController,
+      curve: Curves.easeOut,
+      reverseCurve: Curves.easeIn,
+    );
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
     _subtitlesOn = ref.read(subtitlesEnabledProvider);
@@ -2262,8 +2350,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           if (mounted &&
               ((_shouldPollLiveBuffering &&
                       _effectiveLoadingCurrentSeconds != prevLoadSec) ||
-                  ((_osdOpen || _seekHudVisible) &&
-                      _bufferDeltaSeconds.floor() != prevDeltaFloor))) {
+                  (_seekHudVisible &&
+                      _bufferDeltaSeconds.floor() != prevDeltaFloor) ||
+                  (_osdOpen && _syncDisplayedBufferBadge()))) {
             setState(() {});
           }
         }
@@ -2849,6 +2938,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _interruptDetail = null;
       _autoResumeCountdown = 0;
       _osdOpen = false;
+      _osdFadeController.value = 0.0;
       _detailOpen = false;
       _hudText = null;
       _cornerRecordingNotice = null;
@@ -3551,7 +3641,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         final waitingForInitial = _isPreBuffering;
         if (mounted &&
             ((waitingForInitial && _effectivePreBufferSeconds != prevPreSec) ||
-                ((_osdOpen || _seekHudVisible) && clamped.floor() != prevFloor))) {
+                (_seekHudVisible && clamped.floor() != prevFloor) ||
+                (_osdOpen && _syncDisplayedBufferBadge()))) {
           setState(() {});
         }
       });
@@ -3940,6 +4031,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             _resumeButtonFocusNode.dispose();
             _closeBannerFocusNode.dispose();
             _errorBackFocusNode.dispose();
+            _osdFadeController.dispose();
           },
         ),
         (
@@ -4066,15 +4158,38 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
   }
 
+  bool _syncDisplayedBufferBadge({bool force = false}) {
+    final actualSec = math
+        .max(_bufferedAheadSeconds, _bufferDeltaSeconds)
+        .floor();
+    final now = _now();
+    if (!force &&
+        !shouldRefreshOsdBufferBadge(
+          lastUpdatedAt: _lastBufferBadgeUpdatedAt,
+          now: now,
+          displayedSeconds: _displayedBufferAheadSeconds,
+          actualSeconds: actualSec,
+        )) {
+      return false;
+    }
+    _displayedBufferAheadSeconds = actualSec;
+    _lastBufferBadgeUpdatedAt = now;
+    return true;
+  }
+
   void _openOsd() {
     _channelPreviewTimer?.cancel();
+    _syncDisplayedBufferBadge(force: true);
     setState(() {
       _channelPreviewDirection = null;
       _osdOpen = true;
     });
+    _osdFadeController.forward();
     _osdClockTimer?.cancel();
     _osdClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _osdOpen) setState(() {});
+      if (!mounted || !_osdOpen) return;
+      _syncDisplayedBufferBadge();
+      setState(() {});
     });
     unawaited(_pollMpvBufferProperties());
     _resetOsdTimer();
@@ -4099,6 +4214,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _osdOpen = false;
       _detailOpen = false;
     });
+    _osdFadeController.reverse();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _rootFocusNode.canRequestFocus) {
         _rootFocusNode.requestFocus();
@@ -4301,6 +4417,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         _interruptDetail = null;
         _autoResumeCountdown = 0;
         _osdOpen = false;
+        _osdFadeController.value = 0.0;
         _detailOpen = false;
         _hudText = null;
         _cornerRecordingNotice = null;
@@ -4988,8 +5105,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         ..._buildChannelSwitchPreviewCards(),
                       if (_seekHudVisible && !_osdOpen && !widget.live)
                         _buildSeekHud(),
-                      if (_osdOpen && !_detailOpen) _buildOsdClockOverlay(),
-                      if (_osdOpen) _buildRemoteOsd(),
+                      if (_osdOpen ||
+                          _osdFadeController.status != AnimationStatus.dismissed) ...[
+                        if (!_detailOpen) _buildOsdClockOverlay(),
+                        _buildRemoteOsd(),
+                      ],
                       if (_detailOpen && _hasProgramDetail)
                         Positioned(
                           top: 20,
@@ -5086,7 +5206,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   Widget _buildBufferBadge() {
     final plan = _bufferPlan;
-    final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
+    final aheadSec = _lastBufferBadgeUpdatedAt != null
+        ? _displayedBufferAheadSeconds
+        : math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
     final targetSec = plan?.configuredSeconds ?? 0;
     if (aheadSec <= 0 && targetSec <= 0) return const SizedBox.shrink();
     final text = targetSec > 0
@@ -5096,7 +5218,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       label: text,
       color: const Color(0xB3000000),
       textColor: Colors.white,
-      border: Border.all(color: Colors.white24),
     );
   }
 
@@ -5379,7 +5500,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
   }
 
-  Widget _buildOsdClockOverlay() => PlayerOsdClockOverlay(now: _now());
+  Widget _buildOsdClockOverlay() =>
+      PlayerOsdClockOverlay(now: _now(), opacity: _osdFadeAnimation);
 
   Widget _buildLiveOsdProgramSection() {
     final channel = widget.currentLiveChannel;
@@ -5397,16 +5519,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       left: 0,
       right: 0,
       bottom: 0,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Colors.transparent, Colors.black87, Colors.black],
-          ),
-        ),
-        child: Column(
+      child: IgnorePointer(
+        ignoring: !_osdOpen,
+        child: ExcludeFocus(
+          excluding: !_osdOpen,
+          child: FadeTransition(
+            opacity: _osdFadeAnimation,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.transparent, Colors.black87, Colors.black],
+                ),
+              ),
+              child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -5596,6 +5724,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 ],
             ),
           ],
+        ),
+            ),
+          ),
         ),
       ),
     );

@@ -6539,17 +6539,11 @@ void main() {
             SubtitleEdgeStyle.thickShadow,
             36,
           );
-          expect(thickShadows, hasLength(8));
-          final sumDx = thickShadows.fold<double>(
-            0.0,
-            (s, e) => s + e.offset.dx,
-          );
-          final sumDy = thickShadows.fold<double>(
-            0.0,
-            (s, e) => s + e.offset.dy,
-          );
-          expect(sumDx.abs(), lessThan(0.001));
-          expect(sumDy.abs(), lessThan(0.001));
+          expect(thickShadows, hasLength(4));
+          for (final s in thickShadows) {
+            expect(s.offset, Offset.zero);
+          }
+          expect(thickShadows.last.blurRadius, greaterThanOrEqualTo(20.0));
           expect(subtitleBackgroundOpacityLabel(0), 'なし (0%)');
           expect(subtitleBackgroundOpacityLabel(65), '標準 (65%)');
           expect(SubtitleFontFamily.gothic.fontFamily, 'LINESeedJP');
@@ -6991,15 +6985,9 @@ void main() {
             ],
           );
           expect(tester.widgetList<RichText>(find.byType(RichText)), hasLength(1));
-          final containers = tester.widgetList<Container>(find.byType(Container));
-          for (final c in containers) {
-            final dec = c.decoration;
-            if (dec is BoxDecoration) {
-              expect(dec.color, isNot(Colors.black.withValues(alpha: 0.65)));
-            }
-          }
+          expect(find.byType(SubtitleUnifiedBackgroundBox), findsNothing);
 
-          // Multi-line subtitles use left alignment and per-line snug background pills.
+          // Multi-line subtitles use left alignment and one seamless unified polygon box.
           await pumpOverlay(
             const SubtitleSettings(
               edge: SubtitleEdgeStyle.none,
@@ -7016,15 +7004,16 @@ void main() {
           for (final rt in richLines) {
             expect(rt.textAlign, TextAlign.left);
           }
-          final linePills = tester
-              .widgetList<Container>(find.byType(Container))
-              .where((c) => c.decoration is BoxDecoration)
-              .toList();
-          expect(linePills, hasLength(2));
-          final longPillRect = tester.getRect(find.byWidget(linePills[0]));
-          final shortPillRect = tester.getRect(find.byWidget(linePills[1]));
-          expect(longPillRect.width, greaterThan(shortPillRect.width + 80));
-          expect((longPillRect.left - shortPillRect.left).abs(), lessThan(2.0));
+          final unifiedBoxFinder = find.byType(SubtitleUnifiedBackgroundBox);
+          expect(unifiedBoxFinder, findsOneWidget);
+          final unifiedRender = tester
+              .renderObject<RenderSubtitleUnifiedBackgroundBox>(unifiedBoxFinder);
+          expect(unifiedRender.lineRects, hasLength(2));
+          final longLineRect = unifiedRender.lineRects[0];
+          final shortLineRect = unifiedRender.lineRects[1];
+          expect(longLineRect.bottom, closeTo(shortLineRect.top, 0.01));
+          expect(longLineRect.width, greaterThan(shortLineRect.width + 80));
+          expect((longLineRect.left - shortLineRect.left).abs(), lessThan(2.0));
         },
       );
     },
@@ -7881,17 +7870,10 @@ void main() {
             ),
           );
           final haloStyle = firstStyledRun(haloRichText.text)!;
-          expect(haloStyle.shadows, hasLength(8));
-          final haloSumDx = haloStyle.shadows!.fold<double>(
-            0.0,
-            (s, e) => s + e.offset.dx,
-          );
-          final haloSumDy = haloStyle.shadows!.fold<double>(
-            0.0,
-            (s, e) => s + e.offset.dy,
-          );
-          expect(haloSumDx.abs(), lessThan(0.001));
-          expect(haloSumDy.abs(), lessThan(0.001));
+          expect(haloStyle.shadows, hasLength(4));
+          for (final s in haloStyle.shadows!) {
+            expect(s.offset, Offset.zero);
+          }
 
           // Verify 16:9 preview strictly scales rendered font sizes across 小 / 中 / 大.
           tester.view.physicalSize = const Size(1280, 720);
@@ -8012,8 +7994,10 @@ void main() {
           expect(find.text('16:20'), findsOneWidget);
           final clockWidget = tester.widget<Text>(find.text('16:20'));
           expect(clockWidget.style?.fontFamily, 'GoogleSans');
+          expect(clockWidget.style?.fontWeight, FontWeight.w500);
           expect(clockWidget.style?.fontSize, 44);
-          expect(clockWidget.style?.shadows, hasLength(8));
+          expect(clockWidget.style?.shadows, hasLength(3));
+          expect(clockWidget.style?.shadows?.last.blurRadius, greaterThanOrEqualTo(24.0));
           expect(
             find.ancestor(
               of: find.text('16:20'),
@@ -8109,16 +8093,18 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          final pillFinder = find.descendant(
+          final unifiedFinder = find.descendant(
             of: find.byType(PlayerSubtitleOverlay),
-            matching: find.byWidgetPredicate(
-              (w) => w is Container && w.decoration is BoxDecoration,
-            ),
+            matching: find.byType(SubtitleUnifiedBackgroundBox),
           );
-          expect(pillFinder, findsNWidgets(2));
-          final line1W = tester.getSize(pillFinder.at(0)).width;
-          final line2W = tester.getSize(pillFinder.at(1)).width;
-          expect(line2W, lessThan(line1W * 0.65));
+          expect(unifiedFinder, findsOneWidget);
+          final renderBox = tester
+              .renderObject<RenderSubtitleUnifiedBackgroundBox>(unifiedFinder);
+          expect(renderBox.lineRects, hasLength(2));
+          final line1Rect = renderBox.lineRects[0];
+          final line2Rect = renderBox.lineRects[1];
+          expect(line1Rect.bottom, closeTo(line2Rect.top, 0.01));
+          expect(line2Rect.width, lessThan(line1Rect.width * 0.65));
 
           // 2) Short cue inside centered broadcast box (0.18..0.82) at small
           //    size centers cleanly around 480px rather than hugging x=172px.
@@ -8145,14 +8131,12 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          final centeredPill = find.descendant(
+          final centeredBox = find.descendant(
             of: find.byType(PlayerSubtitleOverlay),
-            matching: find.byWidgetPredicate(
-              (w) => w is Container && w.decoration is BoxDecoration,
-            ),
+            matching: find.byType(SubtitleUnifiedBackgroundBox),
           );
-          expect(centeredPill, findsOneWidget);
-          final centerDx = tester.getCenter(centeredPill).dx;
+          expect(centeredBox, findsOneWidget);
+          final centerDx = tester.getCenter(centeredBox).dx;
           expect((centerDx - 480.0).abs(), lessThan(40.0));
         },
       );
@@ -8224,6 +8208,192 @@ void main() {
           expect(bodyStyle.fontFamily, 'GoogleSans');
           expect(bodyStyle.fontFamilyFallback, contains('LINESeedJP'));
           expect(tester.takeException(), isNull);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 30: unified polygon subtitle box, lighter wide shadows, OSD fade/throttle, and monochrome channel-card triangles',
+    () {
+      test(
+        'buildUnifiedSubtitlePolygonPath merges seams cleanly and hugs shorter or wider lines',
+        () {
+          final emptyPath = buildUnifiedSubtitlePolygonPath(const []);
+          expect(emptyPath.getBounds(), Rect.zero);
+
+          // Step inward (line 2 shorter than line 1): empty trailing area of
+          // line 2 is not filled, while contiguous seam is filled cleanly.
+          final inward = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 320, 48),
+            Rect.fromLTWH(0, 48, 160, 44),
+          ], radius: 5.0);
+          expect(inward.contains(const Offset(280, 20)), isTrue);
+          expect(inward.contains(const Offset(120, 48)), isTrue);
+          expect(inward.contains(const Offset(120, 72)), isTrue);
+          expect(inward.contains(const Offset(280, 72)), isFalse);
+
+          // Step outward (line 2 wider than line 1): top-right stays unfilled.
+          final outward = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 150, 48),
+            Rect.fromLTWH(0, 48, 320, 44),
+          ], radius: 5.0);
+          expect(outward.contains(const Offset(280, 20)), isFalse);
+          expect(outward.contains(const Offset(280, 72)), isTrue);
+
+          // Micro difference (< 2 * radius = 10px) snaps smoothly to outer width.
+          final microSnap = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 200, 48),
+            Rect.fromLTWH(0, 48, 195, 44),
+          ], radius: 5.0);
+          expect(microSnap.contains(const Offset(197, 24)), isTrue);
+          expect(microSnap.contains(const Offset(197, 70)), isTrue);
+        },
+      );
+
+      test(
+        'resolveOsdClockTextShadows and shouldRefreshOsdBufferBadge apply independent light spread and 3s throttle',
+        () {
+          final subShadows = resolveSubtitleTextShadows(
+            SubtitleEdgeStyle.thickShadow,
+            44,
+          );
+          final clockShadows = resolveOsdClockTextShadows(44);
+          expect(subShadows, hasLength(4));
+          expect(clockShadows, hasLength(3));
+          expect(
+            clockShadows.first.color.a,
+            lessThan(subShadows.first.color.a),
+          );
+          expect(clockShadows.last.blurRadius, greaterThanOrEqualTo(24.0));
+
+          final t0 = DateTime.utc(2026, 11, 24, 9, 0, 0);
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: null,
+              now: t0,
+              displayedSeconds: 0,
+              actualSeconds: 0,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 1)),
+              displayedSeconds: 0,
+              actualSeconds: 1,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 2)),
+              displayedSeconds: 3,
+              actualSeconds: 5,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 3)),
+              displayedSeconds: 3,
+              actualSeconds: 6,
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      testWidgets(
+        'PlayerOsdClockOverlay fade opacity, borderless buffer badge, and LiveChannelSwitchPreviewCard monochrome vector arrows',
+        (tester) async {
+          final opacityController = AnimationController(
+            vsync: const TestVSync(),
+            value: 0.5,
+          );
+          addTearDown(opacityController.dispose);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:p30',
+            friendlyName: 'nasne-p30',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final entry = LiveChannelSwitchEntry(
+            channel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+              bandId: '0/video/LiveTuner/DTTB',
+              serviceId: 0xde00,
+              channelName: 'ＮＨＫＥテレ',
+              programTitle: 'テスト番組',
+            ),
+            primaryReg: reg,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: Stack(
+                    children: [
+                      PlayerOsdClockOverlay(
+                        now: DateTime.utc(2026, 11, 24, 9, 5),
+                        opacity: opacityController,
+                      ),
+                      buildPlayerOsdStatusBadge(
+                        label: 'バッファ: 5秒',
+                        color: const Color(0xB3000000),
+                      ),
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.previous,
+                        visible: true,
+                        entry: entry,
+                        onTap: () {},
+                      ),
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.next,
+                        visible: true,
+                        entry: entry,
+                        onTap: () {},
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final clockFade = tester.widget<FadeTransition>(
+            find.descendant(
+              of: find.byType(PlayerOsdClockOverlay),
+              matching: find.byType(FadeTransition),
+            ),
+          );
+          expect(clockFade.opacity.value, closeTo(0.5, 0.001));
+
+          final badgeDeco =
+              tester
+                      .widget<Container>(
+                        find
+                            .ancestor(
+                              of: find.text('バッファ: 5秒'),
+                              matching: find.byType(Container),
+                            )
+                            .first,
+                      )
+                      .decoration!
+                  as BoxDecoration;
+          expect(badgeDeco.border, isNull);
+
+          expect(find.textContaining('◀'), findsNothing);
+          expect(find.textContaining('▶'), findsNothing);
+          expect(find.byIcon(Icons.play_arrow), findsNWidgets(2));
         },
       );
     },
