@@ -276,3 +276,33 @@ NewRecordSchedule? buildImmediateLiveRecordingSchedule({
     recordDestinationId: recordDestinationId,
   );
 }
+
+/// Returns whether an active [activeSchedule] on the channel corresponds to a
+/// programme spanning `[programStart, programEnd)` at [now], preventing an
+/// already-ended programme (such as a stale A-programme snapshot) from
+/// displaying a false "録画中" badge when a subsequent programme starts recording.
+bool isProgramMatchingActiveRecording({
+  required RecordSchedule? activeSchedule,
+  DateTime? programStart,
+  DateTime? programEnd,
+  required DateTime now,
+}) {
+  if (activeSchedule == null ||
+      !isScheduleCurrentlyRecording(activeSchedule, now: now)) {
+    return false;
+  }
+  if (programEnd != null && !programEnd.isAfter(now)) {
+    return false;
+  }
+  if (programStart != null &&
+      programStart.isAfter(now.add(const Duration(minutes: 2)))) {
+    return false;
+  }
+  if (programStart != null && programEnd != null) {
+    if (!activeSchedule.start.isBefore(programEnd) ||
+        !activeSchedule.end.isAfter(programStart)) {
+      return false;
+    }
+  }
+  return true;
+}

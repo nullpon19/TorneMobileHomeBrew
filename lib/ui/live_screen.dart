@@ -25,6 +25,7 @@ import '../app/bs_epg_providers.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'epg_genre.dart';
 import 'epg_subchannel_visibility.dart';
 import 'error_messages.dart';
 import 'format.dart';
@@ -51,6 +52,34 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
   /// Container id / band key whose tab is selected; null means the first band
   /// with channels.
   String? _selectedBandId;
+
+  void _handleTwoPanePlaybackReturned(
+    LiveWatchedChannelTarget target, {
+    required bool isMultiNasne,
+  }) {
+    final activeRegs =
+        ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final regs = activeRegs.length > 1 ? activeRegs : <RegisteredNasne>[target.reg];
+    for (final r in regs) {
+      final liveAsync = ref.read(liveChannelsProvider(r));
+      if (liveAsync.hasValue && !liveAsync.isLoading) {
+        ref.invalidate(liveChannelsProvider(r));
+      }
+      final schedAsync = ref.read(schedulesProvider(r));
+      if (schedAsync.hasValue && !schedAsync.isLoading) {
+        ref.invalidate(schedulesProvider(r));
+      }
+    }
+    setState(() {
+      _selectedId = isMultiNasne ? target.serviceKey : target.channel.id;
+      _selectedBandId = target.channel.bandId;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _detailWatchFocusNode.canRequestFocus) {
+        _detailWatchFocusNode.requestFocus();
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -136,6 +165,10 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
               detailWatchFocusNode: _detailWatchFocusNode,
               onSelectBand: (bandId) =>
                   setState(() => _selectedBandId = bandId),
+              onPlaybackReturned: (target) => _handleTwoPanePlaybackReturned(
+                target,
+                isMultiNasne: activeRegs.length > 1,
+              ),
               onSelect: (selectionKey, channel, candidates, twoPane) {
                 if (twoPane) {
                   setState(() => _selectedId = selectionKey);
@@ -189,6 +222,7 @@ class _LiveList extends ConsumerWidget {
     required this.selectedBandId,
     required this.detailWatchFocusNode,
     required this.onSelectBand,
+    required this.onPlaybackReturned,
     required this.onSelect,
   });
 
@@ -198,6 +232,7 @@ class _LiveList extends ConsumerWidget {
   final String? selectedBandId;
   final FocusNode detailWatchFocusNode;
   final ValueChanged<String> onSelectBand;
+  final ValueChanged<LiveWatchedChannelTarget> onPlaybackReturned;
   final void Function(
     String selectionKey,
     LiveChannel channel,
@@ -213,8 +248,10 @@ class _LiveList extends ConsumerWidget {
 
     if (activeRegs.length <= 1) {
       final bands = ref.watch(liveChannelsProvider(reg));
-      final schedules =
-          ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[];
+      final schedulesByHost = <String, List<RecordSchedule>>{
+        reg.host:
+            ref.watch(schedulesProvider(reg)).value ?? const <RecordSchedule>[],
+      };
       return asyncSection(
         bands,
         (list) {
@@ -242,13 +279,26 @@ class _LiveList extends ConsumerWidget {
                   for (final channel in selectedBand.channels)
                     Builder(
                       builder: (context) {
-                        final isRecording =
-                            findActiveSameChannelRecording(
-                              schedules,
-                              currentChannel: channel,
-                              now: now,
-                            ) !=
-                            null;
+                        final display = resolveLiveChannelDisplay(
+                          channel: channel,
+                          guideEvents: _watchedGuideEventsForChannel(
+                            ref,
+                            reg,
+                            channel,
+                          ),
+                          now: now,
+                        );
+                        final activeSched = _firstActiveScheduleForCandidates(
+                          [OwnedLiveChannel(reg: reg, channel: channel)],
+                          schedulesByHost,
+                          now: now,
+                        );
+                        final isRecording = isProgramMatchingActiveRecording(
+                          activeSchedule: activeSched,
+                          programStart: display.programStart,
+                          programEnd: display.programEnd,
+                          now: now,
+                        );
                         return ListTile(
                           selected: channel.id == selectedId,
                           contentPadding: const EdgeInsets.symmetric(
@@ -257,10 +307,10 @@ class _LiveList extends ConsumerWidget {
                           ),
                           leading: const Icon(Icons.live_tv_outlined),
                           title: Text(
-                            channel.channelName ?? channel.programTitle,
+                            channel.channelName ?? display.programTitle,
                           ),
                           subtitle: Text(
-                            _channelSubtitle(channel),
+                            _channelSubtitleFromDisplay(channel, display),
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -319,6 +369,7 @@ class _LiveList extends ConsumerWidget {
                             reg: reg,
                             channel: selected,
                             watchFocusNode: detailWatchFocusNode,
+                            onLivePlaybackReturned: onPlaybackReturned,
                           ),
                   ),
                 ],
@@ -398,15 +449,25 @@ class _LiveList extends ConsumerWidget {
               Builder(
                 builder: (context) {
                   final ch = merged.primary;
-                  final isRecording = merged.candidates.any(
-                    (c) =>
-                        findActiveSameChannelRecording(
-                          schedulesByHost[c.reg.host] ??
-                              const <RecordSchedule>[],
-                          currentChannel: c.channel,
-                          now: now,
-                        ) !=
-                        null,
+                  final display = resolveLiveChannelDisplay(
+                    channel: ch,
+                    guideEvents: _watchedGuideEventsForChannel(
+                      ref,
+                      merged.primaryReg,
+                      ch,
+                    ),
+                    now: now,
+                  );
+                  final activeSched = _firstActiveScheduleForCandidates(
+                    merged.candidates,
+                    schedulesByHost,
+                    now: now,
+                  );
+                  final isRecording = isProgramMatchingActiveRecording(
+                    activeSchedule: activeSched,
+                    programStart: display.programStart,
+                    programEnd: display.programEnd,
+                    now: now,
                   );
                   return ListTile(
                     selected: merged.serviceKey == selectedId,
@@ -415,9 +476,9 @@ class _LiveList extends ConsumerWidget {
                       vertical: 8,
                     ),
                     leading: const Icon(Icons.live_tv_outlined),
-                    title: Text(ch.channelName ?? ch.programTitle),
+                    title: Text(ch.channelName ?? display.programTitle),
                     subtitle: Text(
-                      _channelSubtitle(ch),
+                      _channelSubtitleFromDisplay(ch, display),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -488,6 +549,7 @@ class _LiveList extends ConsumerWidget {
                       channel: selected.primary,
                       candidates: selected.candidates,
                       watchFocusNode: detailWatchFocusNode,
+                      onLivePlaybackReturned: onPlaybackReturned,
                     ),
             ),
           ],
@@ -497,17 +559,178 @@ class _LiveList extends ConsumerWidget {
   }
 }
 
-/// The list subtitle: the on-air time range and programme title
-/// (the channel name already heads the tile), or the programme
-/// outline when the item carried no channel name.
-String _channelSubtitle(LiveChannel channel) {
-  final start = channel.programStart;
-  final end = channel.programEnd;
+/// Last-viewed live channel returned when exiting live playback or closing
+/// the live detail page, used to sync detail views and the EPG cursor.
+class LiveWatchedChannelTarget {
+  const LiveWatchedChannelTarget({
+    required this.reg,
+    required this.channel,
+    required this.exitedAt,
+  });
+
+  final RegisteredNasne reg;
+  final LiveChannel channel;
+  final DateTime exitedAt;
+
+  int? get bandType => broadcastingTypeForLiveBandId(channel.bandId);
+  String get serviceKey => liveServiceKey(channel);
+}
+
+/// Display-ready current programme metadata for a live channel list tile or
+/// detail view, preferring active EPG data when cached and falling back cleanly
+/// to the [LiveChannel] snapshot.
+class ResolvedLiveChannelDisplay {
+  const ResolvedLiveChannelDisplay({
+    required this.programTitle,
+    this.programStart,
+    this.programEnd,
+    this.genre,
+    this.shortDescription,
+    this.longDescription,
+  });
+
+  final String programTitle;
+  final DateTime? programStart;
+  final DateTime? programEnd;
+  final String? genre;
+  final String? shortDescription;
+  final String? longDescription;
+}
+
+/// Resolves the currently broadcasting programme metadata for [channel] at
+/// [now] from [guideEvents], falling back to [channel]'s snapshot without
+/// leaking an expired programme's description into a newer EPG event.
+ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
+  required LiveChannel channel,
+  required List<EpgEvent> guideEvents,
+  required DateTime now,
+}) {
+  final info = resolveLiveOsdProgramInfo(
+    channel: channel,
+    guideEvents: guideEvents,
+    now: now,
+  );
+  final ev = info.currentEvent;
+  if (ev == null) {
+    return ResolvedLiveChannelDisplay(
+      programTitle: channel.programTitle,
+      programStart: channel.programStart,
+      programEnd: channel.programEnd,
+      genre: channel.genre,
+      shortDescription: channel.description,
+      longDescription: channel.longDescription,
+    );
+  }
+  final hasChannelTimes =
+      channel.programStart != null || channel.programEnd != null;
+  final sameSlot =
+      channel.programStart != null &&
+      channel.programEnd != null &&
+      channel.programStart!.isAtSameMomentAs(ev.start) &&
+      channel.programEnd!.isAtSameMomentAs(ev.end);
+  final preserveChannelFields = sameSlot || !hasChannelTimes;
+  final evTitle = (ev.title ?? '').trim();
+  final evGenre = epgGenreLabel(ev.genreLevel1);
+  final evShort = ev.shortText?.trim() ?? '';
+  final evDesc = ev.description?.trim() ?? '';
+  final evCast = ev.cast?.trim() ?? '';
+
+  String? evShortDescription;
+  String? evLongDescription;
+  if (evShort.isNotEmpty && evDesc.isNotEmpty) {
+    if (evDesc == evShort || evDesc.startsWith(evShort)) {
+      evShortDescription = evDesc;
+      evLongDescription = evCast.isNotEmpty ? '出演: $evCast' : null;
+    } else {
+      evShortDescription = evShort;
+      evLongDescription = evDesc;
+    }
+  } else if (evShort.isNotEmpty) {
+    evShortDescription = evShort;
+    evLongDescription = evCast.isNotEmpty ? '出演: $evCast' : null;
+  } else if (evDesc.isNotEmpty) {
+    evShortDescription = evDesc;
+    evLongDescription = evCast.isNotEmpty ? '出演: $evCast' : null;
+  } else if (evCast.isNotEmpty) {
+    evLongDescription = '出演: $evCast';
+  }
+
+  if (preserveChannelFields) {
+    return ResolvedLiveChannelDisplay(
+      programTitle: channel.programTitle.trim().isNotEmpty
+          ? channel.programTitle
+          : (evTitle.isNotEmpty ? evTitle : info.currentTitle),
+      programStart: channel.programStart ?? ev.start,
+      programEnd: channel.programEnd ?? ev.end,
+      genre: (channel.genre != null && channel.genre!.trim().isNotEmpty)
+          ? channel.genre
+          : evGenre,
+      shortDescription:
+          (channel.description != null &&
+              channel.description!.trim().isNotEmpty)
+          ? channel.description
+          : evShortDescription,
+      longDescription:
+          (channel.longDescription != null &&
+              channel.longDescription!.trim().isNotEmpty)
+          ? channel.longDescription
+          : evLongDescription,
+    );
+  }
+
+  return ResolvedLiveChannelDisplay(
+    programTitle: evTitle.isNotEmpty ? evTitle : info.currentTitle,
+    programStart: ev.start,
+    programEnd: ev.end,
+    genre: evGenre,
+    shortDescription: evShortDescription,
+    longDescription: evLongDescription,
+  );
+}
+
+List<EpgEvent> _watchedGuideEventsForChannel(
+  WidgetRef ref,
+  RegisteredNasne reg,
+  LiveChannel channel,
+) {
+  final bandType = broadcastingTypeForLiveBandId(channel.bandId);
+  EpgGuide? guide;
+  if (bandType == terrestrialBroadcastingType) {
+    guide = ref.watch(epgGuideProvider(reg)).value;
+  } else if (bandType == bsBroadcastingType) {
+    guide = ref.watch(bsEpgGuideProvider(reg)).value;
+  }
+  return _serviceEventsFromGuide(guide, channel);
+}
+
+RecordSchedule? _firstActiveScheduleForCandidates(
+  List<OwnedLiveChannel> candidates,
+  Map<String, List<RecordSchedule>> schedulesByHost, {
+  required DateTime now,
+}) {
+  for (final c in candidates) {
+    final scheds = schedulesByHost[c.reg.host] ?? const <RecordSchedule>[];
+    final active = findActiveSameChannelRecording(
+      scheds,
+      currentChannel: c.channel,
+      now: now,
+    );
+    if (active != null) return active;
+  }
+  return null;
+}
+
+String _channelSubtitleFromDisplay(
+  LiveChannel channel,
+  ResolvedLiveChannelDisplay display,
+) {
+  final start = display.programStart;
+  final end = display.programEnd;
   final range = start != null && end != null
       ? '${formatTimeJst(start)}–${formatTimeJst(end)} '
       : '';
-  if (channel.channelName != null) return '$range${channel.programTitle}';
-  return '$range${channel.description ?? ''}';
+  if (channel.channelName != null) return '$range${display.programTitle}';
+  return '$range${display.shortDescription ?? ''}';
 }
 
 /// The live channel carrying a programme-guide service,
@@ -538,7 +761,7 @@ LiveChannel? liveChannelForService(
 /// the channel cannot be resolved — a band the LiveTuner
 /// tree does not carry, or a failed fetch — a snackbar says
 /// so instead of navigating nowhere.
-Future<void> openLiveChannelForEpg(
+Future<LiveWatchedChannelTarget?> openLiveChannelForEpg(
   BuildContext context,
   WidgetRef ref, {
   required RegisteredNasne reg,
@@ -549,8 +772,30 @@ Future<void> openLiveChannelForEpg(
   final activeRegs = regs.length > 1 ? regs : <RegisteredNasne>[reg];
   final candidates = <OwnedLiveChannel>[];
   var anySucceeded = false;
+  final now = DateTime.now();
 
   for (final r in activeRegs) {
+    final schedAsync = ref.read(schedulesProvider(r));
+    if (schedAsync.hasValue && !schedAsync.isLoading) {
+      ref.invalidate(schedulesProvider(r));
+    }
+    final cached = ref.read(liveChannelsProvider(r)).value;
+    if (cached != null) {
+      final cachedLive = liveChannelForService(
+        cached,
+        networkId: channel.networkId,
+        transportStreamId: channel.transportStreamId,
+        serviceId: channel.serviceId,
+      );
+      final isExpired =
+          cachedLive == null ||
+          (cachedLive.programEnd != null &&
+              !cachedLive.programEnd!.isAfter(now)) ||
+          _hasStaleLiveBand(cached, cachedLive.bandId, now);
+      if (isExpired) {
+        ref.invalidate(liveChannelsProvider(r));
+      }
+    }
     try {
       final bands = await ref.read(liveChannelsProvider(r).future);
       anySucceeded = true;
@@ -567,61 +812,147 @@ Future<void> openLiveChannelForEpg(
       // Skip unavailable nasne; report below only if none responded.
     }
   }
-  if (!context.mounted) return;
+  if (!context.mounted) return null;
   if (!anySucceeded) {
     showSnack(context, 'チャンネル情報を取得できませんでした');
-    return;
+    return null;
   }
   if (candidates.isEmpty) {
     showSnack(context, '視聴可能なチャンネルが見つかりません');
-    return;
+    return null;
   }
   final primary = candidates.first;
-  await Navigator.push(
+  LiveWatchedChannelTarget? latestTarget = LiveWatchedChannelTarget(
+    reg: primary.reg,
+    channel: primary.channel,
+    exitedAt: DateTime.now(),
+  );
+  await Navigator.push<void>(
     context,
     MaterialPageRoute<void>(
       builder: (_) => LiveChannelDetailPage(
         reg: primary.reg,
         channelId: primary.channel.id,
         candidates: candidates.length > 1 ? candidates : null,
+        onActiveChannelChanged: (target) => latestTarget = target,
       ),
     ),
+  );
+  if (latestTarget == null) return null;
+  return LiveWatchedChannelTarget(
+    reg: latestTarget!.reg,
+    channel: latestTarget!.channel,
+    exitedAt: DateTime.now(),
   );
 }
 
 /// Detail page for narrow layouts.
-class LiveChannelDetailPage extends ConsumerWidget {
+class LiveChannelDetailPage extends ConsumerStatefulWidget {
   const LiveChannelDetailPage({
     super.key,
     required this.reg,
     required this.channelId,
     this.candidates,
+    this.onActiveChannelChanged,
   });
 
   final RegisteredNasne reg;
   final String channelId;
   final List<OwnedLiveChannel>? candidates;
+  final ValueChanged<LiveWatchedChannelTarget>? onActiveChannelChanged;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final bands = ref.watch(liveChannelsProvider(reg));
-    return Scaffold(
-      appBar: AppBar(title: const Text('チャンネルの詳細')),
-      body: asyncSection(bands, (list) {
-        for (final band in list) {
-          for (final channel in band.channels) {
-            if (channel.id == channelId) {
-              return LiveChannelDetailView(
-                reg: reg,
-                channel: channel,
-                candidates: candidates,
-                autofocusWatch: true,
-              );
+  ConsumerState<LiveChannelDetailPage> createState() =>
+      _LiveChannelDetailPageState();
+}
+
+class _LiveChannelDetailPageState extends ConsumerState<LiveChannelDetailPage> {
+  late RegisteredNasne _activeReg;
+  late String _activeChannelId;
+  List<OwnedLiveChannel>? _activeCandidates;
+  LiveChannel? _fallbackChannel;
+
+  @override
+  void initState() {
+    super.initState();
+    _activeReg = widget.reg;
+    _activeChannelId = widget.channelId;
+    _activeCandidates = widget.candidates;
+  }
+
+  void _handlePlaybackReturned(LiveWatchedChannelTarget target) {
+    final regs =
+        ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final nextCandidates = <OwnedLiveChannel>[];
+    if (regs.length > 1) {
+      final targetKey = target.serviceKey;
+      for (final r in regs) {
+        final bands = ref.read(liveChannelsProvider(r)).value;
+        if (bands == null) continue;
+        for (final band in bands) {
+          for (final ch in band.channels) {
+            if (liveServiceKey(ch) == targetKey) {
+              nextCandidates.add(OwnedLiveChannel(reg: r, channel: ch));
             }
           }
         }
-        return const Center(child: Text('チャンネルが見つかりません'));
-      }, onRetry: () => ref.invalidate(liveChannelsProvider(reg))),
+      }
+    }
+    setState(() {
+      _activeReg = target.reg;
+      _activeChannelId = target.channel.id;
+      _fallbackChannel = target.channel;
+      _activeCandidates = nextCandidates.length > 1 ? nextCandidates : null;
+    });
+    widget.onActiveChannelChanged?.call(target);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bands = ref.watch(liveChannelsProvider(_activeReg));
+    return Scaffold(
+      appBar: AppBar(title: const Text('チャンネルの詳細')),
+      body: asyncSection(
+        bands,
+        (list) {
+          LiveChannel? matched;
+          final fallback = _fallbackChannel;
+          final fallbackKey = fallback != null ? liveServiceKey(fallback) : null;
+          for (final band in list) {
+            for (final ch in band.channels) {
+              if (ch.id == _activeChannelId) {
+                matched = ch;
+                break;
+              }
+            }
+            if (matched != null) break;
+          }
+          if (matched == null && fallbackKey != null) {
+            for (final band in list) {
+              for (final ch in band.channels) {
+                if (liveServiceKey(ch) == fallbackKey) {
+                  matched = ch;
+                  break;
+                }
+              }
+              if (matched != null) break;
+            }
+          }
+          matched ??= _fallbackChannel;
+          if (matched != null) {
+            return LiveChannelDetailView(
+              reg: _activeReg,
+              channel: matched,
+              candidates: _activeCandidates,
+              autofocusWatch: true,
+              onLivePlaybackReturned: _handlePlaybackReturned,
+            );
+          }
+          return const Center(child: Text('チャンネルが見つかりません'));
+        },
+        skipLoadingOnReload: true,
+        onRetry: () => ref.invalidate(liveChannelsProvider(_activeReg)),
+      ),
     );
   }
 }
@@ -638,6 +969,7 @@ class LiveChannelDetailView extends ConsumerStatefulWidget {
     this.candidates,
     this.watchFocusNode,
     this.autofocusWatch = false,
+    this.onLivePlaybackReturned,
   });
 
   final RegisteredNasne reg;
@@ -645,6 +977,7 @@ class LiveChannelDetailView extends ConsumerStatefulWidget {
   final List<OwnedLiveChannel>? candidates;
   final FocusNode? watchFocusNode;
   final bool autofocusWatch;
+  final ValueChanged<LiveWatchedChannelTarget>? onLivePlaybackReturned;
 
   @override
   ConsumerState<LiveChannelDetailView> createState() =>
@@ -689,18 +1022,31 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
         ? widget.candidates!
         : [OwnedLiveChannel(reg: reg, channel: ch)];
     final now = DateTime.now();
-    final isChannelRecording = effectiveCandidates.any((c) {
-      final scheds =
-          ref.watch(schedulesProvider(c.reg)).value ?? const <RecordSchedule>[];
-      return findActiveSameChannelRecording(
-            scheds,
-            currentChannel: c.channel,
-            now: now,
-          ) !=
-          null;
-    });
-    final start = ch.programStart;
-    final end = ch.programEnd;
+    final guideEvents = _watchedGuideEventsForChannel(ref, reg, ch);
+    final display = resolveLiveChannelDisplay(
+      channel: ch,
+      guideEvents: guideEvents,
+      now: now,
+    );
+    final schedulesByHost = <String, List<RecordSchedule>>{
+      for (final c in effectiveCandidates)
+        c.reg.host:
+            ref.watch(schedulesProvider(c.reg)).value ??
+            const <RecordSchedule>[],
+    };
+    final activeSchedule = _firstActiveScheduleForCandidates(
+      effectiveCandidates,
+      schedulesByHost,
+      now: now,
+    );
+    final isChannelRecording = isProgramMatchingActiveRecording(
+      activeSchedule: activeSchedule,
+      programStart: display.programStart,
+      programEnd: display.programEnd,
+      now: now,
+    );
+    final start = display.programStart;
+    final end = display.programEnd;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -712,7 +1058,7 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
           const SizedBox(height: 8),
         ],
         Text(
-          ch.programTitle,
+          display.programTitle,
           style: Theme.of(context).textTheme.titleLarge,
           maxLines: 3,
           overflow: TextOverflow.ellipsis,
@@ -726,7 +1072,8 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
             value:
                 '${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}',
           ),
-        if (ch.genre != null) FieldRow(label: 'ジャンル', value: ch.genre!),
+        if (display.genre != null && display.genre!.isNotEmpty)
+          FieldRow(label: 'ジャンル', value: display.genre!),
         const SizedBox(height: 16),
         Wrap(
           spacing: 12,
@@ -752,19 +1099,21 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
               ),
           ],
         ),
-        if (ch.description != null && ch.description!.isNotEmpty) ...[
+        if (display.shortDescription != null &&
+            display.shortDescription!.isNotEmpty) ...[
           const SizedBox(height: 12),
           Text(
-            ch.description!,
+            display.shortDescription!,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ],
-        if (ch.longDescription != null && ch.longDescription!.isNotEmpty) ...[
+        if (display.longDescription != null &&
+            display.longDescription!.isNotEmpty) ...[
           const SizedBox(height: 6),
           Text(
-            ch.longDescription!,
+            display.longDescription!,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.bodySmall,
@@ -780,7 +1129,7 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
         _useMobileChoice ?? ref.read(playbackQualityProvider);
     setState(() => _starting = true);
     try {
-      await _launchLiveChannel(
+      final returnedTarget = await _launchLiveChannel(
         context: context,
         ref: ref,
         reg: reg,
@@ -788,6 +1137,28 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
         useMobile: useMobile,
         candidates: widget.candidates,
       );
+      if (!mounted) return;
+      final effectiveRegs = <RegisteredNasne>{
+        reg,
+        if (returnedTarget != null) returnedTarget.reg,
+        if (widget.candidates != null)
+          for (final c in widget.candidates!) c.reg,
+      };
+      for (final r in effectiveRegs) {
+        final liveAsync = ref.read(liveChannelsProvider(r));
+        if ((liveAsync.hasValue && !liveAsync.isLoading) ||
+            (returnedTarget != null && r.host == returnedTarget.reg.host)) {
+          ref.invalidate(liveChannelsProvider(r));
+        }
+        final schedAsync = ref.read(schedulesProvider(r));
+        if ((schedAsync.hasValue && !schedAsync.isLoading) ||
+            (returnedTarget != null && r.host == returnedTarget.reg.host)) {
+          ref.invalidate(schedulesProvider(r));
+        }
+      }
+      if (returnedTarget != null) {
+        widget.onLivePlaybackReturned?.call(returnedTarget);
+      }
     } finally {
       if (mounted) setState(() => _starting = false);
     }
@@ -1180,6 +1551,8 @@ Widget _buildLivePlayerScreen({
   List<LiveChannelSwitchEntry> liveSwitchChannels = const [],
   int currentLiveSwitchIndex = -1,
   String? initialCornerNotice,
+  void Function(RegisteredNasne ownerReg, LiveChannel? lastChannel)?
+      onLiveSessionFinished,
 }) {
   final start = channel.programStart;
   final end = channel.programEnd;
@@ -1249,6 +1622,9 @@ Widget _buildLivePlayerScreen({
     liveSwitchChannels: liveSwitchChannels,
     currentLiveSwitchIndex: currentLiveSwitchIndex,
     initialCornerNotice: initialCornerNotice,
+    onLivePlaybackFinished: onLiveSessionFinished == null
+        ? null
+        : (lastChannel) => onLiveSessionFinished(reg, lastChannel ?? channel),
     onSwitchQuality: canSwitchQuality
         ? (
             playerContext,
@@ -1307,6 +1683,7 @@ Widget _buildLivePlayerScreen({
               liveSwitchChannels: switchCtx.entries,
               currentLiveSwitchIndex: switchCtx.currentIndex,
               initialCornerNotice: notice,
+              onLiveSessionFinished: onLiveSessionFinished,
             );
           }
         : null,
@@ -1343,6 +1720,7 @@ Widget _buildLivePlayerScreen({
           stopCurrentSession: stopCurrentSession,
           useMobile: useMobile,
           multiNasneRegs: multiNasneRegs,
+          onLiveSessionFinished: onLiveSessionFinished,
         ),
     onBuildFailoverPlayer: multiNasneRegs.length > 1
         ? (targetReg, targetChannel, notice) async {
@@ -1380,6 +1758,7 @@ Widget _buildLivePlayerScreen({
               liveSwitchChannels: switchCtx.entries,
               currentLiveSwitchIndex: switchCtx.currentIndex,
               initialCornerNotice: notice,
+              onLiveSessionFinished: onLiveSessionFinished,
             );
           }
         : null,
@@ -1414,6 +1793,7 @@ Widget _buildLivePlayerScreen({
         multiNasneRegs: multiNasneRegs,
         liveSwitchChannels: switchCtx.entries,
         currentLiveSwitchIndex: switchCtx.currentIndex,
+        onLiveSessionFinished: onLiveSessionFinished,
       );
     },
   );
@@ -1426,6 +1806,8 @@ Future<Widget?> _switchLivePlayerToChannel({
   required Future<void> Function() stopCurrentSession,
   required bool useMobile,
   required List<RegisteredNasne> multiNasneRegs,
+  void Function(RegisteredNasne ownerReg, LiveChannel? lastChannel)?
+      onLiveSessionFinished,
 }) async {
   final effectiveCandidates = target.candidates.isNotEmpty
       ? target.candidates
@@ -1550,6 +1932,7 @@ Future<Widget?> _switchLivePlayerToChannel({
     multiNasneRegs: multiNasneRegs,
     liveSwitchChannels: switchCtx.entries,
     currentLiveSwitchIndex: switchCtx.currentIndex,
+    onLiveSessionFinished: onLiveSessionFinished,
   );
 }
 
@@ -1701,7 +2084,7 @@ Future<LiveRecordingActionResult> _startCurrentLiveRecording({
       reservationCreatorId: candidate.reservationCreatorId,
       priorityFlag: candidate.priorityFlag,
       recordDestinationId: candidate.recordDestinationId,
-      title: matchingEvent?.title ?? channel.programTitle,
+      title: matchingEvent?.title ?? effectiveChannel.programTitle,
     );
     final freshWithFallback = ensureSchedulePresent(fresh, fallbackSchedule);
     final merged = [
@@ -1754,7 +2137,7 @@ Future<LiveRecordingActionResult> _stopCurrentLiveRecording({
   }
 }
 
-Future<void> _launchLiveChannel({
+Future<LiveWatchedChannelTarget?> _launchLiveChannel({
   required BuildContext context,
   required WidgetRef ref,
   required RegisteredNasne reg,
@@ -1785,7 +2168,7 @@ Future<void> _launchLiveChannel({
     for (final entry in fetched) {
       schedulesByHost[entry.$1.host] = entry.$2;
     }
-    if (!context.mounted) return;
+    if (!context.mounted) return null;
 
     final selection = selectLiveTunerCandidate(
       candidates: effectiveCandidates,
@@ -1803,16 +2186,16 @@ Future<void> _launchLiveChannel({
           knownSchedules: schedulesByHost[conflictOwner.reg.host],
           nasneName: nasneDisplayLabel(conflictOwner.reg),
         );
-        if (!context.mounted) return;
+        if (!context.mounted) return null;
         if (conflict != null) {
           final switchToRecording = await showLiveRecordingConflictDialog(
             context,
             conflict: conflict,
             midStream: false,
           );
-          if (!context.mounted) return;
+          if (!context.mounted) return null;
           if (switchToRecording == true && conflict.liveChannel != null) {
-            await _launchLiveChannel(
+            return _launchLiveChannel(
               context: context,
               ref: ref,
               reg: conflict.sourceRegistration ?? conflictOwner.reg,
@@ -1822,7 +2205,7 @@ Future<void> _launchLiveChannel({
               allowQualityFallback: true,
             );
           }
-          return;
+          return null;
         }
       }
       chosenSchedules = schedulesByHost[chosenReg.host] ?? const [];
@@ -1836,7 +2219,7 @@ Future<void> _launchLiveChannel({
     }
   } else {
     chosenSchedules = await _fetchFreshSchedules(container, chosenReg);
-    if (!context.mounted) return;
+    if (!context.mounted) return null;
     if (checkConflictBeforeStart) {
       final conflict = await _resolveOtherChannelConflict(
         container,
@@ -1844,16 +2227,16 @@ Future<void> _launchLiveChannel({
         chosenChannel,
         knownSchedules: chosenSchedules,
       );
-      if (!context.mounted) return;
+      if (!context.mounted) return null;
       if (conflict != null) {
         final switchToRecording = await showLiveRecordingConflictDialog(
           context,
           conflict: conflict,
           midStream: false,
         );
-        if (!context.mounted) return;
+        if (!context.mounted) return null;
         if (switchToRecording == true && conflict.liveChannel != null) {
-          await _launchLiveChannel(
+          return _launchLiveChannel(
             context: context,
             ref: ref,
             reg: conflict.sourceRegistration ?? chosenReg,
@@ -1863,7 +2246,7 @@ Future<void> _launchLiveChannel({
             allowQualityFallback: true,
           );
         }
-        return;
+        return null;
       }
     }
   }
@@ -1871,11 +2254,11 @@ Future<void> _launchLiveChannel({
   final engine = container.read(deviceServicesProvider(chosenReg)).playback;
   if (!engine.isSupported) {
     await showPlaybackUnsupportedDialog(context, subject: 'TV視聴');
-    return;
+    return null;
   }
   if (chosenChannel.res.isEmpty) {
     showSnack(context, '視聴可能なコンテンツがありません');
-    return;
+    return null;
   }
   final sameChannelRecording =
       findActiveSameChannelRecording(
@@ -1896,7 +2279,26 @@ Future<void> _launchLiveChannel({
     ownerReg: chosenReg,
     fallback: chosenChannel,
   );
-  if (!context.mounted) return;
+  if (!context.mounted) return null;
+  final exitCompleter = Completer<LiveWatchedChannelTarget?>();
+  var enteredPlayer = false;
+  var lastSeenReg = chosenReg;
+  var lastSeenChannel = effectiveChannel;
+
+  void handleSessionFinished(RegisteredNasne ownerReg, LiveChannel? lastCh) {
+    lastSeenReg = ownerReg;
+    if (lastCh != null) lastSeenChannel = lastCh;
+    if (!exitCompleter.isCompleted) {
+      exitCompleter.complete(
+        LiveWatchedChannelTarget(
+          reg: lastSeenReg,
+          channel: lastSeenChannel,
+          exitedAt: DateTime.now(),
+        ),
+      );
+    }
+  }
+
   await startPlaybackAndShowPlayer(
     context: context,
     ref: ref,
@@ -1906,18 +2308,31 @@ Future<void> _launchLiveChannel({
       useMobile: useMobile,
       allowQualityFallback: allowQualityFallback || sameChannelRecording,
     ),
-    buildPlayer: (session) => _buildLivePlayerScreen(
-      container: container,
-      reg: chosenReg,
-      channel: effectiveChannel,
-      session: session,
-      useMobile: useMobile,
-      initialSchedules: chosenSchedules,
-      multiNasneRegs: multiNasneRegs,
-      liveSwitchChannels: switchCtx.entries,
-      currentLiveSwitchIndex: switchCtx.currentIndex,
-    ),
+    buildPlayer: (session) {
+      enteredPlayer = true;
+      return _buildLivePlayerScreen(
+        container: container,
+        reg: chosenReg,
+        channel: effectiveChannel,
+        session: session,
+        useMobile: useMobile,
+        initialSchedules: chosenSchedules,
+        multiNasneRegs: multiNasneRegs,
+        liveSwitchChannels: switchCtx.entries,
+        currentLiveSwitchIndex: switchCtx.currentIndex,
+        onLiveSessionFinished: handleSessionFinished,
+      );
+    },
     unsupportedSubject: 'TV視聴',
     startFailureMessage: '視聴を開始できませんでした',
+  );
+  if (!enteredPlayer) return null;
+  return exitCompleter.future.timeout(
+    const Duration(seconds: 2),
+    onTimeout: () => LiveWatchedChannelTarget(
+      reg: lastSeenReg,
+      channel: lastSeenChannel,
+      exitedAt: DateTime.now(),
+    ),
   );
 }

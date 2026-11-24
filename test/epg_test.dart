@@ -734,8 +734,10 @@ void main() {
         tester.getCenter(grid),
         kind: PointerDeviceKind.mouse,
       );
-      await gesture.moveBy(const Offset(0, -300));
-      await tester.pump();
+      for (var i = 0; i < 4; i++) {
+        await gesture.moveBy(const Offset(0, -75));
+        await tester.pump();
+      }
       await gesture.up();
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 50));

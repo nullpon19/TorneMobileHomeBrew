@@ -1812,6 +1812,7 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.canSwitchQuality = false,
     this.currentUseMobile = false,
     this.onSwitchQuality,
+    this.onLivePlaybackFinished,
     this.initialCornerNotice,
     this.nowProvider,
   });
@@ -1919,6 +1920,10 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Index of [currentLiveChannel] inside [liveSwitchChannels].
   final int currentLiveSwitchIndex;
+
+  /// Called when live playback actually exits (skipping `pushReplacement` hops
+  /// such as channel/quality switches or failover), passing the last active channel.
+  final void Function(LiveChannel? lastChannel)? onLivePlaybackFinished;
 
   /// Switches to another live channel, calling [stopCurrentSession] only after
   /// any conflict prompt is accepted so cancelled switches keep playing cleanly.
@@ -2125,6 +2130,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   ResolvedProgramDetail? _openedLiveDetail;
   bool _liveDetailLoading = false;
   int _liveDetailRequestSeq = 0;
+  bool _replacedByNextPlayer = false;
   Timer? _osdClockTimer;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
@@ -3299,9 +3305,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       try {
         final nextPlayer = await buildFailover(failoverReg, failoverCh, notice);
         if (!mounted) return;
-        await Navigator.of(context).pushReplacement(
-          MaterialPageRoute<void>(builder: (_) => nextPlayer),
-        );
+        await _pushReplacementPlayer(nextPlayer);
         return;
       } catch (e) {
         _diag(
@@ -3331,9 +3335,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       try {
         final nextPlayer = await buildNext(target);
         if (!mounted) return;
-        await Navigator.of(context).pushReplacement(
-          MaterialPageRoute<void>(builder: (_) => nextPlayer),
-        );
+        await _pushReplacementPlayer(nextPlayer);
       } catch (e) {
         _diag(
           DiagCategory.playback,
@@ -4631,6 +4633,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             name: 'resume report',
             run: () => _reportResumePosition(resumePosition),
           ),
+        (
+          name: 'live finish callback',
+          run: () {
+            if (widget.live && !_replacedByNextPlayer) {
+              widget.onLivePlaybackFinished?.call(_activeLiveChannel);
+            }
+          },
+        ),
       ],
       onFailure: (name, error) {
         _diag(
@@ -5184,6 +5194,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     ).catchError((_) {});
   }
 
+  Future<void> _pushReplacementPlayer(Widget nextPlayer) async {
+    _replacedByNextPlayer = true;
+    try {
+      await Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(builder: (_) => nextPlayer),
+      );
+    } catch (_) {
+      _replacedByNextPlayer = false;
+      rethrow;
+    }
+  }
+
   Future<void> _executeLiveChannelSwitch(LiveChannelSwitchEntry target) async {
     final switcher = widget.onSwitchLiveChannel;
     if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
@@ -5206,9 +5228,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannelLabel = null;
         return;
       }
-      await Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(builder: (_) => nextPlayer),
-      );
+      await _pushReplacementPlayer(nextPlayer);
     } catch (e) {
       _diag(DiagCategory.playback, 'player: live channel switch failed: $e');
       if (!mounted) return;
@@ -5260,9 +5280,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         return;
       }
-      await Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(builder: (_) => nextPlayer),
-      );
+      await _pushReplacementPlayer(nextPlayer);
     } catch (e) {
       _diag(DiagCategory.playback, 'player: quality switch failed: $e');
       if (!mounted) return;

@@ -9839,6 +9839,481 @@ void main() {
       );
     },
   );
+
+  group(
+    'Phase 36: Live detail/list EPG sync, strict recording badge, partial-start matching, and EPG return cursor target',
+    () {
+      const channelMeta = Channel(
+        broadcastingType: terrestrialBroadcastingType,
+        networkId: 0x7880,
+        transportStreamId: 0x7880,
+        serviceId: 0x0400,
+        serviceType: 1,
+        channelNumber: 1,
+        serviceName: '日テレ１',
+      );
+      const reg = RegisteredNasne(
+        host: '192.0.2.36',
+        udn: 'uuid:p36',
+        friendlyName: 'nasne-p36',
+        macAddr: '00:11:22:33:44:66',
+      );
+
+      test(
+        'isProgramMatchingActiveRecording excludes ended A-programme and future C-programme even while channel records B-programme',
+        () {
+          final now = DateTime.utc(2026, 11, 25, 11, 15); // 20:15 JST
+          final schedB = RecordSchedule(
+            id: 'sched-b',
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            durationSeconds: 3600,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          // Programme A (ended 10 min ago) must NOT show 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 10, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 11, 0),
+              now: now,
+            ),
+            isFalse,
+          );
+
+          // Programme B (active & overlapping) shows 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 11, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 12, 0),
+              now: now,
+            ),
+            isTrue,
+          );
+
+          // Programme C (future) must NOT show 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 12, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 13, 0),
+              now: now,
+            ),
+            isFalse,
+          );
+        },
+      );
+
+      test(
+        'resolveLiveChannelDisplay overrides stale A-programme snapshot with current EPG B-programme without leaking old descriptions',
+        () {
+          final staleChannel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            genre: 'ニュース',
+            programTitle: '古いA番組',
+            description: '古いA番組の概要',
+            longDescription: '古いA番組の詳細',
+            programStart: DateTime.utc(2026, 11, 25, 10, 0),
+            programEnd: DateTime.utc(2026, 11, 25, 11, 0),
+          );
+          final eventB = EpgEvent(
+            eventId: 502,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: '新しいB番組',
+            shortText: 'Bの要点',
+            description: 'Bの詳細説明本文',
+            genreLevel1: 3,
+          );
+          final resolved = resolveLiveChannelDisplay(
+            channel: staleChannel,
+            guideEvents: [eventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolved.programTitle, '新しいB番組');
+          expect(resolved.programStart, eventB.start);
+          expect(resolved.programEnd, eventB.end);
+          expect(resolved.genre, 'ドラマ');
+          expect(resolved.shortDescription, 'Bの要点');
+          expect(resolved.longDescription, 'Bの詳細説明本文');
+
+          // New EPG event without descriptions must NOT leak A's old text.
+          final bareEventB = EpgEvent(
+            eventId: 503,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: '説明なしB番組',
+          );
+          final resolvedBare = resolveLiveChannelDisplay(
+            channel: staleChannel,
+            guideEvents: [bareEventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolvedBare.programTitle, '説明なしB番組');
+          expect(resolvedBare.shortDescription, isNull);
+          expect(resolvedBare.longDescription, isNull);
+
+          // Minimal LiveChannel without start/end times keeps its own title
+          // while borrowing EPG times when an on-air EPG event exists.
+          const timelessChannel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: 'ライブ固有タイトル',
+          );
+          final resolvedTimeless = resolveLiveChannelDisplay(
+            channel: timelessChannel,
+            guideEvents: [eventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolvedTimeless.programTitle, 'ライブ固有タイトル');
+          expect(resolvedTimeless.programStart, eventB.start);
+          expect(resolvedTimeless.programEnd, eventB.end);
+        },
+      );
+
+      test(
+        'findMatchingSchedule matches partial-start immediate recording (eventId == 0) to B-programme and never A-programme',
+        () {
+          final eventA = EpgEvent(
+            eventId: 601,
+            start: DateTime.utc(2026, 11, 25, 10, 0),
+            duration: const Duration(hours: 1),
+            title: 'A番組',
+          );
+          final eventB = EpgEvent(
+            eventId: 602,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: 'B番組',
+          );
+          // Immediate manual recording started 15 min after B began, running to B's end.
+          final partialB = RecordSchedule(
+            id: 'partial-b',
+            start: DateTime.utc(2026, 11, 25, 11, 15),
+            durationSeconds: 45 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+          expect(findMatchingSchedule([partialB], channelMeta, eventA), isNull);
+          expect(
+            findMatchingSchedule([partialB], channelMeta, eventB)?.id,
+            'partial-b',
+          );
+        },
+      );
+
+      testWidgets(
+        'showEpgEventDetail omits 録画中 badge for already-ended events even if reservation window overlaps',
+        (tester) async {
+          final now = DateTime.now();
+          final endedEventA = EpgEvent(
+            eventId: 701,
+            start: now.subtract(const Duration(minutes: 65)),
+            duration: const Duration(minutes: 60),
+            title: '終了済みA番組',
+          );
+          final activeSched = RecordSchedule(
+            id: 'rec-active',
+            start: now.subtract(const Duration(minutes: 10)),
+            durationSeconds: 3600,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x02bd',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: Builder(
+                  builder: (ctx) => ElevatedButton(
+                    onPressed: () => showEpgEventDetail(
+                      ctx,
+                      reg: reg,
+                      channel: channelMeta,
+                      channelName: '日テレ１',
+                      event: endedEventA,
+                      existingSchedule: activeSched,
+                    ),
+                    child: const Text('open'),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.tap(find.text('open'));
+          await tester.pumpAndSettle();
+
+          expect(find.text('終了済みA番組'), findsOneWidget);
+          expect(find.text('録画予約済み'), findsOneWidget);
+          expect(find.text('録画中'), findsNothing);
+        },
+      );
+
+      test(
+        'findEpgTileTargetForLiveChannel finds active switched-to B-programme and falls back cleanly for hidden subchannels',
+        () {
+          const chMain = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            serviceType: 1,
+            channelNumber: 1,
+            serviceName: 'ＮＨＫ総合１',
+          );
+          const chOther = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7881,
+            transportStreamId: 0x7881,
+            serviceId: 0x0410,
+            serviceType: 1,
+            channelNumber: 2,
+            serviceName: 'Ｅテレ１',
+          );
+          final evB = EpgEvent(
+            eventId: 802,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: 'チャンネル切替先B番組',
+          );
+          final guide = EpgGuide(
+            broadcastingType: terrestrialBroadcastingType,
+            services: [
+              EpgServiceGuide(channel: chMain, events: [evB]),
+              EpgServiceGuide(
+                channel: chOther,
+                events: [
+                  EpgEvent(
+                    eventId: 809,
+                    start: DateTime.utc(2026, 11, 25, 11, 0),
+                    duration: const Duration(hours: 1),
+                    title: '別局B番組',
+                  ),
+                ],
+              ),
+            ],
+          );
+
+          final switchedMatch = findEpgTileTargetForLiveChannel(
+            guide: guide,
+            targetChannel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7881&tsid=7881&svid=0410',
+              bandId: '0/video/LiveTuner/DTTB',
+              networkId: 0x7881,
+              transportStreamId: 0x7881,
+              serviceId: 0x0410,
+              programTitle: '別局B番組',
+            ),
+            now: DateTime.utc(2026, 11, 25, 11, 10),
+          );
+          expect(switchedMatch, isNotNull);
+          expect(switchedMatch!.serviceIndex, 1);
+          expect(switchedMatch.event.eventId, 809);
+          expect(
+            switchedMatch.tileKey,
+            '${chOther.serviceId}-809-${switchedMatch.event.start}',
+          );
+
+          // Hidden subchannel (0x0401 sharing nid/tsid with chMain 0x0400).
+          final subFallback = findEpgTileTargetForLiveChannel(
+            guide: guide,
+            targetChannel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0401',
+              bandId: '0/video/LiveTuner/DTTB',
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0401,
+              programTitle: 'サブ番組',
+            ),
+            now: DateTime.utc(2026, 11, 25, 11, 10),
+          );
+          expect(subFallback, isNotNull);
+          expect(subFallback!.serviceIndex, 0);
+          expect(subFallback.event.eventId, 802);
+        },
+      );
+
+      testWidgets(
+        'LiveChannelDetailView resolves current B-programme with 録画中 from EPG even when LiveChannel snapshot is stale A-programme, and hides 録画中 on expired CS snapshots',
+        (tester) async {
+          final now = DateTime.now();
+          final staleTerrestrial = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: '終了したA番組',
+            description: '古いA説明',
+            programStart: now.subtract(const Duration(minutes: 70)),
+            programEnd: now.subtract(const Duration(minutes: 10)),
+            res: const [
+              TitleRes(
+                url: 'http://192.0.2.36:58890/web/video/ch?quality=dr',
+                protocolInfo: 'http-get:*:application/x-dtcp1:*',
+                cleartextSize: 100,
+                quality: 'dr',
+              ),
+            ],
+          );
+          final guide = EpgGuide(
+            broadcastingType: terrestrialBroadcastingType,
+            services: [
+              EpgServiceGuide(
+                channel: channelMeta,
+                events: [
+                  EpgEvent(
+                    eventId: 901,
+                    start: now.subtract(const Duration(minutes: 10)),
+                    duration: const Duration(minutes: 60),
+                    title: '放送中のB番組',
+                    description: 'Bの新しい説明',
+                    genreLevel1: 3,
+                  ),
+                ],
+              ),
+            ],
+          );
+          final recB = RecordSchedule(
+            id: 'rec-b-live',
+            start: now.subtract(const Duration(minutes: 5)),
+            durationSeconds: 55 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0385',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          final container1 = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              epgGuideProvider(reg).overrideWith((ref) async => guide),
+              schedulesProvider(reg).overrideWith((ref) async => [recB]),
+            ],
+          );
+          addTearDown(container1.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container1,
+              child: MaterialApp(
+                home: Scaffold(
+                  body: LiveChannelDetailView(
+                    reg: reg,
+                    channel: staleTerrestrial,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('放送中のB番組'), findsOneWidget);
+          expect(find.text('Bの新しい説明'), findsOneWidget);
+          expect(find.text('録画中'), findsOneWidget);
+          expect(find.text('終了したA番組'), findsNothing);
+
+          // On CS (no EPG), an already-expired A-programme snapshot must NOT
+          // show 録画中 while B-programme is recording.
+          final expiredCs = LiveChannel(
+            id: '0/video/LiveTuner/CS/ch?nid=0006&tsid=0001&svid=0100',
+            bandId: '0/video/LiveTuner/CS',
+            networkId: 0x0006,
+            transportStreamId: 0x0001,
+            serviceId: 0x0100,
+            channelName: 'CS チャンネル',
+            programTitle: '終了済みCSのA番組',
+            programStart: now.subtract(const Duration(minutes: 70)),
+            programEnd: now.subtract(const Duration(minutes: 10)),
+            res: staleTerrestrial.res,
+          );
+          final recCs = RecordSchedule(
+            id: 'rec-cs-b',
+            start: now.subtract(const Duration(minutes: 5)),
+            durationSeconds: 55 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: csBroadcastingType,
+              channelType: csBroadcastingType,
+              serviceId: 0x0100,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x0006,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+          final container2 = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              schedulesProvider(reg).overrideWith((ref) async => [recCs]),
+            ],
+          );
+          addTearDown(container2.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container2,
+              child: MaterialApp(
+                home: Scaffold(
+                  body: LiveChannelDetailView(reg: reg, channel: expiredCs),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('終了済みCSのA番組'), findsOneWidget);
+          expect(find.text('録画中'), findsNothing);
+        },
+      );
+    },
+  );
 }
 
 class _DeletableScheduleService implements ScheduleService {
