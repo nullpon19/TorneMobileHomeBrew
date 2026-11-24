@@ -843,6 +843,161 @@ resolveLiveTimeshiftSeekTarget({
   );
 }
 
+/// Resolves the live playback position inside mpv's `seekable-ranges` coordinate
+/// space, preferring `playback-time` when `demuxer-start-time` shifts PTS away
+/// from `0`, and falling back to `time-pos` or [fallbackSeconds].
+double resolveLiveCacheCoordinatePos({
+  required double? playbackTimeSeconds,
+  required double? timePosSeconds,
+  required double cacheStartSeconds,
+  required double cacheEndSeconds,
+  required double fallbackSeconds,
+}) {
+  bool inRange(double? v) =>
+      v != null &&
+      v.isFinite &&
+      v >= cacheStartSeconds - 5.0 &&
+      v <= cacheEndSeconds + 5.0;
+  if (inRange(playbackTimeSeconds)) return playbackTimeSeconds!;
+  if (inRange(timePosSeconds)) return timePosSeconds!;
+  if (playbackTimeSeconds != null && playbackTimeSeconds.isFinite) {
+    return playbackTimeSeconds;
+  }
+  if (timePosSeconds != null && timePosSeconds.isFinite) {
+    return timePosSeconds;
+  }
+  return fallbackSeconds;
+}
+
+/// Immediately clamps an accumulated D-pad rewind/forward delta against the
+/// currently buffered `[cacheStartSeconds, cacheEndSeconds]` window so rapid or
+/// long-held presses never run past playable cache bounds.
+({double clampedDelta, bool hitStart, bool hitEnd, bool hasCache})
+clampLivePendingSeekDelta({
+  required double basePosSeconds,
+  required double desiredDeltaSeconds,
+  required double? cacheStartSeconds,
+  required double? cacheEndSeconds,
+  double startMarginSeconds = 1.0,
+  double liveEdgeMarginSeconds = 0.5,
+}) {
+  if (cacheStartSeconds == null ||
+      cacheEndSeconds == null ||
+      !cacheStartSeconds.isFinite ||
+      !cacheEndSeconds.isFinite ||
+      (cacheEndSeconds - cacheStartSeconds) <
+          (startMarginSeconds + liveEdgeMarginSeconds + 0.5)) {
+    return (
+      clampedDelta: 0.0,
+      hitStart: desiredDeltaSeconds < 0,
+      hitEnd: desiredDeltaSeconds > 0,
+      hasCache: false,
+    );
+  }
+  final minTarget = cacheStartSeconds + startMarginSeconds;
+  final maxTarget = math.max(minTarget, cacheEndSeconds - liveEdgeMarginSeconds);
+  final desiredTarget = basePosSeconds + desiredDeltaSeconds;
+  final clampedTarget = desiredTarget.clamp(minTarget, maxTarget).toDouble();
+  return (
+    clampedDelta: clampedTarget - basePosSeconds,
+    hitStart: desiredDeltaSeconds < 0 && desiredTarget <= minTarget + 0.05,
+    hitEnd: desiredDeltaSeconds > 0 && desiredTarget >= maxTarget - 0.05,
+    hasCache: true,
+  );
+}
+
+/// Combined state for the single programme-total progress / timeshift bar,
+/// mapping the real-time live edge, earliest rewindable cache position, and
+/// active playback/seek cursor onto `[0.0, 1.0]`.
+class LiveTimeshiftBarState {
+  const LiveTimeshiftBarState({
+    required this.liveEdgeFraction,
+    required this.playableStartFraction,
+    required this.playbackFraction,
+    required this.rewindableSeconds,
+    required this.lagSeconds,
+    required this.isTimeshifting,
+    required this.usesProgramTimeline,
+  });
+
+  final double liveEdgeFraction;
+  final double playableStartFraction;
+  final double playbackFraction;
+  final int rewindableSeconds;
+  final int lagSeconds;
+  final bool isTimeshifting;
+  final bool usesProgramTimeline;
+}
+
+/// Maps [info], cache bounds `[cacheStartSeconds, cacheEndSeconds]`, and
+/// [effectivePosSeconds] at [now] onto a single unified [LiveTimeshiftBarState].
+LiveTimeshiftBarState resolveLiveTimeshiftBarState({
+  required LiveOsdProgramInfo? info,
+  required DateTime now,
+  double? cacheStartSeconds,
+  double? cacheEndSeconds,
+  double? effectivePosSeconds,
+  double fallbackLagSeconds = 0.0,
+  required bool liveDelayedByPause,
+}) {
+  final rewindableRaw =
+      (cacheStartSeconds != null &&
+          cacheEndSeconds != null &&
+          cacheStartSeconds.isFinite &&
+          cacheEndSeconds.isFinite &&
+          cacheEndSeconds > cacheStartSeconds)
+      ? (cacheEndSeconds - cacheStartSeconds)
+      : 0.0;
+  final rawLag =
+      (cacheEndSeconds != null &&
+          effectivePosSeconds != null &&
+          cacheEndSeconds.isFinite &&
+          effectivePosSeconds.isFinite)
+      ? (cacheEndSeconds - effectivePosSeconds)
+            .clamp(0.0, rewindableRaw > 0 ? rewindableRaw : double.infinity)
+            .toDouble()
+      : math.max(0.0, fallbackLagSeconds);
+
+  final start = info?.currentStart;
+  final end = info?.currentEnd;
+  final double liveEdgeFrac;
+  final double playableStartFrac;
+  final double playbackFrac;
+  final bool usesProgramTimeline;
+
+  if (start != null && end != null && end.isAfter(start)) {
+    final totalSec = end.difference(start).inMilliseconds / 1000.0;
+    final elapsedSec = now.difference(start).inMilliseconds / 1000.0;
+    liveEdgeFrac = (elapsedSec / totalSec).clamp(0.0, 1.0).toDouble();
+    final effectiveWindow = math.max(rewindableRaw, rawLag);
+    playableStartFrac = ((elapsedSec - effectiveWindow) / totalSec)
+        .clamp(0.0, liveEdgeFrac)
+        .toDouble();
+    playbackFrac = ((elapsedSec - rawLag) / totalSec)
+        .clamp(playableStartFrac, liveEdgeFrac)
+        .toDouble();
+    usesProgramTimeline = true;
+  } else {
+    liveEdgeFrac = 1.0;
+    playableStartFrac = 0.0;
+    final denom = math.max(rewindableRaw, rawLag);
+    playbackFrac = denom > 0.5
+        ? (1.0 - (rawLag / denom)).clamp(0.0, 1.0).toDouble()
+        : 1.0;
+    usesProgramTimeline = false;
+  }
+
+  return LiveTimeshiftBarState(
+    liveEdgeFraction: liveEdgeFrac,
+    playableStartFraction: playableStartFrac,
+    playbackFraction: playbackFrac,
+    rewindableSeconds: math.max(0, rewindableRaw.round()),
+    lagSeconds: math.max(0, rawLag.round()),
+    isTimeshifting: liveDelayedByPause || rawLag > 1.5,
+    usesProgramTimeline: usesProgramTimeline,
+  );
+}
+
 /// Returns `true` only once the initial playback has genuinely started and
 /// exited mpv's initial pre-buffer pause.
 bool shouldLatchInitialPlaybackStarted({
@@ -1228,15 +1383,216 @@ class PlayerOsdClockOverlay extends StatelessWidget {
   }
 }
 
-/// Live TV OSD panel displaying the current programme, broadcast-time progress
-/// bar, remaining minutes, and the upcoming programme from EPG.
-class LiveOsdProgramSection extends StatelessWidget {
-  const LiveOsdProgramSection({super.key, required this.info});
+/// Single unified progress bar for Live playback and timeshift/playback seek,
+/// showing programme total timeline, earliest rewindable boundary, real-time
+/// live edge (red marker), and active playback position (white circle thumb).
+class LiveProgramProgressBar extends StatelessWidget {
+  const LiveProgramProgressBar({
+    super.key,
+    required this.state,
+    this.showDetailsRow = false,
+    this.barHeight = 6.0,
+  });
 
-  final LiveOsdProgramInfo info;
+  final LiveTimeshiftBarState state;
+  final bool showDetailsRow;
+  final double barHeight;
 
   @override
   Widget build(BuildContext context) {
+    final showTimeshiftOverlay =
+        state.rewindableSeconds >= 2 || state.isTimeshifting;
+    final thumbDiameter = barHeight + 6.0;
+    final trackHeight = thumbDiameter + 4.0;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          height: trackHeight,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final width = constraints.maxWidth;
+              final liveFrac = state.liveEdgeFraction.clamp(0.0, 1.0);
+              final playableStartFrac = state.playableStartFraction.clamp(
+                0.0,
+                liveFrac,
+              );
+              final playbackFrac = state.playbackFraction.clamp(
+                playableStartFrac,
+                liveFrac,
+              );
+              final playableStartX = width * playableStartFrac;
+              final liveX = width * liveFrac;
+              final thumbLeft = (width * playbackFrac - (thumbDiameter / 2))
+                  .clamp(0.0, math.max(0.0, width - thumbDiameter))
+                  .toDouble();
+              final tickLeft = (playableStartX - 1.0)
+                  .clamp(0.0, math.max(0.0, width - 2.0))
+                  .toDouble();
+              final liveMarkerLeft = (liveX - 1.5)
+                  .clamp(0.0, math.max(0.0, width - 3.0))
+                  .toDouble();
+              final watchedWidth = math.max(
+                0.0,
+                width * (playbackFrac - playableStartFrac),
+              );
+
+              return Stack(
+                alignment: Alignment.centerLeft,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(barHeight / 2),
+                    child: Container(
+                      height: barHeight,
+                      width: width,
+                      color: Colors.white24,
+                    ),
+                  ),
+                  if (showTimeshiftOverlay) ...[
+                    if (playableStartX > 0)
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(barHeight / 2),
+                        child: Container(
+                          height: barHeight,
+                          width: playableStartX,
+                          color: Colors.lightBlueAccent.withValues(alpha: 0.32),
+                        ),
+                      ),
+                    if (liveX > playableStartX)
+                      Positioned(
+                        left: playableStartX,
+                        width: liveX - playableStartX,
+                        height: barHeight,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(barHeight / 2),
+                          child: Container(color: Colors.white54),
+                        ),
+                      ),
+                    if (watchedWidth > 0)
+                      Positioned(
+                        left: playableStartX,
+                        width: watchedWidth,
+                        height: barHeight,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(barHeight / 2),
+                          child: Container(color: Colors.lightBlueAccent),
+                        ),
+                      ),
+                    Positioned(
+                      left: tickLeft,
+                      top: (trackHeight - (barHeight + 6)) / 2,
+                      width: 2,
+                      height: barHeight + 6,
+                      child: const ColoredBox(color: Colors.white),
+                    ),
+                    Positioned(
+                      left: liveMarkerLeft,
+                      top: (trackHeight - (barHeight + 8)) / 2,
+                      width: 3,
+                      height: barHeight + 8,
+                      child: const ColoredBox(color: Colors.redAccent),
+                    ),
+                  ] else
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(barHeight / 2),
+                      child: Container(
+                        height: barHeight,
+                        width: liveX,
+                        color: Colors.lightBlueAccent,
+                      ),
+                    ),
+                  Positioned(
+                    left: thumbLeft,
+                    top: (trackHeight - thumbDiameter) / 2,
+                    child: Container(
+                      width: thumbDiameter,
+                      height: thumbDiameter,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white,
+                        border: Border.all(
+                          color: Colors.lightBlueAccent,
+                          width: 2,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+        if (showDetailsRow) ...[
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Text(
+                state.rewindableSeconds >= 2
+                    ? '戻れる範囲: 最大 -${_formatOverlaySeconds(state.rewindableSeconds)}'
+                    : '戻れる範囲: キャッシュ蓄積中',
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 12,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+              const Spacer(),
+              Container(
+                width: 7,
+                height: 7,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.redAccent,
+                ),
+              ),
+              const SizedBox(width: 5),
+              Text(
+                state.lagSeconds <= 1
+                    ? '現在位置 (LIVE)'
+                    : '現在位置から -${_formatOverlaySeconds(state.lagSeconds)}',
+                style: TextStyle(
+                  color: state.lagSeconds <= 1 ? Colors.redAccent : Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// Live TV OSD panel displaying the current programme, broadcast-time progress
+/// bar, remaining minutes, and the upcoming programme from EPG.
+class LiveOsdProgramSection extends StatelessWidget {
+  const LiveOsdProgramSection({
+    super.key,
+    required this.info,
+    this.timeshift,
+  });
+
+  final LiveOsdProgramInfo info;
+  final LiveTimeshiftBarState? timeshift;
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveTimeshift =
+        timeshift ??
+        (info.progress != null
+            ? LiveTimeshiftBarState(
+                liveEdgeFraction: info.progress!.clamp(0.0, 1.0),
+                playableStartFraction: info.progress!.clamp(0.0, 1.0),
+                playbackFraction: info.progress!.clamp(0.0, 1.0),
+                rewindableSeconds: 0,
+                lagSeconds: 0,
+                isTimeshifting: false,
+                usesProgramTimeline: true,
+              )
+            : null);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1270,56 +1626,12 @@ class LiveOsdProgramSection extends StatelessWidget {
             ],
           ],
         ),
-        if (info.progress != null) ...[
+        if (effectiveTimeshift != null) ...[
           const SizedBox(height: 6),
-          SizedBox(
-            height: 12,
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final width = constraints.maxWidth;
-                final frac = info.progress!.clamp(0.0, 1.0);
-                final markerLeft = (width * frac - 5)
-                    .clamp(0.0, math.max(0.0, width - 10))
-                    .toDouble();
-                return Stack(
-                  alignment: Alignment.centerLeft,
-                  children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(3),
-                      child: Container(
-                        height: 6,
-                        width: width,
-                        color: Colors.white24,
-                      ),
-                    ),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(3),
-                      child: Container(
-                        height: 6,
-                        width: width * frac,
-                        color: Colors.lightBlueAccent,
-                      ),
-                    ),
-                    Positioned(
-                      left: markerLeft,
-                      top: 1,
-                      child: Container(
-                        width: 10,
-                        height: 10,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.white,
-                          border: Border.all(
-                            color: Colors.lightBlueAccent,
-                            width: 2,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
+          LiveProgramProgressBar(
+            state: effectiveTimeshift,
+            showDetailsRow: effectiveTimeshift.isTimeshifting,
+            barHeight: 6.0,
           ),
         ],
         if (info.nextTitle != null) ...[
@@ -2488,13 +2800,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _bufferedAheadSeconds = parsed;
           }
         } catch (_) {}
+        double? polledPlaybackTime;
+        double? polledTimePos;
         if (widget.live &&
             (_liveDelayedByPause || !_playingNow || _seekHudVisible || _osdOpen)) {
           try {
-            final rawPos = await platform.getProperty('time-pos');
-            final parsedPos = double.tryParse(rawPos);
-            if (parsedPos != null && parsedPos.isFinite) {
-              _liveTimePosSec = parsedPos;
+            final posProps = await Future.wait<String>([
+              _safeGetProp(platform, 'playback-time'),
+              _safeGetProp(platform, 'time-pos'),
+            ]);
+            final pb = double.tryParse(posProps[0]);
+            if (pb != null && pb.isFinite) polledPlaybackTime = pb;
+            final tp = double.tryParse(posProps[1]);
+            if (tp != null && tp.isFinite) polledTimePos = tp;
+            if (polledPlaybackTime != null || polledTimePos != null) {
+              _liveTimePosSec = polledPlaybackTime ?? polledTimePos;
             }
           } catch (_) {}
         }
@@ -2502,11 +2822,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           final rawState = await platform.getProperty('demuxer-cache-state');
           final range = parseDemuxerCacheStateRange(
             rawState,
-            currentPosSeconds: _liveTimePosSec,
+            currentPosSeconds:
+                polledPlaybackTime ?? polledTimePos ?? _liveTimePosSec,
           );
           if (range != null) {
             _liveCacheStartSec = range.startSeconds;
             _liveCacheEndSec = range.endSeconds;
+            if (polledPlaybackTime != null ||
+                polledTimePos != null ||
+                _liveTimePosSec != null) {
+              _liveTimePosSec = resolveLiveCacheCoordinatePos(
+                playbackTimeSeconds: polledPlaybackTime ?? _liveTimePosSec,
+                timePosSeconds: polledTimePos,
+                cacheStartSeconds: range.startSeconds,
+                cacheEndSeconds: range.endSeconds,
+                fallbackSeconds: range.endSeconds,
+              );
+            }
             final aheadFromRange = _liveTimePosSec != null
                 ? math.max(0.0, range.endSeconds - _liveTimePosSec!)
                 : null;
@@ -4592,6 +4924,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               '${plan.cachePauseWaitSeconds}',
             );
           }
+          if (widget.live) {
+            await platform.setProperty('force-seekable', 'yes');
+            await platform.setProperty('demuxer-seekable-cache', 'yes');
+          }
           if (plan.useDiskCache && plan.cacheDirPath != null) {
             await platform.setProperty('cache-on-disk', 'yes');
             await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
@@ -4603,6 +4939,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           DiagCategory.playback,
           'player: mpv buffer plan: target=${plan.configuredSeconds}s '
           'cache=${plan.useCache} disk=${plan.useDiskCache} '
+          'seekableCache=${widget.live} '
           'maxBytes=${plan.demuxerMaxBytes} back=${plan.demuxerMaxBackBytes} '
           'wait=${plan.cachePauseWaitSeconds}s netTimeout=${plan.networkTimeoutSeconds}s',
         );
@@ -5233,18 +5570,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _showSeekHud(Icons.pause, '一時停止');
       return;
     }
-    unawaited(_player.play());
-    if (_liveDelayedByPause &&
-        _livePendingSeekDeltaSec == 0.0 &&
+    unawaited(_resumeLivePlayback());
+  }
+
+  Future<void> _resumeLivePlayback() async {
+    if (!mounted || !widget.live || _switchingChannel || _conflictHandled) {
+      return;
+    }
+    if (_liveSeekDebounceTimer?.isActive == true ||
+        _livePendingSeekDeltaSec != 0.0) {
+      _liveSeekDebounceTimer?.cancel();
+      await _commitPendingLiveSeek();
+      if (!mounted || _switchingChannel || _conflictHandled) return;
+    }
+    final effectivePos = _liveCommittedSeekSec ?? _liveTimePosSec;
+    final atLiveEdge =
         _liveCacheEndSec != null &&
-        _liveTimePosSec != null &&
-        (_liveCacheEndSec! - _liveTimePosSec!) <= 1.5) {
-      unawaited(_finishLiveCatchUp(showHud: true));
+        effectivePos != null &&
+        (_liveCacheEndSec! - effectivePos) <= 1.5;
+    await _player.play();
+    if (!mounted) return;
+    if (_liveDelayedByPause && atLiveEdge) {
+      await _finishLiveCatchUp(showHud: true);
     } else if (_liveRewoundByUser) {
       _liveAutoCatchUpEnabled = false;
       _liveCatchUpRate = 1.0;
-      unawaited(_player.setRate(1.0));
-      _showSeekHud(Icons.play_arrow, 'プレイバック再生 (等速)');
+      await _player.setRate(1.0);
+      if (mounted) _showSeekHud(Icons.play_arrow, 'プレイバック再生 (等速)');
     } else if (_liveDelayedByPause) {
       _showSeekHud(Icons.play_arrow, '追いかけ再生');
     } else {
@@ -5271,6 +5623,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     _liveDelayedByPause = true;
     _startLiveCatchUpMonitor();
+    final base =
+        _livePendingSeekBaseSec ??
+        _liveCommittedSeekSec ??
+        _liveTimePosSec ??
+        _liveCacheEndSec ??
+        (_lastPosition.inMilliseconds / 1000.0);
+    final clamped = clampLivePendingSeekDelta(
+      basePosSeconds: base,
+      desiredDeltaSeconds: _livePendingSeekDeltaSec + deltaSec,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheEndSec,
+    );
+    if (!clamped.hasCache) {
+      _livePendingSeekBaseSec = null;
+      _livePendingSeekDeltaSec = 0.0;
+      _liveSeekDebounceTimer?.cancel();
+      unawaited(_pollMpvBufferProperties());
+      _showSeekHud(Icons.info_outline, '戻れるキャッシュ蓄積中');
+      return;
+    }
     if (deltaSec < 0) {
       _liveRewoundByUser = true;
       _liveAutoCatchUpEnabled = false;
@@ -5279,19 +5651,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         unawaited(_player.setRate(1.0));
       }
     }
-    _livePendingSeekBaseSec ??=
-        _liveCommittedSeekSec ??
-        _liveTimePosSec ??
-        (_lastPosition.inMilliseconds / 1000.0);
-    _livePendingSeekDeltaSec += deltaSec;
-    _showSeekHud(
-      _livePendingSeekDeltaSec < 0 ? Icons.replay_10 : Icons.forward_10,
-      _formatSeekDelta(_livePendingSeekDeltaSec.round()),
-    );
+    _livePendingSeekBaseSec = base;
+    _livePendingSeekDeltaSec = clamped.clampedDelta;
+    if (deltaSec < 0 && clamped.hitStart) {
+      final maxBack = _liveCacheEndSec != null
+          ? math.max(
+              0,
+              (_liveCacheEndSec! - (base + clamped.clampedDelta)).round(),
+            )
+          : 0;
+      _showSeekHud(
+        Icons.first_page,
+        'これ以上戻れません (-${_formatOverlaySeconds(maxBack)})',
+      );
+    } else if (deltaSec > 0 && clamped.hitEnd) {
+      _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
+    } else {
+      _showSeekHud(
+        _livePendingSeekDeltaSec < 0 ? Icons.replay_10 : Icons.forward_10,
+        _formatSeekDelta(_livePendingSeekDeltaSec.round()),
+      );
+    }
     _liveSeekDebounceTimer?.cancel();
-    _liveSeekDebounceTimer = Timer(const Duration(milliseconds: 250), () {
-      unawaited(_commitPendingLiveSeek());
-    });
+    if (_livePendingSeekDeltaSec != 0.0) {
+      _liveSeekDebounceTimer = Timer(const Duration(milliseconds: 250), () {
+        unawaited(_commitPendingLiveSeek());
+      });
+    }
   }
 
   Future<void> _commitPendingLiveSeek() async {
@@ -5316,37 +5702,51 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final props = await Future.wait<String>([
           _safeGetProp(platform, 'demuxer-cache-state'),
           _safeGetProp(platform, 'demuxer-cache-time'),
+          _safeGetProp(platform, 'playback-time'),
           _safeGetProp(platform, 'time-pos'),
           _safeGetProp(platform, 'demuxer-cache-duration'),
         ]);
-        final timePos = double.tryParse(props[2]);
-        if (timePos != null && timePos.isFinite) {
-          currentPos = timePos;
-          _liveTimePosSec = timePos;
-        }
+        final playbackTime = double.tryParse(props[2]);
+        final timePos = double.tryParse(props[3]);
         final cacheTime = double.tryParse(props[1]);
-        final cacheDur = double.tryParse(props[3]);
+        final cacheDur = double.tryParse(props[4]);
         final range = parseDemuxerCacheStateRange(
           props[0],
-          currentPosSeconds: currentPos,
+          currentPosSeconds: playbackTime ?? timePos ?? _liveTimePosSec,
         );
         if (range != null) {
           cacheStart = range.startSeconds;
           cacheEnd = range.endSeconds;
-        } else if (cacheTime != null &&
-            cacheTime.isFinite &&
-            cacheDur != null &&
-            cacheDur.isFinite) {
-          cacheStart ??= math.max(0.0, cacheTime - cacheDur);
-          cacheEnd ??= cacheTime;
+          currentPos = resolveLiveCacheCoordinatePos(
+            playbackTimeSeconds: playbackTime,
+            timePosSeconds: timePos,
+            cacheStartSeconds: cacheStart,
+            cacheEndSeconds: cacheEnd,
+            fallbackSeconds: currentPos ?? cacheEnd,
+          );
+          _liveTimePosSec = currentPos;
+        } else {
+          if (playbackTime != null && playbackTime.isFinite) {
+            currentPos = playbackTime;
+          } else if (timePos != null && timePos.isFinite) {
+            currentPos = timePos;
+          }
+          if (currentPos != null) _liveTimePosSec = currentPos;
+          if (cacheTime != null &&
+              cacheTime.isFinite &&
+              cacheDur != null &&
+              cacheDur.isFinite) {
+            cacheStart ??= math.max(0.0, cacheTime - cacheDur);
+            cacheEnd ??= cacheTime;
+          }
         }
       } catch (e) {
         _diag(DiagCategory.playback, 'player: live seek probe failed: $e');
       }
     }
     if (!mounted) return;
-    if (cacheStart == null || cacheEnd == null || (cacheEnd - cacheStart) < 1.0) {
-      _showSeekHud(Icons.info_outline, 'キャッシュ範囲外です');
+    if (cacheStart == null || cacheEnd == null || (cacheEnd - cacheStart) < 1.5) {
+      _showSeekHud(Icons.info_outline, '戻れるキャッシュ範囲がありません');
       return;
     }
     final resolvedCurrent = currentPos ?? base;
@@ -5357,13 +5757,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       deltaSeconds: offsetSec,
       cacheStartSeconds: cacheStart,
       cacheEndSeconds: cacheEnd,
+      startMarginSeconds: 1.0,
+      liveEdgeMarginSeconds: 0.5,
     );
+    final actualDelta = res.targetSeconds - resolvedCurrent;
     _liveCacheStartSec = cacheStart;
     _liveCacheEndSec = cacheEnd;
     _liveCommittedSeekSec = res.targetSeconds;
     _liveTimePosSec = res.targetSeconds;
     _liveCommittedSeekHoldTimer?.cancel();
-    _liveCommittedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+    _liveCommittedSeekHoldTimer = Timer(const Duration(milliseconds: 1500), () {
       _liveCommittedSeekSec = null;
       if (_seekHudVisible && mounted) setState(() {});
     });
@@ -5373,18 +5776,40 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _liveEstimatedLagSeconds = math.max(0.0, rawLag - targetBufferFloor);
     _diag(
       DiagCategory.playback,
-      'player: live timeshift seek delta=${offsetSec.toStringAsFixed(1)}s '
-      'to ${res.targetSeconds.toStringAsFixed(1)}s '
-      '[${cacheStart.toStringAsFixed(1)}..${cacheEnd.toStringAsFixed(1)}]',
+      'player: live timeshift seek before=${resolvedCurrent.toStringAsFixed(2)} '
+      'offset=${offsetSec.toStringAsFixed(1)} delta=${actualDelta.toStringAsFixed(2)} '
+      'target=${res.targetSeconds.toStringAsFixed(2)} '
+      'range=[${cacheStart.toStringAsFixed(1)}..${cacheEnd.toStringAsFixed(1)}]',
     );
     _clearDisplayedSubtitles();
-    try {
-      await _player.seek(
-        Duration(milliseconds: math.max(0, (res.targetSeconds * 1000).round())),
-      );
-    } catch (e) {
-      _diag(DiagCategory.playback, 'player: live timeshift seek failed: $e');
-      return;
+    if (actualDelta.abs() >= 0.2) {
+      try {
+        if (platform is NativePlayer) {
+          await platform.command([
+            'seek',
+            actualDelta.toStringAsFixed(3),
+            'relative+keyframes',
+          ]);
+          final afterProps = await Future.wait<String>([
+            _safeGetProp(platform, 'playback-time'),
+            _safeGetProp(platform, 'time-pos'),
+          ]);
+          _diag(
+            DiagCategory.playback,
+            'player: live timeshift seek settled '
+            'pb=${afterProps[0]} pos=${afterProps[1]}',
+          );
+        } else {
+          await _player.seek(
+            Duration(
+              milliseconds: math.max(0, (res.targetSeconds * 1000).round()),
+            ),
+          );
+        }
+      } catch (e) {
+        _diag(DiagCategory.playback, 'player: live timeshift seek failed: $e');
+        return;
+      }
     }
     if (!mounted) return;
     if (res.reachedLiveEdge && _playingNow) {
@@ -5392,7 +5817,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } else if (res.hitStart) {
       _showSeekHud(
         Icons.first_page,
-        'キャッシュ先頭 (-${_formatOverlaySeconds((cacheEnd - res.targetSeconds).round())})',
+        'これ以上戻れません (-${_formatOverlaySeconds((cacheEnd - res.targetSeconds).round())})',
       );
     } else if (res.reachedLiveEdge && !_playingNow) {
       _showSeekHud(Icons.live_tv, '現在位置（再開で通常視聴）');
@@ -5788,7 +6213,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannel ||
         _conflictHandled ||
         _livePendingSeekDeltaSec != 0.0 ||
-        _liveCommittedSeekSec != null) {
+        _liveCommittedSeekSec != null ||
+        !_liveAutoCatchUpEnabled) {
       return;
     }
     final targetBufferFloor = (_bufferPlan?.configuredSeconds ?? 0).toDouble();
@@ -5812,7 +6238,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       await _finishLiveCatchUp(showHud: true);
       return;
     }
-    if (!_liveAutoCatchUpEnabled || !_playingNow) return;
+    if (!_playingNow) return;
     final nextRate = liveCatchUpSpeedForLagSeconds(
       effectiveLag,
       currentRate: immediate ? null : _liveCatchUpRate,
@@ -6634,84 +7060,50 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
-  Widget _buildLiveTimeshiftBarSection({required bool isSeekingPreview}) {
-    final start = _liveCacheStartSec;
-    final end = _liveCacheEndSec;
-    final rawPos = _livePendingSeekBaseSec != null
+  LiveTimeshiftBarState _currentLiveTimeshiftBarState(
+    LiveOsdProgramInfo? info,
+    DateTime now,
+  ) {
+    final activePause = _livePausedAt == null
+        ? 0.0
+        : math.max(
+            0.0,
+            now.difference(_livePausedAt!).inMilliseconds / 1000.0,
+          );
+    final fallbackLag = math.max(
+      _liveEstimatedLagSeconds + activePause,
+      _bufferedAheadSeconds,
+    );
+    final effectivePos = _livePendingSeekBaseSec != null
         ? (_livePendingSeekBaseSec! + _livePendingSeekDeltaSec)
         : (_liveCommittedSeekSec ?? _liveTimePosSec);
-    final double posFraction;
-    final int spanSec;
-    final int lagSec;
-    if (start != null && end != null && end > start + 0.5 && rawPos != null) {
-      final span = end - start;
-      final clampedPos = rawPos.clamp(start, end).toDouble();
-      posFraction = ((clampedPos - start) / span).clamp(0.0, 1.0);
-      spanSec = math.max(1, span.round());
-      lagSec = math.max(0, (end - clampedPos).round());
-    } else {
-      final activePause = _livePausedAt == null
-          ? 0.0
-          : math.max(
-              0.0,
-              _now().difference(_livePausedAt!).inMilliseconds / 1000.0,
-            );
-      lagSec = math.max(
-        0,
-        math.max(_liveEstimatedLagSeconds + activePause, _bufferedAheadSeconds)
-            .round(),
-      );
-      spanSec = math.max(livePauseTimeshiftSeconds, lagSec);
-      posFraction = (1.0 - (lagSec / spanSec)).clamp(0.0, 1.0);
-    }
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildSeekProgressTrack(
-          posFraction: posFraction,
-          bufferFraction: 1.0,
-        ),
-        const SizedBox(height: 4),
-        Row(
-          children: [
-            Text(
-              '-${_formatOverlaySeconds(spanSec)} 前',
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 13,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-            const Spacer(),
-            Text(
-              lagSec <= 2
-                  ? '現在位置 (LIVE)'
-                  : 'LIVE から -${_formatOverlaySeconds(lagSec)}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-            const Spacer(),
-            const Text(
-              'LIVE',
-              style: TextStyle(
-                color: Colors.redAccent,
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-      ],
+    return resolveLiveTimeshiftBarState(
+      info: info,
+      now: now,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheEndSec,
+      effectivePosSeconds: effectivePos,
+      fallbackLagSeconds: fallbackLag,
+      liveDelayedByPause: _liveDelayedByPause,
     );
   }
 
   Widget _buildSeekHud() {
+    final now = _now();
+    final activeChannel = widget.live ? _activeLiveChannel : null;
+    final liveInfo = activeChannel != null
+        ? resolveLiveOsdProgramInfo(
+            channel: activeChannel,
+            guideEvents: _guideEventsForChannel(activeChannel),
+            now: now,
+          )
+        : null;
+    final liveTimeshift = widget.live
+        ? _currentLiveTimeshiftBarState(liveInfo, now)
+        : null;
+    final headline = (liveInfo != null && liveInfo.currentTitle.isNotEmpty)
+        ? liveInfo.currentTitle
+        : widget.title;
     return Positioned(
       left: 0,
       right: 0,
@@ -6767,7 +7159,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      widget.title,
+                      headline,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -6777,13 +7169,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       ),
                     ),
                   ),
+                  if (liveInfo?.currentTimeRange != null) ...[
+                    const SizedBox(width: 12),
+                    Text(
+                      liveInfo!.remainingMinutes != null
+                          ? '${liveInfo.currentTimeRange}（残り ${liveInfo.remainingMinutes}分）'
+                          : liveInfo.currentTimeRange!,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
                   const SizedBox(width: 12),
                   _buildBufferBadge(),
                 ],
               ),
               const SizedBox(height: 10),
-              if (widget.live)
-                _buildLiveTimeshiftBarSection(isSeekingPreview: true)
+              if (liveTimeshift != null)
+                LiveProgramProgressBar(
+                  state: liveTimeshift,
+                  showDetailsRow: true,
+                  barHeight: 8.0,
+                )
               else
                 _buildSeekBarSection(isSeekingPreview: true),
             ],
@@ -6851,14 +7260,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       PlayerOsdClockOverlay(now: _now(), opacity: _osdFadeAnimation);
 
   Widget _buildLiveOsdProgramSection() {
+    final now = _now();
     final channel = _activeLiveChannel;
-    if (channel == null) return const SizedBox.shrink();
+    if (channel == null) {
+      if (!_liveDelayedByPause) return const SizedBox.shrink();
+      return LiveProgramProgressBar(
+        state: _currentLiveTimeshiftBarState(null, now),
+        showDetailsRow: true,
+        barHeight: 6.0,
+      );
+    }
     final info = resolveLiveOsdProgramInfo(
       channel: channel,
       guideEvents: _guideEventsForChannel(channel),
-      now: _now(),
+      now: now,
     );
-    return LiveOsdProgramSection(info: info);
+    return LiveOsdProgramSection(
+      info: info,
+      timeshift: _currentLiveTimeshiftBarState(info, now),
+    );
   }
 
   Widget _buildRemoteOsd() {
@@ -6932,16 +7352,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ],
               ],
             ),
-            if (widget.live && _activeLiveChannel != null) ...[
+            if (widget.live && (_activeLiveChannel != null || _liveDelayedByPause)) ...[
               const SizedBox(height: 6),
               _buildLiveOsdProgramSection(),
-              if (_liveDelayedByPause) ...[
-                const SizedBox(height: 8),
-                _buildLiveTimeshiftBarSection(isSeekingPreview: false),
-              ],
-            ] else if (widget.live && _liveDelayedByPause) ...[
-              const SizedBox(height: 8),
-              _buildLiveTimeshiftBarSection(isSeekingPreview: false),
             ] else if (!widget.live) ...[
               if ((widget.recordedChannelName != null &&
                       widget.recordedChannelName!.trim().isNotEmpty) ||

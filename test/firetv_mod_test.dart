@@ -10661,6 +10661,164 @@ void main() {
           expect(find.text('次に見られる予定番組'), findsOneWidget);
         },
       );
+
+      test(
+        'clampLivePendingSeekDelta and resolveLiveCacheCoordinatePos enforce playable cache bounds',
+        () {
+          final noCache = clampLivePendingSeekDelta(
+            basePosSeconds: 50.0,
+            desiredDeltaSeconds: -10.0,
+            cacheStartSeconds: null,
+            cacheEndSeconds: null,
+          );
+          expect(noCache.hasCache, isFalse);
+          expect(noCache.clampedDelta, 0.0);
+
+          final inside = clampLivePendingSeekDelta(
+            basePosSeconds: 200.0,
+            desiredDeltaSeconds: -10.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(inside.hasCache, isTrue);
+          expect(inside.clampedDelta, -10.0);
+          expect(inside.hitStart, isFalse);
+          expect(inside.hitEnd, isFalse);
+
+          final hitStart = clampLivePendingSeekDelta(
+            basePosSeconds: 105.0,
+            desiredDeltaSeconds: -20.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(hitStart.hasCache, isTrue);
+          expect(hitStart.clampedDelta, -4.0);
+          expect(hitStart.hitStart, isTrue);
+          expect(hitStart.hitEnd, isFalse);
+
+          final hitEnd = clampLivePendingSeekDelta(
+            basePosSeconds: 215.0,
+            desiredDeltaSeconds: 10.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(hitEnd.hasCache, isTrue);
+          expect(hitEnd.clampedDelta, 4.5);
+          expect(hitEnd.hitEnd, isTrue);
+
+          expect(
+            resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: 180.0,
+              timePosSeconds: 0.0,
+              cacheStartSeconds: 120.0,
+              cacheEndSeconds: 200.0,
+              fallbackSeconds: 200.0,
+            ),
+            180.0,
+          );
+          expect(
+            resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: 50000.0,
+              timePosSeconds: 150.0,
+              cacheStartSeconds: 120.0,
+              cacheEndSeconds: 200.0,
+              fallbackSeconds: 200.0,
+            ),
+            150.0,
+          );
+        },
+      );
+
+      test(
+        'resolveLiveTimeshiftBarState maps rewindable cache window and live edge onto programme total timeline',
+        () {
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: '60分特番',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+          );
+
+          final state = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          expect(state.usesProgramTimeline, isTrue);
+          expect(state.liveEdgeFraction, closeTo(0.5, 0.001));
+          expect(state.playableStartFraction, closeTo(0.45, 0.001));
+          expect(state.playbackFraction, closeTo(0.475, 0.001));
+          expect(state.rewindableSeconds, 180);
+          expect(state.lagSeconds, 90);
+          expect(state.isTimeshifting, isTrue);
+
+          final fallback = resolveLiveTimeshiftBarState(
+            info: null,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          expect(fallback.usesProgramTimeline, isFalse);
+          expect(fallback.liveEdgeFraction, 1.0);
+          expect(fallback.playableStartFraction, 0.0);
+          expect(fallback.playbackFraction, closeTo(0.5, 0.001));
+        },
+      );
+
+      testWidgets(
+        'LiveOsdProgramSection renders single integrated LiveProgramProgressBar during playback timeshift',
+        (tester) async {
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: 'タイムシフト番組',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+            nextTitle: '次の番組',
+            nextStart: end,
+            nextEnd: end.add(const Duration(minutes: 30)),
+          );
+          final timeshift = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: SizedBox(
+                  width: 900,
+                  child: LiveOsdProgramSection(
+                    info: info,
+                    timeshift: timeshift,
+                  ),
+                ),
+              ),
+            ),
+          );
+
+          expect(find.byType(LiveProgramProgressBar), findsOneWidget);
+          expect(find.text('戻れる範囲: 最大 -3分'), findsOneWidget);
+          expect(find.text('現在位置から -1分30秒'), findsOneWidget);
+          expect(find.text('次の番組'), findsOneWidget);
+        },
+      );
     },
   );
 }
