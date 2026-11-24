@@ -494,10 +494,42 @@ void main() {
         live: true,
         bufferSeconds: 0,
         isAndroid: true,
+        availableDiskBytes: 2 * 1024 * 1024 * 1024,
         cacheDirPath: '/tmp/mpv_cache',
       );
-      expect(liveOff.useCache, isFalse);
+      expect(liveOff.useCache, isTrue);
+      expect(liveOff.useDiskCache, isTrue);
       expect(liveOff.cachePauseInitial, isFalse);
+      expect(liveOff.cachePause, isFalse);
+      expect(liveOff.cachePauseWaitSeconds, 0);
+      expect(liveOff.readaheadSeconds, livePauseTimeshiftSeconds);
+      expect(liveOff.demuxerMaxBytes, 105 * 1024 * 1024);
+
+      final liveDrTight = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 0,
+        isAndroid: true,
+        availableDiskBytes: 800 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+        liveUseMobile: false,
+      );
+      expect(liveDrTight.useCache, isTrue);
+      expect(liveDrTight.useDiskCache, isTrue);
+      expect(liveDrTight.cachePauseInitial, isFalse);
+      expect(liveDrTight.cachePause, isFalse);
+      expect(liveDrTight.demuxerMaxBytes, 288 * 1024 * 1024);
+
+      final liveDrTiny = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 0,
+        isAndroid: true,
+        availableDiskBytes: 400 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+        liveUseMobile: false,
+      );
+      expect(liveDrTiny.useCache, isTrue);
+      expect(liveDrTiny.useDiskCache, isFalse);
+      expect(liveDrTiny.demuxerMaxBytes, lessThanOrEqualTo(24 * 1024 * 1024));
 
       final liveThreeMin = computeMpvBufferPlan(
         live: true,
@@ -509,7 +541,9 @@ void main() {
       expect(liveThreeMin.useCache, isTrue);
       expect(liveThreeMin.useDiskCache, isTrue);
       expect(liveThreeMin.cachePauseInitial, isTrue);
+      expect(liveThreeMin.cachePause, isTrue);
       expect(liveThreeMin.cachePauseWaitSeconds, 180);
+      expect(liveThreeMin.readaheadSeconds, livePauseTimeshiftSeconds);
       expect(liveThreeMin.networkTimeoutSeconds, 210);
       expect(liveThreeMin.startTimeoutSeconds, 225);
     });
@@ -6188,7 +6222,11 @@ void main() {
         );
 
         final tapped = <String>[];
-        Widget buildHarness(ChannelSwitchDirection? activeDir) => MaterialApp(
+        Widget buildHarness(
+          ChannelSwitchDirection? activeDir, {
+          Brightness brightness = Brightness.dark,
+        }) => MaterialApp(
+          theme: ThemeData(brightness: brightness),
           home: Scaffold(
             body: Stack(
               children: [
@@ -6209,7 +6247,7 @@ void main() {
           ),
         );
 
-        // Next card visible at right edge.
+        // Next card visible flush at right edge in Dark mode without border.
         await tester.pumpWidget(buildHarness(ChannelSwitchDirection.next));
         await tester.pump(const Duration(milliseconds: 250));
         final nextFinder = find.byKey(
@@ -6251,18 +6289,34 @@ void main() {
               .opacity,
           0.0,
         );
+        final nextDarkDeco =
+            tester.widget<Container>(nextFinder).decoration! as BoxDecoration;
+        expect(nextDarkDeco.border, isNull);
+        expect(nextDarkDeco.color, const Color(0xD90D1117));
+        expect(
+          nextDarkDeco.borderRadius,
+          const BorderRadius.only(
+            topLeft: Radius.circular(14),
+            bottomLeft: Radius.circular(14),
+          ),
+        );
         expect(find.text('次のチャンネル'), findsOneWidget);
         expect(find.text('日本テレビ'), findsOneWidget);
         expect(find.text('次のニュース番組'), findsOneWidget);
         expect(find.text(nextEntry.broadcastTimeRange!), findsOneWidget);
-        expect(tester.getRect(nextFinder).right, greaterThan(900));
+        expect(tester.getRect(nextFinder).right, closeTo(1280.0, 0.01));
 
         // Tapping next card triggers switch.
         await tester.tap(nextFinder);
         expect(tapped, ['日本テレビ']);
 
-        // Switch to Previous card visible at left edge.
-        await tester.pumpWidget(buildHarness(ChannelSwitchDirection.previous));
+        // Switch to Previous card visible flush at left edge in Light mode.
+        await tester.pumpWidget(
+          buildHarness(
+            ChannelSwitchDirection.previous,
+            brightness: Brightness.light,
+          ),
+        );
         await tester.pump(const Duration(milliseconds: 250));
         expect(
           tester
@@ -6286,7 +6340,18 @@ void main() {
               .opacity,
           0.0,
         );
-        expect(tester.getRect(prevFinder).left, lessThan(100));
+        final prevLightDeco =
+            tester.widget<Container>(prevFinder).decoration! as BoxDecoration;
+        expect(prevLightDeco.border, isNull);
+        expect(prevLightDeco.color, const Color(0xF5FFFFFF));
+        expect(
+          prevLightDeco.borderRadius,
+          const BorderRadius.only(
+            topRight: Radius.circular(14),
+            bottomRight: Radius.circular(14),
+          ),
+        );
+        expect(tester.getRect(prevFinder).left, closeTo(0.0, 0.01));
 
         // Dismiss both cards.
         await tester.pumpWidget(buildHarness(null));
@@ -6302,6 +6367,61 @@ void main() {
               .opacity,
           0.0,
         );
+      },
+    );
+  });
+
+  group('Phase 25: borderless channel card, OSD quality switch, and chase catch-up', () {
+    test(
+      'liveCatchUpSpeedForLagSeconds, osdLiveStatusBadgeSpec, and osdQualityButtonLabel follow Phase 25 policy',
+      () {
+        expect(liveCatchUpSpeedForLagSeconds(0.0), 1.0);
+        expect(liveCatchUpSpeedForLagSeconds(1.5), 1.0);
+        expect(liveCatchUpSpeedForLagSeconds(2.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(15.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(30.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(30.1), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(60.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(120.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(180.0), 2.0);
+
+        // Downward hysteresis avoids speed chattering near thresholds.
+        expect(liveCatchUpSpeedForLagSeconds(118.0, currentRate: 2.0), 2.0);
+        expect(liveCatchUpSpeedForLagSeconds(114.0, currentRate: 2.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(28.0, currentRate: 1.5), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(24.0, currentRate: 1.5), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(1.4, currentRate: 1.25), 1.0);
+
+        final realtimeBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: false,
+          liveCatchUpRate: 1.0,
+        );
+        expect(realtimeBadge.label, 'LIVE');
+        expect(realtimeBadge.color, Colors.redAccent);
+
+        final delayedNormalBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.0,
+        );
+        expect(delayedNormalBadge.label, '追いかけ再生');
+        expect(delayedNormalBadge.color, const Color(0xFFEF6C00));
+
+        final delayedFastBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.5,
+        );
+        expect(delayedFastBadge.label, '追いかけ再生 1.5倍');
+        expect(delayedFastBadge.color, const Color(0xFFEF6C00));
+
+        final delayedDoubleBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 2.0,
+        );
+        expect(delayedDoubleBadge.label, '追いかけ再生 2倍');
+        expect(delayedDoubleBadge.color, const Color(0xFFEF6C00));
+
+        expect(osdQualityButtonLabel(useMobile: false), '画質: 元画質');
+        expect(osdQualityButtonLabel(useMobile: true), '画質: モバイル');
       },
     );
   });

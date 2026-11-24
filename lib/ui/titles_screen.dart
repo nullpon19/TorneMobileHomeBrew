@@ -253,6 +253,21 @@ Future<bool> setRecordedTitleProtection({
 /// zero) shows as no position. A failure throws before the
 /// patch: the display keeps the old value, and the player's
 /// teardown logs the failed report. No refetch either way.
+Future<void> _reportResumePositionWithContainer({
+  required ProviderContainer container,
+  required RegisteredNasne reg,
+  required String titleId,
+  required Duration position,
+}) async {
+  await container
+      .read(deviceServicesProvider(reg))
+      .titles
+      .setResumePosition(titleId, position);
+  container
+      .read(titlesProvider(reg).notifier)
+      .applyResumePoint(titleId, position.inSeconds);
+}
+
 Future<void> reportResumePosition({
   required WidgetRef ref,
   required RegisteredNasne reg,
@@ -266,6 +281,102 @@ Future<void> reportResumePosition({
   ref
       .read(titlesProvider(reg).notifier)
       .applyResumePoint(titleId, position.inSeconds);
+}
+
+Widget _buildRecordedPlayerScreen({
+  required ProviderContainer container,
+  required RegisteredNasne reg,
+  required PlaybackEngine engine,
+  required RecordedTitle title,
+  required PlaybackSession session,
+  required bool useMobile,
+  required Duration? initialStart,
+  required String? detailMeta,
+  required String? detailBody,
+  String? initialCornerNotice,
+}) {
+  final canSwitchQuality =
+      title.originalRes != null &&
+      title.mobileRes != null &&
+      title.originalRes != title.mobileRes;
+  final knownDuration =
+      (useMobile ? title.mobileRes?.duration : title.originalRes?.duration) ??
+      (title.scheduledDurationSeconds != null
+          ? Duration(seconds: title.scheduledDurationSeconds!)
+          : null);
+  return PlayerScreen(
+    title: title.title,
+    session: session,
+    initialStart: initialStart,
+    knownDuration: knownDuration,
+    programDetailTitle: title.title,
+    programDetailMeta: detailMeta,
+    programDetailBody: detailBody,
+    canSwitchQuality: canSwitchQuality,
+    currentUseMobile: useMobile,
+    initialCornerNotice: initialCornerNotice,
+    onSwitchQuality: canSwitchQuality
+        ? (
+            playerContext,
+            nextUseMobile,
+            currentPosition,
+            stopCurrentSession,
+          ) async {
+            await stopCurrentSession();
+            final nextRes = nextUseMobile
+                ? title.mobileRes!
+                : title.originalRes!;
+            final prevRes = useMobile
+                ? (title.mobileRes ?? title.originalRes ?? title.res.first)
+                : (title.originalRes ?? title.mobileRes ?? title.res.first);
+            var actualUseMobile = nextUseMobile;
+            String? notice;
+            PlaybackSession nextSession;
+            try {
+              nextSession = await engine.startPlayback(title, nextRes);
+              notice = nextUseMobile ? 'モバイル画質に切り替えました' : '元画質に切り替えました';
+            } on NasneError {
+              actualUseMobile = useMobile;
+              nextSession = await engine.startPlayback(title, prevRes);
+              notice = '画質を切り替えられませんでした（元の画質で継続）';
+            }
+            if (!playerContext.mounted) {
+              await nextSession.stop();
+              return null;
+            }
+            return _buildRecordedPlayerScreen(
+              container: container,
+              reg: reg,
+              engine: engine,
+              title: title,
+              session: nextSession,
+              useMobile: actualUseMobile,
+              initialStart:
+                  currentPosition > Duration.zero ? currentPosition : null,
+              detailMeta: detailMeta,
+              detailBody: detailBody,
+              initialCornerNotice: notice,
+            );
+          }
+        : null,
+    // Leaving the player reports where the viewing stopped (plan 102), so
+    // the unit's resume point follows even after in-player quality switching.
+    onResumePosition: (position) => _reportResumePositionWithContainer(
+      container: container,
+      reg: reg,
+      titleId: title.id,
+      position: position,
+    ),
+    // The chapter points load as the player opens (plan 112); the service
+    // validates them against the listed duration.
+    loadChapters: () => container
+        .read(deviceServicesProvider(reg))
+        .titles
+        .fetchChapters(
+          title.id,
+          durationSeconds: title.scheduledDurationSeconds ?? 0,
+        ),
+  );
 }
 
 Future<void> _showDeleteRefusal(BuildContext context, String message) {
@@ -1343,46 +1454,23 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
       description: title.description,
       longDescription: title.longDescription,
     );
+    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _starting = true);
     try {
       await startPlaybackAndShowPlayer(
         context: context,
         ref: ref,
         start: () => engine.startPlayback(title, res),
-        buildPlayer: (session) => PlayerScreen(
-          title: title.title,
+        buildPlayer: (session) => _buildRecordedPlayerScreen(
+          container: container,
+          reg: reg,
+          engine: engine,
+          title: title,
           session: session,
+          useMobile: useMobile,
           initialStart: initialStart,
-          knownDuration:
-              res.duration ??
-              (title.scheduledDurationSeconds != null
-                  ? Duration(seconds: title.scheduledDurationSeconds!)
-                  : null),
-          programDetailTitle: title.title,
-          programDetailMeta: detailMeta,
-          programDetailBody: detailBody,
-          // Leaving the player reports where the viewing
-          // stopped (plan 102), so the unit's resume point is
-          // there for the next viewing — in this app or in
-          // the official client — and the loaded list follows
-          // the report at once (plan 104 follow-up).
-          onResumePosition: (position) => reportResumePosition(
-            ref: ref,
-            reg: reg,
-            titleId: title.id,
-            position: position,
-          ),
-          // The chapter points load as the player opens
-          // (plan 112); the service validates them against
-          // the listed duration, and an empty answer leaves
-          // the player without chapter controls.
-          loadChapters: () => ref
-              .read(deviceServicesProvider(reg))
-              .titles
-              .fetchChapters(
-                title.id,
-                durationSeconds: title.scheduledDurationSeconds ?? 0,
-              ),
+          detailMeta: detailMeta,
+          detailBody: detailBody,
         ),
         unsupportedSubject: '録画の再生',
       );

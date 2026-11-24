@@ -239,7 +239,22 @@
 5. **Live 左右キー 2 段階チャンネル切替カード (`lib/ui/live_channel_switch_policy.dart`, `lib/ui/live_screen.dart`, `lib/ui/player_screen.dart`)**:
    - 放送波（地デジ／BS／CS）内の前後チャンネルをループ解決する `LiveChannelSwitchEntry` / `adjacentLiveChannelIndex` と、TV視聴／EPG 双方の起動経路およびフェイルオーバー後にも切替リストを引き継ぐ `_resolveLiveSwitchContext` / `_switchLivePlayerToChannel`（旧セッション停止前競合チェック＋キャンセル時再生継続＋複数台空きチューナー選択）を実装。
    - `PlayerScreen` に `LiveChannelSwitchPreviewCard`（左右端スライドカード・チャンネル名／番組名／放送時間・5 秒自動消灯・`PlayerBackOutcome.closeChannelPreview`・決定／2 回目押し切替）を実装。
-   - `test/firetv_proxy_reconnect_test.dart`・`test/firetv_mod_test.dart` にテスト追加後、`dart analyze` 問題ゼロ・全 658 テスト合格を確認。
+   - `test/firetv_proxy_reconnect_test.dart`・`test/firetv_mod_test.dart` にテスト追加後、`dart analyze` 問題ゼロ・全 658 テスト合格を確認（直後の緊急修正 `d2f3b22` で FFmpeg 初回 `Range: bytes=0-` を `416` で弾かないよう `_parseRangeStart` による `rangeStart > 0` 判定へ改善）。
+
+### 第23弾: チャンネル切替カード「コの字」枠線なし＆ライト白背景・OSD画質切替・追いかけ再生＆可変倍速自動追いつき
+1. **チャンネル切替カードの「コの字」・枠線なし・ライト／ナイト配色 (`lib/ui/player_screen.dart`)**:
+   - `LiveChannelSwitchPreviewCard` の外側余白・アンバー枠線（`border`）を撤去し、画面端（`left == 0` / `right == 1280`）へ密着させ、内側 2 角のみ `14px` 角丸・画面端側内側パディング `22px` に調整。
+   - `Theme.of(context).brightness` に連動し、ダーク時は `Color(0xD90D1117)`＋白文字、ライト時は高不透明白背景（`Color(0xF5FFFFFF)`）＋インディゴ見出し（`#3949AB`）＋黒系文字へ切替。
+2. **視聴中 OSD 画質切替（Live・録画済み両方） (`lib/ui/player_screen.dart`, `lib/ui/live_screen.dart`, `lib/ui/titles_screen.dart`)**:
+   - `PlayerScreen` に `canSwitchQuality` / `currentUseMobile` / `onSwitchQuality` と `osdQualityButtonLabel`（`画質: 元画質` / `画質: モバイル`）および `_suppressResumeReportOnDispose`（切替元終了時のレジューム誤上書き防止）を追加し、確認ダイアログなしの即時画質切替 `_executeQualitySwitch()`（共通停止ヘルパー `_stopPlaybackForReplacement()` 共有）を実装。
+   - `live_screen.dart` では単一チューナー解放後に新画質を試し、録画中エンコーダー競合時は `NasneError` を捕捉して元画質へ安全復帰＋右上通知・後続の左右チャンネル切替／フェイルオーバーへ新画質を引き継ぎ。
+   - `titles_screen.dart` では `_buildRecordedPlayerScreen` と `ProviderContainer` ベースの `_reportResumePositionWithContainer` を切り出し、`pushReplacement` 後も途中再生位置（`initialStart`）とレジューム保存・チャプター取得が安全に維持されるよう配線。
+3. **Live 一時停止〜未追いつき限定「追いかけ再生」UI・現在位置へ・可変倍速自動追いつき (`lib/ui/player_cache_policy.dart`, `lib/ui/player_screen.dart`)**:
+   - `computeMpvBufferPlan` に `liveUseMobile` と `MpvBufferPlan.cachePause` を追加し、Live バッファ `0 秒` でも `cache=yes` / `cache-on-disk=yes` / `readaheadSeconds >= 300`（モバイル `21 MiB/分`・DR `110 MiB/分`、空き `512 MiB` 保護クランプ）＋ `cache-pause-initial=no` / `cache-pause=no` で起動待ちゼロのまま最大 5 分の一時停止蓄積に対応（`test/player_cache_policy_test.dart` 保護のため `mpvCacheMode` は不変）。
+   - `liveCatchUpSpeedForLagSeconds`（`>120秒: 2倍`, `>30秒: 1.5倍`, `>1.5秒: 1.25倍`, 下りヒステリシス付き）と `osdLiveStatusBadgeSpec`（`LIVE` 赤 vs `追いかけ再生` / `追いかけ再生 X倍` `#EF6C00`）を追加。
+   - `PlayerScreen` に一時停止検知 `_markLivePaused`・500ms 追従タイマー `_liveCatchUpTimer`・自動変速 `_updateLiveCatchUpSpeed`（Live 設定バッファ分を差し引いた超過バッファ＋推定ラグで判定）・`等速に戻す`/`倍速追いかけ` トグル `_toggleLiveAutoCatchUp`・自動追いつき完了時 OSD フォーカス保護 `_finishLiveCatchUp` を実装し、`現在位置へ` ボタンおよび `追いかけ再生` バッジを一時停止後〜追いつき完了までの間のみ表示するよう改善。
+4. **検証 (`test/firetv_mod_test.dart`)**:
+   - `plans live initial buffering and timeouts`（DR 時の 512 MiB 保護クランプ含む）および `LiveChannelSwitchPreviewCard` テスト（枠線なし・画面端接地・Light 白背景）を更新し、Phase 25 ポリシーテストを追加して `dart analyze` (`No issues found!`) および全 659 テスト合格を確認。
 
 ---
 
@@ -275,23 +290,23 @@
 | `lib/ui/home_screen.dart` | タイトルを `torne HB FireTV` に統一、2 台以上登録時の上端 nasne 切替バー、600dp 以上 2 カラム配置、全 6 カード D-pad フォーカス＆`scrollCacheExtent` 最下部スクロール対応、録画失敗カードのアプリ内削除同期 |
 | `lib/ui/live_channel_switch_policy.dart` | Live 視聴中の左右 2 段階チャンネル切替モデル・インデックス計算 (`LiveChannelSwitchEntry`, `ChannelSwitchDirection`, `adjacentLiveChannelIndex`) |
 | `lib/ui/live_recording_policy.dart` | チューナー録画競合検知・Live チャンネル照合・画面端録画通知 (`LiveRecordingCornerNotice` / 30 秒)・複数台フェイルオーバー候補保持・即時録画作成・停止直後除外/合成ヘルパー (`schedulesWithoutId` / `schedulesExcludingIds` / `ensureSchedulePresent`)・録画実行中判定 |
-| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー、4 秒予約取得タイムアウト、OSD 即時録画／録画停止配線、バンド内チャンネル切替コンテキスト解決＆事前競合チェック付き切替コールバック、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示 |
+| `lib/ui/live_screen.dart` | 表示時/復帰時シームレス自動更新、複数台 nasne チャンネル統合・空きチューナー自動選択・視聴中自動フェイルオーバー、4 秒予約取得タイムアウト、OSD 即時録画／録画停止配線、バンド内チャンネル切替コンテキスト解決＆事前競合チェック付き切替コールバック、OSD 画質切替（競合フォールバック・左右 CH 引き継ぎ付き）、デフォルト画質追従＋都度切替、`● 録画中` バッジ表示 |
 | `lib/ui/multi_nasne_policy.dart` | 複数台 nasne 統合用ポリシー（サービス統合・空きチューナー優先選択・予約統合＆HDD 空き容量優先自動振り分け・`recNgList` 複合キー＆統合フィルタ・複合キー分離） |
 | `lib/ui/playback_launcher.dart` | エラー／資格情報案内／未実装ダイアログの初期ボタン `autofocus` 対応 |
-| `lib/ui/player_cache_policy.dart` | Android 向けデマクサバッファ削減設定、Live/録画別長時間バッファ・ディスクキャッシュ配分ポリシー (`MpvBufferPlan` / `computeMpvBufferPlan`)、Live MPEG-TS 初期プローブ短縮定数 (`liveDemuxerAnalyzeDurationSeconds`, `liveDemuxerProbeSizeBytes`) |
-| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（`'最新に追いつく'` ハイブリッド機能・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
+| `lib/ui/player_cache_policy.dart` | Android 向けデマクサバッファ削減設定、Live/録画別長時間バッファ・ディスクキャッシュ配分ポリシー (`MpvBufferPlan` / `computeMpvBufferPlan`：Live バッファ 0 秒時も起動待ちゼロのまま裏タイムシフト 5 分＋空き 512 MiB 保護)、可変倍速追いかけ判定 (`liveCatchUpSpeedForLagSeconds`)、Live MPEG-TS 初期プローブ短縮定数 |
+| `lib/ui/player_screen.dart` | フルスクリーン D-pad 操作（録画: ±10秒統一 / Live: 左右 2 段階「コの字」枠線なし＆ライト白背景 `LiveChannelSwitchPreviewCard`）、シークバー HUD、OSD（Live 一時停止時限定 `追いかけ再生` オレンジバッジ・`現在位置へ`・`等速に戻す`/`倍速追いかけ` 自動追いつき制御・Live/録画両対応 `画質: 元画質/モバイル` 即時切替・暗い半透明黒70%統一 `_buildBufferBadge`・`'この番組を録画'`/`'録画を停止'`〔停止ID即除外 `reconcileLiveRecordingSchedules`〕）、`PlayerCornerNotice`（右上30秒録画＆5秒カスタム通知）、Live 初期プローブ短縮設定・競合検知、終了確認、事前バッファ、`cache-on-disk`、無制限自動再開 |
 | `lib/ui/schedule_form.dart` | `FireTvTextInputField` 化、`FireTvTimePickerDialog`（D-pad 時刻設定）、デフォルト録画画質連動、競合警告キャンセル `autofocus`、2 台以上登録時の「録画する nasne」指定／空き容量＆競合考慮の自動振り分け |
 | `lib/ui/schedules_screen.dart` | `新規予約` の `AppBar` 上部移動（FAB 廃止）、詳細 `autofocusEdit`、複数台 nasne 予約時刻順統合一覧＆複合キー管理、「予約一覧 / 録画失敗」管理（詳細・個別削除・すべて削除） |
 | `lib/ui/settings_screen.dart` | 手動登録欄 `FireTvTextInputField` 化、登録済み nasne 行タップメニュー（切替/検証/解除）、単一フォーカス `_BufferOptionTile`、ナイトモード・番組表予約表示設定・デフォルト録画画質・デフォルト再生画質切替・Live/録画バッファ設定・バージョン表記統一 |
 | `lib/ui/tailscale_guard.dart` | LAN 未到達/VPN オフ時の Tailscale 接続補助ガード（複数台時はいずれか到達で待機抑止） |
 | `lib/ui/title_list_filter.dart` | 番組タイトル正規化 (`extractSeriesBaseTitle`)・2パス自動まとめ (`groupRecordedTitles` / `TitleGroup`) を追加 |
-| `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、保護行 `_ProtectionRow` の単一フォーカス＆黄枠強調、削除不能ダイアログ `autofocus`、検索欄 `FireTvTextInputField`、`'番組まとめ'` フォルダ化、2 台以上登録時の複数台横断一覧＆nasne フィルタ（ID 重複安全分離） |
+| `lib/ui/titles_screen.dart` | 1/4 サムネ詳細 UI、デフォルト画質追従＋都度切替、再生中 OSD 画質切替向け `_buildRecordedPlayerScreen` ＆ `ProviderContainer` レジューム報告、保護行 `_ProtectionRow` の単一フォーカス＆黄枠強調、削除不能ダイアログ `autofocus`、検索欄 `FireTvTextInputField`、`'番組まとめ'` フォルダ化、2 台以上登録時の複数台横断一覧＆nasne フィルタ（ID 重複安全分離） |
 | `lib/ui/widgets.dart` | `FireTvTextInputField` (`autofocus` 対応)、`confirmDialog` キャンセル `autofocus`、`asyncSection` `skipLoadingOnReload` 対応、`SectionCard` フォーカス枠・スクロール連動 |
 | `test/credential_flow_test.dart` | 資格情報画面の `FireTvTextInputField` ダイアログ入力へ追従 |
 | `test/dtcp_streaming_test.dart` | `DtcpProxy` の `servedBytes` / `firstByteServedAt` / `lastByteServedAt` 転送カウンタ検証を追加 |
 | `test/epg_search_test.dart` | 番組検索画面の `FireTvTextInputField` ダイアログ入力・デバウンス動作へ追従 |
 | `test/epg_test.dart` | `resolveEpgChannelWidth` 導入後の動的列幅境界スナップ検証へ追従 |
-| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton`・10秒シーク・EPG全般/赤塗り/時刻バー/検索更新D-pad移動・録画まとめ・戻る導線・録画競合検知＆通知・Home 2カラム＆初期フォーカス固定・全画面フォーカス総点検・自動更新・複数台 nasne 統合・Live停止即時反映/通知修正/追いつき/左右2段階チャンネル切替カード）のテスト |
+| `test/firetv_mod_test.dart` | Fire TV 改修全般（入力UI・ネイティブAES・バッファ設計・設定・ナイトモード・`SegmentedButton`・10秒シーク・EPG全般/赤塗り/時刻バー/検索更新D-pad移動・録画まとめ・戻る導線・録画競合検知＆通知・Home 2カラム＆初期フォーカス固定・全画面フォーカス総点検・自動更新・複数台 nasne 統合・Live停止即時反映/通知修正/左右枠なしコの字CH切替カード/OSD画質切替/追いかけ再生可変倍速追いつき）のテスト |
 | `test/firetv_proxy_reconnect_test.dart` | 純 Dart 環境（実ループバック HTTP）での `DtcpProxy` 無制限自動再接続テスト（録画途中切断・Live 再オープン非 `409`・`HEAD`/`Range` 非切断 & `resetToLiveEdge`・Seekable 短め EOF 打ち切り・非 Seekable 録画 EOF 非再接続） |
 | `test/playback_quality_test.dart` | 画質固定解除・初期 `元画質`・詳細都度切替非永続化へのテスト更新 |
 | `test/ui_test.dart` | Fire TV UI 構成・ダイアログ入力・画質設定仕様・日本語 Material ローカライズ (`BackButton`) 反映 |

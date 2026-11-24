@@ -98,6 +98,32 @@ String formatBufferDurationLabel(int seconds) {
   return '${seconds ~/ 60}分';
 }
 
+/// Live pause timeshift target (seconds) buffered in the background so paused
+/// viewers can resume with variable-speed catch-up without startup delay.
+const int livePauseTimeshiftSeconds = 300;
+
+/// Returns the playback speed multiplier for catching up from a paused live
+/// offset, applying light hysteresis on downward transitions to prevent speed
+/// chattering.
+double liveCatchUpSpeedForLagSeconds(
+  double lagSeconds, {
+  double? currentRate,
+}) {
+  if (lagSeconds <= 1.5) return 1.0;
+  if (currentRate != null) {
+    if (currentRate >= 2.0 && lagSeconds > 115.0) return 2.0;
+    if (currentRate >= 1.5 && lagSeconds > 25.0 && lagSeconds <= 120.0) {
+      return 1.5;
+    }
+    if (currentRate >= 1.25 && lagSeconds > 1.5 && lagSeconds <= 30.0) {
+      return 1.25;
+    }
+  }
+  if (lagSeconds > 120.0) return 2.0;
+  if (lagSeconds > 30.0) return 1.5;
+  return 1.25;
+}
+
 /// Resolved mpv cache configuration & timeout plan for a playback session.
 class MpvBufferPlan {
   const MpvBufferPlan({
@@ -112,6 +138,7 @@ class MpvBufferPlan {
     required this.networkTimeoutSeconds,
     required this.startTimeoutSeconds,
     required this.configuredSeconds,
+    this.cachePause = true,
   });
 
   final bool useCache;
@@ -125,6 +152,7 @@ class MpvBufferPlan {
   final int networkTimeoutSeconds;
   final int startTimeoutSeconds;
   final int configuredSeconds;
+  final bool cachePause;
 }
 
 /// Computes RAM vs disk cache limits, pre-buffer wait, and timeouts safely.
@@ -134,24 +162,29 @@ MpvBufferPlan computeMpvBufferPlan({
   required bool isAndroid,
   int? availableDiskBytes,
   String? cacheDirPath,
+  bool liveUseMobile = true,
 }) {
   final normalized = bufferSeconds < 0 ? 0 : bufferSeconds;
-  final useCache = !live || normalized > 0;
+  final effectiveTargetSeconds = live
+      ? math.max(normalized, livePauseTimeshiftSeconds)
+      : normalized;
   var useDiskCache =
-      useCache &&
-      normalized >= 60 &&
+      (live || normalized >= 60) &&
       cacheDirPath != null &&
       cacheDirPath.isNotEmpty;
 
   final int demuxerMaxBytes;
-  if (!useCache) {
-    demuxerMaxBytes = 0;
-  } else if (normalized == 0) {
+  if (effectiveTargetSeconds == 0) {
     demuxerMaxBytes = effectiveRecordingDemuxerMaxBytes(isAndroid: isAndroid);
   } else {
-    // Mobile TS bitrate is ~11-15 MiB/min; provision 21 MiB/min headroom.
-    final minFloor = normalized <= 15 ? 8 * 1024 * 1024 : 14 * 1024 * 1024;
-    final scaled = ((normalized * 21) ~/ 60) * 1024 * 1024;
+    // Mobile TS bitrate is ~11-15 MiB/min (headroom 21 MiB/min); DR is ~90-100
+    // Mbps (headroom 110 MiB/min for 5-minute background live pause timeshift).
+    final mibPerMinute = (live && !liveUseMobile) ? 110 : 21;
+    final minFloor = effectiveTargetSeconds <= 15
+        ? 8 * 1024 * 1024
+        : 14 * 1024 * 1024;
+    final scaled =
+        ((effectiveTargetSeconds * mibPerMinute) ~/ 60) * 1024 * 1024;
     final rawTarget = math.min(
       math.max(minFloor, scaled),
       maxDiskCacheBytes,
@@ -173,9 +206,7 @@ MpvBufferPlan computeMpvBufferPlan({
   }
 
   final int demuxerMaxBackBytes;
-  if (!useCache) {
-    demuxerMaxBackBytes = 0;
-  } else if (live) {
+  if (live) {
     demuxerMaxBackBytes = 2 * 1024 * 1024;
   } else if (useDiskCache) {
     final quarter = demuxerMaxBytes ~/ 4;
@@ -189,8 +220,11 @@ MpvBufferPlan computeMpvBufferPlan({
     );
   }
 
-  final readaheadSeconds = normalized > 0 ? normalized + 15 : 20;
+  final readaheadSeconds = live
+      ? math.max(normalized + 15, livePauseTimeshiftSeconds)
+      : (normalized > 0 ? normalized + 15 : 20);
   final cachePauseInitial = normalized > 0;
+  final cachePause = !live || normalized > 0;
   // Recordings start quickly (~5s) while pre-reading up to [normalized] in the
   // background; Live waits up to [normalized] before playing.
   final cachePauseWaitSeconds = normalized == 0
@@ -202,7 +236,7 @@ MpvBufferPlan computeMpvBufferPlan({
   final startTimeoutSeconds = 45 + (live ? normalized : 15);
 
   return MpvBufferPlan(
-    useCache: useCache,
+    useCache: true,
     useDiskCache: useDiskCache,
     cacheDirPath: useDiskCache ? cacheDirPath : null,
     demuxerMaxBytes: demuxerMaxBytes,
@@ -213,5 +247,6 @@ MpvBufferPlan computeMpvBufferPlan({
     networkTimeoutSeconds: networkTimeoutSeconds,
     startTimeoutSeconds: startTimeoutSeconds,
     configuredSeconds: normalized,
+    cachePause: cachePause,
   );
 }

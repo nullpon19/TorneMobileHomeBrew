@@ -1070,11 +1070,17 @@ Widget _buildLivePlayerScreen({
   final scheduleOwnerById = <String, RegisteredNasne>{
     for (final s in initialSchedules) s.id: reg,
   };
+  final canSwitchQuality =
+      channel.originalRes != null &&
+      channel.mobileRes != null &&
+      channel.originalRes != channel.mobileRes;
   return PlayerScreen(
     title: channel.channelName ?? channel.programTitle,
     session: session,
     live: true,
     liveUseMobile: useMobile,
+    canSwitchQuality: canSwitchQuality,
+    currentUseMobile: useMobile,
     programDetailTitle: channel.programTitle,
     programDetailMeta: detailMeta,
     programDetailBody: detailBody,
@@ -1083,6 +1089,61 @@ Widget _buildLivePlayerScreen({
     liveSwitchChannels: liveSwitchChannels,
     currentLiveSwitchIndex: currentLiveSwitchIndex,
     initialCornerNotice: initialCornerNotice,
+    onSwitchQuality: canSwitchQuality
+        ? (
+            playerContext,
+            nextUseMobile,
+            _,
+            stopCurrentSession,
+          ) async {
+            await stopCurrentSession();
+            final engine = container.read(deviceServicesProvider(reg)).playback;
+            var actualUseMobile = nextUseMobile;
+            String? notice;
+            PlaybackSession nextSession;
+            try {
+              nextSession = await _startLiveSession(
+                engine,
+                channel,
+                useMobile: nextUseMobile,
+                allowQualityFallback: false,
+              );
+              notice = nextUseMobile ? 'モバイル画質に切り替えました' : '元画質に切り替えました';
+            } on NasneError {
+              actualUseMobile = useMobile;
+              nextSession = await _startLiveSession(
+                engine,
+                channel,
+                useMobile: useMobile,
+                allowQualityFallback: true,
+              );
+              notice = '録画中などのため画質を切り替えられませんでした（元の画質で継続）';
+            }
+            if (!playerContext.mounted) {
+              await nextSession.stop();
+              return null;
+            }
+            final freshSchedules = await _fetchFreshSchedules(container, reg);
+            final switchCtx = await _resolveLiveSwitchContext(
+              container: container,
+              currentReg: reg,
+              currentChannel: channel,
+              multiNasneRegs: multiNasneRegs,
+            );
+            return _buildLivePlayerScreen(
+              container: container,
+              reg: reg,
+              channel: channel,
+              session: nextSession,
+              useMobile: actualUseMobile,
+              initialSchedules: freshSchedules,
+              multiNasneRegs: multiNasneRegs,
+              liveSwitchChannels: switchCtx.entries,
+              currentLiveSwitchIndex: switchCtx.currentIndex,
+              initialCornerNotice: notice,
+            );
+          }
+        : null,
     onStartCurrentProgramRecording: () => _startCurrentLiveRecording(
       container: container,
       reg: reg,
