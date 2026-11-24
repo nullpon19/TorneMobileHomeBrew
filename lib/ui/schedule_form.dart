@@ -119,6 +119,8 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
   final _durationMinutes = TextEditingController(text: '60');
   // shared fields
   late int _quality;
+  bool _qualityTouched = false;
+  ProviderSubscription<int>? _defaultQualitySub;
   late bool _priority;
   String _destinationId = recordDestinationInternal;
   // edit fields
@@ -149,7 +151,15 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       _durationMinutes.text = '${original.durationSeconds ~/ 60}';
       _selectedBand = original.channel.broadcastingType;
     } else {
-      _quality = 100;
+      _quality = ref.read(defaultRecordingQualityProvider);
+      _defaultQualitySub = ref.listenManual<int>(
+        defaultRecordingQualityProvider,
+        (prev, next) {
+          if (!_qualityTouched && mounted && _quality != next) {
+            setState(() => _quality = next);
+          }
+        },
+      );
       _priority = false;
       final prefill = widget.prefill;
       if (prefill != null) {
@@ -172,6 +182,7 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
 
   @override
   void dispose() {
+    _defaultQualitySub?.close();
     _durationMinutes.dispose();
     _condition.dispose();
     _destination.dispose();
@@ -401,13 +412,17 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       if (widget.original != null) widget.original!.desiredQualityMode,
     }.toList()..sort();
     return DropdownButtonFormField<int>(
+      key: ValueKey('schedule-quality-$_quality'),
       initialValue: _quality,
       decoration: const InputDecoration(labelText: '画質モード'),
       items: [
         for (final q in options)
           DropdownMenuItem(value: q, child: Text(qualityModeLabel(q))),
       ],
-      onChanged: (v) => setState(() => _quality = v ?? _quality),
+      onChanged: (v) => setState(() {
+        _qualityTouched = true;
+        _quality = v ?? _quality;
+      }),
     );
   }
 

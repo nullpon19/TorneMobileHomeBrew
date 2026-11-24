@@ -339,3 +339,50 @@ RegisteredNasne? selectAutoScheduleNasne({
   });
   return indexed.first.$2;
 }
+
+/// Composite persistence key uniquely identifying a failed recording entry
+/// even when multiple `recNgListGet` items reuse the same `id` string.
+String recNgDismissKey(RegisteredNasne reg, RecNgItem item) =>
+    '${reg.host}|${item.id}|'
+    '${item.startTime?.toUtc().millisecondsSinceEpoch ?? ''}|'
+    '${item.serviceId ?? ''}|${item.title ?? ''}';
+
+/// Failed recording item paired with its owning nasne registration.
+class OwnedRecNgItem {
+  const OwnedRecNgItem({required this.reg, required this.item});
+
+  final RegisteredNasne reg;
+  final RecNgItem item;
+
+  String get dismissKey => recNgDismissKey(reg, item);
+}
+
+/// Merges failed recording items across nasnes, excludes app-dismissed keys,
+/// and sorts newest failure first (entries without a timestamp go last).
+List<OwnedRecNgItem> mergeAndFilterRecNgItems({
+  required List<({RegisteredNasne reg, List<RecNgItem> items})> sources,
+  required Set<String> dismissedKeys,
+}) {
+  final merged = <OwnedRecNgItem>[
+    for (final src in sources)
+      for (final item in src.items)
+        if (!dismissedKeys.contains(recNgDismissKey(src.reg, item)))
+          OwnedRecNgItem(reg: src.reg, item: item),
+  ];
+  merged.sort((a, b) {
+    final startA = a.item.startTime;
+    final startB = b.item.startTime;
+    if (startA != null && startB != null) {
+      final cmp = startB.compareTo(startA);
+      if (cmp != 0) return cmp;
+    } else if (startA != null) {
+      return -1;
+    } else if (startB != null) {
+      return 1;
+    }
+    final hostCmp = a.reg.host.compareTo(b.reg.host);
+    if (hostCmp != 0) return hostCmp;
+    return a.dismissKey.compareTo(b.dismissKey);
+  });
+  return merged;
+}

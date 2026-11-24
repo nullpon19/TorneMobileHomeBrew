@@ -28,6 +28,31 @@ import 'arib_b24_tables.dart';
 /// Decodes one ARIB STD-B24 string (a descriptor text field).
 String decodeAribB24(List<int> data) => _AribB24Decoder().decode(data);
 
+final _sharedCellDecoder = _AribB24Decoder();
+
+/// Decodes a single 1-byte ARIB STD-B24 graphic cell for ESC final byte [finalByte].
+String decodeAribB24OneByteCell(
+  int code,
+  int finalByte, {
+  required bool halfWidth,
+}) {
+  final set = _charsets[finalByte];
+  if (set == null || set.bytes != 1 || set.kind == 'blank') return '';
+  final masked = code & 0x7F;
+  if (masked < 0x21 || masked > 0x7E) return '';
+  return _sharedCellDecoder._oneByte(masked, set.kind, halfWidth);
+}
+
+/// Decodes a single 2-byte ARIB STD-B24 graphic cell for ESC final byte [finalByte].
+String decodeAribB24TwoByteCell(int code, int finalByte) {
+  final set = _charsets[finalByte];
+  if (set == null || set.bytes != 2 || set.kind == 'blank') return '';
+  final high = (code >> 8) & 0x7F;
+  final low = code & 0x7F;
+  if (high < 0x21 || high > 0x7E || low < 0x21 || low > 0x7E) return '';
+  return _sharedCellDecoder._twoByte((high << 8) | low, set.kind);
+}
+
 class _Charset {
   const _Charset(this.bytes, this.kind);
   final int bytes;

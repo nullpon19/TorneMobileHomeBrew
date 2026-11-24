@@ -6,6 +6,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -16,11 +17,14 @@ import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
+import 'package:tmhb/core/dtcp/arib_ts_caption_tap.dart';
 import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
+import 'package:tmhb/ui/format.dart';
 import 'package:tmhb/ui/home_screen.dart';
+import 'package:tmhb/ui/live_channel_switch_policy.dart';
 import 'package:tmhb/ui/live_recording_policy.dart';
 import 'package:tmhb/ui/live_screen.dart';
 import 'package:tmhb/ui/multi_nasne_policy.dart';
@@ -30,6 +34,9 @@ import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/schedule_form.dart';
 import 'package:tmhb/ui/schedules_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
+import 'package:tmhb/ui/subtitle_overlay.dart';
+import 'package:tmhb/ui/subtitle_settings_screen.dart';
+import 'package:tmhb/ui/subtitle_style_policy.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/title_list_filter.dart';
 import 'package:tmhb/ui/titles_screen.dart';
@@ -492,10 +499,42 @@ void main() {
         live: true,
         bufferSeconds: 0,
         isAndroid: true,
+        availableDiskBytes: 2 * 1024 * 1024 * 1024,
         cacheDirPath: '/tmp/mpv_cache',
       );
-      expect(liveOff.useCache, isFalse);
+      expect(liveOff.useCache, isTrue);
+      expect(liveOff.useDiskCache, isTrue);
       expect(liveOff.cachePauseInitial, isFalse);
+      expect(liveOff.cachePause, isFalse);
+      expect(liveOff.cachePauseWaitSeconds, 0);
+      expect(liveOff.readaheadSeconds, livePauseTimeshiftSeconds);
+      expect(liveOff.demuxerMaxBytes, 105 * 1024 * 1024);
+
+      final liveDrTight = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 0,
+        isAndroid: true,
+        availableDiskBytes: 800 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+        liveUseMobile: false,
+      );
+      expect(liveDrTight.useCache, isTrue);
+      expect(liveDrTight.useDiskCache, isTrue);
+      expect(liveDrTight.cachePauseInitial, isFalse);
+      expect(liveDrTight.cachePause, isFalse);
+      expect(liveDrTight.demuxerMaxBytes, 288 * 1024 * 1024);
+
+      final liveDrTiny = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 0,
+        isAndroid: true,
+        availableDiskBytes: 400 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+        liveUseMobile: false,
+      );
+      expect(liveDrTiny.useCache, isTrue);
+      expect(liveDrTiny.useDiskCache, isFalse);
+      expect(liveDrTiny.demuxerMaxBytes, lessThanOrEqualTo(24 * 1024 * 1024));
 
       final liveThreeMin = computeMpvBufferPlan(
         live: true,
@@ -507,7 +546,9 @@ void main() {
       expect(liveThreeMin.useCache, isTrue);
       expect(liveThreeMin.useDiskCache, isTrue);
       expect(liveThreeMin.cachePauseInitial, isTrue);
+      expect(liveThreeMin.cachePause, isTrue);
       expect(liveThreeMin.cachePauseWaitSeconds, 180);
+      expect(liveThreeMin.readaheadSeconds, livePauseTimeshiftSeconds);
       expect(liveThreeMin.networkTimeoutSeconds, 210);
       expect(liveThreeMin.startTimeoutSeconds, 225);
     });
@@ -5320,6 +5361,3869 @@ void main() {
       },
     );
   });
+
+  group('Phase 22 enhancements', () {
+    test('30s live corner notice constant and immediate schedule builder', () {
+      expect(
+        liveRecordingCornerNoticeDuration,
+        const Duration(seconds: 30),
+      );
+      final now = DateTime.utc(2026, 11, 24, 3, 15);
+      const ch = Channel(
+        broadcastingType: 2,
+        networkId: 30848,
+        transportStreamId: 30848,
+        serviceId: 56832,
+        serviceType: 1,
+        channelNumber: 1,
+        serviceName: 'ＮＨＫ総合',
+      );
+      const liveCh = LiveChannel(
+        id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+        bandId: '0/video/LiveTuner/DTTB',
+        networkId: 30848,
+        transportStreamId: 30848,
+        serviceId: 56832,
+        programTitle: '生放送テスト',
+      );
+      final ev = EpgEvent(
+        eventId: 0x1234,
+        start: DateTime.utc(2026, 11, 24, 3, 0),
+        duration: const Duration(minutes: 45),
+        title: '生放送テスト',
+      );
+
+      final withEpg = buildImmediateLiveRecordingSchedule(
+        channel: liveCh,
+        now: now,
+        desiredQualityMode: recordingQualityX3,
+        matchingEpgEvent: ev,
+        matchingChannel: ch,
+      )!;
+      expect(withEpg.eventId, 0x1234);
+      expect(withEpg.start, ev.start);
+      expect(withEpg.durationSeconds, 2700);
+      expect(withEpg.desiredQualityMode, 230);
+      expect(withEpg.channel.serviceId, 56832);
+      expect(withEpg.networkId, 30848);
+
+      final withoutEpg = buildImmediateLiveRecordingSchedule(
+        channel: LiveChannel(
+          id: liveCh.id,
+          bandId: liveCh.bandId,
+          networkId: 30848,
+          serviceId: 56832,
+          programTitle: '手動枠',
+          programEnd: now.add(const Duration(minutes: 20)),
+        ),
+        now: now,
+        desiredQualityMode: recordingQualityDr,
+      )!;
+      expect(withoutEpg.eventId, 0);
+      expect(withoutEpg.start, now);
+      expect(withoutEpg.durationSeconds, 1200);
+      expect(withoutEpg.desiredQualityMode, 100);
+
+      final active = RecordSchedule(
+        id: 'r1',
+        start: now.subtract(const Duration(minutes: 5)),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 56832,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7880,0x1234',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      expect(isScheduleCurrentlyRecording(active, now: now), isTrue);
+      expect(
+        isScheduleCurrentlyRecording(
+          active,
+          now: now.add(const Duration(minutes: 30)),
+        ),
+        isFalse,
+      );
+    });
+
+    testWidgets('OSD 録画中 and LIVE badges use identical box shape and height', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                buildPlayerOsdStatusBadge(
+                  label: '録画中',
+                  color: const Color(0xFFC62828),
+                  icon: Icons.fiber_manual_record,
+                ),
+                const SizedBox(width: 8),
+                buildPlayerOsdStatusBadge(
+                  label: 'LIVE',
+                  color: Colors.redAccent,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final recBox = tester.getRect(
+        find.ancestor(
+          of: find.text('録画中'),
+          matching: find.byType(Container),
+        ),
+      );
+      final liveBox = tester.getRect(
+        find.ancestor(
+          of: find.text('LIVE'),
+          matching: find.byType(Container),
+        ),
+      );
+      expect((recBox.height - liveBox.height).abs(), lessThan(0.1));
+
+      final containers = tester.widgetList<Container>(find.byType(Container));
+      for (final c in containers) {
+        final dec = c.decoration as BoxDecoration?;
+        expect(dec?.borderRadius, BorderRadius.circular(4));
+      }
+    });
+
+    testWidgets(
+      'Default recording quality persists in Settings and seeds new ScheduleFormPage',
+      (tester) async {
+        final kvStore = InMemoryKeyValueStore();
+        const reg = RegisteredNasne(
+          host: '192.0.2.20',
+          udn: 'uuid:q1',
+          friendlyName: 'nasne-q',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const ch = Channel(
+          broadcastingType: 2,
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 0x1111,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト局',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              debugLogSharerProvider.overrideWithValue(null),
+              debugLogFolderOpenerProvider.overrideWithValue(null),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.scrollUntilVisible(
+          find.text('デフォルト録画画質'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('3倍'));
+        await tester.pumpAndSettle();
+        expect(await kvStore.read('firetv_default_recording_quality'), '230');
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              channelsProvider.overrideWith((ref, r) async => const [ch]),
+              hddDetailsProvider.overrideWith((ref, r) async => const []),
+            ],
+            child: MaterialApp(home: ScheduleFormPage.create(reg)),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('3倍'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'EpgEventDetailDialog offers 録画を停止 only while actively recording and calls deleteSchedule',
+      (tester) async {
+        final deletedIds = <String>[];
+        const reg = RegisteredNasne(
+          host: '192.0.2.30',
+          udn: 'uuid:epg-stop',
+          friendlyName: 'nasne-epg',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const ch = Channel(
+          broadcastingType: 2,
+          networkId: 100,
+          transportStreamId: 200,
+          serviceId: 0x2222,
+          serviceType: 1,
+          channelNumber: 1,
+          serviceName: 'テスト局',
+        );
+        final now = DateTime.now();
+        final activeEvent = EpgEvent(
+          eventId: 77,
+          start: now.subtract(const Duration(minutes: 10)),
+          duration: const Duration(minutes: 40),
+          title: '放送中録画番組',
+        );
+        final activeSchedule = RecordSchedule(
+          id: 'sched-active-77',
+          start: activeEvent.start,
+          durationSeconds: 2400,
+          conditionId: '1',
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x2222,
+          ),
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x0064,0x004d',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '放送中録画番組',
+        );
+        final futureEvent = EpgEvent(
+          eventId: 78,
+          start: now.add(const Duration(hours: 2)),
+          duration: const Duration(minutes: 30),
+          title: '未来の予約番組',
+        );
+        final futureSchedule = RecordSchedule(
+          id: 'sched-future-78',
+          start: futureEvent.start,
+          durationSeconds: 1800,
+          conditionId: '1',
+          channel: activeSchedule.channel,
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x0064,0x004e',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '未来の予約番組',
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              deviceServicesProvider.overrideWith(
+                (ref, r) => DeviceServices(
+                  deviceInfo: _StubDeviceInfo(),
+                  settings: _StubSettings(),
+                  schedules: _DeletableScheduleService(
+                    onDelete: deletedIds.add,
+                  ),
+                  titles: _StubTitleCatalog(),
+                  metadata: _StubMetadata(),
+                  live: _StubLiveCatalog(),
+                  playback: _RecordingFallbackLiveEngine(),
+                ),
+              ),
+            ],
+            child: MaterialApp(
+              home: Scaffold(
+                body: Builder(
+                  builder: (context) => Column(
+                    children: [
+                      ElevatedButton(
+                        onPressed: () => showEpgEventDetail(
+                          context,
+                          reg: reg,
+                          channel: ch,
+                          channelName: ch.serviceName,
+                          event: futureEvent,
+                          existingSchedule: futureSchedule,
+                        ),
+                        child: const Text('open_future'),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => showEpgEventDetail(
+                          context,
+                          reg: reg,
+                          channel: ch,
+                          channelName: ch.serviceName,
+                          event: activeEvent,
+                          existingSchedule: activeSchedule,
+                        ),
+                        child: const Text('open_active'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Future reservation shows edit only, not stop.
+        await tester.tap(find.text('open_future'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画を停止'), findsNothing);
+        expect(find.text('予約を編集'), findsOneWidget);
+        await tester.tap(find.text('閉じる'));
+        await tester.pumpAndSettle();
+
+        // Active recording shows 録画を停止 -> confirm -> deleteSchedule.
+        await tester.tap(find.text('open_active'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画中'), findsOneWidget);
+        await tester.tap(find.text('録画を停止'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画を停止しますか？'), findsOneWidget);
+        await tester.tap(find.widgetWithText(FilledButton, '録画を停止'));
+        await tester.pumpAndSettle();
+
+        expect(deletedIds, ['sched-active-77']);
+      },
+    );
+
+    testWidgets(
+      'SchedulesScreen failure management & HomeScreen sync filter dismissed recNg items',
+      (tester) async {
+        const reg = RegisteredNasne(
+          host: '192.0.2.40',
+          udn: 'uuid:recng',
+          friendlyName: 'nasne-ng',
+          macAddr: '00:11:22:33:44:55',
+        );
+        final item1 = RecNgItem.fromJson({
+          'id': '10000000000000000009',
+          'title': '失敗番組A',
+          'scheduledStartDateTime': '2026-11-11T20:30:00+09:00',
+          'scheduledDuration': 900,
+          'scheduledChannelID': 56840,
+          'broadcastingType': 2,
+          'desiredQualityMode': 101,
+          'ngID': 3,
+        });
+        final item2 = RecNgItem.fromJson({
+          'id': '10000000000000000009',
+          'title': '失敗番組B',
+          'scheduledStartDateTime': '2026-11-15T18:45:00+09:00',
+          'scheduledDuration': 1800,
+          'scheduledChannelID': 56832,
+          'broadcastingType': 2,
+          'desiredQualityMode': 100,
+          'ngID': 5,
+        });
+        expect(item1.desiredQualityMode, 101);
+        expect(item1.ngId, 3);
+        expect(recNgQualityModeLabel(101), '3倍');
+        expect(recNgQualityModeLabel(100), 'DR');
+        expect(
+          recNgDismissKey(reg, item1),
+          isNot(recNgDismissKey(reg, item2)),
+        );
+
+        final kvStore = InMemoryKeyValueStore();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const <Channel>[]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: SchedulesScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('録画失敗 (2)'), findsOneWidget);
+        await tester.tap(find.text('録画失敗 (2)'));
+        await tester.pumpAndSettle();
+
+        // Newest failure first ('失敗番組B').
+        expect(find.text('失敗番組B'), findsOneWidget);
+        expect(find.text('失敗番組A'), findsOneWidget);
+        expect(find.text('すべて削除'), findsOneWidget);
+
+        // Dismiss single failure via detail page.
+        await tester.tap(find.text('失敗番組B'));
+        await tester.pumpAndSettle();
+        expect(find.text('ngID=5'), findsOneWidget);
+        await tester.tap(find.text('この履歴を削除'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, '削除'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('失敗番組B'), findsNothing);
+        expect(find.text('失敗番組A'), findsOneWidget);
+        expect(find.text('録画失敗 (1)'), findsOneWidget);
+
+        // Verify HomeScreen stays synchronized with dismissed item.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              deviceInfoProvider.overrideWith(
+                (ref, r) async => const DeviceInfo(
+                  name: 'nasne-ng',
+                  softwareVersion: '0260',
+                ),
+              ),
+              hddDetailsProvider.overrideWith((ref, r) async => const []),
+              liveStatusProvider.overrideWith(
+                (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+              ),
+              networkInfoProvider.overrideWith(
+                (ref, r) async =>
+                    const NetworkInfo(macAddr: '00:11:22:33:44:55', ipv4Addr: '192.0.2.40'),
+              ),
+              bcasInfoProvider.overrideWith((ref, r) async => const BcasInfo()),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: HomeScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('失敗番組B'), findsNothing);
+        expect(find.textContaining('失敗番組A'), findsOneWidget);
+
+        // Verify 'すべて削除' clears remaining entries.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kvStore),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              schedulesProvider.overrideWith(
+                (ref, r) async => const <RecordSchedule>[],
+              ),
+              channelsProvider.overrideWith((ref, r) async => const <Channel>[]),
+              bsChannelsProvider.overrideWith(
+                (ref, r) async => const <Channel>[],
+              ),
+              recNgProvider.overrideWith((ref, r) async => [item1, item2]),
+            ],
+            child: const MaterialApp(home: SchedulesScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('録画失敗 (1)'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('すべて削除'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'すべて削除'));
+        await tester.pumpAndSettle();
+        expect(find.text('録画失敗はありません'), findsOneWidget);
+      },
+    );
+  });
+
+  group('Phase 24: live startup speed, buffer badge, stop sync, catch-up & Left/Right switch', () {
+    test('live demuxer probe limits and schedule/channel switch helpers behave accurately', () {
+      expect(liveDemuxerAnalyzeDurationSeconds, 1.5);
+      expect(liveDemuxerProbeSizeBytes(useMobile: true), 512 * 1024);
+      expect(liveDemuxerProbeSizeBytes(useMobile: false), 2 * 1024 * 1024);
+
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 0,
+          count: 1,
+          direction: ChannelSwitchDirection.next,
+        ),
+        -1,
+      );
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 0,
+          count: 3,
+          direction: ChannelSwitchDirection.previous,
+        ),
+        2,
+      );
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 2,
+          count: 3,
+          direction: ChannelSwitchDirection.next,
+        ),
+        0,
+      );
+
+      final s1 = RecordSchedule(
+        id: '101',
+        start: DateTime.utc(2026, 11, 24, 1, 0),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x0400,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7880,0x0001',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      final s2 = RecordSchedule(
+        id: '102',
+        start: DateTime.utc(2026, 11, 24, 2, 0),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x0408,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7881,0x0002',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      expect(schedulesWithoutId([s1, s2], '101').map((s) => s.id), ['102']);
+      expect(
+        schedulesExcludingIds([s1, s2], {'102'}).map((s) => s.id),
+        ['101'],
+      );
+      expect(ensureSchedulePresent([s1], s2).map((s) => s.id), ['101', '102']);
+      expect(ensureSchedulePresent([s1, s2], s2).length, 2);
+
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          channelPreviewOpen: true,
+        ),
+        PlayerBackOutcome.closeChannelPreview,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: true,
+          channelPreviewOpen: true,
+        ),
+        PlayerBackOutcome.closeOsd,
+      );
+    });
+
+    testWidgets(
+      'PlayerOsdStatusBadge dark translucent style matches LIVE badge geometry',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  buildPlayerOsdStatusBadge(
+                    label: 'バッファ: 15秒',
+                    color: const Color(0xB3000000),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  const SizedBox(width: 8),
+                  buildPlayerOsdStatusBadge(
+                    label: 'LIVE',
+                    color: Colors.redAccent,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final bufFinder = find.ancestor(
+          of: find.text('バッファ: 15秒'),
+          matching: find.byType(Container),
+        );
+        final liveFinder = find.ancestor(
+          of: find.text('LIVE'),
+          matching: find.byType(Container),
+        );
+        final bufRect = tester.getRect(bufFinder);
+        final liveRect = tester.getRect(liveFinder);
+        expect((bufRect.height - liveRect.height).abs(), lessThanOrEqualTo(2.1));
+
+        final bufDec = tester.widget<Container>(bufFinder).decoration
+            as BoxDecoration;
+        expect(bufDec.color, const Color(0xB3000000));
+        expect(bufDec.borderRadius, BorderRadius.circular(4));
+
+        final bufText = tester.widget<Text>(find.text('バッファ: 15秒'));
+        expect(bufText.style?.color, Colors.white);
+        expect(bufText.style?.fontSize, 12);
+        expect(bufText.style?.height, 1.2);
+      },
+    );
+
+    test(
+      'reconcileLiveRecordingSchedules suppresses stale stopped ids and canSeekWithinLiveCache enforces hybrid catch-up bounds',
+      () {
+        final now = DateTime.now();
+        final active = RecordSchedule(
+          id: 'sched-stale-9',
+          start: now.subtract(const Duration(minutes: 5)),
+          durationSeconds: 3600,
+          conditionId: '1',
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x0408,
+          ),
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x7fe1,0x0009',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '現在の番組',
+        );
+        final chCur = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/2',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: 'Eテレ',
+          programTitle: '現在の番組',
+          serviceId: 0x0408,
+          networkId: 0x7FE1,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/cur',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+
+        // Stop succeeded, even if nasne immediately returns the stale schedule -> stays hidden.
+        final afterStop = reconcileLiveRecordingSchedules(
+          currentSchedules: [active],
+          currentStoppedIds: const {},
+          isStopAction: true,
+          actionSucceeded: true,
+          targetScheduleId: active.id,
+          updatedSchedules: [active],
+        );
+        expect(afterStop.stoppedIds, {'sched-stale-9'});
+        expect(afterStop.schedules, isEmpty);
+        expect(
+          findActiveSameChannelRecording(
+            afterStop.schedules,
+            currentChannel: chCur,
+            now: now,
+          ),
+          isNull,
+        );
+
+        // Even if background polling returns [active] again, schedulesExcludingIds hides it.
+        expect(
+          schedulesExcludingIds([active], afterStop.stoppedIds),
+          isEmpty,
+        );
+
+        // Starting a fresh schedule clears the id guard when it appears in updatedSchedules.
+        final afterRestart = reconcileLiveRecordingSchedules(
+          currentSchedules: afterStop.schedules,
+          currentStoppedIds: afterStop.stoppedIds,
+          isStopAction: false,
+          actionSucceeded: true,
+          updatedSchedules: [active],
+        );
+        expect(afterRestart.stoppedIds, isEmpty);
+        expect(afterRestart.schedules, [active]);
+
+        // Hybrid catch-up: buffer=0 -> always resets upstream via proxy.
+        expect(
+          canSeekWithinLiveCache(
+            useCache: false,
+            configuredBufferSeconds: 0,
+            totalPauseLagSeconds: 5,
+            cacheDurationSeconds: 10,
+            cacheTimeSeconds: 20,
+            timePosSeconds: 10,
+          ),
+          isFalse,
+        );
+        // Short pause within 60s buffer -> seamless cache seek!
+        expect(
+          canSeekWithinLiveCache(
+            useCache: true,
+            configuredBufferSeconds: 60,
+            totalPauseLagSeconds: 12,
+            cacheDurationSeconds: 15,
+            cacheTimeSeconds: 45,
+            timePosSeconds: 30,
+          ),
+          isTrue,
+        );
+        // Long pause exceeding configured buffer -> falls back to proxy live-edge reset.
+        expect(
+          canSeekWithinLiveCache(
+            useCache: true,
+            configuredBufferSeconds: 30,
+            totalPauseLagSeconds: 45,
+            cacheDurationSeconds: 15,
+            cacheTimeSeconds: 45,
+            timePosSeconds: 30,
+          ),
+          isFalse,
+        );
+      },
+    );
+
+    testWidgets(
+      'PlayerCornerNotice and shouldShowPlayerCornerNotice display custom notices even when recordingNotice is null',
+      (tester) async {
+        expect(
+          shouldShowPlayerCornerNotice(
+            cornerRecordingNotice: null,
+            customCornerNoticeText: 'フェイルオーバー通知',
+            osdOpen: false,
+            detailOpen: false,
+            interrupted: false,
+            error: null,
+            switchingChannel: false,
+          ),
+          isTrue,
+        );
+        expect(
+          shouldShowPlayerCornerNotice(
+            cornerRecordingNotice: LiveRecordingCornerNotice.recording,
+            customCornerNoticeText: null,
+            osdOpen: true,
+            detailOpen: false,
+            interrupted: false,
+            error: null,
+            switchingChannel: false,
+          ),
+          isFalse,
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  PlayerCornerNotice(
+                    customText: 'フェイルオーバー通知',
+                    recordingNotice: null,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        expect(find.text('フェイルオーバー通知'), findsOneWidget);
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  PlayerCornerNotice(
+                    customText: null,
+                    recordingNotice: LiveRecordingCornerNotice.ended,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        expect(find.text('録画終了'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'LiveChannelSwitchPreviewCard slides from left/right edges, displays programme info, and triggers switch on tap',
+      (tester) async {
+        await tester.binding.setSurfaceSize(const Size(1280, 720));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.55',
+          udn: 'uuid:p24',
+          friendlyName: 'nasne-p24',
+          macAddr: '00:11:22:33:44:55',
+        );
+        final prevStart = DateTime(2026, 11, 24, 11, 0);
+        final prevEnd = DateTime(2026, 11, 24, 12, 0);
+        final start = DateTime(2026, 11, 24, 12, 0);
+        final end = DateTime(2026, 11, 24, 13, 0);
+        final chPrev = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/1',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: 'NHK総合',
+          programTitle: '前の番組',
+          programStart: prevStart,
+          programEnd: prevEnd,
+          serviceId: 0x0400,
+          networkId: 0x7FE0,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/prev',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+        final chNext = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/3',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: '日本テレビ',
+          programTitle: '次のニュース番組',
+          programStart: start,
+          programEnd: end,
+          serviceId: 0x0410,
+          networkId: 0x7FE8,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/next',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+        final prevEntry = LiveChannelSwitchEntry(
+          channel: chPrev,
+          primaryReg: reg,
+          candidates: [OwnedLiveChannel(reg: reg, channel: chPrev)],
+        );
+        final nextEntry = LiveChannelSwitchEntry(
+          channel: chNext,
+          primaryReg: reg,
+          candidates: [OwnedLiveChannel(reg: reg, channel: chNext)],
+        );
+
+        final tapped = <String>[];
+        Widget buildHarness(
+          ChannelSwitchDirection? activeDir, {
+          Brightness brightness = Brightness.dark,
+        }) => MaterialApp(
+          theme: ThemeData(brightness: brightness),
+          home: Scaffold(
+            body: Stack(
+              children: [
+                LiveChannelSwitchPreviewCard(
+                  direction: ChannelSwitchDirection.previous,
+                  visible: activeDir == ChannelSwitchDirection.previous,
+                  entry: prevEntry,
+                  onTap: () => tapped.add(prevEntry.displayChannelName),
+                ),
+                LiveChannelSwitchPreviewCard(
+                  direction: ChannelSwitchDirection.next,
+                  visible: activeDir == ChannelSwitchDirection.next,
+                  entry: nextEntry,
+                  onTap: () => tapped.add(nextEntry.displayChannelName),
+                ),
+              ],
+            ),
+          ),
+        );
+
+        // Next card visible flush at right edge in Dark mode without border.
+        await tester.pumpWidget(buildHarness(ChannelSwitchDirection.next));
+        await tester.pump(const Duration(milliseconds: 250));
+        final nextFinder = find.byKey(
+          const ValueKey('live_channel_preview_next'),
+        );
+        final prevFinder = find.byKey(
+          const ValueKey('live_channel_preview_previous'),
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          1.0,
+        );
+        expect(
+          tester
+              .widget<AnimatedSlide>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedSlide),
+                ),
+              )
+              .offset,
+          Offset.zero,
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
+        final nextDarkDeco =
+            tester.widget<Container>(nextFinder).decoration! as BoxDecoration;
+        expect(nextDarkDeco.border, isNull);
+        expect(nextDarkDeco.color, const Color(0xD90D1117));
+        expect(
+          nextDarkDeco.borderRadius,
+          const BorderRadius.only(
+            topLeft: Radius.circular(14),
+            bottomLeft: Radius.circular(14),
+          ),
+        );
+        expect(find.text('次のチャンネル'), findsOneWidget);
+        expect(find.text('日本テレビ'), findsOneWidget);
+        expect(find.text('次のニュース番組'), findsOneWidget);
+        expect(find.text(nextEntry.broadcastTimeRange!), findsOneWidget);
+        expect(tester.getRect(nextFinder).right, closeTo(1280.0, 0.01));
+
+        // Tapping next card triggers switch.
+        await tester.tap(nextFinder);
+        expect(tapped, ['日本テレビ']);
+
+        // Switch to Previous card visible flush at left edge in Light mode.
+        await tester.pumpWidget(
+          buildHarness(
+            ChannelSwitchDirection.previous,
+            brightness: Brightness.light,
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          1.0,
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
+        final prevLightDeco =
+            tester.widget<Container>(prevFinder).decoration! as BoxDecoration;
+        expect(prevLightDeco.border, isNull);
+        expect(prevLightDeco.color, const Color(0xF5FFFFFF));
+        expect(
+          prevLightDeco.borderRadius,
+          const BorderRadius.only(
+            topRight: Radius.circular(14),
+            bottomRight: Radius.circular(14),
+          ),
+        );
+        expect(tester.getRect(prevFinder).left, closeTo(0.0, 0.01));
+
+        // Dismiss both cards.
+        await tester.pumpWidget(buildHarness(null));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
+      },
+    );
+  });
+
+  group('Phase 25: borderless channel card, OSD quality switch, and chase catch-up', () {
+    test(
+      'liveCatchUpSpeedForLagSeconds, osdLiveStatusBadgeSpec, and osdQualityButtonLabel follow Phase 25 policy',
+      () {
+        expect(liveCatchUpSpeedForLagSeconds(0.0), 1.0);
+        expect(liveCatchUpSpeedForLagSeconds(1.5), 1.0);
+        expect(liveCatchUpSpeedForLagSeconds(2.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(15.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(30.0), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(30.1), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(60.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(120.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(180.0), 2.0);
+
+        // Downward hysteresis avoids speed chattering near thresholds.
+        expect(liveCatchUpSpeedForLagSeconds(118.0, currentRate: 2.0), 2.0);
+        expect(liveCatchUpSpeedForLagSeconds(114.0, currentRate: 2.0), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(28.0, currentRate: 1.5), 1.5);
+        expect(liveCatchUpSpeedForLagSeconds(24.0, currentRate: 1.5), 1.25);
+        expect(liveCatchUpSpeedForLagSeconds(1.4, currentRate: 1.25), 1.0);
+
+        final realtimeBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: false,
+          liveCatchUpRate: 1.0,
+        );
+        expect(realtimeBadge.label, 'LIVE');
+        expect(realtimeBadge.color, Colors.redAccent);
+
+        final delayedPausedBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.5,
+          isPaused: true,
+        );
+        expect(delayedPausedBadge.label, '一時停止');
+        expect(delayedPausedBadge.color, const Color(0xFFEF6C00));
+
+        final delayedNormalBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.0,
+        );
+        expect(delayedNormalBadge.label, '追いかけ再生');
+        expect(delayedNormalBadge.color, const Color(0xFFEF6C00));
+
+        final delayedFastBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 1.5,
+        );
+        expect(delayedFastBadge.label, '追いかけ再生 1.5倍');
+        expect(delayedFastBadge.color, const Color(0xFFEF6C00));
+
+        final delayedDoubleBadge = osdLiveStatusBadgeSpec(
+          liveDelayedByPause: true,
+          liveCatchUpRate: 2.0,
+        );
+        expect(delayedDoubleBadge.label, '追いかけ再生 2倍');
+        expect(delayedDoubleBadge.color, const Color(0xFFEF6C00));
+
+        expect(osdQualityButtonLabel(useMobile: false), '画質: 元画質');
+        expect(osdQualityButtonLabel(useMobile: true), '画質: モバイル');
+      },
+    );
+  });
+
+  group(
+    'Phase 26: TV-sized subtitle customization, ARIB symbols/ASS parser, and clear timing',
+    () {
+      test(
+        'SubtitleSettings defaults, JSON persistence fallback, size, and edge helpers',
+        () {
+          const defaults = SubtitleSettings.defaults;
+          expect(defaults.size, SubtitleSizePreset.medium);
+          expect(defaults.font, SubtitleFontFamily.kosugiMaru);
+          expect(defaults.edge, SubtitleEdgeStyle.thin);
+          expect(defaults.backgroundColor, SubtitleBackgroundColorPreset.black);
+          expect(defaults.backgroundOpacityPercent, 65);
+          expect(
+            defaults.effectiveBackgroundColor.a,
+            closeTo(0.65, 0.01),
+          );
+
+          const transparent = SubtitleSettings(
+            backgroundColor: SubtitleBackgroundColorPreset.navy,
+            backgroundOpacityPercent: 0,
+          );
+          expect(transparent.effectiveBackgroundColor, Colors.transparent);
+
+          final custom = const SubtitleSettings(
+            size: SubtitleSizePreset.large,
+            font: SubtitleFontFamily.gothic,
+            edge: SubtitleEdgeStyle.thick,
+            backgroundColor: SubtitleBackgroundColorPreset.darkGray,
+            backgroundOpacityPercent: 85,
+          );
+          final roundtripped = SubtitleSettings.fromJsonString(
+            custom.toJsonString(),
+          );
+          expect(roundtripped, custom);
+
+          expect(SubtitleSettings.fromJsonString(null), defaults);
+          expect(SubtitleSettings.fromJsonString('not-json'), defaults);
+          expect(
+            SubtitleSettings.fromJsonString(
+              '{"size":"unknown","bgOpacity":33,"font":"lineSeedJp"}',
+            ),
+            const SubtitleSettings(font: SubtitleFontFamily.gothic),
+          );
+          expect(
+            SubtitleSettings.fromJsonString('{"font":"lineSeedJpBold"}').font,
+            SubtitleFontFamily.gothicBold,
+          );
+
+          // 540dp Fire TV viewport yields TV-sized glyphs across 3 presets.
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.small, 540),
+            closeTo(28.08, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
+            closeTo(34.56, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
+            closeTo(41.04, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(
+              SubtitleSizePreset.small,
+              200,
+              minSize: 16.0,
+            ),
+            16.0,
+          );
+
+          expect(resolveSubtitleEdgeWidth(SubtitleEdgeStyle.none, 36), 0.0);
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.dropShadow, 36),
+            0.0,
+          );
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thickShadow, 36),
+            0.0,
+          );
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thin, 36),
+            closeTo(3.96, 0.01),
+          );
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thick, 36),
+            closeTo(6.48, 0.01),
+          );
+          expect(
+            resolveSubtitleTextShadows(SubtitleEdgeStyle.none, 36),
+            isEmpty,
+          );
+          expect(
+            resolveSubtitleTextShadows(SubtitleEdgeStyle.dropShadow, 36),
+            hasLength(2),
+          );
+          expect(SubtitleEdgeStyle.thickShadow.label, '影（中央）');
+          final thickShadows = resolveSubtitleTextShadows(
+            SubtitleEdgeStyle.thickShadow,
+            36,
+          );
+          expect(thickShadows, hasLength(4));
+          for (final s in thickShadows) {
+            expect(s.offset, Offset.zero);
+          }
+          expect(thickShadows.last.blurRadius, greaterThanOrEqualTo(20.0));
+          expect(subtitleBackgroundOpacityLabel(0), 'なし (0%)');
+          expect(subtitleBackgroundOpacityLabel(65), '標準 (65%)');
+          expect(SubtitleFontFamily.gothic.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.gothic.fontWeight, FontWeight.w400);
+          expect(SubtitleFontFamily.gothicBold.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.gothicBold.fontWeight, FontWeight.w700);
+          expect(SubtitleFontFamily.kosugiMaru.fontFamily, 'KosugiMaru');
+          expect(SubtitleFontFamily.kosugiMaru.label, '丸ゴシック');
+          expect(
+            SubtitleFontFamily.values.every(
+              (f) =>
+                  f.fontFamily != 'GoogleSans' &&
+                  !f.fontFamilyFallback.contains('GoogleSans'),
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      test(
+        'normalizeAribSubtitleSymbols maps enclosed symbols/arrows and strips replacement chars',
+        () {
+          expect(
+            normalizeAribSubtitleSymbols(
+              '♪\u{1F211} ニュース \u{1F214} \u{1F14A} \u{1F240} 続けます\u27A1',
+            ),
+            '♪[字] ニュース [二] [HV] 〔本〕 続けます→',
+          );
+          expect(
+            normalizeAribSubtitleSymbols(
+              '\u2B05左 \u2B06上 \u2B07下 バックヤー\uFFFD\uFE0F\u200B',
+            ),
+            '←左 ↑上 ↓下 バックヤー',
+          );
+          expect(
+            normalizeAribSubtitleSymbols('外字\uE001と\uE123'),
+            '外字〓と〓',
+          );
+        },
+      );
+
+      test(
+        'parseAssPlayRes and parseAribAssSubtitle extract coordinates, colors, and strip vector drawings',
+        () {
+          final defaultRes = parseAssPlayRes(null);
+          expect(defaultRes.width, 960.0);
+          expect(defaultRes.height, 540.0);
+
+          final customRes = parseAssPlayRes(
+            '[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n',
+          );
+          expect(customRes.width, 1920.0);
+          expect(customRes.height, 1080.0);
+
+          final parsed = parseAribAssSubtitle(
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,'
+            '{\\an1\\pos(192,432)\\1c&H00FFFF&}こんにちは{\\c&HFFFFFF&}\\Nお元気ですか\n'
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,'
+            '{\\p1}m 0 0 l 100 0 100 20{\\p0}通常字幕',
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(parsed, hasLength(2));
+          expect(parsed[0].alignment, 1);
+          expect(parsed[0].normalizedX, closeTo(0.2, 0.001));
+          expect(parsed[0].normalizedY, closeTo(0.8, 0.001));
+          expect(parsed[0].spans, hasLength(2));
+          expect(parsed[0].spans[0].text, 'こんにちは');
+          expect(parsed[0].spans[0].color, const Color(0xFFFFFF00));
+          expect(parsed[0].spans[1].text, '\nお元気ですか');
+          expect(parsed[0].spans[1].color, Colors.white);
+          expect(parsed[1].plainText, '通常字幕');
+
+          // Same-Y segments placed separately along X merge left-to-right.
+          final merged = parseAribAssSubtitle(
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\pos(600,450)\\c&H00FF00&}後半\n'
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\pos(200,450)\\c&HFFFF00&}前半',
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(merged, hasLength(1));
+          expect(merged.single.spans.map((s) => s.text).toList(), ['前半', '後半']);
+          expect(merged.single.spans[0].color, const Color(0xFF00FFFF));
+          expect(merged.single.spans[1].color, const Color(0xFF00FF00));
+          expect(merged.single.normalizedX, closeTo(200 / 960.0, 0.001));
+        },
+      );
+
+      test(
+        'resolveRawSubtitleCues pairs matching ASS markup and falls back safely on mismatch or clear',
+        () {
+          final matched = resolveRawSubtitleCues(
+            rawAss: '{\\an7\\pos(120,70)\\c&H00FF00&}ニュース\u{1F211}',
+            plainLines: const ['ニュース\u{1F211}'],
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(matched, hasLength(1));
+          expect(matched.single.alignment, 7);
+          expect(matched.single.plainText, 'ニュース[字]');
+          expect(matched.single.spans.single.color, const Color(0xFF00FF00));
+
+          final mismatched = resolveRawSubtitleCues(
+            rawAss: '{\\pos(120,70)}古い字幕',
+            plainLines: const ['新しい字幕\u27A1'],
+          );
+          expect(mismatched, hasLength(1));
+          expect(mismatched.single.normalizedY, isNull);
+          expect(mismatched.single.plainText, '新しい字幕→');
+
+          expect(
+            resolveRawSubtitleCues(
+              rawAss: '{\\pos(120,70)}残骸',
+              plainLines: const [],
+            ),
+            isEmpty,
+          );
+        },
+      );
+
+      test(
+        'SubtitleActiveWindowTracker prevents 7-line lingering, handles bursts/prefix/upgrade, and clears on playback clock',
+        () {
+          SubtitleCue cue(String text, {double? y}) => SubtitleCue(
+            spans: [SubtitleStyledSpan(text: text)],
+            normalizedY: y,
+          );
+
+          final tracker = SubtitleActiveWindowTracker();
+
+          // Initial attach with >2 accumulated lines keeps only last 2.
+          final initial = tracker.update(
+            [cue('行1'), cue('行2'), cue('行3'), cue('行4')],
+            const Duration(seconds: 1),
+          );
+          expect(initial.map((c) => c.plainText).toList(), ['行3', '行4']);
+
+          // Subsequent 7-line mpv accumulation (>900ms spacing) shows only newest line.
+          tracker.reset();
+          var lines = <SubtitleCue>[];
+          for (var i = 1; i <= 7; i++) {
+            lines = [...lines, cue('発話$i')];
+            final shown = tracker.update(
+              lines,
+              Duration(seconds: i * 2),
+            );
+            expect(shown.map((c) => c.plainText).toList(), ['発話$i']);
+          }
+
+          // Two-line burst within <=900ms merges both lines.
+          tracker.reset();
+          expect(
+            tracker
+                .update([cue('1行目')], const Duration(milliseconds: 1000))
+                .map((c) => c.plainText)
+                .toList(),
+            ['1行目'],
+          );
+          expect(
+            tracker
+                .update(
+                  [cue('1行目'), cue('2行目')],
+                  const Duration(milliseconds: 1400),
+                )
+                .map((c) => c.plainText)
+                .toList(),
+            ['1行目', '2行目'],
+          );
+
+          // Progressive prefix line and plain->ASS upgrade within <=900ms do not duplicate.
+          tracker.reset();
+          tracker.update([cue('バック')], const Duration(milliseconds: 1000));
+          final expanded = tracker.update(
+            [cue('バックヤード')],
+            const Duration(milliseconds: 1300),
+          );
+          expect(expanded.map((c) => c.plainText).toList(), ['バックヤード']);
+
+          tracker.reset();
+          tracker.update([cue('おはよう')], const Duration(milliseconds: 1000));
+          final upgraded = tracker.update(
+            [cue('おはよう', y: 0.8)],
+            const Duration(milliseconds: 1200),
+          );
+          expect(upgraded, hasLength(1));
+          expect(upgraded.single.normalizedY, 0.8);
+
+          // Frozen playback clock (paused) preserves subtitle; advancing past expiry clears it.
+          final pausedCues = [cue('一時停止中の字幕')];
+          final clearAt = computeSubtitleAutoClearDuration(pausedCues);
+          expect(clearAt, const Duration(milliseconds: 5500));
+          expect(
+            tracker.update(pausedCues, const Duration(seconds: 20)),
+            hasLength(1),
+          );
+          for (var i = 0; i < 5; i++) {
+            expect(
+              tracker.update(pausedCues, const Duration(seconds: 20)),
+              hasLength(1),
+            );
+          }
+          expect(
+            tracker.update(
+              pausedCues,
+              const Duration(seconds: 20) + clearAt,
+            ),
+            isEmpty,
+          );
+
+          // Empty packet clears immediately.
+          tracker.update([cue('即消去テスト')], const Duration(seconds: 30));
+          expect(tracker.update(const [], const Duration(seconds: 31)), isEmpty);
+        },
+      );
+
+      test(
+        'SubtitleSettingsNotifier restores stored preferences, persists updates, and resets defaults',
+        () async {
+          final kv = InMemoryKeyValueStore();
+          await kv.write(
+            'firetv_subtitle_settings',
+            const SubtitleSettings(
+              size: SubtitleSizePreset.large,
+              font: SubtitleFontFamily.gothicBold,
+              edge: SubtitleEdgeStyle.none,
+              backgroundColor: SubtitleBackgroundColorPreset.navy,
+              backgroundOpacityPercent: 85,
+            ).toJsonString(),
+          );
+
+          final container = ProviderContainer(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          );
+          addTearDown(container.dispose);
+
+          // Trigger provider build, then let microtask restore stored settings.
+          container.read(subtitleSettingsProvider);
+          await Future<void>.delayed(Duration.zero);
+          final restored = container.read(subtitleSettingsProvider);
+          expect(restored.size, SubtitleSizePreset.large);
+          expect(restored.font, SubtitleFontFamily.gothicBold);
+          expect(restored.edge, SubtitleEdgeStyle.none);
+          expect(restored.backgroundColor, SubtitleBackgroundColorPreset.navy);
+          expect(restored.backgroundOpacityPercent, 85);
+
+          await container
+              .read(subtitleSettingsProvider.notifier)
+              .setFont(SubtitleFontFamily.gothic);
+          final savedRaw = await kv.read('firetv_subtitle_settings');
+          expect(
+            SubtitleSettings.fromJsonString(savedRaw).font,
+            SubtitleFontFamily.gothic,
+          );
+
+          await container.read(subtitleSettingsProvider.notifier).resetDefaults();
+          expect(
+            container.read(subtitleSettingsProvider),
+            SubtitleSettings.defaults,
+          );
+        },
+      );
+
+      testWidgets(
+        'SettingsScreen opens SubtitleSettingsScreen and SubtitleSettingsScreen edits & resets live settings',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final kv = InMemoryKeyValueStore();
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(kv),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const []),
+                ),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+              ],
+              child: const MaterialApp(home: SettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.scrollUntilVisible(
+            find.text('字幕表示設定'),
+            200,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('中（標準）・丸ゴシック'),
+            findsOneWidget,
+          );
+
+          await tester.tap(find.text('字幕表示設定'));
+          await tester.pumpAndSettle();
+          expect(find.byType(SubtitleSettingsScreen), findsOneWidget);
+          expect(find.text('プレビュー (16:9)'), findsOneWidget);
+          expect(
+            tester.widget<AspectRatio>(find.byType(AspectRatio)).aspectRatio,
+            closeTo(16 / 9, 0.001),
+          );
+          expect(
+            find.textContaining('テレビ並みの字幕 →'),
+            findsAtLeastNWidgets(1),
+          );
+
+          await tester.tap(find.text('ゴシック体'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('丸ゴシック'));
+          await tester.pumpAndSettle();
+          await tester.scrollUntilVisible(
+            find.text('大'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('大'));
+          await tester.pumpAndSettle();
+          await tester.scrollUntilVisible(
+            find.text('縁取り（太め）'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('縁取り（太め）'));
+          await tester.pumpAndSettle();
+
+          await tester.scrollUntilVisible(
+            find.text('なし (0%)'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('濃紺'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('なし (0%)'));
+          await tester.pumpAndSettle();
+
+          final edited = SubtitleSettings.fromJsonString(
+            await kv.read('firetv_subtitle_settings'),
+          );
+          expect(edited.font, SubtitleFontFamily.kosugiMaru);
+          expect(edited.size, SubtitleSizePreset.large);
+          expect(edited.edge, SubtitleEdgeStyle.thick);
+          expect(edited.backgroundColor, SubtitleBackgroundColorPreset.navy);
+          expect(edited.backgroundOpacityPercent, 0);
+
+          await tester.tap(find.text('初期設定に戻す'));
+          await tester.pumpAndSettle();
+          final reset = SubtitleSettings.fromJsonString(
+            await kv.read('firetv_subtitle_settings'),
+          );
+          expect(reset, SubtitleSettings.defaults);
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay positions ARIB cues cleanly without ragged TextStyle backgroundColor steps',
+        (tester) async {
+          Future<void> pumpOverlay(SubtitleSettings settings, List<SubtitleCue> cues) async {
+            await tester.pumpWidget(
+              MaterialApp(
+                home: Scaffold(
+                  body: Center(
+                    child: SizedBox(
+                      width: 960,
+                      height: 540,
+                      child: PlayerSubtitleOverlay(
+                        settings: settings,
+                        cues: cues,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            await tester.pump();
+          }
+
+          const cues = [
+            SubtitleCue(
+              normalizedX: 0.14,
+              normalizedY: 0.14,
+              alignment: 7,
+              spans: [SubtitleStyledSpan(text: '左上字幕')],
+            ),
+            SubtitleCue(
+              normalizedX: 0.50,
+              normalizedY: 0.88,
+              alignment: 2,
+              spans: [SubtitleStyledSpan(text: '下中央字幕')],
+            ),
+            SubtitleCue(
+              normalizedX: 0.86,
+              normalizedY: 0.50,
+              alignment: 6,
+              spans: [SubtitleStyledSpan(text: '右中央字幕')],
+            ),
+          ];
+
+          // Default thin edge: 2 RichText layers per cue (stroke + fill), step-free StrutStyle.
+          await pumpOverlay(SubtitleSettings.defaults, cues);
+          final richWithEdge = tester.widgetList<RichText>(find.byType(RichText)).toList();
+          expect(richWithEdge, hasLength(6));
+          for (final rt in richWithEdge) {
+            expect(rt.strutStyle?.forceStrutHeight, isTrue);
+            rt.text.visitChildren((span) {
+              if (span is TextSpan) {
+                expect(span.style?.backgroundColor, isNull);
+              }
+              return true;
+            });
+          }
+
+          final topLeftRect = tester.getRect(find.text('左上字幕').first);
+          final bottomCenterRect = tester.getRect(find.text('下中央字幕').first);
+          final midRightRect = tester.getRect(find.text('右中央字幕').first);
+          expect(topLeftRect.top, lessThan(midRightRect.top));
+          expect(midRightRect.top, lessThan(bottomCenterRect.top));
+          expect(topLeftRect.left, lessThan(bottomCenterRect.center.dx));
+          expect(midRightRect.right, greaterThan(bottomCenterRect.center.dx));
+
+          // Zero edge & zero opacity omits stroke layer and background container.
+          await pumpOverlay(
+            const SubtitleSettings(
+              edge: SubtitleEdgeStyle.none,
+              backgroundOpacityPercent: 0,
+            ),
+            const [
+              SubtitleCue(
+                normalizedX: 0.50,
+                normalizedY: 0.88,
+                alignment: 2,
+                spans: [SubtitleStyledSpan(text: '縁なし透明')],
+              ),
+            ],
+          );
+          expect(tester.widgetList<RichText>(find.byType(RichText)), hasLength(1));
+          expect(find.byType(SubtitleUnifiedBackgroundBox), findsNothing);
+
+          // Multi-line subtitles use left alignment and one seamless unified polygon box.
+          await pumpOverlay(
+            const SubtitleSettings(
+              edge: SubtitleEdgeStyle.none,
+              backgroundOpacityPercent: 65,
+            ),
+            const [
+              SubtitleCue(
+                spans: [SubtitleStyledSpan(text: '長い1行目の字幕テストテキストです\n短い行')],
+              ),
+            ],
+          );
+          final richLines = tester.widgetList<RichText>(find.byType(RichText)).toList();
+          expect(richLines, hasLength(2));
+          for (final rt in richLines) {
+            expect(rt.textAlign, TextAlign.left);
+          }
+          final unifiedBoxFinder = find.byType(SubtitleUnifiedBackgroundBox);
+          expect(unifiedBoxFinder, findsOneWidget);
+          final unifiedRender = tester
+              .renderObject<RenderSubtitleUnifiedBackgroundBox>(unifiedBoxFinder);
+          expect(unifiedRender.lineRects, hasLength(2));
+          final longLineRect = unifiedRender.lineRects[0];
+          final shortLineRect = unifiedRender.lineRects[1];
+          expect(longLineRect.bottom, closeTo(shortLineRect.top, 0.01));
+          expect(longLineRect.width, greaterThan(shortLineRect.width + 80));
+          expect((longLineRect.left - shortLineRect.left).abs(), lessThan(2.0));
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 27: ARIB TS position/clear tap, decoder reset guard, persisted toggle, unified live buffering, and rail focus handoff',
+    () {
+      Uint8List wrapTsPacket({
+        required int pid,
+        required bool pusi,
+        required List<int> payload,
+        int packetStride = 192,
+      }) {
+        final pkt = Uint8List(packetStride);
+        final off = packetStride == 192 ? 4 : 0;
+        pkt[off] = 0x47;
+        pkt[off + 1] = ((pusi ? 0x40 : 0x00) | ((pid >> 8) & 0x1F));
+        pkt[off + 2] = pid & 0xFF;
+        pkt[off + 3] = 0x10;
+        final copyLen = payload.length < 184 ? payload.length : 184;
+        pkt.setRange(off + 4, off + 4 + copyLen, payload);
+        for (var i = off + 4 + copyLen; i < off + 188; i++) {
+          pkt[i] = 0xFF;
+        }
+        return pkt;
+      }
+
+      List<int> encodePts(double seconds) {
+        final pts = (seconds * 90000.0).round();
+        return [
+          0x21 | (((pts >> 30) & 0x07) << 1),
+          (pts >> 22) & 0xFF,
+          0x01 | (((pts >> 15) & 0x7F) << 1),
+          (pts >> 7) & 0xFF,
+          0x01 | ((pts & 0x7F) << 1),
+        ];
+      }
+
+      List<int> buildPat({required int pmtPid}) {
+        return [
+          0x00, // pointer_field
+          0x00, // table_id
+          0xB0, 0x0D, // section_length = 13
+          0x00, 0x01, 0xC1, 0x00, 0x00,
+          0x00, 0x01, 0xE0 | ((pmtPid >> 8) & 0x1F), pmtPid & 0xFF,
+          0x00, 0x00, 0x00, 0x00, // dummy CRC
+        ];
+      }
+
+      List<int> buildPmt({required int videoPid, required int captionPid}) {
+        return [
+          0x00, // pointer_field
+          0x02, // table_id
+          0xB0, 0x1E, // section_length = 30
+          0x00, 0x01, 0xC1, 0x00, 0x00,
+          0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF,
+          0xF0, 0x00, // program_info_length = 0
+          // Video stream (0x02)
+          0x02, 0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF, 0xF0, 0x00,
+          // ARIB caption stream (0x06) with 0x52(0x30) + 0xFD(0x0008)
+          0x06, 0xE0 | ((captionPid >> 8) & 0x1F), captionPid & 0xFF, 0xF0, 0x07,
+          0x52, 0x01, 0x30,
+          0xFD, 0x02, 0x00, 0x08,
+          0x00, 0x00, 0x00, 0x00, // dummy CRC
+        ];
+      }
+
+      List<int> buildAribCaptionPesPayload({
+        required double ptsSeconds,
+        required List<int> statementBody,
+        int dataGroupId = 1,
+      }) {
+        final unitLen = statementBody.length;
+        final dataGroupHeader = [
+          (dataGroupId & 0x3F) << 2, // data_group_id + version 0
+          0x00, // link
+          0x00, // last_link
+          ((6 + 5 + unitLen) >> 8) & 0xFF,
+          (6 + 5 + unitLen) & 0xFF,
+          0x00, // TMD = 0
+          (5 + unitLen) >> 16,
+          ((5 + unitLen) >> 8) & 0xFF,
+          (5 + unitLen) & 0xFF,
+          0x1F, // unit_separator
+          0x20, // statement body
+          (unitLen >> 16) & 0xFF,
+          (unitLen >> 8) & 0xFF,
+          unitLen & 0xFF,
+          ...statementBody,
+        ];
+        final aribPes = [0x80, 0xFF, 0x00, ...dataGroupHeader];
+        final pesPacketLen = 8 + aribPes.length;
+        return [
+          0x00, 0x00, 0x01, 0xBD,
+          (pesPacketLen >> 8) & 0xFF,
+          pesPacketLen & 0xFF,
+          0x80, 0x80, 0x05,
+          ...encodePts(ptsSeconds),
+          ...aribPes,
+        ];
+      }
+
+      test(
+        'AribTsCaptionTap extracts top/bottom station coordinates and clear timing from TTS and TS streams',
+        () {
+          List<int> asciiDigits(String s) => s.codeUnits;
+
+          final bodyWithTwoPositionsAndTimedClear = <int>[
+            0x0C, // CS
+            // SWF 7 (960x540)
+            0x9B, ...asciiDigits('7'), 0x20, 0x53,
+            // ACPS(170;90) -> top telop-avoidance line
+            0x9B, ...asciiDigits('170;90'), 0x61,
+            0x30, 0x21, 0x30, 0x22, // 2 kanji
+            // ACPS(220;460) -> bottom line
+            0x9B, ...asciiDigits('220;460'), 0x61,
+            0x30, 0x23, 0x30, 0x24, 0x30, 0x25, // 3 kanji
+            // TIME wait 4.0s (0x40 + 40 = 0x68) then CS clear
+            0x9D, 0x20, 0x68, 0x0C,
+          ];
+
+          for (final stride in [192, 188]) {
+            final streamBytes = BytesBuilder()
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0000,
+                  pusi: true,
+                  payload: buildPat(pmtPid: 0x0100),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0100,
+                  pusi: true,
+                  payload: buildPmt(videoPid: 0x0101, captionPid: 0x0130),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0101,
+                  pusi: true,
+                  payload: [
+                    0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05,
+                    ...encodePts(100.0),
+                  ],
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 105.0,
+                    statementBody: bodyWithTwoPositionsAndTimedClear,
+                  ),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 110.0,
+                    statementBody: const [0x0C], // Standalone clear
+                  ),
+                  packetStride: stride,
+                ),
+              );
+
+            final raw = streamBytes.toBytes();
+            final tap = AribTsCaptionTap();
+            // Feed in arbitrary misaligned chunk splits across packet boundaries.
+            tap.feed(Uint8List.sublistView(raw, 0, 111));
+            tap.feed(Uint8List.sublistView(raw, 111, 417));
+            tap.feed(Uint8List.sublistView(raw, 417));
+
+            expect(tap.captionPid, 0x0130);
+            expect(tap.firstStreamPtsSeconds, closeTo(100.0, 0.001));
+            expect(tap.events, hasLength(2));
+
+            final cueEv = tap.events[0];
+            expect(cueEv.isClearOnly, isFalse);
+            expect(cueEv.ptsSeconds, closeTo(105.0, 0.001));
+            expect(cueEv.clearAfterSeconds, closeTo(4.0, 0.01));
+            expect(cueEv.lines, hasLength(2));
+            expect(cueEv.lines[0].normalizedX, closeTo(170 / 960.0, 0.01));
+            expect(cueEv.lines[0].normalizedY, closeTo((90 - 18) / 540.0, 0.01));
+            expect(cueEv.lines[1].normalizedX, closeTo(220 / 960.0, 0.01));
+            expect(cueEv.lines[1].normalizedY, closeTo((460 - 18) / 540.0, 0.01));
+
+            final clearEv = tap.events[1];
+            expect(clearEv.isClearOnly, isTrue);
+            expect(clearEv.lines, isEmpty);
+            expect(clearEv.ptsSeconds, closeTo(110.0, 0.001));
+
+            tap.resetFraming();
+            expect(tap.events, hasLength(2));
+            tap.resetAll();
+            expect(tap.events, isEmpty);
+            expect(tap.captionPid, isNull);
+
+            // Verify CS + SDP + SS3 default macro (0x60) avoids phantom top-left glyphs
+            // and secondary language data_group_id=2 (0x08) is ignored.
+            final hardenedStream = BytesBuilder()
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0000,
+                  pusi: true,
+                  payload: buildPat(pmtPid: 0x0100),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0100,
+                  pusi: true,
+                  payload: buildPmt(videoPid: 0x0101, captionPid: 0x0130),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 120.0,
+                    dataGroupId: 2,
+                    statementBody: const [0x0C, 0x30, 0x21, 0x30, 0x22],
+                  ),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 121.0,
+                    statementBody: [
+                      0x0C, // CS
+                      // SDP(170;390)
+                      0x9B, ...asciiDigits('170;390'), 0x5F,
+                      0x1D, 0x60, // SS3 + ARIB default macro 0x60 (zero-width)
+                      0x30, 0x21, 0x30, 0x22, // 2 kanji
+                    ],
+                  ),
+                  packetStride: stride,
+                ),
+              );
+            tap.feed(hardenedStream.toBytes());
+            expect(tap.events, hasLength(1));
+            expect(tap.events.single.ptsSeconds, closeTo(121.0, 0.001));
+            expect(tap.events.single.lines, hasLength(1));
+            expect(
+              tap.events.single.lines.single.normalizedX,
+              closeTo(170 / 960.0, 0.01),
+            );
+            expect(
+              tap.events.single.lines.single.normalizedY,
+              closeTo((390 + 60 - 1 - 18) / 540.0, 0.01),
+            );
+          }
+        },
+      );
+
+      test(
+        'ARIB PTS matching, wraparound clear detection, decoder leak reset, and truncated ASS cleanup',
+        () {
+          const events = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 105.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.13,
+                  endNormalizedX: 0.50,
+                  charCount: 8,
+                ),
+                AribCaptionLinePlacement(
+                  normalizedX: 0.22,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 10,
+                ),
+              ],
+              isClearOnly: false,
+              clearAfterSeconds: 4.5,
+            ),
+            AribCaptionLayoutEvent(
+              ptsSeconds: 110.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [],
+              isClearOnly: true,
+            ),
+          ];
+
+          final offset = resolveAribPtsOffset(
+            events: events,
+            mpvSubStartSeconds: 5.05,
+            firstStreamPtsSeconds: 100.0,
+          );
+          expect(offset, closeTo(-100.0, 0.01));
+
+          final matched = findMatchingAribLayoutEvent(
+            events: events,
+            mpvSubStartSeconds: 5.05,
+            ptsOffset: offset!,
+          );
+          expect(matched, isNotNull);
+
+          final applied = applyAribLayoutToCues(
+            cues: const [
+              SubtitleCue(spans: [SubtitleStyledSpan(text: '上行\n下行')]),
+            ],
+            layout: matched!,
+          );
+          expect(applied, hasLength(2));
+          expect(applied[0].plainText, '上行');
+          expect(applied[0].normalizedY, closeTo(0.13, 0.01));
+          expect(applied[1].plainText, '下行');
+          expect(applied[1].normalizedY, closeTo(0.85, 0.01));
+
+          expect(
+            hasAribClearSinceCaption(
+              events: events,
+              activeCaptionMpvPts: 5.05,
+              currentPlaybackMpvPts: 8.5,
+              ptsOffset: offset,
+              activeClearAfterSeconds: 4.5,
+            ),
+            isFalse,
+          );
+          expect(
+            hasAribClearSinceCaption(
+              events: events,
+              activeCaptionMpvPts: 5.05,
+              currentPlaybackMpvPts: 10.1,
+              ptsOffset: offset,
+              activeClearAfterSeconds: null,
+            ),
+            isTrue,
+          );
+          // 90kHz 33-bit wraparound delta stays small across wrap boundary.
+          expect(
+            wrapAwareAribPtsDelta(1.0, AribTsCaptionTap.ptsWrapSeconds - 2.0),
+            closeTo(3.0, 0.001),
+          );
+
+          // Decoder reset guard catches aribb24 i_control_time accumulation & 500-byte cliff.
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 2147483.0, // mpv UNKNOWN_DURATION
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 28.0, // leaked i_control_time alone no longer forces mid-cache flush
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 340,
+              assUtf8Bytes: 390,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 440,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 26.0, // silent gap no longer flushes seekable cache
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+
+          // Truncated ASS override tag tail from mpv's 500-byte cut is stripped cleanly.
+          final truncatedAss = parseAribAssSubtitle(
+            '{\\1c&H00ffff&}テスト文字{\\1c&H00ff',
+          );
+          expect(truncatedAss, hasLength(1));
+          expect(truncatedAss.single.plainText, 'テスト文字');
+          expect(truncatedAss.single.spans.single.color, const Color(0xFFFFFF00));
+        },
+      );
+
+      test(
+        'SubtitlesEnabledNotifier persists and restores firetv_subtitles_enabled',
+        () async {
+          final kv = InMemoryKeyValueStore();
+          await kv.write('firetv_subtitles_enabled', 'true');
+
+          final container = ProviderContainer(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          );
+          addTearDown(container.dispose);
+
+          container.read(subtitlesEnabledProvider);
+          await Future<void>.delayed(Duration.zero);
+          expect(container.read(subtitlesEnabledProvider), isTrue);
+
+          await container.read(subtitlesEnabledProvider.notifier).set(false);
+          expect(await kv.read('firetv_subtitles_enabled'), 'false');
+        },
+      );
+
+      testWidgets(
+        'SubtitleSettingsScreen edits persisted subtitle default toggle',
+        (tester) async {
+          final kv = InMemoryKeyValueStore();
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+              child: const MaterialApp(home: SubtitleSettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.text('字幕表示（再生時の既定）'));
+          await tester.pumpAndSettle();
+          expect(await kv.read('firetv_subtitles_enabled'), 'true');
+        },
+      );
+
+      test(
+        'Live loading overlay stays unified with seconds + progress bar and prevents early latch',
+        () {
+          // Do not latch pre-buffering prematurely while target seconds remain unfilled.
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 4.0,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 9.6,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: true,
+              positionAtFirstFrame: const Duration(seconds: 2),
+              currentPosition: const Duration(seconds: 3),
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 2.0,
+            ),
+            isTrue,
+          );
+
+          final targetSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: true,
+            targetSeconds: 10,
+            currentSeconds: 4,
+            bufferingPercentage: 40,
+            fallbackLabel: '読み込み中…',
+          );
+          expect(targetSpec.showProgressBar, isTrue);
+          expect(targetSpec.progress, closeTo(0.4, 0.01));
+          expect(targetSpec.caption, 'バッファ蓄積中… 4秒 / 10秒');
+
+          final zeroTargetLiveSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: false,
+            targetSeconds: 0,
+            currentSeconds: 2,
+            bufferingPercentage: 55,
+            fallbackLabel: 'バッファリング中…',
+          );
+          expect(zeroTargetLiveSpec.showProgressBar, isFalse);
+          expect(zeroTargetLiveSpec.progress, isNull);
+          expect(zeroTargetLiveSpec.caption, '読み込み中…');
+
+          final rebufferingLiveSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: false,
+            targetSeconds: 10,
+            currentSeconds: 3,
+            bufferingPercentage: 55,
+            fallbackLabel: 'バッファリング中…',
+          );
+          expect(rebufferingLiveSpec.showProgressBar, isTrue);
+          expect(rebufferingLiveSpec.progress, closeTo(0.3, 0.01));
+          expect(rebufferingLiveSpec.caption, 'バッファ蓄積中… 3秒 / 10秒');
+        },
+      );
+
+      testWidgets(
+        'AppShell NavigationRail selection automatically moves focus into right pane while keeping startup rail focus',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.10',
+            udn: 'uuid:rail-handoff',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                fireTvHelperProvider.overrideWithValue(
+                  _FakeFireTvHelper(reachable: true),
+                ),
+                credentialSummaryProvider.overrideWith((ref) async => null),
+                deviceInfoProvider.overrideWith(
+                  (ref, r) async =>
+                      const DeviceInfo(name: 'nasne-1', softwareVersion: '0260'),
+                ),
+                hddDetailsProvider.overrideWith(
+                  (ref, r) async => const <HddDetail>[],
+                ),
+                liveStatusProvider.overrideWith(
+                  (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+                ),
+                recNgProvider.overrideWith((ref, r) async => const <RecNgItem>[]),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+                titlesProvider(reg).overrideWith(
+                  () => _FixedTitlesNotifier(reg, const []),
+                ),
+                titleCountsProvider.overrideWith(
+                  (ref, r) async => const TitleCounts(0, 1000),
+                ),
+                liveChannelsProvider.overrideWith(
+                  (ref, r) async => const <LiveBand>[],
+                ),
+                channelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                bsChannelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                schedulesProvider.overrideWith(
+                  (ref, r) async => const <RecordSchedule>[],
+                ),
+              ],
+              child: const MaterialApp(home: AppShell()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          bool primaryInRail() {
+            final ctx = FocusManager.instance.primaryFocus?.context;
+            if (ctx == null) return false;
+            return find
+                .ancestor(
+                  of: find.byWidget(ctx.widget),
+                  matching: find.byType(NavigationRail),
+                )
+                .evaluate()
+                .isNotEmpty;
+          }
+
+          // Initial app launch stays on NavigationRail 'ホーム'.
+          expect(primaryInRail(), isTrue);
+
+          // Selecting '設定' in NavigationRail switches tab and hands focus to right pane.
+          await tester.tap(
+            find.descendant(
+              of: find.byType(NavigationRail),
+              matching: find.text('設定'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isFalse);
+          expect(
+            find.ancestor(
+              of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+              matching: find.byType(SettingsScreen),
+            ),
+            findsOneWidget,
+          );
+
+          // Back returns to NavigationRail on '設定'.
+          await tester.binding.handlePopRoute();
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isTrue);
+
+          // Selecting 'ホーム' in NavigationRail enters Home right pane too.
+          await tester.tap(
+            find.descendant(
+              of: find.byType(NavigationRail),
+              matching: find.text('ホーム'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isFalse);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 28: ARIB color preservation, speaker separation, shadows, 16:9 proportional preview, and TV-style Live OSD',
+    () {
+      test(
+        'SubtitleActiveWindowTracker upgrades white plain cues to colored ASS in place & findMatchingAribLayoutEvent avoids buffered future events',
+        () {
+          final tracker = SubtitleActiveWindowTracker();
+          final initialWhite = tracker.update(
+            const [
+              SubtitleCue(
+                spans: [SubtitleStyledSpan(text: 'ぜったいにわからない。')],
+              ),
+            ],
+            Duration.zero,
+            mpvSubStartSeconds: 10.0,
+          );
+          expect(initialWhite, hasLength(1));
+          expect(initialWhite.single.spans.single.color, Colors.white);
+
+          // Colored ASS arrives shortly after for identical key/text.
+          final upgradedColored = tracker.update(
+            const [
+              SubtitleCue(
+                spans: [
+                  SubtitleStyledSpan(
+                    text: 'ぜったいにわからない。',
+                    color: Color(0xFFFFFF00),
+                  ),
+                ],
+              ),
+            ],
+            const Duration(milliseconds: 50),
+            mpvSubStartSeconds: 10.0,
+          );
+          expect(upgradedColored, hasLength(1));
+          expect(
+            upgradedColored.single.spans.single.color,
+            const Color(0xFFFFFF00),
+          );
+
+          expect(
+            subtitleTextMatchesAss(
+              rawAss: r'{\1c&H80ffff&}あっ\Nそうだ。',
+              plainLines: const ['あっそうだ。'],
+            ),
+            isTrue,
+          );
+          expect(
+            subtitleTextMatchesAss(
+              rawAss: r'{\1c&H80ffff&}全然別の字幕',
+              plainLines: const ['ぜったいにわからない。'],
+            ),
+            isFalse,
+          );
+
+          final atomicColored = resolveRawSubtitleCues(
+            rawAss: r'{\1c&H00ffff&}話者A「そろそろおやつ」',
+            plainLines: const ['話者A そろそろおやつ'],
+            atomicSnapshot: true,
+          );
+          expect(atomicColored, hasLength(1));
+          expect(atomicColored.single.spans.single.color, const Color(0xFFFFFF00));
+
+          const tsEvents = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 100.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.14,
+                  normalizedY: 0.14,
+                  endNormalizedX: 0.50,
+                  charCount: 6,
+                ),
+              ],
+              isClearOnly: false,
+            ),
+            AribCaptionLayoutEvent(
+              ptsSeconds: 101.1,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.50,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.85,
+                  charCount: 8,
+                ),
+              ],
+              isClearOnly: false,
+            ),
+          ];
+          final picked = findMatchingAribLayoutEvent(
+            events: tsEvents,
+            mpvSubStartSeconds: 0.15,
+            ptsOffset: -100.0,
+          );
+          expect(picked, isNotNull);
+          expect(picked!.ptsSeconds, closeTo(100.0, 0.001));
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay separates horizontal speakers, applies dropShadow/thickShadow, and SubtitleSettingsScreen scales preview sizes in 16:9',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(edge: SubtitleEdgeStyle.dropShadow),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.12,
+                        normalizedY: 0.72,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: '左の話者',
+                            color: Color(0xFF80FFFF),
+                          ),
+                        ],
+                      ),
+                      SubtitleCue(
+                        normalizedX: 0.58,
+                        normalizedY: 0.75,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: '右の話者',
+                            color: Color(0xFFFFFF00),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final leftDx = tester.getTopLeft(find.text('左の話者')).dx;
+          final rightDx = tester.getTopLeft(find.text('右の話者')).dx;
+          expect(leftDx, lessThan(220));
+          expect(rightDx, greaterThan(480));
+
+          TextStyle? firstStyledRun(InlineSpan span) {
+            if (span is TextSpan) {
+              if (span.text != null &&
+                  span.text!.isNotEmpty &&
+                  span.style != null) {
+                return span.style;
+              }
+              for (final child in span.children ?? const <InlineSpan>[]) {
+                final found = firstStyledRun(child);
+                if (found != null) return found;
+              }
+            }
+            return null;
+          }
+
+          final dropRichText = tester.widget<RichText>(
+            find.descendant(
+              of: find.byType(PlayerSubtitleOverlay),
+              matching: find.byWidgetPredicate(
+                (w) => w is RichText && w.text.toPlainText().contains('左の話者'),
+              ),
+            ),
+          );
+          final dropStyle = firstStyledRun(dropRichText.text)!;
+          expect(dropStyle.shadows, hasLength(2));
+          expect(dropStyle.shadows!.first.offset.dx, greaterThan(1.0));
+          expect(dropStyle.shadows!.first.offset.dy, greaterThan(1.0));
+
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(
+                      edge: SubtitleEdgeStyle.thickShadow,
+                    ),
+                    cues: [
+                      SubtitleCue(
+                        spans: [SubtitleStyledSpan(text: 'ズレなし厚影')],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          final haloRichText = tester.widget<RichText>(
+            find.descendant(
+              of: find.byType(PlayerSubtitleOverlay),
+              matching: find.byType(RichText),
+            ),
+          );
+          final haloStyle = firstStyledRun(haloRichText.text)!;
+          expect(haloStyle.shadows, hasLength(4));
+          for (final s in haloStyle.shadows!) {
+            expect(s.offset, Offset.zero);
+          }
+
+          // Verify 16:9 preview strictly scales rendered font sizes across 小 / 中 / 大.
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+
+          final kv = InMemoryKeyValueStore();
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+              child: const MaterialApp(home: SubtitleSettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          double readPreviewSampleFontSize() {
+            final rt = tester.widgetList<RichText>(
+              find.descendant(
+                of: find.byType(PlayerSubtitleOverlay),
+                matching: find.byWidgetPredicate(
+                  (w) =>
+                      w is RichText &&
+                      w.text.toPlainText().contains('テレビ並みの字幕'),
+                ),
+              ),
+            ).last;
+            return firstStyledRun(rt.text)!.fontSize!;
+          }
+
+          final mediumSize = readPreviewSampleFontSize();
+          await tester.tap(find.text('小'));
+          await tester.pumpAndSettle();
+          final smallSize = readPreviewSampleFontSize();
+          await tester.tap(find.text('大'));
+          await tester.pumpAndSettle();
+          final largeSize = readPreviewSampleFontSize();
+
+          expect(smallSize, lessThan(mediumSize));
+          expect(mediumSize, lessThan(largeSize));
+        },
+      );
+
+      testWidgets(
+        'resolveLiveOsdProgramInfo, LiveOsdProgramSection, and PlayerOsdClockOverlay render TV-style live programme progress and clock',
+        (tester) async {
+          DateTime jst(int h, int m) => DateTime.utc(2026, 11, 24, h, m).subtract(
+            const Duration(hours: 9),
+          );
+
+          final channel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            serviceId: 0xde00,
+            channelName: 'ＮＨＫＥテレ',
+            programTitle: '古い番組情報',
+            programStart: jst(15, 30),
+            programEnd: jst(16, 0),
+          );
+          final events = [
+            EpgEvent(
+              eventId: 101,
+              start: jst(16, 0),
+              duration: const Duration(minutes: 30),
+              title: 'サイエンスZERO',
+            ),
+            EpgEvent(
+              eventId: 102,
+              start: jst(16, 30),
+              duration: const Duration(minutes: 30),
+              title: '次のテレビ番組',
+            ),
+          ];
+
+          final at1620 = resolveLiveOsdProgramInfo(
+            channel: channel,
+            guideEvents: events,
+            now: jst(16, 20),
+          );
+          expect(at1620.currentTitle, 'サイエンスZERO');
+          expect(at1620.currentTimeRange, '16:00–16:30');
+          expect(at1620.progress, closeTo(2 / 3, 0.01));
+          expect(at1620.remainingMinutes, 10);
+          expect(at1620.nextTitle, '次のテレビ番組');
+          expect(at1620.nextTimeRange, '16:30–17:00');
+
+          final rolled = resolveLiveOsdProgramInfo(
+            channel: channel,
+            guideEvents: events,
+            now: jst(16, 31),
+          );
+          expect(rolled.currentTitle, '次のテレビ番組');
+          expect(rolled.nextTitle, isNull);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: Stack(
+                    children: [
+                      PlayerOsdClockOverlay(now: jst(16, 20)),
+                      Positioned(
+                        left: 24,
+                        right: 24,
+                        bottom: 24,
+                        child: LiveOsdProgramSection(info: at1620),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(tester.takeException(), isNull);
+          expect(find.text('16:20'), findsOneWidget);
+          final clockWidget = tester.widget<Text>(find.text('16:20'));
+          expect(clockWidget.style?.fontFamily, 'GoogleSans');
+          expect(clockWidget.style?.fontWeight, FontWeight.w500);
+          expect(clockWidget.style?.fontSize, 44);
+          expect(clockWidget.style?.shadows, hasLength(3));
+          expect(clockWidget.style?.shadows?.last.blurRadius, greaterThanOrEqualTo(24.0));
+          expect(
+            find.ancestor(
+              of: find.text('16:20'),
+              matching: find.byWidgetPredicate(
+                (w) => w is Container && w.decoration != null,
+              ),
+            ),
+            findsNothing,
+          );
+          expect(find.text('サイエンスZERO'), findsOneWidget);
+          expect(find.text('16:00–16:30（残り 10分）'), findsOneWidget);
+          expect(find.text('次'), findsOneWidget);
+          expect(find.text('16:30–17:00'), findsOneWidget);
+          expect(find.text('次のテレビ番組'), findsOneWidget);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 29: Soft-wrapped per-line pills, broadcast centering, blink suppression, and Google Sans + LINESeedJP UI font',
+    () {
+      test(
+        'subtitleCaptionSignature & shouldSuppressClearedSubtitle block lingering cleared captions without blocking new captions',
+        () {
+          final sig1 = subtitleCaptionSignature(
+            subStartSeconds: 120.5,
+            plainCompact: 'またらいしゅう！',
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: sig1,
+              currentSignature: subtitleCaptionSignature(
+                subStartSeconds: 120.501,
+                plainCompact: 'またらいしゅう！',
+              ),
+            ),
+            isTrue,
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: sig1,
+              currentSignature: subtitleCaptionSignature(
+                subStartSeconds: 123.0,
+                plainCompact: 'またらいしゅう！',
+              ),
+            ),
+            isFalse,
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: null,
+              currentSignature: sig1,
+            ),
+            isFalse,
+          );
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay splits soft-wrapped lines into snug pills and centers scaled cues inside broadcast bounds',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          // 1) Soft-wrapped long caption (no explicit \n) yields 2 pills where
+          //    line 2 ends tightly around its shorter text.
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(size: SubtitleSizePreset.medium),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.45,
+                        endNormalizedX: 0.96,
+                        normalizedY: 0.78,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: 'あのいぬになってまたあそびにきたい！',
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final unifiedFinder = find.descendant(
+            of: find.byType(PlayerSubtitleOverlay),
+            matching: find.byType(SubtitleUnifiedBackgroundBox),
+          );
+          expect(unifiedFinder, findsOneWidget);
+          final renderBox = tester
+              .renderObject<RenderSubtitleUnifiedBackgroundBox>(unifiedFinder);
+          expect(renderBox.lineRects, hasLength(2));
+          final line1Rect = renderBox.lineRects[0];
+          final line2Rect = renderBox.lineRects[1];
+          expect(line1Rect.bottom, closeTo(line2Rect.top, 0.01));
+          expect(line2Rect.width, lessThan(line1Rect.width * 0.65));
+
+          // 2) Short cue inside centered broadcast box (0.18..0.82) at small
+          //    size centers cleanly around 480px rather than hugging x=172px.
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(size: SubtitleSizePreset.small),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.18,
+                        endNormalizedX: 0.82,
+                        normalizedY: 0.82,
+                        spans: [SubtitleStyledSpan(text: '短い中央')],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final centeredBox = find.descendant(
+            of: find.byType(PlayerSubtitleOverlay),
+            matching: find.byType(SubtitleUnifiedBackgroundBox),
+          );
+          expect(centeredBox, findsOneWidget);
+          final centerDx = tester.getCenter(centeredBox).dx;
+          expect((centerDx - 480.0).abs(), lessThan(40.0));
+        },
+      );
+
+      testWidgets(
+        'TmhbApp uses GoogleSans with LINESeedJP fallback for app-wide UI typography',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.20',
+            udn: 'uuid:theme-font',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                fireTvHelperProvider.overrideWithValue(
+                  _FakeFireTvHelper(reachable: true),
+                ),
+                credentialSummaryProvider.overrideWith((ref) async => null),
+                deviceInfoProvider.overrideWith(
+                  (ref, r) async =>
+                      const DeviceInfo(name: 'nasne-1', softwareVersion: '0260'),
+                ),
+                hddDetailsProvider.overrideWith(
+                  (ref, r) async => const <HddDetail>[],
+                ),
+                liveStatusProvider.overrideWith(
+                  (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+                ),
+                recNgProvider.overrideWith((ref, r) async => const <RecNgItem>[]),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+                titlesProvider(reg).overrideWith(
+                  () => _FixedTitlesNotifier(reg, const []),
+                ),
+                titleCountsProvider.overrideWith(
+                  (ref, r) async => const TitleCounts(0, 1000),
+                ),
+                liveChannelsProvider.overrideWith(
+                  (ref, r) async => const <LiveBand>[],
+                ),
+                channelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                bsChannelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                schedulesProvider.overrideWith(
+                  (ref, r) async => const <RecordSchedule>[],
+                ),
+              ],
+              child: const TmhbApp(),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final shellCtx = tester.element(find.byType(AppShell));
+          final bodyStyle = Theme.of(shellCtx).textTheme.bodyMedium!;
+          expect(bodyStyle.fontFamily, 'GoogleSans');
+          expect(bodyStyle.fontFamilyFallback, contains('LINESeedJP'));
+          expect(tester.takeException(), isNull);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 30: unified polygon subtitle box, lighter wide shadows, OSD fade/throttle, and monochrome channel-card triangles',
+    () {
+      test(
+        'buildUnifiedSubtitlePolygonPath merges seams cleanly and hugs shorter or wider lines',
+        () {
+          final emptyPath = buildUnifiedSubtitlePolygonPath(const []);
+          expect(emptyPath.getBounds(), Rect.zero);
+
+          // Step inward (line 2 shorter than line 1): empty trailing area of
+          // line 2 is not filled, while contiguous seam is filled cleanly.
+          final inward = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 320, 48),
+            Rect.fromLTWH(0, 48, 160, 44),
+          ], radius: 5.0);
+          expect(inward.contains(const Offset(280, 20)), isTrue);
+          expect(inward.contains(const Offset(120, 48)), isTrue);
+          expect(inward.contains(const Offset(120, 72)), isTrue);
+          expect(inward.contains(const Offset(280, 72)), isFalse);
+
+          // Step outward (line 2 wider than line 1): top-right stays unfilled.
+          final outward = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 150, 48),
+            Rect.fromLTWH(0, 48, 320, 44),
+          ], radius: 5.0);
+          expect(outward.contains(const Offset(280, 20)), isFalse);
+          expect(outward.contains(const Offset(280, 72)), isTrue);
+
+          // Micro difference (< 2 * radius = 10px) snaps smoothly to outer width.
+          final microSnap = buildUnifiedSubtitlePolygonPath(const [
+            Rect.fromLTWH(0, 0, 200, 48),
+            Rect.fromLTWH(0, 48, 195, 44),
+          ], radius: 5.0);
+          expect(microSnap.contains(const Offset(197, 24)), isTrue);
+          expect(microSnap.contains(const Offset(197, 70)), isTrue);
+        },
+      );
+
+      test(
+        'resolveOsdClockTextShadows and shouldRefreshOsdBufferBadge apply independent light spread and 3s throttle',
+        () {
+          final subShadows = resolveSubtitleTextShadows(
+            SubtitleEdgeStyle.thickShadow,
+            44,
+          );
+          final clockShadows = resolveOsdClockTextShadows(44);
+          expect(subShadows, hasLength(4));
+          expect(clockShadows, hasLength(3));
+          expect(
+            clockShadows.first.color.a,
+            lessThan(subShadows.first.color.a),
+          );
+          expect(clockShadows.last.blurRadius, greaterThanOrEqualTo(24.0));
+
+          final t0 = DateTime.utc(2026, 11, 24, 9, 0, 0);
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: null,
+              now: t0,
+              displayedSeconds: 0,
+              actualSeconds: 0,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 1)),
+              displayedSeconds: 0,
+              actualSeconds: 1,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 2)),
+              displayedSeconds: 3,
+              actualSeconds: 5,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldRefreshOsdBufferBadge(
+              lastUpdatedAt: t0,
+              now: t0.add(const Duration(seconds: 3)),
+              displayedSeconds: 3,
+              actualSeconds: 6,
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      testWidgets(
+        'PlayerOsdClockOverlay fade opacity, borderless buffer badge, and LiveChannelSwitchPreviewCard monochrome vector arrows',
+        (tester) async {
+          final opacityController = AnimationController(
+            vsync: const TestVSync(),
+            value: 0.5,
+          );
+          addTearDown(opacityController.dispose);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:p30',
+            friendlyName: 'nasne-p30',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final entry = LiveChannelSwitchEntry(
+            channel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+              bandId: '0/video/LiveTuner/DTTB',
+              serviceId: 0xde00,
+              channelName: 'ＮＨＫＥテレ',
+              programTitle: 'テスト番組',
+            ),
+            primaryReg: reg,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: Stack(
+                    children: [
+                      PlayerOsdClockOverlay(
+                        now: DateTime.utc(2026, 11, 24, 9, 5),
+                        opacity: opacityController,
+                      ),
+                      buildPlayerOsdStatusBadge(
+                        label: 'バッファ: 5秒',
+                        color: const Color(0xB3000000),
+                      ),
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.previous,
+                        visible: true,
+                        entry: entry,
+                        onTap: () {},
+                      ),
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.next,
+                        visible: true,
+                        entry: entry,
+                        onTap: () {},
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final clockFade = tester.widget<FadeTransition>(
+            find.descendant(
+              of: find.byType(PlayerOsdClockOverlay),
+              matching: find.byType(FadeTransition),
+            ),
+          );
+          expect(clockFade.opacity.value, closeTo(0.5, 0.001));
+
+          final badgeDeco =
+              tester
+                      .widget<Container>(
+                        find
+                            .ancestor(
+                              of: find.text('バッファ: 5秒'),
+                              matching: find.byType(Container),
+                            )
+                            .first,
+                      )
+                      .decoration!
+                  as BoxDecoration;
+          expect(badgeDeco.border, isNull);
+
+          expect(find.textContaining('◀'), findsNothing);
+          expect(find.textContaining('▶'), findsNothing);
+          expect(find.byIcon(Icons.play_arrow), findsNWidgets(2));
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 31: direct Dart ARIB decoding, cache-safe subtitle sync, lightBlue seekbar, quality icon, and recorded OSD info',
+    () {
+      test(
+        'AribTsCaptionTap.parseAribStatementBody decodes ARIB text, colors, DRCS, macros, and horizontal speaker separation',
+        () {
+          List<int> ascii(String s) => s.codeUnits;
+          final body = Uint8List.fromList([
+            0x0C, // CS (sets startsWithClear)
+            0x9B, ...ascii('7'), 0x20, 0x53, // SWF 7 (960x540)
+            0x9B, ...ascii('100;460'), 0x61, // ACPS(100,460)
+            0x83, // YLF (yellow 0xFFFFFF00)
+            0x1B, 0x28, 0x30, // ESC ( 0 -> G0 = Hiragana
+            0x22, 0x24, // あ い
+            0x1B, 0x24, 0x42, // ESC $ B -> G0 = Kanji
+            0x30, 0x21, // 亜
+            0x86, // CNF (cyan 0xFF00FFFF)
+            0x1D, 0x61, // SS3 macro 0x61 (G0=Kanji, G1=Katakana, GL=0)
+            0x0E, // LS1 -> Katakana
+            0x22, 0x24, // ア イ
+            0x0F, // LS0 -> Kanji
+            0x1B, 0x28, 0x20, 0x40, // G0 = 1-byte DRCS
+            0x41, // DRCS glyph -> '〓'
+            // Second speaker far to the right on same baseline -> separate bucket
+            0x9B, ...ascii('620;460'), 0x61,
+            0x90, 0x20, 0x01, 0x90, 0x47, // COL palette 1 index 7 -> white
+            0x1D, 0x60, // default macro 0x60 (G0=Kanji)
+            0x30, 0x21, // 亜
+          ]);
+
+          final ev = AribTsCaptionTap.parseAribStatementBody(
+            body,
+            ptsSeconds: 50.0,
+          );
+          expect(ev, isNotNull);
+          expect(ev!.startsWithClear, isTrue);
+          expect(ev.hasDecodedText, isTrue);
+          expect(ev.lines, hasLength(2));
+
+          final leftLine = ev.lines[0];
+          expect(leftLine.normalizedX, closeTo(100 / 960.0, 0.01));
+          expect(leftLine.runs, hasLength(2));
+          expect(leftLine.runs[0].text, 'あい亜');
+          expect(leftLine.runs[0].colorArgb, 0xFFFFFF00);
+          expect(leftLine.runs[1].text, 'アイ〓');
+          expect(leftLine.runs[1].colorArgb, 0xFF00FFFF);
+
+          final rightLine = ev.lines[1];
+          expect(rightLine.normalizedX, closeTo(620 / 960.0, 0.01));
+          expect(rightLine.runs.single.text, '亜');
+          expect(rightLine.runs.single.colorArgb, 0xFFFFFFFF);
+        },
+      );
+
+      test(
+        'resolveDirectAribTsSubtitleCues and canResetAribSubtitleDecoderSafely handle live/recorded playback, appends, clear, and wraparound',
+        () {
+          final events = [
+            const AribCaptionLayoutEvent(
+              ptsSeconds: AribTsCaptionTap.ptsWrapSeconds - 1.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.78,
+                  endNormalizedX: 0.60,
+                  charCount: 4,
+                  runs: [
+                    AribCaptionStyledRun(
+                      text: '話者１：最初',
+                      colorArgb: 0xFFFFFF00,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 1.0, // +2s across 33-bit wrap boundary
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: false, // incremental append!
+              clearAfterSeconds: 4.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.86,
+                  endNormalizedX: 0.55,
+                  charCount: 3,
+                  runs: [
+                    AribCaptionStyledRun(
+                      text: '追記行',
+                      colorArgb: 0xFF00FFFF,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ];
+
+          final offset = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 12.0,
+            demuxerStartTimeSeconds: AribTsCaptionTap.ptsWrapSeconds - 10.0,
+          );
+          expect(offset, isNotNull);
+
+          // At playbackTime = 12.0s (event 2 at 11.0s), both speaker 1 & append line render.
+          final active = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 12.0,
+            ptsOffset: offset!,
+          );
+          expect(active.handled, isTrue);
+          expect(active.cues, hasLength(2));
+          expect(active.cues[0].plainText, '話者１：最初');
+          expect(active.cues[0].spans.single.color, const Color(0xFFFFFF00));
+          expect(active.cues[1].plainText, '追記行');
+          expect(active.cues[1].spans.single.color, const Color(0xFF00FFFF));
+
+          // Past clearAfterSeconds (11.0 + 4.0 = 15.0s), caption clears cleanly.
+          final cleared = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 15.2,
+            ptsOffset: offset,
+          );
+          expect(cleared.handled, isTrue);
+          expect(cleared.cues, isEmpty);
+
+          // Safe reset guard forbids sid cycling on Recorded & buffered/chase Live.
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: false,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 0.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 15,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 2.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: true,
+              bufferedAheadSeconds: 2.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 12.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 1.5,
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      testWidgets(
+        'formatRecordedBroadcastTimeRangeJst, osdQualityButtonIcon, and RecordedOsdProgramSection render expected labels & neutral icon',
+        (tester) async {
+          final startJst = DateTime.utc(2026, 11, 24, 9, 0); // 18:00 JST Tue
+          expect(
+            formatRecordedBroadcastTimeRangeJst(startJst, 180),
+            '2026/11/24 (火) 18:00–18:03',
+          );
+          expect(
+            formatRecordedBroadcastTimeRangeJst(startJst, null),
+            '2026/11/24 (火) 18:00',
+          );
+          expect(osdQualityButtonIcon(useMobile: false), Icons.video_settings);
+          expect(osdQualityButtonIcon(useMobile: true), Icons.video_settings);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const RecordedOsdProgramSection(
+                        programTitle: 'テスト録画番組',
+                        broadcastTimeRange: '2026/11/24 (火) 18:00–18:03',
+                      ),
+                      const SizedBox(height: 8),
+                      Icon(osdQualityButtonIcon(useMobile: true)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('テスト録画番組'), findsOneWidget);
+          expect(find.text('2026/11/24 (火) 18:00–18:03'), findsOneWidget);
+          expect(find.byIcon(Icons.video_settings), findsOneWidget);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 32: ARIB DRCS bitmap decoding & inline subtitle rendering',
+    () {
+      Uint8List wrapTsPacket188({
+        required int pid,
+        required bool pusi,
+        required List<int> payload,
+      }) {
+        final pkt = Uint8List(188);
+        pkt[0] = 0x47;
+        pkt[1] = (pusi ? 0x40 : 0x00) | ((pid >> 8) & 0x1F);
+        pkt[2] = pid & 0xFF;
+        pkt[3] = 0x10;
+        final copyLen = payload.length < 184 ? payload.length : 184;
+        pkt.setRange(4, 4 + copyLen, payload);
+        for (var i = 4 + copyLen; i < 188; i++) {
+          pkt[i] = 0xFF;
+        }
+        return pkt;
+      }
+
+      List<int> encodePts(double seconds) {
+        final pts = (seconds * 90000.0).round();
+        return [
+          0x21 | (((pts >> 30) & 0x07) << 1),
+          (pts >> 22) & 0xFF,
+          0x01 | (((pts >> 15) & 0x7F) << 1),
+          (pts >> 7) & 0xFF,
+          0x01 | ((pts & 0x7F) << 1),
+        ];
+      }
+
+      List<int> buildPat({required int pmtPid}) => [
+        0x00,
+        0x00,
+        0xB0, 0x0D,
+        0x00, 0x01, 0xC1, 0x00, 0x00,
+        0x00, 0x01, 0xE0 | ((pmtPid >> 8) & 0x1F), pmtPid & 0xFF,
+        0x00, 0x00, 0x00, 0x00,
+      ];
+
+      List<int> buildPmt({required int videoPid, required int captionPid}) => [
+        0x00,
+        0x02,
+        0xB0, 0x1E,
+        0x00, 0x01, 0xC1, 0x00, 0x00,
+        0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF,
+        0xF0, 0x00,
+        0x02, 0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF, 0xF0, 0x00,
+        0x06,
+        0xE0 | ((captionPid >> 8) & 0x1F),
+        captionPid & 0xFF,
+        0xF0,
+        0x07,
+        0x52, 0x01, 0x30,
+        0xFD, 0x02, 0x00, 0x08,
+        0x00, 0x00, 0x00, 0x00,
+      ];
+
+      List<int> wrapPesPacket({
+        required List<int> dataGroupPayload,
+        double? ptsSeconds,
+      }) {
+        final aribPes = [0x80, 0xFF, 0x00, ...dataGroupPayload];
+        if (ptsSeconds != null) {
+          final pesLen = 8 + aribPes.length;
+          return [
+            0x00, 0x00, 0x01, 0xBD,
+            (pesLen >> 8) & 0xFF,
+            pesLen & 0xFF,
+            0x80, 0x80, 0x05,
+            ...encodePts(ptsSeconds),
+            ...aribPes,
+          ];
+        }
+        final pesLen = 3 + aribPes.length;
+        return [
+          0x00, 0x00, 0x01, 0xBD,
+          (pesLen >> 8) & 0xFF,
+          pesLen & 0xFF,
+          0x80, 0x00, 0x00,
+          ...aribPes,
+        ];
+      }
+
+      List<int> buildDataUnit(int param, List<int> body) => [
+        0x1F,
+        param,
+        (body.length >> 16) & 0xFF,
+        (body.length >> 8) & 0xFF,
+        body.length & 0xFF,
+        ...body,
+      ];
+
+      test(
+        'AribTsCaptionTap decodes 1-byte/2-byte DRCS across management & statement PES, resolves direct cues, and falls back on undefined codes',
+        () {
+          // 1-byte DRCS-1 0x4121: 1bpp (mode=0), 8x8 border frame
+          final drcs1Unit = <int>[
+            0x01, // number_of_code
+            0x41, 0x21, // character_code (DRCS-1, cell 0x21)
+            0x01, // number_of_font
+            0x00, // font_id=0, mode=0 (1bpp uncompressed)
+            0x00, // depth=0
+            0x08, 0x08, // width=8, height=8
+            0xFF, 0x81, 0xBD, 0xA5, 0xA5, 0xBD, 0x81, 0xFF,
+          ];
+
+          // Caption management group (data_group_id=0x00), no PTS
+          final mgmtUnits = buildDataUnit(0x30, drcs1Unit);
+          final mgmtGroupBody = <int>[
+            0x00, // TMD = 0
+            0x01, // num_languages = 1
+            0x00, // lang_tag=0, dmf=0 (no DC)
+            0x6A, 0x70, 0x6E, // "jpn"
+            0x00, // format/tcs/rollup
+            (mgmtUnits.length >> 16) & 0xFF,
+            (mgmtUnits.length >> 8) & 0xFF,
+            mgmtUnits.length & 0xFF,
+            ...mgmtUnits,
+          ];
+          final mgmtGroup = <int>[
+            0x00, // data_group_id=0, version=0
+            0x00,
+            0x00,
+            (mgmtGroupBody.length >> 8) & 0xFF,
+            mgmtGroupBody.length & 0xFF,
+            ...mgmtGroupBody,
+          ];
+
+          // 2-byte DRCS-0 0x2121: 2bpp (mode=1, depth=2 => 4 gradations), 4x4
+          final drcs2Unit = <int>[
+            0x01, // number_of_code
+            0x21, 0x21, // character_code (2-byte DRCS-0)
+            0x01, // number_of_font
+            0x01, // font_id=0, mode=1 (multi-gradation uncompressed)
+            0x02, // depth=2 (4 gradations = 2bpp)
+            0x04, 0x04, // width=4, height=4
+            0x1B, // row 0: [0, 1, 2, 3]
+            0xE4, // row 1: [3, 2, 1, 0]
+            0x0F, // row 2: [0, 0, 3, 3]
+            0xF0, // row 3: [3, 3, 0, 0]
+          ];
+
+          List<int> ascii(String s) => s.codeUnits;
+          final statementBody = <int>[
+            0x0C, // CS
+            0x9B, ...ascii('7'), 0x20, 0x53, // SWF 7 (960x540)
+            0x9B, ...ascii('100;460'), 0x61, // ACPS(100,460)
+            0x83, // Yellow
+            0x1B, 0x28, 0x30, // G0 = Hiragana
+            0x22, 0x24, // あ い
+            0x1B, 0x28, 0x20, 0x41, // G0 = 1-byte DRCS-1
+            0x21, // 0x4121 (defined in management data)
+            0x1B, 0x24, 0x28, 0x20, 0x40, // G0 = 2-byte DRCS-0
+            0x21, 0x21, // 0x2121 (defined in this PES)
+            0x1B, 0x28, 0x20, 0x41, // G0 = 1-byte DRCS-1
+            0x22, // 0x4122 (undefined -> fallback '〓')
+          ];
+
+          final stmtUnits = [
+            ...buildDataUnit(0x31, drcs2Unit),
+            ...buildDataUnit(0x20, statementBody),
+          ];
+          final stmtGroupBody = <int>[
+            0x00, // TMD = 0
+            (stmtUnits.length >> 16) & 0xFF,
+            (stmtUnits.length >> 8) & 0xFF,
+            stmtUnits.length & 0xFF,
+            ...stmtUnits,
+          ];
+          final stmtGroup = <int>[
+            0x04, // data_group_id=1 (0x01 << 2)
+            0x00,
+            0x00,
+            (stmtGroupBody.length >> 8) & 0xFF,
+            stmtGroupBody.length & 0xFF,
+            ...stmtGroupBody,
+          ];
+
+          List<Uint8List> chunkPesPackets(int pid, List<int> pesBytes) {
+            final pkts = <Uint8List>[];
+            for (var i = 0; i < pesBytes.length; i += 184) {
+              final end = i + 184 < pesBytes.length ? i + 184 : pesBytes.length;
+              pkts.add(
+                wrapTsPacket188(
+                  pid: pid,
+                  pusi: i == 0,
+                  payload: pesBytes.sublist(i, end),
+                ),
+              );
+            }
+            return pkts;
+          }
+
+          final tap = AribTsCaptionTap();
+          final pat = wrapTsPacket188(pid: 0, pusi: true, payload: buildPat(pmtPid: 0x0100));
+          final pmt = wrapTsPacket188(
+            pid: 0x0100,
+            pusi: true,
+            payload: buildPmt(videoPid: 0x0111, captionPid: 0x0120),
+          );
+          final mgmtPesPkts = chunkPesPackets(
+            0x0120,
+            wrapPesPacket(dataGroupPayload: mgmtGroup),
+          );
+          final stmtPesPkts = chunkPesPackets(
+            0x0120,
+            wrapPesPacket(dataGroupPayload: stmtGroup, ptsSeconds: 40.0),
+          );
+
+          final builder = BytesBuilder()
+            ..add(pat)
+            ..add(pmt);
+          for (final p in mgmtPesPkts) {
+            builder.add(p);
+          }
+          for (final p in stmtPesPkts) {
+            builder.add(p);
+          }
+          // Duplicate PAT triggers flush/verify stream without trailing PES pending.
+          builder.add(pat);
+
+          tap.feed(builder.takeBytes());
+
+          expect(tap.drcsGlyphs, hasLength(2));
+          final key1b = AribTsCaptionTap.drcsOneByteKey(0x41, 0x21);
+          final key2b = AribTsCaptionTap.drcsTwoByteKey(0x2121);
+          expect(tap.drcsGlyphs.containsKey(key1b), isTrue);
+          expect(tap.drcsGlyphs.containsKey(key2b), isTrue);
+
+          final g1b = tap.drcsGlyphs[key1b]!;
+          expect(g1b.width, 8);
+          expect(g1b.height, 8);
+          expect(g1b.maxLevel, 1);
+          expect(g1b.levels.sublist(0, 8), [1, 1, 1, 1, 1, 1, 1, 1]);
+          expect(g1b.levels.sublist(8, 16), [1, 0, 0, 0, 0, 0, 0, 1]);
+
+          final g2b = tap.drcsGlyphs[key2b]!;
+          expect(g2b.width, 4);
+          expect(g2b.height, 4);
+          expect(g2b.maxLevel, 3);
+          expect(
+            g2b.levels,
+            [0, 1, 2, 3, 3, 2, 1, 0, 0, 0, 3, 3, 3, 3, 0, 0],
+          );
+
+          // Management PES without PTS should not emit a layout event; statement emits 1.
+          expect(tap.events, hasLength(1));
+          final ev = tap.events.single;
+          expect(ev.hasDecodedText, isTrue);
+          expect(ev.lines, hasLength(1));
+          final runs = ev.lines.single.runs;
+          expect(runs, hasLength(4));
+          expect(runs[0].text, 'あい');
+          expect(runs[0].drcsGlyph, isNull);
+          expect(runs[0].colorArgb, 0xFFFFFF00);
+
+          expect(runs[1].text, '\uFFFC');
+          expect(runs[1].drcsGlyph, equals(g1b));
+          expect(runs[1].colorArgb, 0xFFFFFF00);
+
+          expect(runs[2].text, '\uFFFC');
+          expect(runs[2].drcsGlyph, equals(g2b));
+          expect(runs[2].colorArgb, 0xFFFFFF00);
+
+          expect(runs[3].text, '〓');
+          expect(runs[3].drcsGlyph, isNull);
+          expect(runs[3].colorArgb, 0xFFFFFF00);
+
+          final direct = resolveDirectAribTsSubtitleCues(
+            events: tap.events,
+            currentPlaybackMpvPts: 41.0,
+            ptsOffset: 0.0,
+          );
+          expect(direct.handled, isTrue);
+          expect(direct.cues, hasLength(1));
+          expect(direct.cues.single.spans, hasLength(4));
+          expect(direct.cues.single.spans[1].drcsGlyph, equals(g1b));
+          expect(direct.cues.single.spans[1].color, const Color(0xFFFFFF00));
+          expect(direct.cues.single.spans[2].drcsGlyph, equals(g2b));
+          expect(direct.cues.single.spans[3].text, '〓');
+
+          final cueCopyDifferentGlyph = SubtitleCue(
+            spans: [
+              const SubtitleStyledSpan(text: 'あい'),
+              SubtitleStyledSpan(text: '\uFFFC', drcsGlyph: g2b),
+            ],
+          );
+          final cueCopyOriginalGlyph = SubtitleCue(
+            spans: [
+              const SubtitleStyledSpan(text: 'あい'),
+              SubtitleStyledSpan(text: '\uFFFC', drcsGlyph: g1b),
+            ],
+          );
+          expect(
+            cueCopyDifferentGlyph.dedupeKey,
+            isNot(equals(cueCopyOriginalGlyph.dedupeKey)),
+          );
+
+          tap.resetFraming();
+          expect(tap.drcsGlyphs, hasLength(2));
+          tap.resetAll();
+          expect(tap.drcsGlyphs, isEmpty);
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay renders AribDrcsGlyphWidget across outline, centerShadow, wrapping, and unified polygon box',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final squareGlyph = AribDrcsGlyph.fromLevels(
+            width: 4,
+            height: 4,
+            maxLevel: 1,
+            levels: Uint8List.fromList([
+              1, 1, 1, 1,
+              1, 0, 0, 1,
+              1, 0, 0, 1,
+              1, 1, 1, 1,
+            ]),
+          );
+          final narrowGlyph = AribDrcsGlyph.fromLevels(
+            width: 2,
+            height: 4,
+            maxLevel: 3,
+            levels: Uint8List.fromList([
+              3, 2,
+              3, 2,
+              1, 0,
+              3, 3,
+            ]),
+          );
+
+          final cue = SubtitleCue(
+            normalizedX: 0.18,
+            endNormalizedX: 0.80,
+            normalizedY: 0.85,
+            alignment: 1,
+            spans: [
+              const SubtitleStyledSpan(
+                text: 'さあ 9時発の このバスで',
+                color: Color(0xFFFFFF00),
+              ),
+              SubtitleStyledSpan(
+                text: '\uFFFC',
+                color: const Color(0xFFFFFF00),
+                drcsGlyph: squareGlyph,
+              ),
+              const SubtitleStyledSpan(text: ' 次へ'),
+              SubtitleStyledSpan(
+                text: '\uFFFC',
+                color: const Color(0xFF00FFFF),
+                drcsGlyph: narrowGlyph,
+              ),
+            ],
+          );
+
+          // 1) Outline edge mode renders both stroke & fill widget layers per glyph.
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    edge: SubtitleEdgeStyle.thin,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [cue],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(4));
+          expect(find.byType(SubtitleUnifiedBackgroundBox), findsOneWidget);
+
+          // 2) Shadow-only mode renders single fill+shadow widget layer per glyph.
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    edge: SubtitleEdgeStyle.thickShadow,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [cue],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(2));
+
+          // 3) Narrow viewport forces multi-line wrapping with trailing DRCS glyph.
+          tester.view.physicalSize = const Size(320, 540);
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    size: SubtitleSizePreset.large,
+                    edge: SubtitleEdgeStyle.thin,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [
+                    SubtitleCue(
+                      normalizedX: 0.15,
+                      endNormalizedX: 0.88,
+                      normalizedY: 0.85,
+                      alignment: 1,
+                      spans: [
+                        const SubtitleStyledSpan(
+                          text: 'とても長い駅前から9時発のバスで旅に出かけます',
+                          color: Color(0xFFFFFF00),
+                        ),
+                        SubtitleStyledSpan(
+                          text: '\uFFFC',
+                          color: const Color(0xFFFFFF00),
+                          drcsGlyph: squareGlyph,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final boxRender = tester.renderObject<RenderSubtitleUnifiedBackgroundBox>(
+            find.byType(SubtitleUnifiedBackgroundBox),
+          );
+          expect(boxRender.lineRects.length, greaterThanOrEqualTo(2));
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(2));
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 33: direct ARIB clock isolation from libaribb24 leak & CM silence stability',
+    () {
+      test(
+        'resolveDirectAribPtsOffset ignores leaked mpvSubStartSeconds and avoids replaying start-of-stream captions',
+        () {
+          final events = [
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 50005.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 7,
+                  runs: [AribCaptionStyledRun(text: '開始当初の字幕')],
+                ),
+              ],
+            ),
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 50600.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 8,
+                  runs: [AribCaptionStyledRun(text: '10分後の現在字幕')],
+                ),
+              ],
+            ),
+          ];
+
+          // Leaked sub-start (+600s) must never pull t=0 captions to now.
+          final withDemux = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 600.5,
+            mpvSubStartSeconds: 1200.0,
+            demuxerStartTimeSeconds: 50000.0,
+            firstStreamPtsSeconds: 50000.2,
+          );
+          expect(withDemux, -50000.0);
+
+          final cues = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 600.5,
+            ptsOffset: withDemux!,
+          );
+          expect(cues.handled, isTrue);
+          expect(cues.cues, hasLength(1));
+          expect(cues.cues.single.plainText, '10分後の現在字幕');
+
+          // Without demuxerStartTimeSeconds, falls back to -firstStreamPtsSeconds,
+          // never (playbackTime - firstStreamPtsSeconds).
+          final withoutDemux = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 600.5,
+            mpvSubStartSeconds: 1200.0,
+            demuxerStartTimeSeconds: null,
+            firstStreamPtsSeconds: 50000.2,
+          );
+          expect(withoutDemux, -50000.2);
+
+          final cuesNoDemux = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 600.5,
+            ptsOffset: withoutDemux!,
+          );
+          expect(cuesNoDemux.handled, isTrue);
+          expect(cuesNoDemux.cues.single.plainText, '10分後の現在字幕');
+
+          // Raw non-rebased playbackTime selects 0.0 offset accurately.
+          final rawOffset = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 50600.5,
+            demuxerStartTimeSeconds: 50000.0,
+          );
+          expect(rawOffset, 0.0);
+        },
+      );
+
+      test(
+        'resolveDirectAribTsSubtitleCues stays handled across long (>120s) CM silence gaps when aligned, and false when unaligned',
+        () {
+          const events = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 50600.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 5,
+                  runs: [AribCaptionStyledRun(text: 'CM前の字幕')],
+                ),
+              ],
+            ),
+          ];
+
+          final cmGap = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 900.0,
+            ptsOffset: -50000.0,
+          );
+          expect(cmGap.handled, isTrue);
+          expect(cmGap.cues, isEmpty);
+
+          final unaligned = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 900.0,
+            ptsOffset: 0.0,
+          );
+          expect(unaligned.handled, isFalse);
+          expect(unaligned.cues, isEmpty);
+        },
+      );
+    },
+  );
+}
+
+class _DeletableScheduleService implements ScheduleService {
+  _DeletableScheduleService({required this.onDelete});
+  final void Function(String id) onDelete;
+
+  @override
+  Future<void> deleteSchedule(String id) async {
+    onDelete(id);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _FakeProtectTitleCatalog implements TitleCatalogService {

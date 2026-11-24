@@ -33,6 +33,7 @@ import 'dart:typed_data';
 
 import '../diagnostics.dart';
 import '../errors.dart';
+import 'arib_ts_caption_tap.dart';
 import 'pcp.dart';
 
 /// The source's answer to a time-seek content request (plan 61):
@@ -378,6 +379,7 @@ class DtcpProxy {
 
   _PlaintextQueue _queue = _PlaintextQueue();
   int _legacyGeneration = 0;
+  int _pumpGeneration = 0;
   bool _legacyPumpActive = false;
   int _cipherBytes = 0;
   int _servedBytes = 0;
@@ -399,6 +401,14 @@ class DtcpProxy {
 
   /// Number of consecutive upstream reconnect attempts without decrypting data.
   int get consecutiveReconnectErrors => _consecutiveReconnectErrors;
+  final AribTsCaptionTap _aribCaptionTap = AribTsCaptionTap();
+  int _lastTappedSeekPos = -1;
+
+  /// Extracted ARIB caption coordinates and clear events from plaintext TS/TTS.
+  List<AribCaptionLayoutEvent> get aribCaptionEvents => _aribCaptionTap.events;
+
+  /// Initial A/V stream PTS observed by [_aribCaptionTap], if any.
+  double? get firstStreamPtsSeconds => _aribCaptionTap.firstStreamPtsSeconds;
   bool _claimed = false;
   bool _stopRequested = false;
   bool _downstreamGone = false;
@@ -551,6 +561,8 @@ class DtcpProxy {
   /// upstream drops retry indefinitely with backoff until [_stopRequested].
   Future<void> _pump() async {
     final stopwatch = Stopwatch()..start();
+    final pumpGen = ++_pumpGeneration;
+    final queue = _queue;
     var packets = 0;
     var plainBytes = 0;
     var lastMilestone = 0;
@@ -558,7 +570,9 @@ class DtcpProxy {
     var consecutiveErrors = 0;
     _legacyPumpActive = true;
     try {
-      while (!_stopRequested && !_downstreamGone) {
+      while (pumpGen == _pumpGeneration &&
+          !_stopRequested &&
+          !_downstreamGone) {
         Object? attemptError;
         var unexpectedEof = false;
         try {
@@ -586,14 +600,17 @@ class DtcpProxy {
           _iterator = iterator;
           final yieldWatch = Stopwatch()..start();
           try {
-            while (!_stopRequested && !_downstreamGone) {
-              if (_queue.bufferedBytes >= prefetchCapBytes) {
-                await _waitForDrain();
+            while (pumpGen == _pumpGeneration &&
+                !_stopRequested &&
+                !_downstreamGone) {
+              if (queue.bufferedBytes >= prefetchCapBytes) {
+                await _waitForDrain(queue, pumpGen);
                 continue;
               }
               if (!await iterator.moveNext()) {
                 if (_autoReconnect &&
                     _isLive &&
+                    pumpGen == _pumpGeneration &&
                     !_stopRequested &&
                     !_downstreamGone) {
                   unexpectedEof = true;
@@ -606,6 +623,7 @@ class DtcpProxy {
               packets = decryptor.packetsDecrypted;
               plainBytes = decryptor.plaintextBytes;
               for (final piece in pieces) {
+                if (pumpGen != _pumpGeneration) break;
                 consecutiveErrors = 0;
                 _consecutiveReconnectErrors = 0;
                 if (!firstPlainLogged) {
@@ -617,7 +635,7 @@ class DtcpProxy {
                     'content GET',
                   );
                 }
-                _queue.add(piece);
+                queue.add(piece);
               }
               if (packets > lastMilestone &&
                   (packets == 1 || packets % 50 == 0)) {
@@ -635,15 +653,20 @@ class DtcpProxy {
             }
           } finally {
             await iterator.cancel();
-            _iterator = null;
+            if (identical(_iterator, iterator)) _iterator = null;
           }
         } catch (e) {
           attemptError = e;
         }
 
+        if (pumpGen != _pumpGeneration) {
+          queue.close();
+          return;
+        }
+
         if (!_autoReconnect) {
           if (attemptError != null) {
-            _queue.close(attemptError);
+            queue.close(attemptError);
             _diag(
               DiagCategory.playback,
               'proxy: upstream closed with an error after $_cipherBytes '
@@ -658,7 +681,7 @@ class DtcpProxy {
               : _stopRequested
               ? 'stopped (session end)'
               : 'the upstream ended the stream';
-          _queue.close();
+          queue.close();
           _diag(
             DiagCategory.playback,
             'proxy: stream ended: $endKind; received $_cipherBytes '
@@ -670,11 +693,11 @@ class DtcpProxy {
         }
 
         if (_stopRequested || _downstreamGone) {
-          _queue.close();
+          queue.close();
           return;
         }
         if (attemptError == null && !unexpectedEof) {
-          _queue.close();
+          queue.close();
           return;
         }
         final delay = _backoffForAttempt(consecutiveErrors);
@@ -689,8 +712,8 @@ class DtcpProxy {
         if (delay > Duration.zero) {
           await Future<void>.delayed(delay);
         }
-        if (_stopRequested || _downstreamGone) {
-          _queue.close();
+        if (pumpGen != _pumpGeneration || _stopRequested || _downstreamGone) {
+          queue.close();
           return;
         }
         _fetcher.resetClient();
@@ -705,20 +728,49 @@ class DtcpProxy {
           }
         }
       }
-      _queue.close();
+      queue.close();
     } finally {
-      _legacyPumpActive = false;
+      if (pumpGen == _pumpGeneration) {
+        _legacyPumpActive = false;
+      }
     }
   }
 
   /// Waits while the prefetch buffer is at the cap, until the
-  /// player drains some of it or the session stops.
-  Future<void> _waitForDrain() async {
+  /// player drains some of it, [pumpGen] is superseded, or the session stops.
+  Future<void> _waitForDrain(_PlaintextQueue queue, int pumpGen) async {
     while (!_stopRequested &&
-        !_queue.isClosed &&
-        _queue.bufferedBytes >= prefetchCapBytes) {
-      await _queue.waitChange();
+        pumpGen == _pumpGeneration &&
+        !queue.isClosed &&
+        queue.bufferedBytes >= prefetchCapBytes) {
+      await queue.waitChange();
     }
+  }
+
+  /// Flushes paused/buffered live plaintext and reconnects upstream at the latest
+  /// broadcast edge without re-running initial DTCP-IP AKE.
+  Future<void> resetToLiveEdge() async {
+    if (_seekable || !_isLive || _stopRequested) return;
+    _diag(DiagCategory.playback, 'proxy: resetting stream to latest live edge');
+    ++_legacyGeneration;
+    ++_pumpGeneration;
+    _queue.close();
+    final oldIter = _iterator;
+    _iterator = null;
+    if (oldIter != null) {
+      await oldIter.cancel().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
+    }
+    _fetcher.resetClient();
+    _queue = _PlaintextQueue();
+    _aribCaptionTap.resetAll();
+    _firstServedAt = null;
+    _lastServedAt = null;
+    _downstreamGone = false;
+    _legacyPumpActive = true;
+    _pumpFuture = _pump();
   }
 
   Future<void> _handle(HttpRequest request) async {
@@ -734,7 +786,35 @@ class DtcpProxy {
     }
   }
 
+  static final RegExp _rangeStartPattern = RegExp(r'^bytes=(\d+)-');
+
+  static int? _parseRangeStart(String? header) {
+    if (header == null) return null;
+    final match = _rangeStartPattern.firstMatch(header.trim());
+    if (match == null) return null;
+    return int.tryParse(match.group(1)!);
+  }
+
   Future<void> _handleLegacy(HttpRequest request) async {
+    if (request.method == 'HEAD') {
+      final response = request.response;
+      response.statusCode = HttpStatus.ok;
+      response.headers.contentType = ContentType('video', 'mp2t');
+      response.headers.set('Accept-Ranges', 'none');
+      response.headers.set('transferMode.dlna.org', 'Streaming');
+      await response.close();
+      return;
+    }
+    final rangeStart = _parseRangeStart(
+      request.headers.value(HttpHeaders.rangeHeader),
+    );
+    if (rangeStart != null && rangeStart > 0) {
+      final response = request.response;
+      response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+      response.headers.set('Accept-Ranges', 'none');
+      await response.close();
+      return;
+    }
     _requestCount++;
     final requestNo = _requestCount;
     if (!_autoReconnect && _claimed) {
@@ -776,11 +856,13 @@ class DtcpProxy {
     }
     response.statusCode = HttpStatus.ok;
     response.headers.contentType = ContentType('video', 'mp2t');
+    response.headers.set('Accept-Ranges', 'none');
     response.headers.set('transferMode.dlna.org', 'Streaming');
     try {
       // Headers go out immediately; the first plaintext follows
       // as soon as the pump produces it (prefetched or live).
       await response.flush();
+      _aribCaptionTap.resetFraming();
       while (gen == _legacyGeneration && !_stopRequested) {
         final chunk = await queue.read(
           isSuperseded: () => gen != _legacyGeneration || _stopRequested,
@@ -792,6 +874,9 @@ class DtcpProxy {
           final now = DateTime.now();
           _firstServedAt ??= now;
           _lastServedAt = now;
+          try {
+            _aribCaptionTap.feed(chunk);
+          } catch (_) {}
         }
         response.add(chunk);
         await response.flush();
@@ -1292,11 +1377,17 @@ class DtcpProxy {
           consecutiveReconnectErrors = 0;
           stalledRestarts = 0;
           final take = min(chunk.length, reqEnd - pos + 1);
-          response.add(
-            take == chunk.length
-                ? chunk
-                : Uint8List.sublistView(chunk, 0, take),
-          );
+          final slice = take == chunk.length
+              ? chunk
+              : Uint8List.sublistView(chunk, 0, take);
+          try {
+            if (_lastTappedSeekPos != pos) {
+              _aribCaptionTap.resetFraming();
+            }
+            _aribCaptionTap.feed(slice);
+            _lastTappedSeekPos = pos + take;
+          } catch (_) {}
+          response.add(slice);
           pos += take;
           servedHere += take;
           await response.flush();

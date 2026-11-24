@@ -111,6 +111,8 @@ class RecNgItem {
     this.durationSeconds,
     this.serviceId,
     this.broadcastingType,
+    this.desiredQualityMode,
+    this.ngId,
     required this.raw,
   });
 
@@ -120,6 +122,8 @@ class RecNgItem {
   final int? durationSeconds;
   final int? serviceId;
   final int? broadcastingType;
+  final int? desiredQualityMode;
+  final int? ngId;
   final Map<String, dynamic> raw;
 
   factory RecNgItem.fromJson(Map<String, dynamic> json) {
@@ -131,6 +135,8 @@ class RecNgItem {
       durationSeconds: optInt(json, 'scheduledDuration'),
       serviceId: optInt(json, 'scheduledChannelID'),
       broadcastingType: optInt(json, 'broadcastingType'),
+      desiredQualityMode: optInt(json, 'desiredQualityMode'),
+      ngId: optInt(json, 'ngID'),
       raw: json,
     );
   }

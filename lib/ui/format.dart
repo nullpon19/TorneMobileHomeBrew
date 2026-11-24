@@ -52,6 +52,17 @@ String formatDateTimeWithWeekdayJst(DateTime instant) =>
     '${formatDateJst(instant)} (${formatWeekdayJst(instant)}) '
     '${formatTimeJst(instant)}';
 
+/// `2026/11/18 (水) 04:00–04:30` (or `2026/11/18 (水) 04:00` if duration unset).
+String formatRecordedBroadcastTimeRangeJst(
+  DateTime start,
+  int? durationSeconds,
+) {
+  final head = formatDateTimeWithWeekdayJst(start);
+  if (durationSeconds == null || durationSeconds <= 0) return head;
+  final end = start.add(Duration(seconds: durationSeconds));
+  return '$head–${formatTimeJst(end)}';
+}
+
 /// Duration text: `30秒` / `45分` / `1時間` / `1時間30分`.
 String formatDurationSeconds(int seconds) {
   if (seconds < 60) return '$seconds秒';
@@ -96,6 +107,14 @@ String qualityModeLabel(int mode) => switch (mode) {
   100 => 'DR',
   230 => '3倍',
   _ => '$mode',
+};
+
+/// Display label for `desiredQualityMode` in WebAPI `recNgListGet`, where
+/// `101` (alongside XSRS `230`) represents 3倍 mode.
+String recNgQualityModeLabel(int mode) => switch (mode) {
+  100 => 'DR',
+  101 || 230 => '3倍',
+  _ => qualityModeLabel(mode),
 };
 
 /// Display label of a DIDL res `quality` value (plan 33): the

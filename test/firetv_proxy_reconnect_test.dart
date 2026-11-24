@@ -373,5 +373,127 @@ void main() {
         expect(upstreamAttempt, 1);
       },
     );
+
+    test(
+      'live proxy responds HEAD and Range probes without breaking active GET stream and resetToLiveEdge flushes backlog',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final stalePart = Uint8List.fromList(List.filled(4096, 0x41));
+        final liveEdgePart = Uint8List.fromList(List.filled(4096, 0x5A));
+        var upstreamAttempt = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.contentType = ContentType(
+            'application',
+            'x-dtcp1',
+          );
+          if (upstreamAttempt == 1) {
+            request.response.add(_buildTestPcpPacket(exchangeKey, stalePart));
+            await request.response.flush();
+            await Future<void>.delayed(const Duration(milliseconds: 600));
+            try {
+              await request.response.close();
+            } catch (_) {}
+          } else {
+            request.response.add(_buildTestPcpPacket(exchangeKey, liveEdgePart));
+            await request.response.flush();
+            await Future<void>.delayed(const Duration(milliseconds: 120));
+            try {
+              await request.response.close();
+            } catch (_) {}
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/live'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          isLive: true,
+          autoReconnect: true,
+          reconnectBackoff: const [Duration(milliseconds: 20)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+
+        // 1. Primary GET (with FFmpeg's default `Range: bytes=0-`) begins streaming stalePart as 200 OK.
+        final req1 = await client.getUrl(proxy.uri);
+        req1.headers.set('Range', 'bytes=0-');
+        final resp1 = await req1.close();
+        expect(resp1.statusCode, HttpStatus.ok);
+        expect(resp1.headers.value('accept-ranges'), 'none');
+
+        final streamBytes = <int>[];
+        final firstGot = Completer<void>();
+        final streamClosed = Completer<void>();
+        late StreamSubscription<List<int>> sub1;
+        sub1 = resp1.listen(
+          (chunk) {
+            streamBytes.addAll(chunk);
+            if (streamBytes.length >= stalePart.length &&
+                !firstGot.isCompleted) {
+              firstGot.complete();
+            }
+          },
+          onDone: () {
+            if (!streamClosed.isCompleted) streamClosed.complete();
+          },
+          onError: (_) {
+            if (!streamClosed.isCompleted) streamClosed.complete();
+          },
+        );
+        addTearDown(sub1.cancel);
+        await firstGot.future.timeout(const Duration(seconds: 5));
+        expect(streamBytes.sublist(0, stalePart.length), stalePart);
+
+        // 2. Concurrent HEAD & non-zero Range seek probe must return
+        //    Accept-Ranges: none / 416 WITHOUT terminating resp1 or reopening upstream!
+        final headReq = await client.headUrl(proxy.uri);
+        final headResp = await headReq.close();
+        await headResp.drain<void>();
+        expect(headResp.statusCode, HttpStatus.ok);
+        expect(headResp.headers.value('accept-ranges'), 'none');
+
+        final rangeReq = await client.getUrl(proxy.uri);
+        rangeReq.headers.set('Range', 'bytes=1024-2047');
+        final rangeResp = await rangeReq.close();
+        await rangeResp.drain<void>();
+        expect(rangeResp.statusCode, HttpStatus.requestedRangeNotSatisfiable);
+        expect(rangeResp.headers.value('accept-ranges'), 'none');
+        expect(upstreamAttempt, 1);
+        expect(streamClosed.isCompleted, isFalse);
+
+        // 3. resetToLiveEdge flushes old stream and opens fresh upstream attempt.
+        await proxy.resetToLiveEdge();
+        await streamClosed.future.timeout(const Duration(seconds: 3));
+
+        final edgeUri = proxy.uri.replace(queryParameters: {'live_edge': '1'});
+        final req2 = await client.getUrl(edgeUri);
+        final resp2 = await req2.close();
+        expect(resp2.statusCode, HttpStatus.ok);
+        final receivedEdge = BytesBuilder(copy: false);
+        await for (final chunk in resp2.timeout(const Duration(seconds: 5))) {
+          receivedEdge.add(chunk);
+          if (receivedEdge.length >= liveEdgePart.length) break;
+        }
+        expect(
+          receivedEdge.toBytes().sublist(0, liveEdgePart.length),
+          liveEdgePart,
+        );
+        expect(upstreamAttempt, greaterThanOrEqualTo(2));
+      },
+    );
   });
 }

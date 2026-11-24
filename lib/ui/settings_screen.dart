@@ -20,6 +20,7 @@ import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'player_cache_policy.dart';
+import 'subtitle_settings_screen.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -234,6 +235,42 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           const Divider(),
+          _sectionTitle(context, '録画・予約'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'デフォルト録画画質',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment(
+                      value: recordingQualityDr,
+                      label: Text('DR'),
+                    ),
+                    ButtonSegment(
+                      value: recordingQualityX3,
+                      label: Text('3倍'),
+                    ),
+                  ],
+                  selected: {ref.watch(defaultRecordingQualityProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(defaultRecordingQualityProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '新規予約・番組表からの予約・Live 視聴中の即時録画で使われる既定の録画画質です。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          const Divider(),
           _sectionTitle(context, '再生'),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -318,6 +355,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               current: recordedBufferSeconds,
               onSelected: (value) =>
                   ref.read(recordedBufferSecondsProvider.notifier).set(value),
+            ),
+          ),
+          ListTile(
+            title: const Text('字幕表示設定'),
+            subtitle: Text(ref.watch(subtitleSettingsProvider).summaryLabel),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => const SubtitleSettingsScreen(),
+              ),
             ),
           ),
           const Divider(),

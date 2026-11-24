@@ -27,6 +27,7 @@ import 'epg_genre.dart';
 import 'epg_search_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'live_recording_policy.dart';
 import 'live_screen.dart';
 import 'multi_nasne_policy.dart';
 import 'schedule_form.dart';
@@ -2035,24 +2036,60 @@ void showEpgEventDetail(
   final now = DateTime.now();
   final watchable =
       onWatch != null && !event.start.isAfter(now) && event.end.isAfter(now);
+  final recordingNow =
+      existingSchedule != null &&
+      isScheduleCurrentlyRecording(existingSchedule, now: now);
+  final ownerReg = existingScheduleReg ?? reg;
   showDialog<void>(
     context: context,
     builder: (dialogContext) => EpgEventDetailDialog(
       event: event,
       channelName: channelName,
       reservedNasneName: reservedNasneName,
+      isRecordingNow: recordingNow,
       onEditSchedule: existingSchedule != null
           ? () {
               Navigator.of(dialogContext).pop();
               Navigator.of(context).push(
                 MaterialPageRoute<void>(
                   builder: (_) => ScheduleDetailPage(
-                    reg: existingScheduleReg ?? reg,
+                    reg: ownerReg,
                     scheduleId: existingSchedule.id,
                     autofocusEdit: true,
                   ),
                 ),
               );
+            }
+          : null,
+      onStopRecording: recordingNow
+          ? () async {
+              final titleText =
+                  event.title ?? existingSchedule.title ?? 'この番組';
+              final ok = await confirmDialog(
+                dialogContext,
+                title: '録画を停止しますか？',
+                message:
+                    '「$titleText」の録画を停止します。'
+                    'ここまでに録画された内容は録画済み一覧に残ります。',
+                confirmLabel: '録画を停止',
+              );
+              if (!ok) return;
+              final scopeContext =
+                  context.mounted ? context : dialogContext;
+              if (!scopeContext.mounted) return;
+              final container = ProviderScope.containerOf(scopeContext);
+              try {
+                await container
+                    .read(deviceServicesProvider(ownerReg))
+                    .schedules
+                    .deleteSchedule(existingSchedule.id);
+              } catch (e) {
+                if (context.mounted) showSnack(context, userMessageForError(e));
+                return;
+              }
+              container.invalidate(schedulesProvider(ownerReg));
+              if (dialogContext.mounted) Navigator.of(dialogContext).pop();
+              if (context.mounted) showSnack(context, '録画を停止しました');
             }
           : null,
       onReserve: existingSchedule == null && event.end.isAfter(now)
@@ -2085,8 +2122,10 @@ class EpgEventDetailDialog extends StatefulWidget {
     required this.event,
     required this.channelName,
     this.reservedNasneName,
+    this.isRecordingNow = false,
     this.onReserve,
     this.onEditSchedule,
+    this.onStopRecording,
     this.onWatch,
   });
 
@@ -2094,12 +2133,18 @@ class EpgEventDetailDialog extends StatefulWidget {
   final String channelName;
   final String? reservedNasneName;
 
+  /// Whether a matching reservation is currently recording this event.
+  final bool isRecordingNow;
+
   /// Opens the prefilled reservation form (plan 28); null when
   /// the event has already ended or is already scheduled.
   final VoidCallback? onReserve;
 
   /// Opens [ScheduleDetailPage] for an already-reserved programme.
   final VoidCallback? onEditSchedule;
+
+  /// Stops an actively recording schedule from the detail dialog.
+  final VoidCallback? onStopRecording;
 
   /// Opens the channel's live viewing (plan 95); null unless
   /// the event is on air now.
@@ -2216,24 +2261,51 @@ class _EpgEventDetailDialogState extends State<EpgEventDetailDialog> {
                   '（${event.duration.inMinutes}分）',
                   style: theme.textTheme.bodyMedium,
                 ),
-                if (widget.onEditSchedule != null) ...[
+                if (widget.onEditSchedule != null || widget.isRecordingNow) ...[
                   const SizedBox(height: 6),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
                     children: [
-                      Icon(
-                        Icons.fiber_manual_record,
-                        size: 12,
-                        color: reservedColor,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        reservedText,
-                        style: theme.textTheme.labelMedium?.copyWith(
-                          color: reservedColor,
-                          fontWeight: FontWeight.bold,
+                      if (widget.onEditSchedule != null)
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.fiber_manual_record,
+                              size: 12,
+                              color: reservedColor,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              reservedText,
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                color: reservedColor,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
                         ),
-                      ),
+                      if (widget.isRecordingNow)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFC62828),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text(
+                            '録画中',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
                     ],
                   ),
                 ],
@@ -2282,6 +2354,12 @@ class _EpgEventDetailDialogState extends State<EpgEventDetailDialog> {
             onPressed: widget.onWatch,
             icon: const Icon(Icons.live_tv, size: 18),
             label: const Text('試聴'),
+          ),
+        if (widget.onStopRecording != null)
+          OutlinedButton.icon(
+            onPressed: widget.onStopRecording,
+            icon: const Icon(Icons.stop_circle_outlined, size: 18),
+            label: const Text('録画を停止'),
           ),
         if (widget.onEditSchedule != null)
           FilledButton.icon(
