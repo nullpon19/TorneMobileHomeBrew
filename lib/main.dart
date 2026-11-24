@@ -75,6 +75,8 @@ class TmhbApp extends ConsumerWidget {
     return ThemeData(
       brightness: brightness,
       colorScheme: scheme,
+      fontFamily: 'GoogleSans',
+      fontFamilyFallback: const ['LINESeedJP', 'NotoSansCJK', 'sans-serif'],
       scaffoldBackgroundColor: isDark ? const Color(0xFF0E1014) : null,
       focusColor: (isDark ? Colors.amberAccent : Colors.amber).withValues(
         alpha: 0.28,
@@ -194,7 +196,11 @@ class TmhbApp extends ConsumerWidget {
       // A tap outside a text field dismisses the keyboard
       // anywhere in the app (plan 54).
       builder: (context, child) => DefaultTextStyle.merge(
-        style: const TextStyle(locale: Locale('ja', 'JP')),
+        style: const TextStyle(
+          locale: Locale('ja', 'JP'),
+          fontFamily: 'GoogleSans',
+          fontFamilyFallback: ['LINESeedJP', 'NotoSansCJK', 'sans-serif'],
+        ),
         child: KeyboardDismissOnTap(child: child ?? const SizedBox.shrink()),
       ),
       theme: _buildTheme(Brightness.light),

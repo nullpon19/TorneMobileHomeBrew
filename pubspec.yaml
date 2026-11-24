@@ -44,6 +44,14 @@ flutter:
     - family: KosugiMaru
       fonts:
         - asset: assets/fonts/KosugiMaru-Regular.ttf
+    - family: GoogleSans
+      fonts:
+        - asset: assets/fonts/GoogleSans-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/GoogleSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/GoogleSans-Bold.ttf
+          weight: 700
 
 # App icon generation (dart run flutter_launcher_icons).
 # Source art: assets/icon/app_icon_source.webp; the 1024 PNG is the

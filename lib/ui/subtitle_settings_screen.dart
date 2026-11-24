@@ -22,16 +22,16 @@ const List<SubtitleCue> _previewSampleCues = [
     ],
   ),
   SubtitleCue(
-    normalizedX: 0.18,
+    normalizedX: 0.14,
     normalizedY: 0.72,
     alignment: 1,
     spans: [
       SubtitleStyledSpan(text: '[二] 話者A：', color: Color(0xFF80FFFF)),
-      SubtitleStyledSpan(text: 'テレビ並みに見やすい字幕 →'),
+      SubtitleStyledSpan(text: 'テレビ並みの字幕 →'),
     ],
   ),
   SubtitleCue(
-    normalizedX: 0.18,
+    normalizedX: 0.14,
     normalizedY: 0.84,
     alignment: 1,
     spans: [

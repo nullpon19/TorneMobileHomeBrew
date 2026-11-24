@@ -29,35 +29,23 @@ double resolveSubtitleFontSize(
       ? viewportHeight
       : 540.0;
   final factor = switch (preset) {
-    SubtitleSizePreset.small => 0.042,
-    SubtitleSizePreset.medium => 0.052,
-    SubtitleSizePreset.large => 0.064,
+    SubtitleSizePreset.small => 0.052,
+    SubtitleSizePreset.medium => 0.064,
+    SubtitleSizePreset.large => 0.076,
   };
-  return (safeHeight * factor).clamp(minSize, 64.0).toDouble();
+  return (safeHeight * factor).clamp(minSize, 76.0).toDouble();
 }
 
-/// Six selectable font families combining Fire TV OS fonts and bundled fonts.
+/// Four selectable subtitle font families (excluding Google Sans per user preference).
 enum SubtitleFontFamily {
   gothic(
     label: 'ゴシック体',
-    fontFamily: 'sans-serif',
-    fontWeight: FontWeight.w400,
-    fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
-  ),
-  gothicBold(
-    label: '太字ゴシック',
-    fontFamily: 'sans-serif',
-    fontWeight: FontWeight.w700,
-    fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
-  ),
-  lineSeedJp(
-    label: 'LINE Seed JP',
     fontFamily: 'LINESeedJP',
     fontWeight: FontWeight.w400,
     fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
   ),
-  lineSeedJpBold(
-    label: 'LINE Seed JP（太字）',
+  gothicBold(
+    label: 'ゴシック体（太字）',
     fontFamily: 'LINESeedJP',
     fontWeight: FontWeight.w700,
     fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
@@ -66,13 +54,13 @@ enum SubtitleFontFamily {
     label: '丸ゴシック',
     fontFamily: 'KosugiMaru',
     fontWeight: FontWeight.w400,
-    fontFamilyFallback: ['NotoSansCJK', 'sans-serif'],
+    fontFamilyFallback: ['LINESeedJP', 'NotoSansCJK', 'sans-serif'],
   ),
   mincho(
     label: '明朝体',
     fontFamily: 'serif',
     fontWeight: FontWeight.w400,
-    fontFamilyFallback: ['NotoSerifCJK', 'serif', 'NotoSansCJK', 'sans-serif'],
+    fontFamilyFallback: ['NotoSerifCJK', 'serif', 'LINESeedJP', 'NotoSansCJK', 'sans-serif'],
   );
 
   const SubtitleFontFamily({
@@ -94,7 +82,7 @@ enum SubtitleEdgeStyle {
   thin('縁取り（細め）'),
   thick('縁取り（太め）'),
   dropShadow('影（右下）'),
-  thickShadow('影（ズレなし・厚め）');
+  thickShadow('影（中央）');
 
   const SubtitleEdgeStyle(this.label);
   final String label;
@@ -136,22 +124,19 @@ List<Shadow> resolveSubtitleTextShadows(
         ),
       ];
     case SubtitleEdgeStyle.thickShadow:
+      final d = (fontSize * 0.038).clamp(0.9, 2.4).toDouble();
+      final tight = (fontSize * 0.10).clamp(2.4, 6.0).toDouble();
+      final mid = (fontSize * 0.20).clamp(4.8, 11.5).toDouble();
+      final wide = (fontSize * 0.32).clamp(7.5, 17.0).toDouble();
       return [
-        Shadow(
-          color: Colors.black,
-          offset: Offset.zero,
-          blurRadius: (fontSize * 0.10).clamp(2.0, 5.0).toDouble(),
-        ),
-        Shadow(
-          color: Colors.black,
-          offset: Offset.zero,
-          blurRadius: (fontSize * 0.20).clamp(4.0, 10.0).toDouble(),
-        ),
-        Shadow(
-          color: const Color(0xDD000000),
-          offset: Offset.zero,
-          blurRadius: (fontSize * 0.30).clamp(6.0, 14.0).toDouble(),
-        ),
+        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: tight),
+        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: tight),
+        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: mid),
+        Shadow(color: Colors.black, offset: Offset.zero, blurRadius: wide),
+        Shadow(color: Colors.black, offset: Offset(-d, -d), blurRadius: tight),
+        Shadow(color: Colors.black, offset: Offset(d, -d), blurRadius: tight),
+        Shadow(color: Colors.black, offset: Offset(-d, d), blurRadius: tight),
+        Shadow(color: Colors.black, offset: Offset(d, d), blurRadius: tight),
       ];
     case SubtitleEdgeStyle.none:
     case SubtitleEdgeStyle.thin:
@@ -199,7 +184,7 @@ const Duration subtitleStaleTimeout = Duration(seconds: 12);
 class SubtitleSettings {
   const SubtitleSettings({
     this.size = SubtitleSizePreset.medium,
-    this.font = SubtitleFontFamily.gothicBold,
+    this.font = SubtitleFontFamily.kosugiMaru,
     this.edge = SubtitleEdgeStyle.thin,
     this.backgroundColor = SubtitleBackgroundColorPreset.black,
     this.backgroundOpacityPercent = 65,
@@ -258,9 +243,14 @@ class SubtitleSettings {
         decoded['size'] as String?,
         defaults.size,
       );
+      final rawFontName = switch (decoded['font'] as String?) {
+        'lineSeedJp' => SubtitleFontFamily.gothic.name,
+        'lineSeedJpBold' => SubtitleFontFamily.gothicBold.name,
+        final other => other,
+      };
       final font = _enumByName(
         SubtitleFontFamily.values,
-        decoded['font'] as String?,
+        rawFontName,
         defaults.font,
       );
       final edge = _enumByName(
@@ -458,12 +448,14 @@ class SubtitleCue {
   const SubtitleCue({
     required this.spans,
     this.normalizedX,
+    this.endNormalizedX,
     this.normalizedY,
     this.alignment = 2,
   });
 
   final List<SubtitleStyledSpan> spans;
   final double? normalizedX;
+  final double? endNormalizedX;
   final double? normalizedY;
   final int alignment;
 
@@ -693,9 +685,14 @@ List<SubtitleCue> parseAribAssSubtitle(
     final combinedX = existingBefore
         ? (existing.normalizedX ?? cue.normalizedX)
         : (cue.normalizedX ?? existing.normalizedX);
+    final combinedEndX =
+        (existing.endNormalizedX != null && cue.endNormalizedX != null)
+        ? math.max(existing.endNormalizedX!, cue.endNormalizedX!)
+        : (existing.endNormalizedX ?? cue.endNormalizedX);
     merged[matchIndex] = SubtitleCue(
       spans: orderedSpans,
       normalizedX: combinedX,
+      endNormalizedX: combinedEndX,
       normalizedY: existing.normalizedY,
       alignment: existingBefore ? existing.alignment : cue.alignment,
     );
@@ -795,6 +792,7 @@ List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
       SubtitleCue(
         spans: lines.single,
         normalizedX: cue.normalizedX,
+        endNormalizedX: cue.endNormalizedX,
         normalizedY: cue.normalizedY,
         alignment: cue.alignment,
       ),
@@ -806,6 +804,7 @@ List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
       SubtitleCue(
         spans: lines[idx],
         normalizedX: cue.normalizedX,
+        endNormalizedX: cue.endNormalizedX,
         normalizedY: cue.normalizedY == null
             ? null
             : (cue.normalizedY! + idx * 0.055).clamp(0.02, 0.98).toDouble(),
@@ -1153,6 +1152,20 @@ bool hasAribClearSinceCaption({
   return false;
 }
 
+/// Builds a stable signature for deduplicating an already-cleared caption that
+/// lingers inside mpv's subtitle output buffer.
+String subtitleCaptionSignature({
+  double? subStartSeconds,
+  required String plainCompact,
+}) => '${subStartSeconds?.toStringAsFixed(2) ?? '-'}|$plainCompact';
+
+/// Returns `true` when [currentSignature] matches a previously cleared caption
+/// signature so boundary-time captions never blink on/off repeatedly.
+bool shouldSuppressClearedSubtitle({
+  required String? suppressedSignature,
+  required String currentSignature,
+}) => suppressedSignature != null && suppressedSignature == currentSignature;
+
 /// Applies broadcast ARIB coordinates extracted from MPEG-TS onto decoded
 /// [cues], splitting multiline cues into per-line positioned items.
 List<SubtitleCue> applyAribLayoutToCues({
@@ -1176,6 +1189,7 @@ List<SubtitleCue> applyAribLayoutToCues({
         return SubtitleCue(
           spans: flatCues[i].spans,
           normalizedX: line.normalizedX,
+          endNormalizedX: line.endNormalizedX,
           normalizedY: line.normalizedY,
           alignment: 1,
         );

@@ -6447,7 +6447,7 @@ void main() {
         () {
           const defaults = SubtitleSettings.defaults;
           expect(defaults.size, SubtitleSizePreset.medium);
-          expect(defaults.font, SubtitleFontFamily.gothicBold);
+          expect(defaults.font, SubtitleFontFamily.kosugiMaru);
           expect(defaults.edge, SubtitleEdgeStyle.thin);
           expect(defaults.backgroundColor, SubtitleBackgroundColorPreset.black);
           expect(defaults.backgroundOpacityPercent, 65);
@@ -6464,7 +6464,7 @@ void main() {
 
           final custom = const SubtitleSettings(
             size: SubtitleSizePreset.large,
-            font: SubtitleFontFamily.lineSeedJp,
+            font: SubtitleFontFamily.gothic,
             edge: SubtitleEdgeStyle.thick,
             backgroundColor: SubtitleBackgroundColorPreset.darkGray,
             backgroundOpacityPercent: 85,
@@ -6478,23 +6478,27 @@ void main() {
           expect(SubtitleSettings.fromJsonString('not-json'), defaults);
           expect(
             SubtitleSettings.fromJsonString(
-              '{"size":"unknown","bgOpacity":33,"font":"kosugiMaru"}',
+              '{"size":"unknown","bgOpacity":33,"font":"lineSeedJp"}',
             ),
-            const SubtitleSettings(font: SubtitleFontFamily.kosugiMaru),
+            const SubtitleSettings(font: SubtitleFontFamily.gothic),
+          );
+          expect(
+            SubtitleSettings.fromJsonString('{"font":"lineSeedJpBold"}').font,
+            SubtitleFontFamily.gothicBold,
           );
 
           // 540dp Fire TV viewport yields TV-sized glyphs across 3 presets.
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.small, 540),
-            closeTo(22.68, 0.05),
-          );
-          expect(
-            resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
             closeTo(28.08, 0.05),
           );
           expect(
-            resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
+            resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
             closeTo(34.56, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
+            closeTo(41.04, 0.05),
           );
           expect(
             resolveSubtitleFontSize(
@@ -6530,22 +6534,38 @@ void main() {
             resolveSubtitleTextShadows(SubtitleEdgeStyle.dropShadow, 36),
             hasLength(2),
           );
+          expect(SubtitleEdgeStyle.thickShadow.label, '影（中央）');
           final thickShadows = resolveSubtitleTextShadows(
             SubtitleEdgeStyle.thickShadow,
             36,
           );
-          expect(thickShadows, hasLength(3));
-          expect(
-            thickShadows.every((s) => s.offset == Offset.zero),
-            isTrue,
+          expect(thickShadows, hasLength(8));
+          final sumDx = thickShadows.fold<double>(
+            0.0,
+            (s, e) => s + e.offset.dx,
           );
+          final sumDy = thickShadows.fold<double>(
+            0.0,
+            (s, e) => s + e.offset.dy,
+          );
+          expect(sumDx.abs(), lessThan(0.001));
+          expect(sumDy.abs(), lessThan(0.001));
           expect(subtitleBackgroundOpacityLabel(0), 'なし (0%)');
           expect(subtitleBackgroundOpacityLabel(65), '標準 (65%)');
-          expect(SubtitleFontFamily.lineSeedJp.fontFamily, 'LINESeedJP');
-          expect(SubtitleFontFamily.lineSeedJpBold.fontFamily, 'LINESeedJP');
-          expect(SubtitleFontFamily.lineSeedJpBold.fontWeight, FontWeight.w700);
+          expect(SubtitleFontFamily.gothic.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.gothic.fontWeight, FontWeight.w400);
+          expect(SubtitleFontFamily.gothicBold.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.gothicBold.fontWeight, FontWeight.w700);
           expect(SubtitleFontFamily.kosugiMaru.fontFamily, 'KosugiMaru');
           expect(SubtitleFontFamily.kosugiMaru.label, '丸ゴシック');
+          expect(
+            SubtitleFontFamily.values.every(
+              (f) =>
+                  f.fontFamily != 'GoogleSans' &&
+                  !f.fontFamilyFallback.contains('GoogleSans'),
+            ),
+            isTrue,
+          );
         },
       );
 
@@ -6753,7 +6773,7 @@ void main() {
             'firetv_subtitle_settings',
             const SubtitleSettings(
               size: SubtitleSizePreset.large,
-              font: SubtitleFontFamily.kosugiMaru,
+              font: SubtitleFontFamily.gothicBold,
               edge: SubtitleEdgeStyle.none,
               backgroundColor: SubtitleBackgroundColorPreset.navy,
               backgroundOpacityPercent: 85,
@@ -6770,18 +6790,18 @@ void main() {
           await Future<void>.delayed(Duration.zero);
           final restored = container.read(subtitleSettingsProvider);
           expect(restored.size, SubtitleSizePreset.large);
-          expect(restored.font, SubtitleFontFamily.kosugiMaru);
+          expect(restored.font, SubtitleFontFamily.gothicBold);
           expect(restored.edge, SubtitleEdgeStyle.none);
           expect(restored.backgroundColor, SubtitleBackgroundColorPreset.navy);
           expect(restored.backgroundOpacityPercent, 85);
 
           await container
               .read(subtitleSettingsProvider.notifier)
-              .setFont(SubtitleFontFamily.lineSeedJp);
+              .setFont(SubtitleFontFamily.gothic);
           final savedRaw = await kv.read('firetv_subtitle_settings');
           expect(
             SubtitleSettings.fromJsonString(savedRaw).font,
-            SubtitleFontFamily.lineSeedJp,
+            SubtitleFontFamily.gothic,
           );
 
           await container.read(subtitleSettingsProvider.notifier).resetDefaults();
@@ -6822,7 +6842,7 @@ void main() {
           );
           await tester.pumpAndSettle();
           expect(
-            find.textContaining('中（標準）・太字ゴシック'),
+            find.textContaining('中（標準）・丸ゴシック'),
             findsOneWidget,
           );
 
@@ -6835,11 +6855,11 @@ void main() {
             closeTo(16 / 9, 0.001),
           );
           expect(
-            find.textContaining('テレビ並みに見やすい字幕 →'),
+            find.textContaining('テレビ並みの字幕 →'),
             findsAtLeastNWidgets(1),
           );
 
-          await tester.tap(find.text('LINE Seed JP'));
+          await tester.tap(find.text('ゴシック体'));
           await tester.pumpAndSettle();
           await tester.tap(find.text('丸ゴシック'));
           await tester.pumpAndSettle();
@@ -7861,8 +7881,17 @@ void main() {
             ),
           );
           final haloStyle = firstStyledRun(haloRichText.text)!;
-          expect(haloStyle.shadows, hasLength(3));
-          expect(haloStyle.shadows!.every((s) => s.offset == Offset.zero), isTrue);
+          expect(haloStyle.shadows, hasLength(8));
+          final haloSumDx = haloStyle.shadows!.fold<double>(
+            0.0,
+            (s, e) => s + e.offset.dx,
+          );
+          final haloSumDy = haloStyle.shadows!.fold<double>(
+            0.0,
+            (s, e) => s + e.offset.dy,
+          );
+          expect(haloSumDx.abs(), lessThan(0.001));
+          expect(haloSumDy.abs(), lessThan(0.001));
 
           // Verify 16:9 preview strictly scales rendered font sizes across 小 / 中 / 大.
           tester.view.physicalSize = const Size(1280, 720);
@@ -7884,7 +7913,7 @@ void main() {
                 matching: find.byWidgetPredicate(
                   (w) =>
                       w is RichText &&
-                      w.text.toPlainText().contains('テレビ並みに見やすい字幕'),
+                      w.text.toPlainText().contains('テレビ並みの字幕'),
                 ),
               ),
             ).last;
@@ -7981,11 +8010,220 @@ void main() {
 
           expect(tester.takeException(), isNull);
           expect(find.text('16:20'), findsOneWidget);
+          final clockWidget = tester.widget<Text>(find.text('16:20'));
+          expect(clockWidget.style?.fontFamily, 'GoogleSans');
+          expect(clockWidget.style?.fontSize, 44);
+          expect(clockWidget.style?.shadows, hasLength(8));
+          expect(
+            find.ancestor(
+              of: find.text('16:20'),
+              matching: find.byWidgetPredicate(
+                (w) => w is Container && w.decoration != null,
+              ),
+            ),
+            findsNothing,
+          );
           expect(find.text('サイエンスZERO'), findsOneWidget);
           expect(find.text('16:00–16:30（残り 10分）'), findsOneWidget);
           expect(find.text('次'), findsOneWidget);
           expect(find.text('16:30–17:00'), findsOneWidget);
           expect(find.text('次のテレビ番組'), findsOneWidget);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 29: Soft-wrapped per-line pills, broadcast centering, blink suppression, and Google Sans + LINESeedJP UI font',
+    () {
+      test(
+        'subtitleCaptionSignature & shouldSuppressClearedSubtitle block lingering cleared captions without blocking new captions',
+        () {
+          final sig1 = subtitleCaptionSignature(
+            subStartSeconds: 120.5,
+            plainCompact: 'またらいしゅう！',
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: sig1,
+              currentSignature: subtitleCaptionSignature(
+                subStartSeconds: 120.501,
+                plainCompact: 'またらいしゅう！',
+              ),
+            ),
+            isTrue,
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: sig1,
+              currentSignature: subtitleCaptionSignature(
+                subStartSeconds: 123.0,
+                plainCompact: 'またらいしゅう！',
+              ),
+            ),
+            isFalse,
+          );
+          expect(
+            shouldSuppressClearedSubtitle(
+              suppressedSignature: null,
+              currentSignature: sig1,
+            ),
+            isFalse,
+          );
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay splits soft-wrapped lines into snug pills and centers scaled cues inside broadcast bounds',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          // 1) Soft-wrapped long caption (no explicit \n) yields 2 pills where
+          //    line 2 ends tightly around its shorter text.
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(size: SubtitleSizePreset.medium),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.45,
+                        endNormalizedX: 0.96,
+                        normalizedY: 0.78,
+                        spans: [
+                          SubtitleStyledSpan(
+                            text: 'あのいぬになってまたあそびにきたい！',
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final pillFinder = find.descendant(
+            of: find.byType(PlayerSubtitleOverlay),
+            matching: find.byWidgetPredicate(
+              (w) => w is Container && w.decoration is BoxDecoration,
+            ),
+          );
+          expect(pillFinder, findsNWidgets(2));
+          final line1W = tester.getSize(pillFinder.at(0)).width;
+          final line2W = tester.getSize(pillFinder.at(1)).width;
+          expect(line2W, lessThan(line1W * 0.65));
+
+          // 2) Short cue inside centered broadcast box (0.18..0.82) at small
+          //    size centers cleanly around 480px rather than hugging x=172px.
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: PlayerSubtitleOverlay(
+                    settings: SubtitleSettings(size: SubtitleSizePreset.small),
+                    cues: [
+                      SubtitleCue(
+                        normalizedX: 0.18,
+                        endNormalizedX: 0.82,
+                        normalizedY: 0.82,
+                        spans: [SubtitleStyledSpan(text: '短い中央')],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final centeredPill = find.descendant(
+            of: find.byType(PlayerSubtitleOverlay),
+            matching: find.byWidgetPredicate(
+              (w) => w is Container && w.decoration is BoxDecoration,
+            ),
+          );
+          expect(centeredPill, findsOneWidget);
+          final centerDx = tester.getCenter(centeredPill).dx;
+          expect((centerDx - 480.0).abs(), lessThan(40.0));
+        },
+      );
+
+      testWidgets(
+        'TmhbApp uses GoogleSans with LINESeedJP fallback for app-wide UI typography',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.20',
+            udn: 'uuid:theme-font',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                fireTvHelperProvider.overrideWithValue(
+                  _FakeFireTvHelper(reachable: true),
+                ),
+                credentialSummaryProvider.overrideWith((ref) async => null),
+                deviceInfoProvider.overrideWith(
+                  (ref, r) async =>
+                      const DeviceInfo(name: 'nasne-1', softwareVersion: '0260'),
+                ),
+                hddDetailsProvider.overrideWith(
+                  (ref, r) async => const <HddDetail>[],
+                ),
+                liveStatusProvider.overrideWith(
+                  (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+                ),
+                recNgProvider.overrideWith((ref, r) async => const <RecNgItem>[]),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+                titlesProvider(reg).overrideWith(
+                  () => _FixedTitlesNotifier(reg, const []),
+                ),
+                titleCountsProvider.overrideWith(
+                  (ref, r) async => const TitleCounts(0, 1000),
+                ),
+                liveChannelsProvider.overrideWith(
+                  (ref, r) async => const <LiveBand>[],
+                ),
+                channelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                bsChannelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                schedulesProvider.overrideWith(
+                  (ref, r) async => const <RecordSchedule>[],
+                ),
+              ],
+              child: const TmhbApp(),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final shellCtx = tester.element(find.byType(AppShell));
+          final bodyStyle = Theme.of(shellCtx).textTheme.bodyMedium!;
+          expect(bodyStyle.fontFamily, 'GoogleSans');
+          expect(bodyStyle.fontFamilyFallback, contains('LINESeedJP'));
+          expect(tester.takeException(), isNull);
         },
       );
     },

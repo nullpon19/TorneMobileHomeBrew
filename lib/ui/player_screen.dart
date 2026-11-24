@@ -184,6 +184,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
+import '../core/dtcp/arib_ts_caption_tap.dart';
 import 'format.dart';
 import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
@@ -841,23 +842,21 @@ class PlayerOsdClockOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Positioned(
-      top: 20,
-      left: 24,
+      top: 22,
+      left: 28,
       child: IgnorePointer(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-          decoration: BoxDecoration(
-            color: const Color(0xB3000000),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.white24),
-          ),
-          child: Text(
-            formatTimeJst(now),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 22,
-              fontWeight: FontWeight.w700,
-              fontFeatures: [FontFeature.tabularFigures()],
+        child: Text(
+          formatTimeJst(now),
+          style: TextStyle(
+            fontFamily: 'GoogleSans',
+            color: Colors.white,
+            fontSize: 44,
+            fontWeight: FontWeight.w600,
+            height: 1.0,
+            fontFeatures: const [FontFeature.tabularFigures()],
+            shadows: resolveSubtitleTextShadows(
+              SubtitleEdgeStyle.thickShadow,
+              44,
             ),
           ),
         ),
@@ -1795,7 +1794,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _pendingImmediateSubtitleSync = false;
   int _subtitleMismatchRetries = 0;
   String _lastRenderedPlainCompact = '';
-  double? _lastRenderedSubStartSeconds;
+  String? _suppressedCaptionSignature;
+  double? _lastSeenSubStartSeconds;
   Duration _subtitlePlaybackClock = Duration.zero;
   double? _aribPtsOffset;
   double? _activeSubStartSeconds;
@@ -2426,7 +2426,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(stopTimer: true);
-    _aribPtsOffset = null;
+    _resetSubtitleTrackTracking();
     _wakelockSession.setPlaying(false);
     _diag(DiagCategory.playback, 'player: recorded playback finished ($reason)');
     if (mounted && (_interrupted || _autoResumeCountdown != 0 || _buffering)) {
@@ -2829,7 +2829,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(stopTimer: true);
-    _aribPtsOffset = null;
+    _resetSubtitleTrackTracking();
     _resetLiveCatchUpState(resetPlayerRate: false);
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
@@ -2993,7 +2993,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(stopTimer: true);
-    _aribPtsOffset = null;
+    _resetSubtitleTrackTracking();
     if (widget.live) {
       _resetLiveCatchUpState(resetPlayerRate: true);
     }
@@ -3093,6 +3093,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
+  void _resetSubtitleTrackTracking() {
+    _aribPtsOffset = null;
+    _suppressedCaptionSignature = null;
+    _lastSeenSubStartSeconds = null;
+  }
+
   void _clearDisplayedSubtitles({bool notify = true, bool stopTimer = false}) {
     if (stopTimer || !_subtitlesOn) {
       _stopSubtitleSyncTimer();
@@ -3107,7 +3113,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _activeClearAfterSeconds = null;
     _subtitleMismatchRetries = 0;
     _lastRenderedPlainCompact = '';
-    _lastRenderedSubStartSeconds = null;
     if (_visibleSubtitleCues.isEmpty) return;
     _visibleSubtitleCues = const [];
     if (notify && mounted) {
@@ -3184,6 +3189,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         await platform.setProperty('sid', id);
       }
       if (mounted) {
+        _resetSubtitleTrackTracking();
         _clearDisplayedSubtitles(stopTimer: false);
       }
     } catch (e) {
@@ -3298,9 +3304,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             if (line.trim().isNotEmpty) line,
         ];
         if (nextPlain.isEmpty && rawAssNow.trim().isEmpty) {
-          _subtitleMismatchRetries = 0;
-          _lastRenderedPlainCompact = '';
-          _lastRenderedSubStartSeconds = null;
+          _suppressedCaptionSignature = null;
           _clearDisplayedSubtitles(stopTimer: false);
           return;
         }
@@ -3323,6 +3327,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         final nextPlainCompact = normalizeAribSubtitleSymbols(
           nextPlain.join(),
         ).replaceAll(RegExp(r'[\s\u00A0]+'), '');
+        final captionSig = subtitleCaptionSignature(
+          subStartSeconds: subStart,
+          plainCompact: nextPlainCompact,
+        );
+        if (shouldSuppressClearedSubtitle(
+          suppressedSignature: _suppressedCaptionSignature,
+          currentSignature: captionSig,
+        )) {
+          return;
+        }
+        _suppressedCaptionSignature = null;
+
         final assMatches = subtitleTextMatchesAss(
           rawAss: rawAssNow,
           plainLines: nextPlain,
@@ -3331,16 +3347,43 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         );
         final textChanged =
             nextPlainCompact != _lastRenderedPlainCompact &&
-            _lastRenderedPlainCompact.isNotEmpty;
+            nextPlainCompact.isNotEmpty;
         final subStartStale =
             textChanged &&
             subStart != null &&
-            _lastRenderedSubStartSeconds != null &&
-            (subStart - _lastRenderedSubStartSeconds!).abs() < 0.05;
+            _lastSeenSubStartSeconds != null &&
+            (subStart - _lastSeenSubStartSeconds!).abs() < 0.05;
+
+        final layoutSource = widget.session is AribCaptionLayoutSource
+            ? widget.session as AribCaptionLayoutSource
+            : null;
+        final ptsRef = subStart ?? playbackTime;
+        AribCaptionLayoutEvent? matchedLayout;
+        if (layoutSource != null && ptsRef != null) {
+          _aribPtsOffset = resolveAribPtsOffset(
+            events: layoutSource.aribCaptionEvents,
+            mpvSubStartSeconds: ptsRef,
+            firstStreamPtsSeconds: layoutSource.firstStreamPtsSeconds,
+            currentOffset: _aribPtsOffset,
+          );
+          if (_aribPtsOffset != null) {
+            matchedLayout = findMatchingAribLayoutEvent(
+              events: layoutSource.aribCaptionEvents,
+              mpvSubStartSeconds: ptsRef,
+              ptsOffset: _aribPtsOffset!,
+            );
+          }
+        }
+        final waitingForTsLayout =
+            layoutSource != null &&
+            layoutSource.aribCaptionEvents.isNotEmpty &&
+            matchedLayout == null;
+
         if (((rawAssNow.trim().isNotEmpty && !assMatches) ||
                 (rawAssNow.trim().isEmpty && _subtitleMismatchRetries == 0) ||
-                subStartStale) &&
-            _subtitleMismatchRetries < 2) {
+                subStartStale ||
+                waitingForTsLayout) &&
+            _subtitleMismatchRetries < 3) {
           _subtitleMismatchRetries++;
           _subtitleRetryTimer?.cancel();
           _subtitleRetryTimer = Timer(
@@ -3350,35 +3393,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           return;
         }
         _subtitleMismatchRetries = 0;
-        _lastRenderedPlainCompact = nextPlainCompact;
-        _lastRenderedSubStartSeconds = subStart;
 
-        final ptsRef = subStart ?? playbackTime;
-        _activeSubStartSeconds = ptsRef;
-        if (widget.session case final AribCaptionLayoutSource layoutSource) {
-          if (ptsRef != null) {
-            _aribPtsOffset = resolveAribPtsOffset(
+        if (layoutSource != null &&
+            _aribPtsOffset != null &&
+            ptsRef != null &&
+            playbackTime != null &&
+            hasAribClearSinceCaption(
               events: layoutSource.aribCaptionEvents,
-              mpvSubStartSeconds: ptsRef,
-              firstStreamPtsSeconds: layoutSource.firstStreamPtsSeconds,
-              currentOffset: _aribPtsOffset,
-            );
-          }
-          if (_aribPtsOffset != null &&
-              ptsRef != null &&
-              playbackTime != null &&
-              hasAribClearSinceCaption(
-                events: layoutSource.aribCaptionEvents,
-                activeCaptionMpvPts: ptsRef,
-                currentPlaybackMpvPts: playbackTime,
-                ptsOffset: _aribPtsOffset!,
-                activeClearAfterSeconds: _activeClearAfterSeconds,
-              )) {
-            _clearDisplayedSubtitles(stopTimer: false);
-            return;
-          }
+              activeCaptionMpvPts: ptsRef,
+              currentPlaybackMpvPts: playbackTime,
+              ptsOffset: _aribPtsOffset!,
+              activeClearAfterSeconds:
+                  matchedLayout?.clearAfterSeconds ?? _activeClearAfterSeconds,
+            )) {
+          _suppressedCaptionSignature = captionSig;
+          _clearDisplayedSubtitles(stopTimer: false);
+          return;
         }
 
+        _lastRenderedPlainCompact = nextPlainCompact;
+        if (subStart != null) {
+          _lastSeenSubStartSeconds = subStart;
+        }
+        _activeSubStartSeconds = ptsRef;
         _plainSubtitleLines = nextPlain;
         _rawAssSubtitle = rawAssNow;
       }
@@ -3431,6 +3468,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     unawaited(ref.read(subtitlesEnabledProvider.notifier).set(_subtitlesOn));
     if (!_subtitlesOn) {
+      _resetSubtitleTrackTracking();
       _clearDisplayedSubtitles(stopTimer: true);
     }
     _applySubtitleSelection();
@@ -3595,6 +3633,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       forward ? '次チャプター' : '前チャプター',
     );
     _clearDisplayedSubtitles();
+    _resetSubtitleTrackTracking();
     try {
       await _player.seek(target);
     } catch (e) {
@@ -4178,6 +4217,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       'player: dpad seek by ${offset.inSeconds}s to ${target.inSeconds}s',
     );
     _clearDisplayedSubtitles();
+    _resetSubtitleTrackTracking();
     try {
       await _player.seek(target);
     } catch (e) {
@@ -4238,6 +4278,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(notify: false, stopTimer: true);
+    _resetSubtitleTrackTracking();
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
     _customCornerNoticeTimer?.cancel();
@@ -4593,7 +4634,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       }
 
       if (widget.session case final LiveEdgeResettable resettable) {
-        _aribPtsOffset = null;
+        _resetSubtitleTrackTracking();
         await resettable.resetToLiveEdge();
       }
       await _finishLiveCatchUp(showHud: false);

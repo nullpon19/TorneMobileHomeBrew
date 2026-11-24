@@ -47,6 +47,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
             minSize: minFontSize,
           );
           final edgeWidth = resolveSubtitleEdgeWidth(settings.edge, fontSize);
+          final textScaler = MediaQuery.textScalerOf(context);
           final blocks = _clusterSubtitleBlocks(lineCues);
           return Stack(
             fit: StackFit.expand,
@@ -58,6 +59,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
                   viewH: viewH,
                   fontSize: fontSize,
                   edgeWidth: edgeWidth,
+                  textScaler: textScaler,
                 ),
             ],
           );
@@ -113,12 +115,180 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     return blocks;
   }
 
+  static const TextHeightBehavior _textHeightBehavior = TextHeightBehavior(
+    applyHeightToFirstAscent: true,
+    applyHeightToLastDescent: true,
+  );
+
+  StrutStyle _strutStyle(double fontSize) => StrutStyle(
+    fontSize: fontSize,
+    height: 1.28,
+    forceStrutHeight: true,
+  );
+
+  TextSpan _buildCueSpan({
+    required SubtitleCue cue,
+    required double fontSize,
+    required double edgeWidth,
+    required List<Shadow> textShadows,
+    required bool isStroke,
+  }) {
+    return TextSpan(
+      children: [
+        for (final run in cue.spans)
+          TextSpan(
+            text: run.text,
+            style: TextStyle(
+              fontFamily: settings.font.fontFamily,
+              fontFamilyFallback: settings.font.fontFamilyFallback,
+              fontWeight: settings.font.fontWeight,
+              fontSize: fontSize * run.scale,
+              height: 1.28,
+              locale: const Locale('ja', 'JP'),
+              color: isStroke ? null : run.color,
+              foreground: isStroke
+                  ? (Paint()
+                      ..style = PaintingStyle.stroke
+                      ..strokeWidth = edgeWidth
+                      ..strokeJoin = StrokeJoin.round
+                      ..color = Colors.black)
+                  : null,
+              shadows: isStroke
+                  ? const [
+                      Shadow(
+                        color: Colors.black87,
+                        blurRadius: 3.0,
+                        offset: Offset(0, 1),
+                      ),
+                    ]
+                  : (textShadows.isEmpty ? null : textShadows),
+            ),
+          ),
+      ],
+    );
+  }
+
+  List<SubtitleStyledSpan> _sliceCueSpans(
+    List<SubtitleStyledSpan> spans,
+    int start,
+    int end,
+  ) {
+    if (end <= start) return const [];
+    final out = <SubtitleStyledSpan>[];
+    var cursor = 0;
+    for (final span in spans) {
+      final spanEnd = cursor + span.text.length;
+      if (spanEnd > start && cursor < end) {
+        final localStart = math.max(0, start - cursor);
+        final localEnd = math.min(span.text.length, end - cursor);
+        if (localEnd > localStart) {
+          final chunk = span.text.substring(localStart, localEnd);
+          if (chunk.isNotEmpty) {
+            out.add(
+              SubtitleStyledSpan(
+                text: chunk,
+                color: span.color,
+                scale: span.scale,
+              ),
+            );
+          }
+        }
+      }
+      cursor = spanEnd;
+      if (cursor >= end) break;
+    }
+    while (out.isNotEmpty) {
+      final last = out.last;
+      final trimmed = last.text.replaceFirst(RegExp(r'[\r\n]+$'), '');
+      if (trimmed == last.text) break;
+      out.removeLast();
+      if (trimmed.isNotEmpty) {
+        out.add(
+          SubtitleStyledSpan(
+            text: trimmed,
+            color: last.color,
+            scale: last.scale,
+          ),
+        );
+        break;
+      }
+    }
+    return out;
+  }
+
+  ({List<SubtitleCue> lines, double maxLineWidth}) _splitCueIntoVisualLines({
+    required SubtitleCue cue,
+    required double maxTextWidth,
+    required double fontSize,
+    required StrutStyle strut,
+    required TextScaler textScaler,
+  }) {
+    final fullText = cue.plainText;
+    if (fullText.isEmpty) {
+      return (lines: [cue], maxLineWidth: 0.0);
+    }
+    final painter = TextPainter(
+      text: _buildCueSpan(
+        cue: cue,
+        fontSize: fontSize,
+        edgeWidth: 0.0,
+        textShadows: const [],
+        isStroke: false,
+      ),
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.left,
+      textScaler: textScaler,
+      strutStyle: strut,
+      textHeightBehavior: _textHeightBehavior,
+    )..layout(maxWidth: maxTextWidth);
+
+    try {
+      final lineMetrics = painter.computeLineMetrics();
+      final maxLineW = lineMetrics.isEmpty
+          ? painter.width
+          : lineMetrics.map((m) => m.width).reduce(math.max);
+      if (lineMetrics.length <= 1) {
+        return (lines: [cue], maxLineWidth: maxLineW);
+      }
+
+      final visualLines = <SubtitleCue>[];
+      var offset = 0;
+      while (offset < fullText.length) {
+        final range = painter.getLineBoundary(TextPosition(offset: offset));
+        final nextEnd = math.min(fullText.length, range.end);
+        if (nextEnd <= offset) break;
+        final sliceStart = math.max(offset, range.start);
+        final sliced = _sliceCueSpans(cue.spans, sliceStart, nextEnd);
+        final slicedText = [for (final s in sliced) s.text].join().trim();
+        if (slicedText.isNotEmpty) {
+          visualLines.add(
+            SubtitleCue(
+              spans: sliced,
+              normalizedX: cue.normalizedX,
+              endNormalizedX: cue.endNormalizedX,
+              normalizedY: cue.normalizedY,
+              alignment: cue.alignment,
+            ),
+          );
+        }
+        offset = nextEnd;
+      }
+      return (
+        lines: visualLines.isEmpty ? [cue] : visualLines,
+        maxLineWidth: maxLineW,
+      );
+    } finally {
+      painter.dispose();
+    }
+  }
+
   Widget _buildBlock({
     required List<SubtitleCue> block,
     required double viewW,
     required double viewH,
     required double fontSize,
     required double edgeWidth,
+    required TextScaler textScaler,
   }) {
     final positionedY = [
       for (final cue in block)
@@ -127,6 +297,10 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     final positionedX = [
       for (final cue in block)
         if (cue.normalizedX != null) cue.normalizedX!,
+    ];
+    final positionedEndX = [
+      for (final cue in block)
+        if (cue.endNormalizedX != null) cue.endNormalizedX!,
     ];
 
     final double? avgY = positionedY.isEmpty
@@ -141,14 +315,61 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     final double? minX = positionedX.isEmpty
         ? null
         : positionedX.reduce(math.min);
+    final double? maxEndX = positionedEndX.isEmpty
+        ? null
+        : positionedEndX.reduce(math.max);
+
+    final hasBackground = settings.backgroundOpacityPercent > 0;
+    final hPad = hasBackground ? fontSize * 0.34 : 0.0;
+    final baseLeft = minX != null
+        ? (minX * viewW).clamp(16.0, viewW * 0.58).toDouble()
+        : 24.0;
+    final maxBlockW = minX != null
+        ? math.max(120.0, viewW - baseLeft - 16.0)
+        : math.max(120.0, viewW - 48.0);
+    final maxTextWidth = math.max(40.0, maxBlockW - hPad * 2);
+    final strut = _strutStyle(fontSize);
+
+    final visualLines = <SubtitleCue>[];
+    var maxLineWidth = 0.0;
+    for (final cue in block) {
+      final split = _splitCueIntoVisualLines(
+        cue: cue,
+        maxTextWidth: maxTextWidth,
+        fontSize: fontSize,
+        strut: strut,
+        textScaler: textScaler,
+      );
+      visualLines.addAll(split.lines);
+      if (split.maxLineWidth > maxLineWidth) {
+        maxLineWidth = split.maxLineWidth;
+      }
+    }
+    final maxRenderedPillW = math.min(
+      maxBlockW,
+      maxLineWidth.ceilToDouble() + hPad * 2 + 2.0,
+    );
 
     final double xAlign;
     final double leftPad;
     final double rightPad;
     if (minX != null) {
       xAlign = -1.0;
-      leftPad = (minX * viewW).clamp(16.0, viewW * 0.58).toDouble();
       rightPad = 16.0;
+      if (maxEndX != null && maxEndX > minX) {
+        final broadcastW = (maxEndX - minX) * viewW;
+        final broadcastCenterX = ((minX + maxEndX) * 0.5) * viewW;
+        final maxAllowedLeft = math.max(16.0, viewW - maxRenderedPillW - 16.0);
+        if (maxRenderedPillW < broadcastW) {
+          leftPad = (broadcastCenterX - maxRenderedPillW * 0.5)
+              .clamp(16.0, maxAllowedLeft)
+              .toDouble();
+        } else {
+          leftPad = baseLeft.clamp(16.0, maxAllowedLeft).toDouble();
+        }
+      } else {
+        leftPad = baseLeft;
+      }
     } else {
       // Unpositioned fallback centers the left-aligned column as a block.
       xAlign = 0.0;
@@ -180,12 +401,12 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       bottomPad = bottomSafePadding;
     }
 
-    final hasBackground = settings.backgroundOpacityPercent > 0;
     Widget buildLinePill(SubtitleCue cue) {
       final textWidget = _buildCueText(
         cue: cue,
         fontSize: fontSize,
         edgeWidth: edgeWidth,
+        strut: strut,
       );
       if (!hasBackground) return textWidget;
       return Container(
@@ -205,9 +426,9 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        for (var i = 0; i < block.length; i++) ...[
+        for (var i = 0; i < visualLines.length; i++) ...[
           if (i > 0) SizedBox(height: math.max(2.0, fontSize * 0.12)),
-          buildLinePill(block[i]),
+          buildLinePill(visualLines[i]),
         ],
       ],
     );
@@ -224,60 +445,21 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     required SubtitleCue cue,
     required double fontSize,
     required double edgeWidth,
+    required StrutStyle strut,
   }) {
-    final strut = StrutStyle(
-      fontSize: fontSize,
-      height: 1.28,
-      forceStrutHeight: true,
-    );
-    const heightBehavior = TextHeightBehavior(
-      applyHeightToFirstAscent: true,
-      applyHeightToLastDescent: true,
-    );
-
     final textShadows = resolveSubtitleTextShadows(settings.edge, fontSize);
 
-    InlineSpan buildSpan({required bool isStroke}) {
-      return TextSpan(
-        children: [
-          for (final run in cue.spans)
-            TextSpan(
-              text: run.text,
-              style: TextStyle(
-                fontFamily: settings.font.fontFamily,
-                fontFamilyFallback: settings.font.fontFamilyFallback,
-                fontWeight: settings.font.fontWeight,
-                fontSize: fontSize * run.scale,
-                height: 1.28,
-                locale: const Locale('ja', 'JP'),
-                color: isStroke ? null : run.color,
-                foreground: isStroke
-                    ? (Paint()
-                        ..style = PaintingStyle.stroke
-                        ..strokeWidth = edgeWidth
-                        ..strokeJoin = StrokeJoin.round
-                        ..color = Colors.black)
-                    : null,
-                shadows: isStroke
-                    ? const [
-                        Shadow(
-                          color: Colors.black87,
-                          blurRadius: 3.0,
-                          offset: Offset(0, 1),
-                        ),
-                      ]
-                    : (textShadows.isEmpty ? null : textShadows),
-              ),
-            ),
-        ],
-      );
-    }
-
     final fillText = Text.rich(
-      buildSpan(isStroke: false),
+      _buildCueSpan(
+        cue: cue,
+        fontSize: fontSize,
+        edgeWidth: edgeWidth,
+        textShadows: textShadows,
+        isStroke: false,
+      ),
       textAlign: TextAlign.left,
       strutStyle: strut,
-      textHeightBehavior: heightBehavior,
+      textHeightBehavior: _textHeightBehavior,
     );
     if (edgeWidth <= 0) return fillText;
 
@@ -285,10 +467,16 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       alignment: Alignment.centerLeft,
       children: [
         Text.rich(
-          buildSpan(isStroke: true),
+          _buildCueSpan(
+            cue: cue,
+            fontSize: fontSize,
+            edgeWidth: edgeWidth,
+            textShadows: textShadows,
+            isStroke: true,
+          ),
           textAlign: TextAlign.left,
           strutStyle: strut,
-          textHeightBehavior: heightBehavior,
+          textHeightBehavior: _textHeightBehavior,
         ),
         fillText,
       ],
