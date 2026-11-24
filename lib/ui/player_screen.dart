@@ -171,7 +171,7 @@
 library;
 
 import 'dart:async';
-import 'dart:convert' show jsonDecode;
+import 'dart:convert' show jsonDecode, utf8;
 import 'dart:io' show Directory, Platform;
 import 'dart:math' as math;
 
@@ -688,14 +688,67 @@ bool shouldLatchInitialPlaybackStarted({
   required bool buffering,
   Duration? positionAtFirstFrame,
   Duration currentPosition = Duration.zero,
+  int preBufferTargetSeconds = 0,
+  double preBufferCurrentSeconds = 0.0,
 }) {
   if (!hasVideoFrame || !playingNow) return false;
+  if (preBufferTargetSeconds > 0) {
+    final posAdvanced =
+        positionAtFirstFrame != null &&
+        currentPosition - positionAtFirstFrame >= const Duration(seconds: 1);
+    if (posAdvanced) return true;
+    return !buffering &&
+        preBufferCurrentSeconds >= (preBufferTargetSeconds - 0.5);
+  }
   if (!buffering) return true;
   if (positionAtFirstFrame != null &&
       currentPosition - positionAtFirstFrame >= const Duration(seconds: 1)) {
     return true;
   }
   return false;
+}
+
+String _formatOverlaySeconds(int seconds) {
+  if (seconds <= 0) return '0秒';
+  final min = seconds ~/ 60;
+  final sec = seconds % 60;
+  if (min > 0 && sec > 0) return '$min分$sec秒';
+  if (min > 0) return '$min分';
+  return '$sec秒';
+}
+
+/// Computes the spinner caption and progress bar state for the loading overlay.
+/// Live viewing unifies initial buffering, 0-second buffer mode, and
+/// mid-stream rebuffering onto the seconds + progress bar display.
+({bool showProgressBar, double? progress, String caption})
+liveLoadingOverlaySpec({
+  required bool isLive,
+  required bool isPreBuffering,
+  required int targetSeconds,
+  required int currentSeconds,
+  required double bufferingPercentage,
+  required String fallbackLabel,
+}) {
+  if (isPreBuffering && targetSeconds > 0) {
+    return (
+      showProgressBar: true,
+      progress: (currentSeconds / targetSeconds).clamp(0.0, 1.0).toDouble(),
+      caption:
+          'バッファ蓄積中… ${_formatOverlaySeconds(currentSeconds)} / '
+          '${_formatOverlaySeconds(targetSeconds)}',
+    );
+  }
+  if (isLive) {
+    final pctProgress = bufferingPercentage > 0
+        ? (bufferingPercentage / 100.0).clamp(0.0, 1.0).toDouble()
+        : null;
+    return (
+      showProgressBar: true,
+      progress: pctProgress,
+      caption: 'バッファ蓄積中… ${_formatOverlaySeconds(currentSeconds)}',
+    );
+  }
+  return (showProgressBar: false, progress: null, caption: fallbackLabel);
 }
 
 double _clampedStepSeconds(DateTime from, DateTime to) {
@@ -1421,8 +1474,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       if (isRealTrackId(track.id)) track,
   ];
 
-  /// The caption toggle (plan 53). Default off, per the
-  /// owner's spec; kept in this state only, never persisted.
+  /// The caption toggle (persisted via [subtitlesEnabledProvider] across
+  /// channel switches, recordings, and restarts).
   bool _subtitlesOn = false;
   final SubtitleActiveWindowTracker _subtitleTracker =
       SubtitleActiveWindowTracker();
@@ -1436,6 +1489,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Timer? _subtitleSyncTimer;
   bool _pollingSubtitleSync = false;
   Duration _subtitlePlaybackClock = Duration.zero;
+  double? _aribPtsOffset;
+  double? _activeSubStartSeconds;
+  double? _lastPlaybackTimeSeconds;
+  double? _activeClearAfterSeconds;
+  DateTime? _lastAribDecoderResetAt;
+  bool _resettingAribDecoder = false;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
   /// normal speed. Offered for recordings only (see
@@ -1545,16 +1604,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   bool _maybeLatchInitialPlaybackStarted() {
     if (_initialPlaybackStarted) return false;
+    final targetSec = (_bufferPlan?.cachePauseInitial == true)
+        ? (_bufferPlan?.cachePauseWaitSeconds ?? 0)
+        : 0;
     final ready = shouldLatchInitialPlaybackStarted(
       hasVideoFrame: _hasVideoFrame,
       playingNow: _playingNow,
       buffering: _buffering,
       positionAtFirstFrame: _positionAtFirstFrame,
       currentPosition: _lastPosition,
+      preBufferTargetSeconds: targetSec,
+      preBufferCurrentSeconds: _effectivePreBufferSeconds.toDouble(),
     );
     if (!ready) return false;
     _initialPlaybackStarted = true;
-    _stopPreBufferPoller();
+    if (!_buffering) {
+      _stopPreBufferPoller();
+    }
     final startedAt = _openStartedAt;
     if (startedAt != null && startedAt.isRunning) {
       startedAt.stop();
@@ -1585,12 +1651,31 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
   );
 
+  int get _effectiveLoadingCurrentSeconds {
+    final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
+    if (target > 0 && _isPreBuffering) {
+      return _effectivePreBufferSeconds;
+    }
+    final best = math.max(
+      _bufferedAheadSeconds,
+      math.max(
+        _bufferDeltaSeconds,
+        widget.live ? _liveTransferAccumulatedSeconds : 0.0,
+      ),
+    );
+    return best.isFinite && best > 0 ? best.floor() : 0;
+  }
+
+  bool get _shouldPollLiveBuffering =>
+      _isPreBuffering ||
+      (widget.live && (!_initialPlaybackStarted || _buffering));
+
   void _startPreBufferPoller() {
-    _preBufferPollTimer?.cancel();
+    if (_preBufferPollTimer != null) return;
     _preBufferPollTimer = Timer.periodic(const Duration(milliseconds: 500), (
       _,
     ) {
-      if (!mounted || !_isPreBuffering) {
+      if (!mounted || !_shouldPollLiveBuffering) {
         _stopPreBufferPoller();
         return;
       }
@@ -1608,7 +1693,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (_pollingBufferProps || !mounted) return;
     final platform = _player.platform;
     _pollingBufferProps = true;
-    final prevPreSec = _effectivePreBufferSeconds;
+    final prevLoadSec = _effectiveLoadingCurrentSeconds;
+    final prevPct = _bufferingPercentage.round();
     final prevAheadFloor = _bufferedAheadSeconds.floor();
     try {
       if (platform is NativePlayer) {
@@ -1637,7 +1723,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           }
         } catch (_) {}
       }
-      if (widget.live && _isPreBuffering) {
+      if (widget.live && _shouldPollLiveBuffering) {
         if (widget.session case final StreamTransferMetrics metrics) {
           final next = advanceLiveTransferSeconds(
             currentAccumulatedSeconds: _liveTransferAccumulatedSeconds,
@@ -1654,8 +1740,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         }
       }
       if (!mounted) return;
-      final nextPreSec = _effectivePreBufferSeconds;
-      if ((_isPreBuffering && nextPreSec != prevPreSec) ||
+      final latched = _maybeLatchInitialPlaybackStarted();
+      final nextLoadSec = _effectiveLoadingCurrentSeconds;
+      final nextPct = _bufferingPercentage.round();
+      if (latched ||
+          (_shouldPollLiveBuffering &&
+              (nextLoadSec != prevLoadSec || nextPct != prevPct)) ||
           ((_osdOpen || _seekHudVisible) &&
               _bufferedAheadSeconds.floor() != prevAheadFloor)) {
         setState(() {});
@@ -1689,6 +1779,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     super.initState();
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
+    _subtitlesOn = ref.read(subtitlesEnabledProvider);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -1785,6 +1876,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         }
         final changed = _buffering != buffering;
         _buffering = buffering;
+        if (widget.live && buffering) {
+          _startPreBufferPoller();
+        }
         final latched = _maybeLatchInitialPlaybackStarted();
         if (mounted && (changed || latched)) {
           setState(() {});
@@ -1843,7 +1937,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _subscriptions.add(
       _player.stream.buffer.listen((bufferEnd) {
-        final prevPreSec = _effectivePreBufferSeconds;
+        final prevLoadSec = _effectiveLoadingCurrentSeconds;
         final prevDeltaFloor = _bufferDeltaSeconds.floor();
         if (bufferEnd > Duration.zero && _initialBufferPosition == null) {
           _initialBufferPosition = bufferEnd <= const Duration(seconds: 5)
@@ -1853,8 +1947,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         if (bufferEnd != _bufferEndPosition) {
           _bufferEndPosition = bufferEnd;
           if (mounted &&
-              ((_isPreBuffering &&
-                      _effectivePreBufferSeconds != prevPreSec) ||
+              ((_shouldPollLiveBuffering &&
+                      _effectiveLoadingCurrentSeconds != prevLoadSec) ||
                   ((_osdOpen || _seekHudVisible) &&
                       _bufferDeltaSeconds.floor() != prevDeltaFloor))) {
             setState(() {});
@@ -1866,11 +1960,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       _player.stream.bufferingPercentage.listen((pct) {
         if (!pct.isFinite) return;
         final clamped = pct.clamp(0.0, 100.0).toDouble();
-        final prevPreSec = _effectivePreBufferSeconds;
+        final prevLoadSec = _effectiveLoadingCurrentSeconds;
+        final prevPct = _bufferingPercentage.round();
         _bufferingPercentage = clamped;
         if (mounted &&
-            _isPreBuffering &&
-            _effectivePreBufferSeconds != prevPreSec) {
+            _shouldPollLiveBuffering &&
+            (_effectiveLoadingCurrentSeconds != prevLoadSec ||
+                clamped.round() != prevPct)) {
           setState(() {});
         }
       }),
@@ -2009,7 +2105,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
-    _clearDisplayedSubtitles();
+    _clearDisplayedSubtitles(stopTimer: true);
+    _aribPtsOffset = null;
     _wakelockSession.setPlaying(false);
     _diag(DiagCategory.playback, 'player: recorded playback finished ($reason)');
     if (mounted && (_interrupted || _autoResumeCountdown != 0 || _buffering)) {
@@ -2411,7 +2508,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
-    _clearDisplayedSubtitles();
+    _clearDisplayedSubtitles(stopTimer: true);
+    _aribPtsOffset = null;
     _resetLiveCatchUpState(resetPlayerRate: false);
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
@@ -2572,7 +2670,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
-    _clearDisplayedSubtitles();
+    _clearDisplayedSubtitles(stopTimer: true);
+    _aribPtsOffset = null;
     if (widget.live) {
       _resetLiveCatchUpState(resetPlayerRate: true);
     }
@@ -2653,11 +2752,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
   }
 
-  void _clearDisplayedSubtitles({bool notify = true}) {
-    _stopSubtitleSyncTimer();
+  void _clearDisplayedSubtitles({bool notify = true, bool stopTimer = false}) {
+    if (stopTimer || !_subtitlesOn) {
+      _stopSubtitleSyncTimer();
+    }
     _subtitleTracker.reset();
     _plainSubtitleLines = const [];
     _rawAssSubtitle = '';
+    _activeSubStartSeconds = null;
+    _activeClearAfterSeconds = null;
     if (_visibleSubtitleCues.isEmpty) return;
     _visibleSubtitleCues = const [];
     if (notify && mounted) {
@@ -2667,7 +2770,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _recomputeVisibleSubtitles() {
     if (!_subtitlesOn) {
-      _clearDisplayedSubtitles();
+      _clearDisplayedSubtitles(stopTimer: true);
       return;
     }
     final rawCues = resolveRawSubtitleCues(
@@ -2676,16 +2779,69 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       playResWidth: _assPlayResWidth,
       playResHeight: _assPlayResHeight,
     );
-    final nextCues = _subtitleTracker.update(rawCues, _subtitlePlaybackClock);
-    if (nextCues.isEmpty) {
-      _stopSubtitleSyncTimer();
-    } else {
+    var nextCues = _subtitleTracker.update(
+      rawCues,
+      _subtitlePlaybackClock,
+      mpvSubStartSeconds: _activeSubStartSeconds,
+    );
+    if (nextCues.isNotEmpty) {
       _startSubtitleSyncTimer();
+      final layoutSource = widget.session is AribCaptionLayoutSource
+          ? widget.session as AribCaptionLayoutSource
+          : null;
+      final ptsRef = _activeSubStartSeconds ?? _lastPlaybackTimeSeconds;
+      if (layoutSource != null && ptsRef != null) {
+        final events = layoutSource.aribCaptionEvents;
+        _aribPtsOffset = resolveAribPtsOffset(
+          events: events,
+          mpvSubStartSeconds: ptsRef,
+          firstStreamPtsSeconds: layoutSource.firstStreamPtsSeconds,
+          currentOffset: _aribPtsOffset,
+        );
+        if (_aribPtsOffset != null) {
+          final matched = findMatchingAribLayoutEvent(
+            events: events,
+            mpvSubStartSeconds: ptsRef,
+            ptsOffset: _aribPtsOffset!,
+          );
+          if (matched != null) {
+            _activeClearAfterSeconds = matched.clearAfterSeconds;
+            nextCues = applyAribLayoutToCues(cues: nextCues, layout: matched);
+          }
+        }
+      }
     }
     final changed = !_cuesEqual(_visibleSubtitleCues, nextCues);
     _visibleSubtitleCues = nextCues;
     if (changed && mounted) {
       setState(() {});
+    }
+  }
+
+  Future<void> _resetAribSubtitleDecoder(NativePlayer platform) async {
+    if (_resettingAribDecoder || !mounted || !_subtitlesOn) return;
+    _resettingAribDecoder = true;
+    _lastAribDecoderResetAt = _now();
+    _diag(
+      DiagCategory.playback,
+      'player: resetting libaribb24 decoder to clear accumulated timing buffer',
+    );
+    try {
+      await platform.setProperty('sid', 'no');
+      final id = subtitleTrackIdToSelect(
+        subtitlesOn: _subtitlesOn,
+        subtitleTrackIds: [for (final track in _realSubtitleTracks) track.id],
+      );
+      if (mounted && _subtitlesOn && id != null) {
+        await platform.setProperty('sid', id);
+      }
+      if (mounted) {
+        _clearDisplayedSubtitles(stopTimer: false);
+      }
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: arib decoder reset failed: $e');
+    } finally {
+      _resettingAribDecoder = false;
     }
   }
 
@@ -2790,19 +2946,79 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           plainNow = '';
         }
         if (!mounted || !_subtitlesOn) return;
+        String rawAssNow = _rawAssSubtitle;
+        try {
+          rawAssNow = await platform.getProperty('sub-text-ass');
+        } catch (_) {}
+        double? subStart;
+        double? subEnd;
+        double? playbackTime;
+        try {
+          subStart = double.tryParse(await platform.getProperty('sub-start'));
+        } catch (_) {}
+        try {
+          subEnd = double.tryParse(await platform.getProperty('sub-end'));
+        } catch (_) {}
+        try {
+          playbackTime = double.tryParse(
+            await platform.getProperty('playback-time'),
+          );
+        } catch (_) {}
+        if (!mounted || !_subtitlesOn) return;
+        if (playbackTime != null && playbackTime.isFinite) {
+          _lastPlaybackTimeSeconds = playbackTime;
+        }
+
         final nextPlain = [
           for (final line in plainNow.split('\n'))
             if (line.trim().isNotEmpty) line,
         ];
         if (nextPlain.isEmpty) {
-          _clearDisplayedSubtitles();
+          _clearDisplayedSubtitles(stopTimer: false);
           return;
         }
-        String rawAssNow = _rawAssSubtitle;
-        try {
-          rawAssNow = await platform.getProperty('sub-text-ass');
-        } catch (_) {}
-        if (!mounted || !_subtitlesOn) return;
+
+        if (shouldResetAribSubtitleDecoder(
+              subStartSeconds: subStart,
+              subEndSeconds: subEnd,
+              playbackTimeSeconds: playbackTime,
+              plainUtf8Bytes: utf8.encode(plainNow).length,
+              assUtf8Bytes: utf8.encode(rawAssNow).length,
+            ) &&
+            !_resettingAribDecoder &&
+            (_lastAribDecoderResetAt == null ||
+                _now().difference(_lastAribDecoderResetAt!) >=
+                    const Duration(seconds: 8))) {
+          await _resetAribSubtitleDecoder(platform);
+          return;
+        }
+
+        final ptsRef = subStart ?? playbackTime;
+        _activeSubStartSeconds = ptsRef;
+        if (widget.session case final AribCaptionLayoutSource layoutSource) {
+          if (ptsRef != null) {
+            _aribPtsOffset = resolveAribPtsOffset(
+              events: layoutSource.aribCaptionEvents,
+              mpvSubStartSeconds: ptsRef,
+              firstStreamPtsSeconds: layoutSource.firstStreamPtsSeconds,
+              currentOffset: _aribPtsOffset,
+            );
+          }
+          if (_aribPtsOffset != null &&
+              ptsRef != null &&
+              playbackTime != null &&
+              hasAribClearSinceCaption(
+                events: layoutSource.aribCaptionEvents,
+                activeCaptionMpvPts: ptsRef,
+                currentPlaybackMpvPts: playbackTime,
+                ptsOffset: _aribPtsOffset!,
+                activeClearAfterSeconds: _activeClearAfterSeconds,
+              )) {
+            _clearDisplayedSubtitles(stopTimer: false);
+            return;
+          }
+        }
+
         _plainSubtitleLines = nextPlain;
         _rawAssSubtitle = rawAssNow;
       }
@@ -2824,13 +3040,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     try {
       if (id == null) {
-        _clearDisplayedSubtitles();
+        _clearDisplayedSubtitles(stopTimer: !_subtitlesOn);
         await _player.setSubtitleTrack(SubtitleTrack.no());
       } else {
         _assExtradataLoaded = false;
         await _player.setSubtitleTrack(
           _realSubtitleTracks.firstWhere((track) => track.id == id),
         );
+        _startSubtitleSyncTimer();
         Future.delayed(const Duration(milliseconds: 250), () {
           if (mounted && _subtitlesOn) {
             unawaited(_syncSubtitleTick());
@@ -2848,8 +3065,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       DiagCategory.playback,
       'player: subtitles ${_subtitlesOn ? 'on' : 'off'} (user toggle)',
     );
+    unawaited(ref.read(subtitlesEnabledProvider.notifier).set(_subtitlesOn));
     if (!_subtitlesOn) {
-      _clearDisplayedSubtitles();
+      _clearDisplayedSubtitles(stopTimer: true);
     }
     _applySubtitleSelection();
   }
@@ -3056,7 +3274,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         await platform.setProperty('sid', 'no');
         await platform.setProperty('sub-ass', 'yes');
         await platform.setProperty('sub-visibility', 'no');
-        await platform.setProperty('sub-fix-timing', 'yes');
+        await platform.setProperty('sub-fix-timing', 'no');
         await platform.setProperty('sub-clear-on-seek', 'yes');
         if (widget.live) {
           final probeSize = liveDemuxerProbeSizeBytes(
@@ -3113,7 +3331,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       }
       if (mounted) {
         setState(() {});
-        if (plan.cachePauseInitial && plan.cachePauseWaitSeconds > 0) {
+        if (widget.live ||
+            (plan.cachePauseInitial && plan.cachePauseWaitSeconds > 0)) {
           _startPreBufferPoller();
         }
       }
@@ -3637,7 +3856,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
-    _clearDisplayedSubtitles();
+    _clearDisplayedSubtitles(notify: false, stopTimer: true);
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
     _customCornerNoticeTimer?.cancel();
@@ -3991,6 +4210,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       }
 
       if (widget.session case final LiveEdgeResettable resettable) {
+        _aribPtsOffset = null;
         await resettable.resetToLiveEdge();
       }
       await _finishLiveCatchUp(showHud: false);
@@ -4379,15 +4599,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   Widget _buildLoadingOverlay(String fallbackLabel) {
     final plan = _bufferPlan;
-    final showPreBuffer = _isPreBuffering;
-    final targetSec = showPreBuffer ? plan!.cachePauseWaitSeconds : 0;
-    final curSec = showPreBuffer ? _effectivePreBufferSeconds : 0;
-    final progress = showPreBuffer && targetSec > 0
-        ? (curSec / targetSec).clamp(0.0, 1.0)
-        : null;
-    final caption = showPreBuffer
-        ? 'バッファ蓄積中… ${_formatShortDurationSeconds(curSec)} / ${_formatShortDurationSeconds(targetSec)}'
-        : fallbackLabel;
+    final spec = liveLoadingOverlaySpec(
+      isLive: widget.live,
+      isPreBuffering: _isPreBuffering,
+      targetSeconds: plan?.cachePauseWaitSeconds ?? 0,
+      currentSeconds: _effectiveLoadingCurrentSeconds,
+      bufferingPercentage: _bufferingPercentage,
+      fallbackLabel: fallbackLabel,
+    );
     return IgnorePointer(
       child: Center(
         child: DecoratedBox(
@@ -4413,17 +4632,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     ),
                     const SizedBox(width: 12),
                     Text(
-                      caption,
+                      spec.caption,
                       style: const TextStyle(color: Colors.white),
                     ),
                   ],
                 ),
-                if (progress != null) ...[
+                if (spec.showProgressBar) ...[
                   const SizedBox(height: 10),
                   SizedBox(
                     width: 220,
                     child: LinearProgressIndicator(
-                      value: progress,
+                      value: spec.progress,
                       backgroundColor: Colors.white24,
                       color: Colors.lightBlueAccent,
                       minHeight: 5,

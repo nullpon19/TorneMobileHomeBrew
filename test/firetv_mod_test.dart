@@ -6,6 +6,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -16,6 +17,7 @@ import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
+import 'package:tmhb/core/dtcp/arib_ts_caption_tap.dart';
 import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
@@ -6484,15 +6486,15 @@ void main() {
           // 540dp Fire TV viewport yields TV-sized glyphs across 3 presets.
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.small, 540),
-            closeTo(25.92, 0.05),
+            closeTo(20.52, 0.05),
           );
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
-            closeTo(34.56, 0.05),
+            closeTo(25.92, 0.05),
           );
           expect(
             resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
-            closeTo(44.28, 0.05),
+            closeTo(32.40, 0.05),
           );
           expect(
             resolveSubtitleFontSize(
@@ -6809,7 +6811,19 @@ void main() {
           await tester.pumpAndSettle();
           await tester.tap(find.text('丸ゴシック (Kosugi Maru)'));
           await tester.pumpAndSettle();
+          await tester.scrollUntilVisible(
+            find.text('大'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
           await tester.tap(find.text('大'));
+          await tester.pumpAndSettle();
+          await tester.scrollUntilVisible(
+            find.text('太め'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
           await tester.pumpAndSettle();
           await tester.tap(find.text('太め'));
           await tester.pumpAndSettle();
@@ -6932,6 +6946,676 @@ void main() {
               expect(dec.color, isNot(Colors.black.withValues(alpha: 0.65)));
             }
           }
+
+          // Multi-line subtitles use left alignment and per-line snug background pills.
+          await pumpOverlay(
+            const SubtitleSettings(
+              edge: SubtitleEdgeStyle.none,
+              backgroundOpacityPercent: 65,
+            ),
+            const [
+              SubtitleCue(
+                spans: [SubtitleStyledSpan(text: '長い1行目の字幕テストテキストです\n短い行')],
+              ),
+            ],
+          );
+          final richLines = tester.widgetList<RichText>(find.byType(RichText)).toList();
+          expect(richLines, hasLength(2));
+          for (final rt in richLines) {
+            expect(rt.textAlign, TextAlign.left);
+          }
+          final linePills = tester
+              .widgetList<Container>(find.byType(Container))
+              .where((c) => c.decoration is BoxDecoration)
+              .toList();
+          expect(linePills, hasLength(2));
+          final longPillRect = tester.getRect(find.byWidget(linePills[0]));
+          final shortPillRect = tester.getRect(find.byWidget(linePills[1]));
+          expect(longPillRect.width, greaterThan(shortPillRect.width + 80));
+          expect((longPillRect.left - shortPillRect.left).abs(), lessThan(2.0));
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 27: ARIB TS position/clear tap, decoder reset guard, persisted toggle, unified live buffering, and rail focus handoff',
+    () {
+      Uint8List wrapTsPacket({
+        required int pid,
+        required bool pusi,
+        required List<int> payload,
+        int packetStride = 192,
+      }) {
+        final pkt = Uint8List(packetStride);
+        final off = packetStride == 192 ? 4 : 0;
+        pkt[off] = 0x47;
+        pkt[off + 1] = ((pusi ? 0x40 : 0x00) | ((pid >> 8) & 0x1F));
+        pkt[off + 2] = pid & 0xFF;
+        pkt[off + 3] = 0x10;
+        final copyLen = payload.length < 184 ? payload.length : 184;
+        pkt.setRange(off + 4, off + 4 + copyLen, payload);
+        for (var i = off + 4 + copyLen; i < off + 188; i++) {
+          pkt[i] = 0xFF;
+        }
+        return pkt;
+      }
+
+      List<int> encodePts(double seconds) {
+        final pts = (seconds * 90000.0).round();
+        return [
+          0x21 | (((pts >> 30) & 0x07) << 1),
+          (pts >> 22) & 0xFF,
+          0x01 | (((pts >> 15) & 0x7F) << 1),
+          (pts >> 7) & 0xFF,
+          0x01 | ((pts & 0x7F) << 1),
+        ];
+      }
+
+      List<int> buildPat({required int pmtPid}) {
+        return [
+          0x00, // pointer_field
+          0x00, // table_id
+          0xB0, 0x0D, // section_length = 13
+          0x00, 0x01, 0xC1, 0x00, 0x00,
+          0x00, 0x01, 0xE0 | ((pmtPid >> 8) & 0x1F), pmtPid & 0xFF,
+          0x00, 0x00, 0x00, 0x00, // dummy CRC
+        ];
+      }
+
+      List<int> buildPmt({required int videoPid, required int captionPid}) {
+        return [
+          0x00, // pointer_field
+          0x02, // table_id
+          0xB0, 0x1E, // section_length = 30
+          0x00, 0x01, 0xC1, 0x00, 0x00,
+          0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF,
+          0xF0, 0x00, // program_info_length = 0
+          // Video stream (0x02)
+          0x02, 0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF, 0xF0, 0x00,
+          // ARIB caption stream (0x06) with 0x52(0x30) + 0xFD(0x0008)
+          0x06, 0xE0 | ((captionPid >> 8) & 0x1F), captionPid & 0xFF, 0xF0, 0x07,
+          0x52, 0x01, 0x30,
+          0xFD, 0x02, 0x00, 0x08,
+          0x00, 0x00, 0x00, 0x00, // dummy CRC
+        ];
+      }
+
+      List<int> buildAribCaptionPesPayload({
+        required double ptsSeconds,
+        required List<int> statementBody,
+        int dataGroupId = 1,
+      }) {
+        final unitLen = statementBody.length;
+        final dataGroupHeader = [
+          (dataGroupId & 0x3F) << 2, // data_group_id + version 0
+          0x00, // link
+          0x00, // last_link
+          ((6 + 5 + unitLen) >> 8) & 0xFF,
+          (6 + 5 + unitLen) & 0xFF,
+          0x00, // TMD = 0
+          (5 + unitLen) >> 16,
+          ((5 + unitLen) >> 8) & 0xFF,
+          (5 + unitLen) & 0xFF,
+          0x1F, // unit_separator
+          0x20, // statement body
+          (unitLen >> 16) & 0xFF,
+          (unitLen >> 8) & 0xFF,
+          unitLen & 0xFF,
+          ...statementBody,
+        ];
+        final aribPes = [0x80, 0xFF, 0x00, ...dataGroupHeader];
+        final pesPacketLen = 8 + aribPes.length;
+        return [
+          0x00, 0x00, 0x01, 0xBD,
+          (pesPacketLen >> 8) & 0xFF,
+          pesPacketLen & 0xFF,
+          0x80, 0x80, 0x05,
+          ...encodePts(ptsSeconds),
+          ...aribPes,
+        ];
+      }
+
+      test(
+        'AribTsCaptionTap extracts top/bottom station coordinates and clear timing from TTS and TS streams',
+        () {
+          List<int> asciiDigits(String s) => s.codeUnits;
+
+          final bodyWithTwoPositionsAndTimedClear = <int>[
+            0x0C, // CS
+            // SWF 7 (960x540)
+            0x9B, ...asciiDigits('7'), 0x20, 0x53,
+            // ACPS(170;90) -> top telop-avoidance line
+            0x9B, ...asciiDigits('170;90'), 0x61,
+            0x30, 0x21, 0x30, 0x22, // 2 kanji
+            // ACPS(220;460) -> bottom line
+            0x9B, ...asciiDigits('220;460'), 0x61,
+            0x30, 0x23, 0x30, 0x24, 0x30, 0x25, // 3 kanji
+            // TIME wait 4.0s (0x40 + 40 = 0x68) then CS clear
+            0x9D, 0x20, 0x68, 0x0C,
+          ];
+
+          for (final stride in [192, 188]) {
+            final streamBytes = BytesBuilder()
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0000,
+                  pusi: true,
+                  payload: buildPat(pmtPid: 0x0100),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0100,
+                  pusi: true,
+                  payload: buildPmt(videoPid: 0x0101, captionPid: 0x0130),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0101,
+                  pusi: true,
+                  payload: [
+                    0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05,
+                    ...encodePts(100.0),
+                  ],
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 105.0,
+                    statementBody: bodyWithTwoPositionsAndTimedClear,
+                  ),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 110.0,
+                    statementBody: const [0x0C], // Standalone clear
+                  ),
+                  packetStride: stride,
+                ),
+              );
+
+            final raw = streamBytes.toBytes();
+            final tap = AribTsCaptionTap();
+            // Feed in arbitrary misaligned chunk splits across packet boundaries.
+            tap.feed(Uint8List.sublistView(raw, 0, 111));
+            tap.feed(Uint8List.sublistView(raw, 111, 417));
+            tap.feed(Uint8List.sublistView(raw, 417));
+
+            expect(tap.captionPid, 0x0130);
+            expect(tap.firstStreamPtsSeconds, closeTo(100.0, 0.001));
+            expect(tap.events, hasLength(2));
+
+            final cueEv = tap.events[0];
+            expect(cueEv.isClearOnly, isFalse);
+            expect(cueEv.ptsSeconds, closeTo(105.0, 0.001));
+            expect(cueEv.clearAfterSeconds, closeTo(4.0, 0.01));
+            expect(cueEv.lines, hasLength(2));
+            expect(cueEv.lines[0].normalizedX, closeTo(170 / 960.0, 0.01));
+            expect(cueEv.lines[0].normalizedY, closeTo((90 - 18) / 540.0, 0.01));
+            expect(cueEv.lines[1].normalizedX, closeTo(220 / 960.0, 0.01));
+            expect(cueEv.lines[1].normalizedY, closeTo((460 - 18) / 540.0, 0.01));
+
+            final clearEv = tap.events[1];
+            expect(clearEv.isClearOnly, isTrue);
+            expect(clearEv.lines, isEmpty);
+            expect(clearEv.ptsSeconds, closeTo(110.0, 0.001));
+
+            tap.resetFraming();
+            expect(tap.events, hasLength(2));
+            tap.resetAll();
+            expect(tap.events, isEmpty);
+            expect(tap.captionPid, isNull);
+
+            // Verify CS + SDP + SS3 default macro (0x60) avoids phantom top-left glyphs
+            // and secondary language data_group_id=2 (0x08) is ignored.
+            final hardenedStream = BytesBuilder()
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0000,
+                  pusi: true,
+                  payload: buildPat(pmtPid: 0x0100),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0100,
+                  pusi: true,
+                  payload: buildPmt(videoPid: 0x0101, captionPid: 0x0130),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 120.0,
+                    dataGroupId: 2,
+                    statementBody: const [0x0C, 0x30, 0x21, 0x30, 0x22],
+                  ),
+                  packetStride: stride,
+                ),
+              )
+              ..add(
+                wrapTsPacket(
+                  pid: 0x0130,
+                  pusi: true,
+                  payload: buildAribCaptionPesPayload(
+                    ptsSeconds: 121.0,
+                    statementBody: [
+                      0x0C, // CS
+                      // SDP(170;390)
+                      0x9B, ...asciiDigits('170;390'), 0x5F,
+                      0x1D, 0x60, // SS3 + ARIB default macro 0x60 (zero-width)
+                      0x30, 0x21, 0x30, 0x22, // 2 kanji
+                    ],
+                  ),
+                  packetStride: stride,
+                ),
+              );
+            tap.feed(hardenedStream.toBytes());
+            expect(tap.events, hasLength(1));
+            expect(tap.events.single.ptsSeconds, closeTo(121.0, 0.001));
+            expect(tap.events.single.lines, hasLength(1));
+            expect(
+              tap.events.single.lines.single.normalizedX,
+              closeTo(170 / 960.0, 0.01),
+            );
+            expect(
+              tap.events.single.lines.single.normalizedY,
+              closeTo((390 + 60 - 1 - 18) / 540.0, 0.01),
+            );
+          }
+        },
+      );
+
+      test(
+        'ARIB PTS matching, wraparound clear detection, decoder leak reset, and truncated ASS cleanup',
+        () {
+          const events = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 105.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.13,
+                  endNormalizedX: 0.50,
+                  charCount: 8,
+                ),
+                AribCaptionLinePlacement(
+                  normalizedX: 0.22,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 10,
+                ),
+              ],
+              isClearOnly: false,
+              clearAfterSeconds: 4.5,
+            ),
+            AribCaptionLayoutEvent(
+              ptsSeconds: 110.0,
+              planeWidth: 960.0,
+              planeHeight: 540.0,
+              lines: [],
+              isClearOnly: true,
+            ),
+          ];
+
+          final offset = resolveAribPtsOffset(
+            events: events,
+            mpvSubStartSeconds: 5.05,
+            firstStreamPtsSeconds: 100.0,
+          );
+          expect(offset, closeTo(-100.0, 0.01));
+
+          final matched = findMatchingAribLayoutEvent(
+            events: events,
+            mpvSubStartSeconds: 5.05,
+            ptsOffset: offset!,
+          );
+          expect(matched, isNotNull);
+
+          final applied = applyAribLayoutToCues(
+            cues: const [
+              SubtitleCue(spans: [SubtitleStyledSpan(text: '上行\n下行')]),
+            ],
+            layout: matched!,
+          );
+          expect(applied, hasLength(2));
+          expect(applied[0].plainText, '上行');
+          expect(applied[0].normalizedY, closeTo(0.13, 0.01));
+          expect(applied[1].plainText, '下行');
+          expect(applied[1].normalizedY, closeTo(0.85, 0.01));
+
+          expect(
+            hasAribClearSinceCaption(
+              events: events,
+              activeCaptionMpvPts: 5.05,
+              currentPlaybackMpvPts: 8.5,
+              ptsOffset: offset,
+              activeClearAfterSeconds: 4.5,
+            ),
+            isFalse,
+          );
+          expect(
+            hasAribClearSinceCaption(
+              events: events,
+              activeCaptionMpvPts: 5.05,
+              currentPlaybackMpvPts: 10.1,
+              ptsOffset: offset,
+              activeClearAfterSeconds: null,
+            ),
+            isTrue,
+          );
+          // 90kHz 33-bit wraparound delta stays small across wrap boundary.
+          expect(
+            wrapAwareAribPtsDelta(1.0, AribTsCaptionTap.ptsWrapSeconds - 2.0),
+            closeTo(3.0, 0.001),
+          );
+
+          // Decoder reset guard catches aribb24 i_control_time accumulation & 500-byte cliff.
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 2147483.0, // mpv UNKNOWN_DURATION
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 28.0, // leaked i_control_time = 18s
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 340,
+              assUtf8Bytes: 390,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 26.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 80,
+            ),
+            isTrue,
+          );
+
+          // Truncated ASS override tag tail from mpv's 500-byte cut is stripped cleanly.
+          final truncatedAss = parseAribAssSubtitle(
+            '{\\1c&H00ffff&}テスト文字{\\1c&H00ff',
+          );
+          expect(truncatedAss, hasLength(1));
+          expect(truncatedAss.single.plainText, 'テスト文字');
+          expect(truncatedAss.single.spans.single.color, const Color(0xFFFFFF00));
+        },
+      );
+
+      test(
+        'SubtitlesEnabledNotifier persists and restores firetv_subtitles_enabled',
+        () async {
+          final kv = InMemoryKeyValueStore();
+          await kv.write('firetv_subtitles_enabled', 'true');
+
+          final container = ProviderContainer(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          );
+          addTearDown(container.dispose);
+
+          container.read(subtitlesEnabledProvider);
+          await Future<void>.delayed(Duration.zero);
+          expect(container.read(subtitlesEnabledProvider), isTrue);
+
+          await container.read(subtitlesEnabledProvider.notifier).set(false);
+          expect(await kv.read('firetv_subtitles_enabled'), 'false');
+        },
+      );
+
+      testWidgets(
+        'SubtitleSettingsScreen edits persisted subtitle default toggle',
+        (tester) async {
+          final kv = InMemoryKeyValueStore();
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+              child: const MaterialApp(home: SubtitleSettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.text('字幕表示（再生時の既定）'));
+          await tester.pumpAndSettle();
+          expect(await kv.read('firetv_subtitles_enabled'), 'true');
+        },
+      );
+
+      test(
+        'Live loading overlay stays unified with seconds + progress bar and prevents early latch',
+        () {
+          // Do not latch pre-buffering prematurely while target seconds remain unfilled.
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 4.0,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 9.6,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldLatchInitialPlaybackStarted(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: true,
+              positionAtFirstFrame: const Duration(seconds: 2),
+              currentPosition: const Duration(seconds: 3),
+              preBufferTargetSeconds: 10,
+              preBufferCurrentSeconds: 2.0,
+            ),
+            isTrue,
+          );
+
+          final targetSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: true,
+            targetSeconds: 10,
+            currentSeconds: 4,
+            bufferingPercentage: 40,
+            fallbackLabel: '読み込み中…',
+          );
+          expect(targetSpec.showProgressBar, isTrue);
+          expect(targetSpec.progress, closeTo(0.4, 0.01));
+          expect(targetSpec.caption, 'バッファ蓄積中… 4秒 / 10秒');
+
+          final zeroTargetLiveSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: false,
+            targetSeconds: 0,
+            currentSeconds: 2,
+            bufferingPercentage: 0,
+            fallbackLabel: '読み込み中…',
+          );
+          expect(zeroTargetLiveSpec.showProgressBar, isTrue);
+          expect(zeroTargetLiveSpec.progress, isNull);
+          expect(zeroTargetLiveSpec.caption, 'バッファ蓄積中… 2秒');
+
+          final rebufferingLiveSpec = liveLoadingOverlaySpec(
+            isLive: true,
+            isPreBuffering: false,
+            targetSeconds: 10,
+            currentSeconds: 3,
+            bufferingPercentage: 55,
+            fallbackLabel: 'バッファリング中…',
+          );
+          expect(rebufferingLiveSpec.showProgressBar, isTrue);
+          expect(rebufferingLiveSpec.progress, closeTo(0.55, 0.01));
+          expect(rebufferingLiveSpec.caption, 'バッファ蓄積中… 3秒');
+        },
+      );
+
+      testWidgets(
+        'AppShell NavigationRail selection automatically moves focus into right pane while keeping startup rail focus',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.10',
+            udn: 'uuid:rail-handoff',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                fireTvHelperProvider.overrideWithValue(
+                  _FakeFireTvHelper(reachable: true),
+                ),
+                credentialSummaryProvider.overrideWith((ref) async => null),
+                deviceInfoProvider.overrideWith(
+                  (ref, r) async =>
+                      const DeviceInfo(name: 'nasne-1', softwareVersion: '0260'),
+                ),
+                hddDetailsProvider.overrideWith(
+                  (ref, r) async => const <HddDetail>[],
+                ),
+                liveStatusProvider.overrideWith(
+                  (ref, r) async => const LiveStatus(sections: {}, raw: {}),
+                ),
+                recNgProvider.overrideWith((ref, r) async => const <RecNgItem>[]),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+                titlesProvider(reg).overrideWith(
+                  () => _FixedTitlesNotifier(reg, const []),
+                ),
+                titleCountsProvider.overrideWith(
+                  (ref, r) async => const TitleCounts(0, 1000),
+                ),
+                liveChannelsProvider.overrideWith(
+                  (ref, r) async => const <LiveBand>[],
+                ),
+                channelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                bsChannelsProvider.overrideWith(
+                  (ref, r) async => const <Channel>[],
+                ),
+                schedulesProvider.overrideWith(
+                  (ref, r) async => const <RecordSchedule>[],
+                ),
+              ],
+              child: const MaterialApp(home: AppShell()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          bool primaryInRail() {
+            final ctx = FocusManager.instance.primaryFocus?.context;
+            if (ctx == null) return false;
+            return find
+                .ancestor(
+                  of: find.byWidget(ctx.widget),
+                  matching: find.byType(NavigationRail),
+                )
+                .evaluate()
+                .isNotEmpty;
+          }
+
+          // Initial app launch stays on NavigationRail 'ホーム'.
+          expect(primaryInRail(), isTrue);
+
+          // Selecting '設定' in NavigationRail switches tab and hands focus to right pane.
+          await tester.tap(
+            find.descendant(
+              of: find.byType(NavigationRail),
+              matching: find.text('設定'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isFalse);
+          expect(
+            find.ancestor(
+              of: find.byWidget(FocusManager.instance.primaryFocus!.context!.widget),
+              matching: find.byType(SettingsScreen),
+            ),
+            findsOneWidget,
+          );
+
+          // Back returns to NavigationRail on '設定'.
+          await tester.binding.handlePopRoute();
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isTrue);
+
+          // Selecting 'ホーム' in NavigationRail enters Home right pane too.
+          await tester.tap(
+            find.descendant(
+              of: find.byType(NavigationRail),
+              matching: find.text('ホーム'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(primaryInRail(), isFalse);
         },
       );
     },

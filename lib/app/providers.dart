@@ -579,6 +579,39 @@ final subtitleSettingsProvider =
       SubtitleSettingsNotifier.new,
     );
 
+/// Persisted subtitle ON/OFF toggle retained across channels, recordings,
+/// and app restarts (defaults to OFF).
+class SubtitlesEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_subtitles_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final subtitlesEnabledProvider =
+    NotifierProvider<SubtitlesEnabledNotifier, bool>(
+      SubtitlesEnabledNotifier.new,
+    );
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {

@@ -7,6 +7,7 @@ library;
 
 import 'dart:typed_data';
 
+import '../dtcp/arib_ts_caption_tap.dart';
 import '../models/device.dart';
 import '../models/didl.dart';
 import '../models/epg.dart';
@@ -211,6 +212,13 @@ abstract interface class StreamTransferMetrics {
 /// broadcast edge without redoing DTCP-IP AKE.
 abstract interface class LiveEdgeResettable {
   Future<void> resetToLiveEdge();
+}
+
+/// Optional read-only ARIB STD-B24 caption layout & clear-event feed tapped
+/// from the plaintext MPEG-TS/TTS stream in `DtcpProxy`.
+abstract interface class AribCaptionLayoutSource {
+  List<AribCaptionLayoutEvent> get aribCaptionEvents;
+  double? get firstStreamPtsSeconds;
 }
 
 /// Playback boundary (plan 5.7). v1 shipped only the stub, which

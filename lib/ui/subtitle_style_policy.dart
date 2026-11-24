@@ -7,6 +7,8 @@ import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 
+import '../core/dtcp/arib_ts_caption_tap.dart';
+
 /// Three preset text-size steps tuned for Fire TV 10-foot viewing.
 enum SubtitleSizePreset {
   small('小'),
@@ -21,17 +23,17 @@ enum SubtitleSizePreset {
 double resolveSubtitleFontSize(
   SubtitleSizePreset preset,
   double viewportHeight, {
-  double minSize = 16.0,
+  double minSize = 14.0,
 }) {
   final safeHeight = viewportHeight.isFinite && viewportHeight > 0
       ? viewportHeight
       : 540.0;
   final factor = switch (preset) {
-    SubtitleSizePreset.small => 0.048,
-    SubtitleSizePreset.medium => 0.064,
-    SubtitleSizePreset.large => 0.082,
+    SubtitleSizePreset.small => 0.038,
+    SubtitleSizePreset.medium => 0.048,
+    SubtitleSizePreset.large => 0.060,
   };
-  return (safeHeight * factor).clamp(minSize, 72.0).toDouble();
+  return (safeHeight * factor).clamp(minSize, 64.0).toDouble();
 }
 
 /// Five selectable font families combining Fire TV OS fonts and bundled fonts.
@@ -516,7 +518,11 @@ List<SubtitleCue> parseAribAssSubtitle(
       }
       final closeBrace = payload.indexOf('}', openBrace + 1);
       if (closeBrace < 0) {
-        appendText(payload.substring(openBrace));
+        final tail = payload.substring(openBrace);
+        // Drop truncated ASS override tails at mpv's 500-byte text buffer cut.
+        if (!tail.startsWith(r'{\')) {
+          appendText(tail);
+        }
         break;
       }
       final tagBlock = payload.substring(openBrace + 1, closeBrace);
@@ -625,6 +631,65 @@ List<SubtitleCue> parseAribAssSubtitle(
 String _compactCompareText(String text) =>
     text.replaceAll(RegExp(r'[\s\u00A0]+'), '');
 
+/// Splits any [cue] containing explicit `\n` breaks into individual single-line
+/// cues while preserving span colors/scales and coordinates.
+List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
+  final hasBreak = cue.spans.any((s) => s.text.contains('\n'));
+  if (!hasBreak) return [cue];
+
+  final lines = <List<SubtitleStyledSpan>>[];
+  var currentLine = <SubtitleStyledSpan>[];
+
+  void flushLine() {
+    final text = [for (final s in currentLine) s.text].join().trim();
+    if (text.isNotEmpty) {
+      lines.add(currentLine);
+    }
+    currentLine = <SubtitleStyledSpan>[];
+  }
+
+  for (final span in cue.spans) {
+    final parts = span.text.split('\n');
+    for (var i = 0; i < parts.length; i++) {
+      if (i > 0) flushLine();
+      if (parts[i].isNotEmpty) {
+        currentLine.add(
+          SubtitleStyledSpan(
+            text: parts[i],
+            color: span.color,
+            scale: span.scale,
+          ),
+        );
+      }
+    }
+  }
+  flushLine();
+
+  if (lines.isEmpty) return const [];
+  if (lines.length == 1) {
+    return [
+      SubtitleCue(
+        spans: lines.single,
+        normalizedX: cue.normalizedX,
+        normalizedY: cue.normalizedY,
+        alignment: cue.alignment,
+      ),
+    ];
+  }
+
+  return [
+    for (var idx = 0; idx < lines.length; idx++)
+      SubtitleCue(
+        spans: lines[idx],
+        normalizedX: cue.normalizedX,
+        normalizedY: cue.normalizedY == null
+            ? null
+            : (cue.normalizedY! + idx * 0.055).clamp(0.02, 0.98).toDouble(),
+        alignment: cue.alignment,
+      ),
+  ];
+}
+
 /// Resolves raw active cues from [rawAss] and [plainLines] without applying the
 /// rolling deduplication window yet.
 List<SubtitleCue> resolveRawSubtitleCues({
@@ -656,7 +721,9 @@ List<SubtitleCue> resolveRawSubtitleCues({
           (assCompact == plainCompact ||
               assCompact.contains(plainCompact) ||
               plainCompact.contains(assCompact))) {
-        return parsedAss;
+        return [
+          for (final cue in parsedAss) ...splitSubtitleCueLines(cue),
+        ];
       }
     }
   }
@@ -684,6 +751,7 @@ class SubtitleActiveWindowTracker {
   Map<String, int> _previousIncomingCounts = const {};
   List<SubtitleCue> _activeCues = const [];
   Duration _lastArrivalPlaybackTime = Duration.zero;
+  double? _lastSubStartSeconds;
   Duration _activeExpiryDuration = const Duration(seconds: 6);
   bool _initialized = false;
 
@@ -691,14 +759,16 @@ class SubtitleActiveWindowTracker {
     _previousIncomingCounts = const {};
     _activeCues = const [];
     _lastArrivalPlaybackTime = Duration.zero;
+    _lastSubStartSeconds = null;
     _activeExpiryDuration = const Duration(seconds: 6);
     _initialized = false;
   }
 
   List<SubtitleCue> update(
     List<SubtitleCue> incomingCues,
-    Duration playbackElapsed,
-  ) {
+    Duration playbackElapsed, {
+    double? mpvSubStartSeconds,
+  }) {
     if (incomingCues.isEmpty) {
       reset();
       return const [];
@@ -716,6 +786,7 @@ class SubtitleActiveWindowTracker {
           : List<SubtitleCue>.of(incomingCues);
       _previousIncomingCounts = incomingCounts;
       _lastArrivalPlaybackTime = playbackElapsed;
+      _lastSubStartSeconds = mpvSubStartSeconds;
       _activeExpiryDuration = computeSubtitleAutoClearDuration(_activeCues);
       return List<SubtitleCue>.unmodifiable(_activeCues);
     }
@@ -733,7 +804,14 @@ class SubtitleActiveWindowTracker {
 
     if (newCues.isNotEmpty) {
       final delta = playbackElapsed - _lastArrivalPlaybackTime;
-      if (_activeCues.isEmpty || delta > const Duration(milliseconds: 900)) {
+      final ptsAdvanced =
+          mpvSubStartSeconds != null &&
+          _lastSubStartSeconds != null &&
+          wrapAwareAribPtsDelta(mpvSubStartSeconds, _lastSubStartSeconds!) >
+              0.9;
+      if (_activeCues.isEmpty ||
+          delta > const Duration(milliseconds: 900) ||
+          ptsAdvanced) {
         _activeCues = List<SubtitleCue>.of(newCues);
       } else {
         // Combine multi-cue burst packets from the same utterance while
@@ -755,13 +833,16 @@ class SubtitleActiveWindowTracker {
           }
         }
         merged.addAll(newCues);
-        if (merged.length > 4) {
-          _activeCues = merged.sublist(merged.length - 4);
+        if (merged.length > 3) {
+          _activeCues = merged.sublist(merged.length - 3);
         } else {
           _activeCues = merged;
         }
       }
       _lastArrivalPlaybackTime = playbackElapsed;
+      if (mpvSubStartSeconds != null) {
+        _lastSubStartSeconds = mpvSubStartSeconds;
+      }
       _activeExpiryDuration = computeSubtitleAutoClearDuration(_activeCues);
     } else if (_activeCues.isNotEmpty) {
       final remainingCounts = Map<String, int>.of(incomingCounts);
@@ -784,6 +865,165 @@ class SubtitleActiveWindowTracker {
     _previousIncomingCounts = incomingCounts;
     return List<SubtitleCue>.unmodifiable(_activeCues);
   }
+}
+
+/// Computes `a - b` across the 33-bit 90 kHz MPEG-TS PTS wrap boundary.
+double wrapAwareAribPtsDelta(double a, double b) {
+  const period = AribTsCaptionTap.ptsWrapSeconds;
+  var d = a - b;
+  if (d > period / 2) d -= period;
+  if (d < -period / 2) d += period;
+  return d;
+}
+
+/// Detects FFmpeg/libaribb24's accumulated `i_control_time` duration leak or
+/// impending overflow of mpv's fixed 500-byte `last_text` buffer so the
+/// subtitle decoder alone can be safely reset before desync occurs.
+bool shouldResetAribSubtitleDecoder({
+  double? subStartSeconds,
+  double? subEndSeconds,
+  double? playbackTimeSeconds,
+  required int plainUtf8Bytes,
+  required int assUtf8Bytes,
+}) {
+  if (plainUtf8Bytes >= 320 || assUtf8Bytes >= 420) {
+    return true;
+  }
+  if (subStartSeconds != null && subEndSeconds != null) {
+    final duration = subEndSeconds - subStartSeconds;
+    // Ignore mpv UNKNOWN_DURATION (~24.8 days); target leaked aribb24 times.
+    if (duration > 12.0 && duration < 86400.0) {
+      return true;
+    }
+  }
+  if (subStartSeconds != null &&
+      playbackTimeSeconds != null &&
+      (playbackTimeSeconds - subStartSeconds) > 14.0) {
+    return true;
+  }
+  return false;
+}
+
+/// Resolves the constant PTS offset (`mpvTime - tsPts`) mapping MPEG-TS PTS
+/// values to mpv's playback clock (`sub-start` / `playback-time`).
+double? resolveAribPtsOffset({
+  required List<AribCaptionLayoutEvent> events,
+  required double mpvSubStartSeconds,
+  double? firstStreamPtsSeconds,
+  double? currentOffset,
+}) {
+  if (events.isEmpty) return currentOffset;
+
+  bool hasMatchAt(double candidate, double tolerance) {
+    for (final e in events) {
+      if (e.isClearOnly) continue;
+      if (wrapAwareAribPtsDelta(e.ptsSeconds + candidate, mpvSubStartSeconds)
+              .abs() <=
+          tolerance) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (currentOffset != null && hasMatchAt(currentOffset, 1.8)) {
+    return currentOffset;
+  }
+  if (hasMatchAt(0.0, 1.5)) {
+    return 0.0;
+  }
+  if (firstStreamPtsSeconds != null) {
+    final zeroAnchored = -firstStreamPtsSeconds;
+    if (hasMatchAt(zeroAnchored, 2.5)) {
+      return zeroAnchored;
+    }
+  }
+  for (var i = events.length - 1; i >= 0; i--) {
+    final e = events[i];
+    if (!e.isClearOnly) {
+      return mpvSubStartSeconds - e.ptsSeconds;
+    }
+  }
+  return currentOffset;
+}
+
+/// Finds the non-clear ARIB TS layout event closest to [mpvSubStartSeconds].
+AribCaptionLayoutEvent? findMatchingAribLayoutEvent({
+  required List<AribCaptionLayoutEvent> events,
+  required double mpvSubStartSeconds,
+  required double ptsOffset,
+}) {
+  AribCaptionLayoutEvent? best;
+  var bestAbs = 1.5;
+  for (final e in events) {
+    if (e.isClearOnly) continue;
+    final diff = wrapAwareAribPtsDelta(
+      e.ptsSeconds + ptsOffset,
+      mpvSubStartSeconds,
+    ).abs();
+    if (diff <= bestAbs) {
+      bestAbs = diff;
+      best = e;
+    }
+  }
+  return best;
+}
+
+/// Returns `true` when broadcast `TIME+CS` or a standalone ARIB clear (`CS`)
+/// packet indicates the active caption has expired on playback clock.
+bool hasAribClearSinceCaption({
+  required List<AribCaptionLayoutEvent> events,
+  required double activeCaptionMpvPts,
+  required double currentPlaybackMpvPts,
+  required double ptsOffset,
+  double? activeClearAfterSeconds,
+}) {
+  if (activeClearAfterSeconds != null &&
+      activeClearAfterSeconds > 0 &&
+      currentPlaybackMpvPts >= activeCaptionMpvPts + activeClearAfterSeconds) {
+    return true;
+  }
+  for (final e in events) {
+    if (!e.isClearOnly) continue;
+    final mappedPts =
+        activeCaptionMpvPts +
+        wrapAwareAribPtsDelta(e.ptsSeconds + ptsOffset, activeCaptionMpvPts);
+    if (mappedPts > activeCaptionMpvPts + 0.15 &&
+        mappedPts <= currentPlaybackMpvPts + 0.10) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Applies broadcast ARIB coordinates extracted from MPEG-TS onto decoded
+/// [cues], splitting multiline cues into per-line positioned items.
+List<SubtitleCue> applyAribLayoutToCues({
+  required List<SubtitleCue> cues,
+  required AribCaptionLayoutEvent layout,
+}) {
+  if (cues.isEmpty || layout.lines.isEmpty) return cues;
+  final flatCues = [for (final c in cues) ...splitSubtitleCueLines(c)];
+  if (flatCues.isEmpty) return cues;
+
+  return [
+    for (var i = 0; i < flatCues.length; i++)
+      () {
+        final lineIndex = flatCues.length == layout.lines.length
+            ? i
+            : ((i * layout.lines.length) ~/ flatCues.length).clamp(
+                0,
+                layout.lines.length - 1,
+              );
+        final line = layout.lines[lineIndex];
+        return SubtitleCue(
+          spans: flatCues[i].spans,
+          normalizedX: line.normalizedX,
+          normalizedY: line.normalizedY,
+          alignment: 1,
+        );
+      }(),
+  ];
 }
 
 /// Vertical tolerance when clustering nearby positioned cues so enlarged lines

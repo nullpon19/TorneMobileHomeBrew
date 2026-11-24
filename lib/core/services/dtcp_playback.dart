@@ -11,6 +11,7 @@ import 'dart:typed_data';
 
 import '../diagnostics.dart';
 import '../dtcp/ake.dart';
+import '../dtcp/arib_ts_caption_tap.dart';
 import '../dtcp/credential_store.dart';
 import '../dtcp/dtcp_crypto.dart';
 import '../dtcp/dtcp_proxy.dart';
@@ -280,7 +281,11 @@ class DtcpPlaybackEngine implements PlaybackEngine {
 }
 
 class _DtcpPlaybackSession
-    implements PlaybackSession, StreamTransferMetrics, LiveEdgeResettable {
+    implements
+        PlaybackSession,
+        StreamTransferMetrics,
+        LiveEdgeResettable,
+        AribCaptionLayoutSource {
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
 
   final DtcpProxy _proxy;
@@ -302,6 +307,13 @@ class _DtcpPlaybackSession
 
   @override
   int get consecutiveReconnectErrors => _proxy.consecutiveReconnectErrors;
+
+  @override
+  List<AribCaptionLayoutEvent> get aribCaptionEvents =>
+      _proxy.aribCaptionEvents;
+
+  @override
+  double? get firstStreamPtsSeconds => _proxy.firstStreamPtsSeconds;
 
   @override
   Future<void> resetToLiveEdge() => _proxy.resetToLiveEdge();

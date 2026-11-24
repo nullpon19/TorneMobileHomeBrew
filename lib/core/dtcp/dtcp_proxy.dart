@@ -33,6 +33,7 @@ import 'dart:typed_data';
 
 import '../diagnostics.dart';
 import '../errors.dart';
+import 'arib_ts_caption_tap.dart';
 import 'pcp.dart';
 
 /// The source's answer to a time-seek content request (plan 61):
@@ -400,6 +401,14 @@ class DtcpProxy {
 
   /// Number of consecutive upstream reconnect attempts without decrypting data.
   int get consecutiveReconnectErrors => _consecutiveReconnectErrors;
+  final AribTsCaptionTap _aribCaptionTap = AribTsCaptionTap();
+  int _lastTappedSeekPos = -1;
+
+  /// Extracted ARIB caption coordinates and clear events from plaintext TS/TTS.
+  List<AribCaptionLayoutEvent> get aribCaptionEvents => _aribCaptionTap.events;
+
+  /// Initial A/V stream PTS observed by [_aribCaptionTap], if any.
+  double? get firstStreamPtsSeconds => _aribCaptionTap.firstStreamPtsSeconds;
   bool _claimed = false;
   bool _stopRequested = false;
   bool _downstreamGone = false;
@@ -756,6 +765,7 @@ class DtcpProxy {
     }
     _fetcher.resetClient();
     _queue = _PlaintextQueue();
+    _aribCaptionTap.resetAll();
     _firstServedAt = null;
     _lastServedAt = null;
     _downstreamGone = false;
@@ -852,6 +862,7 @@ class DtcpProxy {
       // Headers go out immediately; the first plaintext follows
       // as soon as the pump produces it (prefetched or live).
       await response.flush();
+      _aribCaptionTap.resetFraming();
       while (gen == _legacyGeneration && !_stopRequested) {
         final chunk = await queue.read(
           isSuperseded: () => gen != _legacyGeneration || _stopRequested,
@@ -863,6 +874,9 @@ class DtcpProxy {
           final now = DateTime.now();
           _firstServedAt ??= now;
           _lastServedAt = now;
+          try {
+            _aribCaptionTap.feed(chunk);
+          } catch (_) {}
         }
         response.add(chunk);
         await response.flush();
@@ -1363,11 +1377,17 @@ class DtcpProxy {
           consecutiveReconnectErrors = 0;
           stalledRestarts = 0;
           final take = min(chunk.length, reqEnd - pos + 1);
-          response.add(
-            take == chunk.length
-                ? chunk
-                : Uint8List.sublistView(chunk, 0, take),
-          );
+          final slice = take == chunk.length
+              ? chunk
+              : Uint8List.sublistView(chunk, 0, take);
+          try {
+            if (_lastTappedSeekPos != pos) {
+              _aribCaptionTap.resetFraming();
+            }
+            _aribCaptionTap.feed(slice);
+            _lastTappedSeekPos = pos + take;
+          } catch (_) {}
+          response.add(slice);
           pos += take;
           servedHere += take;
           await response.flush();

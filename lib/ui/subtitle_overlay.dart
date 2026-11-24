@@ -1,6 +1,6 @@
 /// Custom Fire TV subtitle renderer supporting station-specified ARIB positions
 /// and speaker colors alongside user-configurable font, size, edge outline, and
-/// step-free uniform background boxes.
+/// per-line snug step-free background pills with Japanese TV left alignment.
 library;
 
 import 'dart:math' as math;
@@ -16,7 +16,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     required this.settings,
     required this.cues,
     this.bottomSafePadding = 24.0,
-    this.minFontSize = 16.0,
+    this.minFontSize = 14.0,
   });
 
   final SubtitleSettings settings;
@@ -27,6 +27,9 @@ class PlayerSubtitleOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (cues.isEmpty) return const SizedBox.shrink();
+    final lineCues = [for (final cue in cues) ...splitSubtitleCueLines(cue)];
+    if (lineCues.isEmpty) return const SizedBox.shrink();
+
     return IgnorePointer(
       child: LayoutBuilder(
         builder: (context, constraints) {
@@ -44,7 +47,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
             minSize: minFontSize,
           );
           final edgeWidth = resolveSubtitleEdgeWidth(settings.edge, fontSize);
-          final blocks = _clusterSubtitleBlocks(cues);
+          final blocks = _clusterSubtitleBlocks(lineCues);
           return Stack(
             fit: StackFit.expand,
             children: [
@@ -104,42 +107,37 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     required double fontSize,
     required double edgeWidth,
   }) {
-    final positionedCues = [
+    final positionedY = [
       for (final cue in block)
-        if (cue.normalizedY != null) cue,
+        if (cue.normalizedY != null) cue.normalizedY!,
     ];
-    final double? avgY = positionedCues.isEmpty
+    final positionedX = [
+      for (final cue in block)
+        if (cue.normalizedX != null) cue.normalizedX!,
+    ];
+
+    final double? avgY = positionedY.isEmpty
         ? null
-        : positionedCues.fold<double>(0.0, (s, c) => s + c.normalizedY!) /
-              positionedCues.length;
-    final avgX = block.first.normalizedX ?? 0.5;
-    final alignment = block.first.alignment;
+        : positionedY.reduce((a, b) => a + b) / positionedY.length;
+    final double? minY = positionedY.isEmpty
+        ? null
+        : positionedY.reduce(math.min);
+    final double? maxY = positionedY.isEmpty
+        ? null
+        : positionedY.reduce(math.max);
+    final double? minX = positionedX.isEmpty
+        ? null
+        : positionedX.reduce(math.min);
 
-    final isRight = (alignment % 3 == 0) || avgX > 0.67;
-    final isLeft = !isRight && avgX < 0.33;
-
-    final TextAlign textAlign;
-    final CrossAxisAlignment crossAlign;
     final double xAlign;
     final double leftPad;
     final double rightPad;
-    if (isRight) {
-      textAlign = TextAlign.right;
-      crossAlign = CrossAxisAlignment.end;
-      xAlign = 1.0;
-      leftPad = 24.0;
-      rightPad = alignment % 3 == 0
-          ? math.max(24.0, math.min((1.0 - avgX) * viewW, viewW * 0.25))
-          : 24.0;
-    } else if (isLeft) {
-      textAlign = TextAlign.left;
-      crossAlign = CrossAxisAlignment.start;
+    if (minX != null) {
       xAlign = -1.0;
-      leftPad = math.max(24.0, math.min(avgX * viewW, viewW * 0.25));
-      rightPad = 24.0;
+      leftPad = (minX * viewW).clamp(16.0, viewW * 0.58).toDouble();
+      rightPad = 16.0;
     } else {
-      textAlign = TextAlign.center;
-      crossAlign = CrossAxisAlignment.center;
+      // Unpositioned fallback centers the left-aligned column as a block.
       xAlign = 0.0;
       leftPad = 24.0;
       rightPad = 24.0;
@@ -148,57 +146,63 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     final double yAlign;
     final double topPad;
     final double bottomPad;
-    if (avgY == null || avgY > 0.65) {
+    if (avgY == null) {
       yAlign = 1.0;
       topPad = 16.0;
-      bottomPad = avgY == null
-          ? bottomSafePadding
-          : math.max(bottomSafePadding, ((1.0 - avgY) * viewH * 0.55));
-    } else if (avgY < 0.35) {
-      yAlign = -1.0;
-      topPad = math.max(16.0, avgY * viewH * 0.6);
       bottomPad = bottomSafePadding;
+    } else if (avgY <= 0.38) {
+      yAlign = -1.0;
+      topPad = math.max(16.0, (minY! * viewH) - fontSize * 0.8);
+      bottomPad = bottomSafePadding;
+    } else if (avgY >= 0.65) {
+      yAlign = 1.0;
+      topPad = 16.0;
+      bottomPad = math.max(
+        bottomSafePadding,
+        ((1.0 - maxY!) * viewH - fontSize * 0.6).clamp(0.0, viewH * 0.38),
+      );
     } else {
-      yAlign = ((avgY * 2.0) - 1.0).clamp(-0.6, 0.6).toDouble();
+      yAlign = ((avgY * 2.0) - 1.0).clamp(-0.65, 0.65).toDouble();
       topPad = 16.0;
       bottomPad = bottomSafePadding;
     }
 
     final hasBackground = settings.backgroundOpacityPercent > 0;
+    Widget buildLinePill(SubtitleCue cue) {
+      final textWidget = _buildCueText(
+        cue: cue,
+        fontSize: fontSize,
+        edgeWidth: edgeWidth,
+      );
+      if (!hasBackground) return textWidget;
+      return Container(
+        padding: EdgeInsets.symmetric(
+          horizontal: fontSize * 0.34,
+          vertical: fontSize * 0.14,
+        ),
+        decoration: BoxDecoration(
+          color: settings.effectiveBackgroundColor,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: textWidget,
+      );
+    }
+
     final content = Column(
       mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: crossAlign,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         for (var i = 0; i < block.length; i++) ...[
-          if (i > 0) SizedBox(height: math.max(2.0, fontSize * 0.08)),
-          _buildCueText(
-            cue: block[i],
-            fontSize: fontSize,
-            edgeWidth: edgeWidth,
-            textAlign: textAlign,
-          ),
+          if (i > 0) SizedBox(height: math.max(2.0, fontSize * 0.12)),
+          buildLinePill(block[i]),
         ],
       ],
     );
 
-    final box = hasBackground
-        ? Container(
-            padding: EdgeInsets.symmetric(
-              horizontal: fontSize * 0.48,
-              vertical: fontSize * 0.24,
-            ),
-            decoration: BoxDecoration(
-              color: settings.effectiveBackgroundColor,
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: content,
-          )
-        : content;
-
     return Positioned.fill(
       child: Padding(
         padding: EdgeInsets.fromLTRB(leftPad, topPad, rightPad, bottomPad),
-        child: Align(alignment: Alignment(xAlign, yAlign), child: box),
+        child: Align(alignment: Alignment(xAlign, yAlign), child: content),
       ),
     );
   }
@@ -207,11 +211,10 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     required SubtitleCue cue,
     required double fontSize,
     required double edgeWidth,
-    required TextAlign textAlign,
   }) {
     final strut = StrutStyle(
       fontSize: fontSize,
-      height: 1.32,
+      height: 1.28,
       forceStrutHeight: true,
     );
     const heightBehavior = TextHeightBehavior(
@@ -230,7 +233,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
                 fontFamilyFallback: settings.font.fontFamilyFallback,
                 fontWeight: settings.font.fontWeight,
                 fontSize: fontSize * run.scale,
-                height: 1.32,
+                height: 1.28,
                 locale: const Locale('ja', 'JP'),
                 color: isStroke ? null : run.color,
                 foreground: isStroke
@@ -257,22 +260,18 @@ class PlayerSubtitleOverlay extends StatelessWidget {
 
     final fillText = Text.rich(
       buildSpan(isStroke: false),
-      textAlign: textAlign,
+      textAlign: TextAlign.left,
       strutStyle: strut,
       textHeightBehavior: heightBehavior,
     );
     if (edgeWidth <= 0) return fillText;
 
     return Stack(
-      alignment: switch (textAlign) {
-        TextAlign.left => Alignment.centerLeft,
-        TextAlign.right => Alignment.centerRight,
-        _ => Alignment.center,
-      },
+      alignment: Alignment.centerLeft,
       children: [
         Text.rich(
           buildSpan(isStroke: true),
-          textAlign: textAlign,
+          textAlign: TextAlign.left,
           strutStyle: strut,
           textHeightBehavior: heightBehavior,
         ),

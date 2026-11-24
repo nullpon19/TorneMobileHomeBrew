@@ -204,6 +204,40 @@ class _AppShellState extends ConsumerState<AppShell> {
     return false;
   }
 
+  bool _focusRightPaneFirst() {
+    if (_rightPaneFocusNode.context == null) return false;
+    final candidates = _rightPaneFocusNode.traversalDescendants
+        .where(
+          (n) =>
+              n.canRequestFocus &&
+              !n.skipTraversal &&
+              n.context != null &&
+              n.rect.width > 0 &&
+              n.rect.height > 0,
+        )
+        .toList();
+    if (candidates.isEmpty) return false;
+    final paneBox = _rightPaneFocusNode.context?.findRenderObject() as RenderBox?;
+    final paneTop = paneBox?.localToGlobal(Offset.zero).dy ?? 0.0;
+    int compareVisualOrder(FocusNode a, FocusNode b) {
+      final dyDiff = a.rect.top - b.rect.top;
+      if (dyDiff.abs() > 8.0) return dyDiff.compareTo(0.0);
+      return a.rect.left.compareTo(b.rect.left);
+    }
+
+    final bodyCandidates = [
+      for (final n in candidates)
+        if (n.rect.top >= paneTop + 56.0) n,
+    ]..sort(compareVisualOrder);
+    if (bodyCandidates.isNotEmpty) {
+      bodyCandidates.first.requestFocus();
+      return true;
+    }
+    candidates.sort(compareVisualOrder);
+    candidates.first.requestFocus();
+    return true;
+  }
+
   Future<void> _confirmExit() async {
     if (_exitDialogOpen || !mounted) return;
     _exitDialogOpen = true;
@@ -265,9 +299,13 @@ class _AppShellState extends ConsumerState<AppShell> {
     ];
     void select(int index) {
       if (index == AppTabs.home) {
-        _userMovedIntoHomePane = false;
+        _userMovedIntoHomePane = true;
       }
       ref.read(tabIndexProvider.notifier).select(index);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _focusRightPaneFirst();
+      });
     }
 
     return PopScope(

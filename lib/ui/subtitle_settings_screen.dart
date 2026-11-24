@@ -22,20 +22,20 @@ const List<SubtitleCue> _previewSampleCues = [
     ],
   ),
   SubtitleCue(
-    normalizedX: 0.50,
-    normalizedY: 0.78,
-    alignment: 2,
+    normalizedX: 0.18,
+    normalizedY: 0.72,
+    alignment: 1,
     spans: [
       SubtitleStyledSpan(text: '[二] 話者A：', color: Color(0xFF80FFFF)),
       SubtitleStyledSpan(text: 'テレビ並みに見やすい字幕 →'),
     ],
   ),
   SubtitleCue(
-    normalizedX: 0.50,
-    normalizedY: 0.89,
-    alignment: 2,
+    normalizedX: 0.18,
+    normalizedY: 0.84,
+    alignment: 1,
     spans: [
-      SubtitleStyledSpan(text: '話者B「背景色や書体もここで確認できます」'),
+      SubtitleStyledSpan(text: '話者B「短い行」'),
     ],
   ),
 ];
@@ -48,6 +48,7 @@ class SubtitleSettingsScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(subtitleSettingsProvider);
     final notifier = ref.read(subtitleSettingsProvider.notifier);
+    final subtitlesOn = ref.watch(subtitlesEnabledProvider);
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -130,6 +131,15 @@ class SubtitleSettingsScreen extends ConsumerWidget {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
               children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('字幕表示（再生時の既定）'),
+                  subtitle: const Text('オン／オフの状態を記憶し、チャンネル切替後も維持します'),
+                  value: subtitlesOn,
+                  onChanged: (value) =>
+                      ref.read(subtitlesEnabledProvider.notifier).set(value),
+                ),
+                const Divider(height: 16),
                 _SectionHeader(title: '文字サイズ', theme: theme),
                 const SizedBox(height: 8),
                 SegmentedButton<SubtitleSizePreset>(
