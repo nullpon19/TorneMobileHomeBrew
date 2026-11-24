@@ -9080,6 +9080,137 @@ void main() {
       );
     },
   );
+
+  group(
+    'Phase 33: direct ARIB clock isolation from libaribb24 leak & CM silence stability',
+    () {
+      test(
+        'resolveDirectAribPtsOffset ignores leaked mpvSubStartSeconds and avoids replaying start-of-stream captions',
+        () {
+          final events = [
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 50005.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 7,
+                  runs: [AribCaptionStyledRun(text: '開始当初の字幕')],
+                ),
+              ],
+            ),
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 50600.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 8,
+                  runs: [AribCaptionStyledRun(text: '10分後の現在字幕')],
+                ),
+              ],
+            ),
+          ];
+
+          // Leaked sub-start (+600s) must never pull t=0 captions to now.
+          final withDemux = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 600.5,
+            mpvSubStartSeconds: 1200.0,
+            demuxerStartTimeSeconds: 50000.0,
+            firstStreamPtsSeconds: 50000.2,
+          );
+          expect(withDemux, -50000.0);
+
+          final cues = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 600.5,
+            ptsOffset: withDemux!,
+          );
+          expect(cues.handled, isTrue);
+          expect(cues.cues, hasLength(1));
+          expect(cues.cues.single.plainText, '10分後の現在字幕');
+
+          // Without demuxerStartTimeSeconds, falls back to -firstStreamPtsSeconds,
+          // never (playbackTime - firstStreamPtsSeconds).
+          final withoutDemux = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 600.5,
+            mpvSubStartSeconds: 1200.0,
+            demuxerStartTimeSeconds: null,
+            firstStreamPtsSeconds: 50000.2,
+          );
+          expect(withoutDemux, -50000.2);
+
+          final cuesNoDemux = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 600.5,
+            ptsOffset: withoutDemux!,
+          );
+          expect(cuesNoDemux.handled, isTrue);
+          expect(cuesNoDemux.cues.single.plainText, '10分後の現在字幕');
+
+          // Raw non-rebased playbackTime selects 0.0 offset accurately.
+          final rawOffset = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 50600.5,
+            demuxerStartTimeSeconds: 50000.0,
+          );
+          expect(rawOffset, 0.0);
+        },
+      );
+
+      test(
+        'resolveDirectAribTsSubtitleCues stays handled across long (>120s) CM silence gaps when aligned, and false when unaligned',
+        () {
+          const events = [
+            AribCaptionLayoutEvent(
+              ptsSeconds: 50600.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.85,
+                  endNormalizedX: 0.60,
+                  charCount: 5,
+                  runs: [AribCaptionStyledRun(text: 'CM前の字幕')],
+                ),
+              ],
+            ),
+          ];
+
+          final cmGap = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 900.0,
+            ptsOffset: -50000.0,
+          );
+          expect(cmGap.handled, isTrue);
+          expect(cmGap.cues, isEmpty);
+
+          final unaligned = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 900.0,
+            ptsOffset: 0.0,
+          );
+          expect(unaligned.handled, isFalse);
+          expect(unaligned.cues, isEmpty);
+        },
+      );
+    },
+  );
 }
 
 class _DeletableScheduleService implements ScheduleService {

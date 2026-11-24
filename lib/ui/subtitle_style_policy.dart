@@ -1110,8 +1110,9 @@ double? resolveAribPtsOffset({
 }
 
 /// Resolves the PTS offset (`playbackClock - tsPts`) for direct Dart ARIB
-/// caption rendering, preferring exact calibration against [mpvSubStartSeconds]
-/// and otherwise validating [demuxerStartTimeSeconds] or stream anchor PTS.
+/// caption rendering purely from demuxer / TS stream anchors so `libaribb24`'s
+/// internal `i_control_time` leak (`mpvSubStartSeconds`) can never pull old
+/// start-of-stream captions into current Live playback.
 double? resolveDirectAribPtsOffset({
   required List<AribCaptionLayoutEvent> events,
   required double playbackTimeSeconds,
@@ -1121,65 +1122,49 @@ double? resolveDirectAribPtsOffset({
   double? currentOffset,
 }) {
   if (events.isEmpty) return currentOffset;
-  if (mpvSubStartSeconds != null) {
-    return resolveAribPtsOffset(
-      events: events,
-      mpvSubStartSeconds: mpvSubStartSeconds,
-      firstStreamPtsSeconds: firstStreamPtsSeconds,
-      currentOffset: currentOffset,
-    );
-  }
 
-  bool anyEventInPlaybackRange(double offset) {
+  double minEventDistance(double offset) {
+    var best = double.infinity;
     for (final e in events) {
-      final delta = wrapAwareAribPtsDelta(
+      final dist = wrapAwareAribPtsDelta(
         e.ptsSeconds + offset,
         playbackTimeSeconds,
-      );
-      if (delta >= -60.0 && delta <= 600.0) {
-        return true;
-      }
+      ).abs();
+      if (dist < best) best = dist;
     }
-    return false;
+    return best;
   }
 
-  if (currentOffset != null) {
-    for (final e in events) {
-      final delta = wrapAwareAribPtsDelta(
-        e.ptsSeconds + currentOffset,
-        playbackTimeSeconds,
-      );
-      if (delta >= -180.0 && delta <= 600.0) {
-        return currentOffset;
-      }
-    }
-  }
-
+  // Derive clock-origin offsets solely from mpv/TS stream anchors.
+  // Never use mpvSubStartSeconds (libaribb24 leaks i_control_time) or
+  // (playbackTime - firstStreamPts), which shifts initial captions to now.
   final candidates = <double>[
     if (demuxerStartTimeSeconds != null && demuxerStartTimeSeconds.isFinite)
       -demuxerStartTimeSeconds,
     if (firstStreamPtsSeconds != null && firstStreamPtsSeconds.isFinite)
       -firstStreamPtsSeconds,
-    if (firstStreamPtsSeconds != null &&
-        firstStreamPtsSeconds.isFinite &&
-        playbackTimeSeconds > 1.0)
-      playbackTimeSeconds - firstStreamPtsSeconds,
     0.0,
   ];
+
+  double? bestCandidate;
+  var bestDist = double.infinity;
   for (final candidate in candidates) {
-    if (anyEventInPlaybackRange(candidate)) {
-      return candidate;
+    final dist = minEventDistance(candidate);
+    if (dist <= 3600.0 && dist + 15.0 < bestDist) {
+      bestDist = dist;
+      bestCandidate = candidate;
     }
+  }
+  if (bestCandidate != null) {
+    return bestCandidate;
   }
   if (demuxerStartTimeSeconds != null && demuxerStartTimeSeconds.isFinite) {
     return -demuxerStartTimeSeconds;
   }
   if (firstStreamPtsSeconds != null && firstStreamPtsSeconds.isFinite) {
-    return playbackTimeSeconds > 1.0
-        ? playbackTimeSeconds - firstStreamPtsSeconds
-        : -firstStreamPtsSeconds;
+    return -firstStreamPtsSeconds;
   }
-  return currentOffset;
+  return currentOffset ?? 0.0;
 }
 
 /// Resolves active [SubtitleCue]s directly from decoded MPEG-TS/TTS
@@ -1195,22 +1180,24 @@ double? resolveDirectAribPtsOffset({
   }
 
   final eligible = <({AribCaptionLayoutEvent event, double mapped})>[];
-  var hasNearbyFuture = false;
+  var hasAlignedEvent = false;
   for (final e in events) {
-    final mapped =
-        currentPlaybackMpvPts +
-        wrapAwareAribPtsDelta(e.ptsSeconds + ptsOffset, currentPlaybackMpvPts);
+    final delta = wrapAwareAribPtsDelta(
+      e.ptsSeconds + ptsOffset,
+      currentPlaybackMpvPts,
+    );
+    if (delta.abs() <= 3600.0) {
+      hasAlignedEvent = true;
+    }
+    final mapped = currentPlaybackMpvPts + delta;
     final lag = currentPlaybackMpvPts - mapped;
     if (lag >= -0.12 && lag <= 120.0) {
       eligible.add((event: e, mapped: mapped));
-    } else if (mapped > currentPlaybackMpvPts + 0.12 &&
-        mapped - currentPlaybackMpvPts <= 120.0) {
-      hasNearbyFuture = true;
     }
   }
 
   if (eligible.isEmpty) {
-    return (handled: hasNearbyFuture, cues: const []);
+    return (handled: hasAlignedEvent, cues: const []);
   }
 
   eligible.sort((a, b) => a.mapped.compareTo(b.mapped));

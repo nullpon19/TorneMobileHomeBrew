@@ -3439,8 +3439,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _safeGetProp(platform, 'sub-start'),
           _safeGetProp(platform, 'sub-end'),
           _safeGetProp(platform, 'playback-time'),
-          if (_demuxerStartTimeSeconds == null)
-            _safeGetProp(platform, 'demuxer-start-time'),
+          _safeGetProp(platform, 'demuxer-start-time'),
         ]);
         if (!mounted || !_subtitlesOn) return;
         final plainNow = props[0];
@@ -3448,11 +3447,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final subStart = double.tryParse(props[2]);
         final subEnd = double.tryParse(props[3]);
         final playbackTime = double.tryParse(props[4]);
-        if (props.length > 5 && _demuxerStartTimeSeconds == null) {
-          final demuxStart = double.tryParse(props[5]);
-          if (demuxStart != null && demuxStart.isFinite) {
-            _demuxerStartTimeSeconds = demuxStart;
-          }
+        final demuxStart = double.tryParse(props[5]);
+        if (demuxStart != null && demuxStart.isFinite) {
+          _demuxerStartTimeSeconds = demuxStart;
         }
         if (playbackTime != null && playbackTime.isFinite) {
           _lastPlaybackTimeSeconds = playbackTime;
@@ -3471,6 +3468,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             ? widget.session as AribCaptionLayoutSource
             : null;
         if (directSource != null && playbackTime != null) {
+          final prevOffset = _aribPtsOffset;
           _aribPtsOffset = resolveDirectAribPtsOffset(
             events: directSource.aribCaptionEvents,
             playbackTimeSeconds: playbackTime,
@@ -3479,6 +3477,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             firstStreamPtsSeconds: directSource.firstStreamPtsSeconds,
             currentOffset: _aribPtsOffset,
           );
+          if (_aribPtsOffset != null &&
+              (prevOffset == null ||
+                  (_aribPtsOffset! - prevOffset).abs() > 1.0)) {
+            _diag(
+              DiagCategory.playback,
+              'player: direct ARIB offset=$_aribPtsOffset '
+              't=$playbackTime demux=$_demuxerStartTimeSeconds '
+              'firstPts=${directSource.firstStreamPtsSeconds} '
+              'events=${directSource.aribCaptionEvents.length}',
+            );
+          }
           if (_aribPtsOffset != null) {
             final direct = resolveDirectAribTsSubtitleCues(
               events: directSource.aribCaptionEvents,
