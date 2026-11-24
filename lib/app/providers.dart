@@ -307,6 +307,40 @@ final liveBufferSecondsProvider =
       LiveBufferSecondsNotifier.new,
     );
 
+/// Persisted video hardware/software decoding mode (default auto).
+class VideoHwdecModeNotifier extends Notifier<VideoHwdecMode> {
+  static const _key = 'firetv_video_hwdec_mode';
+  bool _dirty = false;
+
+  @override
+  VideoHwdecMode build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty || raw == null) return;
+      for (final mode in VideoHwdecMode.values) {
+        if (mode.name == raw && state != mode) {
+          state = mode;
+          return;
+        }
+      }
+    });
+    return VideoHwdecMode.auto;
+  }
+
+  Future<void> set(VideoHwdecMode mode) async {
+    _dirty = true;
+    state = mode;
+    await ref.read(keyValueStoreProvider).write(_key, mode.name);
+  }
+}
+
+final videoHwdecModeProvider =
+    NotifierProvider<VideoHwdecModeNotifier, VideoHwdecMode>(
+      VideoHwdecModeNotifier.new,
+    );
+
 /// Persisted night mode preference (dark theme toggle, default off = light).
 class NightModeNotifier extends Notifier<bool> {
   static const _key = 'firetv_night_mode';
@@ -698,6 +732,9 @@ final debugLogFolderOpenerProvider = Provider<DebugLogFolderOpener?>((ref) {
 final fileBytesPickerProvider = Provider<FileBytesPicker>(
   (ref) => FileBytesPicker(),
 );
+
+/// Android `Build.VERSION.SDK_INT` resolved at bootstrap (`null` on non-Android/tests).
+final androidSdkIntProvider = Provider<int?>((ref) => null);
 
 /// Platform helper for Fire TV (volume max, Tailscale, local file scan).
 final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());

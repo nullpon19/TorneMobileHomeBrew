@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <sys/socket.h>
 
 // Extracts the raw descriptor from a java.io.FileDescriptor. The
 // "descriptor" field is the one libcore itself maintains and it has
@@ -41,4 +42,22 @@ Java_com_markun_tmhb_FcntlCompat_nativeFcntlInt(JNIEnv *env, jobject thiz,
         return -errno;
     }
     return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_markun_tmhb_FcntlCompat_nativeSetsockoptInt(JNIEnv *env, jobject thiz,
+                                                     jobject file_descriptor,
+                                                     jint level, jint option,
+                                                     jint value) {
+    (void)thiz;
+    int fd = descriptor_of(env, file_descriptor);
+    if (fd < 0) {
+        return -EBADF;
+    }
+    int opt = (int)value;
+    int result = setsockopt(fd, level, option, &opt, (socklen_t)sizeof(opt));
+    if (result < 0) {
+        return -errno;
+    }
+    return 0;
 }

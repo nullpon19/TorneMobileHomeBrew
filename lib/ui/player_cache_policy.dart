@@ -75,8 +75,177 @@ const List<int> liveBufferOptionsSeconds = [0, 15, 30, 60, 180, 300];
 /// Default live buffer duration: standard low-latency (`0` = no extra delay).
 const int defaultLiveBufferSeconds = 0;
 
-/// Minimum free storage space preserved when sizing mpv's disk cache (512 MiB).
-const int minFreeDiskReserveBytes = 512 * 1024 * 1024;
+/// Minimum free storage space preserved when sizing mpv's disk cache (1 GiB).
+const int minFreeDiskReserveBytes = 1024 * 1024 * 1024;
+
+/// Comfort headroom target used when highlighting the recommended buffer tier.
+const int recommendedFreeDiskReserveBytes = 1536 * 1024 * 1024;
+
+/// Worst-case DR (元画質) MPEG-2 TS disk consumption estimate per minute.
+const int drDiskMibPerMinute = 110;
+
+/// Video hardware/software decoding preference for compatibility with older SoCs.
+enum VideoHwdecMode {
+  /// Default `auto-safe` hardware acceleration.
+  auto,
+
+  /// Keep H.264/HEVC in hardware, force MPEG-2 (DR broadcasts) to software.
+  mpeg2Software,
+
+  /// Disable hardware decoding (`hwdec=no`) across all codecs.
+  software,
+}
+
+/// Hardware-decode codec list excluding `mpeg2video` for legacy Fire TV devices
+/// whose MediaCodec MPEG-2 decoder stalls on interlaced DR streams.
+const String mpeg2SoftwareHwdecCodecs = 'h264,hevc,mpeg4,vp8,vp9,av1';
+
+/// Short label displayed on the Settings tile trailing summary.
+String videoHwdecModeShortLabel(VideoHwdecMode mode) {
+  switch (mode) {
+    case VideoHwdecMode.auto:
+      return '標準（自動）';
+    case VideoHwdecMode.mpeg2Software:
+      return 'MPEG-2 のみSW';
+    case VideoHwdecMode.software:
+      return 'すべてSW';
+  }
+}
+
+/// Full option label displayed in the Settings picker dialog.
+String videoHwdecModeLabel(VideoHwdecMode mode) {
+  switch (mode) {
+    case VideoHwdecMode.auto:
+      return '標準（自動 / ハードウェア優先）';
+    case VideoHwdecMode.mpeg2Software:
+      return 'MPEG-2 のみソフトウェア（旧世代 DR 対策）';
+    case VideoHwdecMode.software:
+      return 'すべてソフトウェア（互換優先）';
+  }
+}
+
+/// Concise helper text shown below each option or in the Settings summary.
+String videoHwdecModeDescription(VideoHwdecMode mode) {
+  switch (mode) {
+    case VideoHwdecMode.auto:
+      return '通常はこちら（Fire OS 8 等はハードウェア再生）';
+    case VideoHwdecMode.mpeg2Software:
+      return '元画質 (DR) の黒画面対策・モバイル画質はハードウェアのまま';
+    case VideoHwdecMode.software:
+      return '映像デコードで固まる場合の最終手段（負荷増）';
+  }
+}
+
+/// Estimated total disk cache footprint (forward + backward) in bytes using DR
+/// headroom so storage-tight devices stay protected.
+int estimateBufferDiskBytes({required bool live, required int bufferSeconds}) {
+  if (bufferSeconds <= 0) return 0;
+  if (!live && bufferSeconds < 60) return 0;
+  final forward = math.max(
+    14 * 1024 * 1024,
+    ((bufferSeconds * drDiskMibPerMinute) ~/ 60) * 1024 * 1024,
+  );
+  final back = live
+      ? 2 * 1024 * 1024
+      : math.max(
+          4 * 1024 * 1024,
+          math.min(forward ~/ 4, maxDiskBackCacheBytes),
+        );
+  return forward + back;
+}
+
+/// Classification of a buffer duration option relative to free storage.
+enum BufferOptionTier { recommended, available, insufficientStorage }
+
+/// Storage-aware evaluation result for one buffer duration option.
+class BufferOptionEvaluation {
+  const BufferOptionEvaluation({
+    required this.seconds,
+    required this.estimatedDiskBytes,
+    required this.tier,
+  });
+
+  final int seconds;
+  final int estimatedDiskBytes;
+  final BufferOptionTier tier;
+
+  bool get selectable => tier != BufferOptionTier.insufficientStorage;
+  bool get isRecommended => tier == BufferOptionTier.recommended;
+}
+
+/// Formats byte sizes concisely for Fire TV settings dialogs (`GB` / `MB`).
+String formatStorageBytes(int bytes) {
+  const gib = 1024 * 1024 * 1024;
+  if (bytes >= gib) {
+    return '${(bytes / gib).toStringAsFixed(1)} GB';
+  }
+  return '${(bytes / (1024 * 1024)).round()} MB';
+}
+
+/// Evaluates each candidate buffer duration against [availableDiskBytes] using
+/// DR-basis estimates and a strict 1 GiB minimum free reserve.
+List<BufferOptionEvaluation> evaluateBufferOptions({
+  required List<int> options,
+  required bool live,
+  required int? availableDiskBytes,
+}) {
+  final estimates = <int, int>{
+    for (final opt in options)
+      opt: estimateBufferDiskBytes(live: live, bufferSeconds: opt),
+  };
+
+  bool isSelectable(int opt) {
+    if (availableDiskBytes == null) return true;
+    final est = estimates[opt]!;
+    if (est == 0) return true;
+    return (availableDiskBytes - est) >= minFreeDiskReserveBytes;
+  }
+
+  int? recommendedSeconds;
+  if (availableDiskBytes != null) {
+    if (live) {
+      recommendedSeconds = options.contains(0)
+          ? 0
+          : options.firstWhere(isSelectable, orElse: () => options.first);
+    } else {
+      for (final opt in options) {
+        if (opt > defaultRecordedBufferSeconds) continue;
+        final est = estimates[opt]!;
+        if (est > 0 &&
+            isSelectable(opt) &&
+            (availableDiskBytes - est) >= recommendedFreeDiskReserveBytes) {
+          recommendedSeconds = opt;
+        }
+      }
+      if (recommendedSeconds == null) {
+        for (final opt in options) {
+          if (opt <= defaultRecordedBufferSeconds &&
+              estimates[opt] == 0 &&
+              isSelectable(opt)) {
+            recommendedSeconds = opt;
+          }
+        }
+      }
+      recommendedSeconds ??= options.firstWhere(
+        isSelectable,
+        orElse: () => options.first,
+      );
+    }
+  }
+
+  return [
+    for (final opt in options)
+      BufferOptionEvaluation(
+        seconds: opt,
+        estimatedDiskBytes: estimates[opt]!,
+        tier: !isSelectable(opt)
+            ? BufferOptionTier.insufficientStorage
+            : (opt == recommendedSeconds
+                  ? BufferOptionTier.recommended
+                  : BufferOptionTier.available),
+      ),
+  ];
+}
 
 /// Upper bound on forward disk cache size (~60 min of mobile stream, < 2 GiB).
 const int maxDiskCacheBytes = 1200 * 1024 * 1024;
@@ -191,12 +360,22 @@ MpvBufferPlan computeMpvBufferPlan({
     );
     if (useDiskCache && availableDiskBytes != null) {
       final safeLimit = availableDiskBytes - minFreeDiskReserveBytes;
-      if (safeLimit <= 16 * 1024 * 1024) {
+      if (safeLimit <= 20 * 1024 * 1024) {
         // Low storage fallback: disable disk cache and keep a small RAM budget.
         useDiskCache = false;
         demuxerMaxBytes = math.min(rawTarget, 24 * 1024 * 1024);
       } else {
-        demuxerMaxBytes = math.min(rawTarget, safeLimit);
+        final int backBudget;
+        if (live) {
+          backBudget = 2 * 1024 * 1024;
+        } else {
+          backBudget = math.max(
+            4 * 1024 * 1024,
+            math.min(math.min(rawTarget, safeLimit) ~/ 5, maxDiskBackCacheBytes),
+          );
+        }
+        final forwardCap = math.max(14 * 1024 * 1024, safeLimit - backBudget);
+        demuxerMaxBytes = math.min(rawTarget, forwardCap);
       }
     } else if (!useDiskCache) {
       demuxerMaxBytes = math.min(rawTarget, 48 * 1024 * 1024);

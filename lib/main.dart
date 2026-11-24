@@ -18,6 +18,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app/bootstrap.dart';
+import 'app/firetv_helper.dart';
 import 'ui/widgets.dart';
 import 'app/lifecycle_log.dart';
 import 'app/providers.dart';
@@ -41,9 +42,13 @@ Future<void> main() async {
   } catch (_) {
     // Non-fatal: mpv falls back to RAM cache if cache directory creation fails.
   }
+  final androidSdkInt = Platform.isAndroid
+      ? await FireTvHelper().getAndroidSdkInt()
+      : null;
   final container = fileStoreContainer(
     storeDirectory,
     mpvCacheDirectory: mpvCacheDir,
+    androidSdkInt: androidSdkInt,
   );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed

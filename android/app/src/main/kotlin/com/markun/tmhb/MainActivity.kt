@@ -140,6 +140,7 @@ class MainActivity : FlutterActivity() {
                     "hasStoragePermission" -> result.success(hasStoragePermission())
                     "requestStoragePermission" -> requestStoragePermission(result)
                     "getAppFilesDirPath" -> result.success(getExternalFilesDir(null)?.absolutePath)
+                    "getAndroidSdkInt" -> result.success(Build.VERSION.SDK_INT)
                     "getCacheAvailableBytes" -> {
                         val avail = try {
                             StatFs(cacheDir.absolutePath).availableBytes
@@ -381,6 +382,11 @@ class MainActivity : FlutterActivity() {
                 2,
             ),
             Triple(
+                File(Environment.getExternalStorageDirectory(), "Downloads"),
+                "Downloads",
+                2,
+            ),
+            Triple(
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
                 "Documents",
                 2,
@@ -488,11 +494,22 @@ private object FcntlCompat {
     }
 
     private external fun nativeFcntlInt(fd: FileDescriptor, cmd: Int, arg: Int): Int
+    private external fun nativeSetsockoptInt(
+        fd: FileDescriptor,
+        level: Int,
+        option: Int,
+        value: Int,
+    ): Int
 
     fun fcntlInt(fd: FileDescriptor, cmd: Int, arg: Int): Int {
         val result = nativeFcntlInt(fd, cmd, arg)
         if (result < 0) throw ErrnoException("fcntl", -result)
         return result
+    }
+
+    fun setsockoptInt(fd: FileDescriptor, level: Int, option: Int, value: Int) {
+        val result = nativeSetsockoptInt(fd, level, option, value)
+        if (result < 0) throw ErrnoException("setsockopt", -result)
     }
 }
 
@@ -514,8 +531,8 @@ private class AkeSocketConnection(
     fun connect(host: String, port: Int, timeoutMs: Int) {
         val descriptor = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_STREAM, 0)
         try {
-            Os.setsockoptInt(descriptor, OsConstants.IPPROTO_IP, OsConstants.IP_TTL, 3)
-            Os.setsockoptInt(descriptor, OsConstants.IPPROTO_TCP, OsConstants.TCP_NODELAY, 1)
+            FcntlCompat.setsockoptInt(descriptor, OsConstants.IPPROTO_IP, OsConstants.IP_TTL, 3)
+            FcntlCompat.setsockoptInt(descriptor, OsConstants.IPPROTO_TCP, OsConstants.TCP_NODELAY, 1)
             val address = InetAddress.getByName(host)
             val flags = FcntlCompat.fcntlInt(descriptor, OsConstants.F_GETFL, 0)
             FcntlCompat.fcntlInt(descriptor, OsConstants.F_SETFL, flags or OsConstants.O_NONBLOCK)
