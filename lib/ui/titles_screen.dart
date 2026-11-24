@@ -304,11 +304,19 @@ Widget _buildRecordedPlayerScreen({
       (title.scheduledDurationSeconds != null
           ? Duration(seconds: title.scheduledDurationSeconds!)
           : null);
+  final recordedBroadcastTimeRange = title.scheduledStart != null
+      ? formatRecordedBroadcastTimeRangeJst(
+          title.scheduledStart!,
+          title.scheduledDurationSeconds,
+        )
+      : null;
   return PlayerScreen(
     title: title.title,
     session: session,
     initialStart: initialStart,
     knownDuration: knownDuration,
+    recordedChannelName: title.channelName,
+    recordedBroadcastTimeRange: recordedBroadcastTimeRange,
     programDetailTitle: title.title,
     programDetailMeta: detailMeta,
     programDetailBody: detailBody,

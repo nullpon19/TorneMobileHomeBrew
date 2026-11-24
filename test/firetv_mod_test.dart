@@ -7394,12 +7394,12 @@ void main() {
           expect(
             shouldResetAribSubtitleDecoder(
               subStartSeconds: 10.0,
-              subEndSeconds: 28.0, // leaked i_control_time = 18s
+              subEndSeconds: 28.0, // leaked i_control_time alone no longer forces mid-cache flush
               playbackTimeSeconds: 12.0,
               plainUtf8Bytes: 40,
               assUtf8Bytes: 80,
             ),
-            isTrue,
+            isFalse,
           );
           expect(
             shouldResetAribSubtitleDecoder(
@@ -7415,11 +7415,21 @@ void main() {
             shouldResetAribSubtitleDecoder(
               subStartSeconds: 10.0,
               subEndSeconds: 15.0,
-              playbackTimeSeconds: 26.0,
+              playbackTimeSeconds: 12.0,
+              plainUtf8Bytes: 40,
+              assUtf8Bytes: 440,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldResetAribSubtitleDecoder(
+              subStartSeconds: 10.0,
+              subEndSeconds: 15.0,
+              playbackTimeSeconds: 26.0, // silent gap no longer flushes seekable cache
               plainUtf8Bytes: 40,
               assUtf8Bytes: 80,
             ),
-            isTrue,
+            isFalse,
           );
 
           // Truncated ASS override tag tail from mpv's 500-byte cut is stripped cleanly.
@@ -8394,6 +8404,234 @@ void main() {
           expect(find.textContaining('◀'), findsNothing);
           expect(find.textContaining('▶'), findsNothing);
           expect(find.byIcon(Icons.play_arrow), findsNWidgets(2));
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 31: direct Dart ARIB decoding, cache-safe subtitle sync, lightBlue seekbar, quality icon, and recorded OSD info',
+    () {
+      test(
+        'AribTsCaptionTap.parseAribStatementBody decodes ARIB text, colors, DRCS, macros, and horizontal speaker separation',
+        () {
+          List<int> ascii(String s) => s.codeUnits;
+          final body = Uint8List.fromList([
+            0x0C, // CS (sets startsWithClear)
+            0x9B, ...ascii('7'), 0x20, 0x53, // SWF 7 (960x540)
+            0x9B, ...ascii('100;460'), 0x61, // ACPS(100,460)
+            0x83, // YLF (yellow 0xFFFFFF00)
+            0x1B, 0x28, 0x30, // ESC ( 0 -> G0 = Hiragana
+            0x22, 0x24, // あ い
+            0x1B, 0x24, 0x42, // ESC $ B -> G0 = Kanji
+            0x30, 0x21, // 亜
+            0x86, // CNF (cyan 0xFF00FFFF)
+            0x1D, 0x61, // SS3 macro 0x61 (G0=Kanji, G1=Katakana, GL=0)
+            0x0E, // LS1 -> Katakana
+            0x22, 0x24, // ア イ
+            0x0F, // LS0 -> Kanji
+            0x1B, 0x28, 0x20, 0x40, // G0 = 1-byte DRCS
+            0x41, // DRCS glyph -> '〓'
+            // Second speaker far to the right on same baseline -> separate bucket
+            0x9B, ...ascii('620;460'), 0x61,
+            0x90, 0x20, 0x01, 0x90, 0x47, // COL palette 1 index 7 -> white
+            0x1D, 0x60, // default macro 0x60 (G0=Kanji)
+            0x30, 0x21, // 亜
+          ]);
+
+          final ev = AribTsCaptionTap.parseAribStatementBody(
+            body,
+            ptsSeconds: 50.0,
+          );
+          expect(ev, isNotNull);
+          expect(ev!.startsWithClear, isTrue);
+          expect(ev.hasDecodedText, isTrue);
+          expect(ev.lines, hasLength(2));
+
+          final leftLine = ev.lines[0];
+          expect(leftLine.normalizedX, closeTo(100 / 960.0, 0.01));
+          expect(leftLine.runs, hasLength(2));
+          expect(leftLine.runs[0].text, 'あい亜');
+          expect(leftLine.runs[0].colorArgb, 0xFFFFFF00);
+          expect(leftLine.runs[1].text, 'アイ〓');
+          expect(leftLine.runs[1].colorArgb, 0xFF00FFFF);
+
+          final rightLine = ev.lines[1];
+          expect(rightLine.normalizedX, closeTo(620 / 960.0, 0.01));
+          expect(rightLine.runs.single.text, '亜');
+          expect(rightLine.runs.single.colorArgb, 0xFFFFFFFF);
+        },
+      );
+
+      test(
+        'resolveDirectAribTsSubtitleCues and canResetAribSubtitleDecoderSafely handle live/recorded playback, appends, clear, and wraparound',
+        () {
+          final events = [
+            const AribCaptionLayoutEvent(
+              ptsSeconds: AribTsCaptionTap.ptsWrapSeconds - 1.0,
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: true,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.78,
+                  endNormalizedX: 0.60,
+                  charCount: 4,
+                  runs: [
+                    AribCaptionStyledRun(
+                      text: '話者１：最初',
+                      colorArgb: 0xFFFFFF00,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const AribCaptionLayoutEvent(
+              ptsSeconds: 1.0, // +2s across 33-bit wrap boundary
+              planeWidth: 960,
+              planeHeight: 540,
+              isClearOnly: false,
+              startsWithClear: false, // incremental append!
+              clearAfterSeconds: 4.0,
+              lines: [
+                AribCaptionLinePlacement(
+                  normalizedX: 0.18,
+                  normalizedY: 0.86,
+                  endNormalizedX: 0.55,
+                  charCount: 3,
+                  runs: [
+                    AribCaptionStyledRun(
+                      text: '追記行',
+                      colorArgb: 0xFF00FFFF,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ];
+
+          final offset = resolveDirectAribPtsOffset(
+            events: events,
+            playbackTimeSeconds: 12.0,
+            demuxerStartTimeSeconds: AribTsCaptionTap.ptsWrapSeconds - 10.0,
+          );
+          expect(offset, isNotNull);
+
+          // At playbackTime = 12.0s (event 2 at 11.0s), both speaker 1 & append line render.
+          final active = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 12.0,
+            ptsOffset: offset!,
+          );
+          expect(active.handled, isTrue);
+          expect(active.cues, hasLength(2));
+          expect(active.cues[0].plainText, '話者１：最初');
+          expect(active.cues[0].spans.single.color, const Color(0xFFFFFF00));
+          expect(active.cues[1].plainText, '追記行');
+          expect(active.cues[1].spans.single.color, const Color(0xFF00FFFF));
+
+          // Past clearAfterSeconds (11.0 + 4.0 = 15.0s), caption clears cleanly.
+          final cleared = resolveDirectAribTsSubtitleCues(
+            events: events,
+            currentPlaybackMpvPts: 15.2,
+            ptsOffset: offset,
+          );
+          expect(cleared.handled, isTrue);
+          expect(cleared.cues, isEmpty);
+
+          // Safe reset guard forbids sid cycling on Recorded & buffered/chase Live.
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: false,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 0.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 15,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 2.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: true,
+              bufferedAheadSeconds: 2.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 12.0,
+            ),
+            isFalse,
+          );
+          expect(
+            canResetAribSubtitleDecoderSafely(
+              live: true,
+              configuredLiveBufferSeconds: 0,
+              liveDelayedByPause: false,
+              bufferedAheadSeconds: 1.5,
+            ),
+            isTrue,
+          );
+        },
+      );
+
+      testWidgets(
+        'formatRecordedBroadcastTimeRangeJst, osdQualityButtonIcon, and RecordedOsdProgramSection render expected labels & neutral icon',
+        (tester) async {
+          final startJst = DateTime.utc(2026, 11, 24, 9, 0); // 18:00 JST Tue
+          expect(
+            formatRecordedBroadcastTimeRangeJst(startJst, 180),
+            '2026/11/24 (火) 18:00–18:03',
+          );
+          expect(
+            formatRecordedBroadcastTimeRangeJst(startJst, null),
+            '2026/11/24 (火) 18:00',
+          );
+          expect(osdQualityButtonIcon(useMobile: false), Icons.video_settings);
+          expect(osdQualityButtonIcon(useMobile: true), Icons.video_settings);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const RecordedOsdProgramSection(
+                        programTitle: 'テスト録画番組',
+                        broadcastTimeRange: '2026/11/24 (火) 18:00–18:03',
+                      ),
+                      const SizedBox(height: 8),
+                      Icon(osdQualityButtonIcon(useMobile: true)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('テスト録画番組'), findsOneWidget);
+          expect(find.text('2026/11/24 (火) 18:00–18:03'), findsOneWidget);
+          expect(find.byIcon(Icons.video_settings), findsOneWidget);
         },
       );
     },

@@ -295,6 +295,10 @@ Widget buildPlayerOsdStatusBadge({
 String osdQualityButtonLabel({required bool useMobile}) =>
     useMobile ? '画質: モバイル' : '画質: 元画質';
 
+/// Returns the resolution-neutral OSD button icon for playback quality switch.
+IconData osdQualityButtonIcon({required bool useMobile}) =>
+    Icons.video_settings;
+
 /// Returns whether the top-right corner notice overlay should be visible.
 bool shouldShowPlayerCornerNotice({
   required LiveRecordingCornerNotice? cornerRecordingNotice,
@@ -1079,6 +1083,51 @@ class LiveOsdProgramSection extends StatelessWidget {
   }
 }
 
+/// Recorded playback OSD row matching [LiveOsdProgramSection]'s header line,
+/// showing the programme title and original broadcast date/time range.
+class RecordedOsdProgramSection extends StatelessWidget {
+  const RecordedOsdProgramSection({
+    super.key,
+    required this.programTitle,
+    this.broadcastTimeRange,
+  });
+
+  final String programTitle;
+  final String? broadcastTimeRange;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            programTitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        if (broadcastTimeRange != null &&
+            broadcastTimeRange!.trim().isNotEmpty) ...[
+          const SizedBox(width: 12),
+          Text(
+            broadcastTimeRange!,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 13,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
 /// Computes the spinner caption and progress bar state for the loading overlay.
 /// When Live buffer is set (>= 5s), initial pre-buffering and mid-stream
 /// rebuffering share `バッファ蓄積中… X秒 / Y秒` + progress bar; when Live buffer
@@ -1576,6 +1625,8 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.programDetailTitle,
     this.programDetailMeta,
     this.programDetailBody,
+    this.recordedChannelName,
+    this.recordedBroadcastTimeRange,
     this.currentLiveChannel,
     this.initialRecordingSchedules = const [],
     this.liveUseMobile = false,
@@ -1661,6 +1712,12 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Combined full programme description body shown when opening "番組詳細" in the OSD.
   final String? programDetailBody;
+
+  /// Recorded channel label displayed in Row 1 of the recorded OSD header.
+  final String? recordedChannelName;
+
+  /// Formatted recorded broadcast date/time range displayed beside the programme title.
+  final String? recordedBroadcastTimeRange;
 
   /// Channel metadata for live viewing so same-channel recording status and
   /// other-channel recording conflicts can be detected.
@@ -1866,6 +1923,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   double? _lastSeenSubStartSeconds;
   Duration _subtitlePlaybackClock = Duration.zero;
   double? _aribPtsOffset;
+  double? _demuxerStartTimeSeconds;
+  bool _usingDirectAribCaptions = false;
   double? _activeSubStartSeconds;
   double? _lastPlaybackTimeSeconds;
   double? _activeClearAfterSeconds;
@@ -2418,7 +2477,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             if (line.trim().isNotEmpty) line,
         ];
         if (nonEmpty.isEmpty) {
-          _clearDisplayedSubtitles();
+          if (_usingDirectAribCaptions && _subtitlesOn) {
+            _requestImmediateSubtitleSync();
+          } else {
+            _clearDisplayedSubtitles();
+          }
           return;
         }
         if (!_subtitlesOn) return;
@@ -3185,6 +3248,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _resetSubtitleTrackTracking() {
     _aribPtsOffset = null;
+    _demuxerStartTimeSeconds = null;
+    _usingDirectAribCaptions = false;
     _suppressedCaptionSignature = null;
     _lastSeenSubStartSeconds = null;
   }
@@ -3336,7 +3401,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         if (!_subtitlesOn) return;
         if (value.trim().isEmpty && _plainSubtitleLines.isEmpty) {
-          _clearDisplayedSubtitles();
+          if (_usingDirectAribCaptions) {
+            _requestImmediateSubtitleSync();
+          } else {
+            _clearDisplayedSubtitles();
+          }
           return;
         }
         _requestImmediateSubtitleSync();
@@ -3369,6 +3438,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _safeGetProp(platform, 'sub-start'),
           _safeGetProp(platform, 'sub-end'),
           _safeGetProp(platform, 'playback-time'),
+          if (_demuxerStartTimeSeconds == null)
+            _safeGetProp(platform, 'demuxer-start-time'),
         ]);
         if (!mounted || !_subtitlesOn) return;
         final plainNow = props[0];
@@ -3376,6 +3447,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final subStart = double.tryParse(props[2]);
         final subEnd = double.tryParse(props[3]);
         final playbackTime = double.tryParse(props[4]);
+        if (props.length > 5 && _demuxerStartTimeSeconds == null) {
+          final demuxStart = double.tryParse(props[5]);
+          if (demuxStart != null && demuxStart.isFinite) {
+            _demuxerStartTimeSeconds = demuxStart;
+          }
+        }
         if (playbackTime != null && playbackTime.isFinite) {
           _lastPlaybackTimeSeconds = playbackTime;
         }
@@ -3389,6 +3466,42 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
         }
 
+        final directSource = widget.session is AribCaptionLayoutSource
+            ? widget.session as AribCaptionLayoutSource
+            : null;
+        if (directSource != null && playbackTime != null) {
+          _aribPtsOffset = resolveDirectAribPtsOffset(
+            events: directSource.aribCaptionEvents,
+            playbackTimeSeconds: playbackTime,
+            mpvSubStartSeconds: subStart,
+            demuxerStartTimeSeconds: _demuxerStartTimeSeconds,
+            firstStreamPtsSeconds: directSource.firstStreamPtsSeconds,
+            currentOffset: _aribPtsOffset,
+          );
+          if (_aribPtsOffset != null) {
+            final direct = resolveDirectAribTsSubtitleCues(
+              events: directSource.aribCaptionEvents,
+              currentPlaybackMpvPts: playbackTime,
+              ptsOffset: _aribPtsOffset!,
+            );
+            if (direct.handled) {
+              _usingDirectAribCaptions = true;
+              _subtitleMismatchRetries = 0;
+              _suppressedCaptionSignature = null;
+              if (subStart != null) {
+                _lastSeenSubStartSeconds = subStart;
+              }
+              final changed = !_cuesEqual(_visibleSubtitleCues, direct.cues);
+              _visibleSubtitleCues = direct.cues;
+              if (changed && mounted) {
+                setState(() {});
+              }
+              return;
+            }
+          }
+        }
+        _usingDirectAribCaptions = false;
+
         final nextPlain = [
           for (final line in plainNow.split('\n'))
             if (line.trim().isNotEmpty) line,
@@ -3399,7 +3512,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           return;
         }
 
-        if (shouldResetAribSubtitleDecoder(
+        if (canResetAribSubtitleDecoderSafely(
+              live: widget.live,
+              configuredLiveBufferSeconds: _bufferPlan?.configuredSeconds ?? 0,
+              liveDelayedByPause: _liveDelayedByPause,
+              bufferedAheadSeconds: _bufferedAheadSeconds,
+            ) &&
+            shouldResetAribSubtitleDecoder(
               subStartSeconds: subStart,
               subEndSeconds: subEnd,
               playbackTimeSeconds: playbackTime,
@@ -3529,16 +3648,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       subtitlesOn: _subtitlesOn,
       subtitleTrackIds: [for (final track in _realSubtitleTracks) track.id],
     );
+    final currentId = _selectedTrack.subtitle.id;
     try {
       if (id == null) {
         _clearDisplayedSubtitles(stopTimer: !_subtitlesOn);
-        await _player.setSubtitleTrack(SubtitleTrack.no());
+        if (currentId != 'no') {
+          await _player.setSubtitleTrack(SubtitleTrack.no());
+        }
       } else {
-        _assExtradataLoaded = false;
-        await _player.setSubtitleTrack(
-          _realSubtitleTracks.firstWhere((track) => track.id == id),
-        );
         _startSubtitleSyncTimer();
+        final alreadySelected =
+            currentId == id ||
+            (currentId == 'auto' &&
+                _realSubtitleTracks.isNotEmpty &&
+                _realSubtitleTracks.first.id == id);
+        if (!alreadySelected) {
+          _assExtradataLoaded = false;
+          await _player.setSubtitleTrack(
+            _realSubtitleTracks.firstWhere((track) => track.id == id),
+          );
+        }
         Future.delayed(const Duration(milliseconds: 250), () {
           if (mounted && _subtitlesOn) {
             unawaited(_syncSubtitleTick());
@@ -3776,7 +3905,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           'network-timeout',
           '${plan.networkTimeoutSeconds}',
         );
-        await platform.setProperty('sid', 'no');
+        await platform.setProperty('sid', _subtitlesOn ? 'auto' : 'no');
         await platform.setProperty('sub-ass', 'yes');
         await platform.setProperty('sub-visibility', 'no');
         await platform.setProperty('sub-fix-timing', 'no');
@@ -3860,6 +3989,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: open completed');
       await _applySubtitleSelection();
+      if (_subtitlesOn && mounted) {
+        _startSubtitleSyncTimer();
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: open failed: $e');
       if (!playerErrorIsFatal('$e', live: widget.live)) {
@@ -5074,7 +5206,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           settings: ref.watch(subtitleSettingsProvider),
                           cues: _visibleSubtitleCues,
                           bottomSafePadding: _osdOpen
-                              ? (widget.live ? 216.0 : 148.0)
+                              ? (widget.live ? 216.0 : 176.0)
                               : 24.0,
                         ),
                       if (!_conflictHandled &&
@@ -5269,9 +5401,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             : posFraction;
         final ticks = chapterTickFractions(chapters: _chapters, duration: dur);
         final remaining = dur > clampedPos ? dur - clampedPos : Duration.zero;
-        final barColor = isSeekingPreview || _seekHudPositionOverride != null
-            ? Colors.amberAccent
-            : Colors.lightBlueAccent;
+        const barColor = Colors.lightBlueAccent;
 
         return Column(
           mainAxisSize: MainAxisSize.min,
@@ -5396,7 +5526,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     decoration: BoxDecoration(
                       color: Colors.black87,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.amberAccent),
+                      border: Border.all(color: Colors.lightBlueAccent),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -5404,7 +5534,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         if (_seekHudIcon != null) ...[
                           Icon(
                             _seekHudIcon,
-                            color: Colors.amberAccent,
+                            color: Colors.lightBlueAccent,
                             size: 20,
                           ),
                           const SizedBox(width: 6),
@@ -5542,7 +5672,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               children: [
                 Expanded(
                   child: Text(
-                    widget.title,
+                    (!widget.live &&
+                            widget.recordedChannelName != null &&
+                            widget.recordedChannelName!.trim().isNotEmpty)
+                        ? widget.recordedChannelName!.trim()
+                        : widget.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -5584,6 +5718,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               const SizedBox(height: 6),
               _buildLiveOsdProgramSection(),
             ] else if (!widget.live) ...[
+              if ((widget.recordedChannelName != null &&
+                      widget.recordedChannelName!.trim().isNotEmpty) ||
+                  (widget.recordedBroadcastTimeRange != null &&
+                      widget.recordedBroadcastTimeRange!.trim().isNotEmpty)) ...[
+                const SizedBox(height: 4),
+                RecordedOsdProgramSection(
+                  programTitle: widget.title,
+                  broadcastTimeRange: widget.recordedBroadcastTimeRange,
+                ),
+              ],
               const SizedBox(height: 8),
               _buildSeekBarSection(isSeekingPreview: false),
             ],
@@ -5679,7 +5823,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     ),
                   if (widget.canSwitchQuality && widget.onSwitchQuality != null)
                     _osdButton(
-                      icon: Icons.hd_outlined,
+                      icon: osdQualityButtonIcon(
+                        useMobile: widget.currentUseMobile,
+                      ),
                       label: osdQualityButtonLabel(
                         useMobile: widget.currentUseMobile,
                       ),

@@ -1028,9 +1028,9 @@ double wrapAwareAribPtsDelta(double a, double b) {
   return d;
 }
 
-/// Detects FFmpeg/libaribb24's accumulated `i_control_time` duration leak or
-/// impending overflow of mpv's fixed 500-byte `last_text` buffer so the
-/// subtitle decoder alone can be safely reset before desync occurs.
+/// Detects impending overflow of mpv's fixed 500-byte `last_text` buffer when
+/// falling back to `libaribb24`, without false-triggering on normal gaps or
+/// long display intervals.
 bool shouldResetAribSubtitleDecoder({
   double? subStartSeconds,
   double? subEndSeconds,
@@ -1038,23 +1038,21 @@ bool shouldResetAribSubtitleDecoder({
   required int plainUtf8Bytes,
   required int assUtf8Bytes,
 }) {
-  if (plainUtf8Bytes >= 320 || assUtf8Bytes >= 420) {
-    return true;
-  }
-  if (subStartSeconds != null && subEndSeconds != null) {
-    final duration = subEndSeconds - subStartSeconds;
-    // Ignore mpv UNKNOWN_DURATION (~24.8 days); target leaked aribb24 times.
-    if (duration > 12.0 && duration < 86400.0) {
-      return true;
-    }
-  }
-  if (subStartSeconds != null &&
-      playbackTimeSeconds != null &&
-      (playbackTimeSeconds - subStartSeconds) > 14.0) {
-    return true;
-  }
-  return false;
+  return plainUtf8Bytes >= 340 || assUtf8Bytes >= 440;
 }
+
+/// Returns `true` only during low-latency real-time Live playback where toggling
+/// `sid` cannot flush seekable or buffered cache.
+bool canResetAribSubtitleDecoderSafely({
+  required bool live,
+  required int configuredLiveBufferSeconds,
+  required bool liveDelayedByPause,
+  required double bufferedAheadSeconds,
+}) =>
+    live &&
+    configuredLiveBufferSeconds == 0 &&
+    !liveDelayedByPause &&
+    bufferedAheadSeconds <= 5.0;
 
 /// Resolves the constant PTS offset (`mpvTime - tsPts`) mapping MPEG-TS PTS
 /// values to mpv's playback clock (`sub-start` / `playback-time`).
@@ -1097,6 +1095,189 @@ double? resolveAribPtsOffset({
     }
   }
   return currentOffset;
+}
+
+/// Resolves the PTS offset (`playbackClock - tsPts`) for direct Dart ARIB
+/// caption rendering, preferring exact calibration against [mpvSubStartSeconds]
+/// and otherwise validating [demuxerStartTimeSeconds] or stream anchor PTS.
+double? resolveDirectAribPtsOffset({
+  required List<AribCaptionLayoutEvent> events,
+  required double playbackTimeSeconds,
+  double? mpvSubStartSeconds,
+  double? demuxerStartTimeSeconds,
+  double? firstStreamPtsSeconds,
+  double? currentOffset,
+}) {
+  if (events.isEmpty) return currentOffset;
+  if (mpvSubStartSeconds != null) {
+    return resolveAribPtsOffset(
+      events: events,
+      mpvSubStartSeconds: mpvSubStartSeconds,
+      firstStreamPtsSeconds: firstStreamPtsSeconds,
+      currentOffset: currentOffset,
+    );
+  }
+
+  bool anyEventInPlaybackRange(double offset) {
+    for (final e in events) {
+      final delta = wrapAwareAribPtsDelta(
+        e.ptsSeconds + offset,
+        playbackTimeSeconds,
+      );
+      if (delta >= -60.0 && delta <= 600.0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (currentOffset != null) {
+    for (final e in events) {
+      final delta = wrapAwareAribPtsDelta(
+        e.ptsSeconds + currentOffset,
+        playbackTimeSeconds,
+      );
+      if (delta >= -180.0 && delta <= 600.0) {
+        return currentOffset;
+      }
+    }
+  }
+
+  final candidates = <double>[
+    if (demuxerStartTimeSeconds != null && demuxerStartTimeSeconds.isFinite)
+      -demuxerStartTimeSeconds,
+    if (firstStreamPtsSeconds != null && firstStreamPtsSeconds.isFinite)
+      -firstStreamPtsSeconds,
+    if (firstStreamPtsSeconds != null &&
+        firstStreamPtsSeconds.isFinite &&
+        playbackTimeSeconds > 1.0)
+      playbackTimeSeconds - firstStreamPtsSeconds,
+    0.0,
+  ];
+  for (final candidate in candidates) {
+    if (anyEventInPlaybackRange(candidate)) {
+      return candidate;
+    }
+  }
+  if (demuxerStartTimeSeconds != null && demuxerStartTimeSeconds.isFinite) {
+    return -demuxerStartTimeSeconds;
+  }
+  if (firstStreamPtsSeconds != null && firstStreamPtsSeconds.isFinite) {
+    return playbackTimeSeconds > 1.0
+        ? playbackTimeSeconds - firstStreamPtsSeconds
+        : -firstStreamPtsSeconds;
+  }
+  return currentOffset;
+}
+
+/// Resolves active [SubtitleCue]s directly from decoded MPEG-TS/TTS
+/// [AribCaptionLayoutEvent]s at [currentPlaybackMpvPts], bypassing mpv's
+/// internal `libaribb24` decoder when decoded ARIB text is available.
+({bool handled, List<SubtitleCue> cues}) resolveDirectAribTsSubtitleCues({
+  required List<AribCaptionLayoutEvent> events,
+  required double currentPlaybackMpvPts,
+  required double ptsOffset,
+}) {
+  if (!events.any((e) => e.hasDecodedText)) {
+    return (handled: false, cues: const []);
+  }
+
+  final eligible = <({AribCaptionLayoutEvent event, double mapped})>[];
+  var hasNearbyFuture = false;
+  for (final e in events) {
+    final mapped =
+        currentPlaybackMpvPts +
+        wrapAwareAribPtsDelta(e.ptsSeconds + ptsOffset, currentPlaybackMpvPts);
+    final lag = currentPlaybackMpvPts - mapped;
+    if (lag >= -0.12 && lag <= 120.0) {
+      eligible.add((event: e, mapped: mapped));
+    } else if (mapped > currentPlaybackMpvPts + 0.12 &&
+        mapped - currentPlaybackMpvPts <= 120.0) {
+      hasNearbyFuture = true;
+    }
+  }
+
+  if (eligible.isEmpty) {
+    return (handled: hasNearbyFuture, cues: const []);
+  }
+
+  eligible.sort((a, b) => a.mapped.compareTo(b.mapped));
+  final latest = eligible.last;
+  if (latest.event.isClearOnly) {
+    return (handled: true, cues: const []);
+  }
+  final clearAfter = latest.event.clearAfterSeconds;
+  if (clearAfter != null &&
+      clearAfter > 0 &&
+      currentPlaybackMpvPts >= latest.mapped + clearAfter) {
+    return (handled: true, cues: const []);
+  }
+  if (currentPlaybackMpvPts - latest.mapped >= subtitleStaleTimeout.inSeconds) {
+    return (handled: true, cues: const []);
+  }
+
+  // Merge incremental non-CS append packets (e.g. second speaker added live).
+  final activeEvents = <({AribCaptionLayoutEvent event, double mapped})>[latest];
+  var idx = eligible.length - 1;
+  while (idx > 0 &&
+      !eligible[idx].event.startsWithClear &&
+      activeEvents.length < 4) {
+    final prev = eligible[idx - 1];
+    if (prev.event.isClearOnly) break;
+    if (latest.mapped - prev.mapped > 8.0) break;
+    final prevClear = prev.event.clearAfterSeconds;
+    if (prevClear != null &&
+        prevClear > 0 &&
+        currentPlaybackMpvPts >= prev.mapped + prevClear) {
+      break;
+    }
+    activeEvents.insert(0, prev);
+    idx--;
+  }
+
+  final mergedLines = <AribCaptionLinePlacement>[];
+  for (final item in activeEvents) {
+    for (final line in item.event.lines) {
+      final hasVisibleRun = line.runs.any(
+        (r) => normalizeAribSubtitleSymbols(r.text).trim().isNotEmpty,
+      );
+      if (!hasVisibleRun) continue;
+      mergedLines.removeWhere(
+        (existing) =>
+            (existing.normalizedY - line.normalizedY).abs() < 0.04 &&
+            !(line.endNormalizedX <= existing.normalizedX ||
+                existing.endNormalizedX <= line.normalizedX),
+      );
+      mergedLines.add(line);
+    }
+  }
+
+  final cues = <SubtitleCue>[];
+  for (final line in mergedLines) {
+    final spans = <SubtitleStyledSpan>[];
+    for (final run in line.runs) {
+      final normalized = normalizeAribSubtitleSymbols(run.text);
+      if (normalized.isEmpty) continue;
+      spans.add(
+        SubtitleStyledSpan(
+          text: normalized,
+          color: Color(run.colorArgb),
+          scale: run.scale,
+        ),
+      );
+    }
+    if (spans.isEmpty) continue;
+    cues.add(
+      SubtitleCue(
+        spans: spans,
+        normalizedX: line.normalizedX,
+        endNormalizedX: line.endNormalizedX,
+        normalizedY: line.normalizedY,
+        alignment: 1,
+      ),
+    );
+  }
+  return (handled: true, cues: List<SubtitleCue>.unmodifiable(cues));
 }
 
 /// Finds the non-clear ARIB TS layout event closest to [mpvSubStartSeconds],

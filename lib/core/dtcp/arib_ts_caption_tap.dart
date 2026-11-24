@@ -6,13 +6,29 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-/// Horizontal & vertical bounds of one decoded ARIB caption text line.
+import '../arib_b24.dart';
+
+/// One decoded styled span inside an ARIB caption line.
+class AribCaptionStyledRun {
+  const AribCaptionStyledRun({
+    required this.text,
+    this.colorArgb = 0xFFFFFFFF,
+    this.scale = 1.0,
+  });
+
+  final String text;
+  final int colorArgb;
+  final double scale;
+}
+
+/// Horizontal & vertical bounds and decoded styled text runs of one ARIB caption line.
 class AribCaptionLinePlacement {
   const AribCaptionLinePlacement({
     required this.normalizedX,
     required this.normalizedY,
     required this.endNormalizedX,
     required this.charCount,
+    this.runs = const [],
   });
 
   /// Normalized left edge (`0.0..1.0` across [AribCaptionLayoutEvent.planeWidth]).
@@ -26,9 +42,12 @@ class AribCaptionLinePlacement {
 
   /// Number of visible characters measured on this line.
   final int charCount;
+
+  /// Decoded ARIB STD-B24 styled text runs for direct rendering.
+  final List<AribCaptionStyledRun> runs;
 }
 
-/// Decoded caption positioning and timing metadata extracted from one ARIB PES.
+/// Decoded caption positioning, styled text, and timing metadata from one ARIB PES.
 class AribCaptionLayoutEvent {
   const AribCaptionLayoutEvent({
     required this.ptsSeconds,
@@ -37,6 +56,7 @@ class AribCaptionLayoutEvent {
     required this.lines,
     required this.isClearOnly,
     this.clearAfterSeconds,
+    this.startsWithClear = false,
   });
 
   final double ptsSeconds;
@@ -45,6 +65,10 @@ class AribCaptionLayoutEvent {
   final List<AribCaptionLinePlacement> lines;
   final bool isClearOnly;
   final double? clearAfterSeconds;
+  final bool startsWithClear;
+
+  bool get hasDecodedText =>
+      lines.any((l) => l.runs.any((r) => r.text.trim().isNotEmpty));
 }
 
 class _MutableLineBucket {
@@ -61,6 +85,71 @@ class _MutableLineBucket {
   double minX;
   double maxEndX;
   int charCount;
+  bool pendingSpace = false;
+  final List<AribCaptionStyledRun> runs = [];
+
+  void appendText(String text, int colorArgb, double scale) {
+    if (text.isEmpty) return;
+    if (pendingSpace && runs.isNotEmpty) {
+      _appendMerged(' ', runs.last.colorArgb, runs.last.scale);
+    }
+    pendingSpace = false;
+    _appendMerged(text, colorArgb, scale);
+  }
+
+  void _appendMerged(String text, int colorArgb, double scale) {
+    if (text.isEmpty) return;
+    if (runs.isNotEmpty &&
+        runs.last.colorArgb == colorArgb &&
+        runs.last.scale == scale) {
+      final prev = runs.removeLast();
+      runs.add(
+        AribCaptionStyledRun(
+          text: '${prev.text}$text',
+          colorArgb: colorArgb,
+          scale: scale,
+        ),
+      );
+      return;
+    }
+    runs.add(
+      AribCaptionStyledRun(text: text, colorArgb: colorArgb, scale: scale),
+    );
+  }
+
+  List<AribCaptionStyledRun> buildTrimmedRuns() {
+    if (runs.isEmpty) return const [];
+    final out = List<AribCaptionStyledRun>.of(runs);
+    while (out.isNotEmpty) {
+      final trimmed = out.first.text.replaceFirst(RegExp(r'^ +'), '');
+      if (trimmed == out.first.text) break;
+      if (trimmed.isEmpty) {
+        out.removeAt(0);
+      } else {
+        out[0] = AribCaptionStyledRun(
+          text: trimmed,
+          colorArgb: out.first.colorArgb,
+          scale: out.first.scale,
+        );
+        break;
+      }
+    }
+    while (out.isNotEmpty) {
+      final trimmed = out.last.text.replaceFirst(RegExp(r' +$'), '');
+      if (trimmed == out.last.text) break;
+      if (trimmed.isEmpty) {
+        out.removeLast();
+      } else {
+        out[out.length - 1] = AribCaptionStyledRun(
+          text: trimmed,
+          colorArgb: out.last.colorArgb,
+          scale: out.last.scale,
+        );
+        break;
+      }
+    }
+    return List<AribCaptionStyledRun>.unmodifiable(out);
+  }
 }
 
 /// Parses MPEG-TS (`188` B) or MPEG-TTS (`192` B) plaintext byte slices on the
@@ -69,7 +158,7 @@ class AribTsCaptionTap {
   static const int _tsPacketSize = 188;
   static const int _ttsPacketSize = 192;
   static const int _maxCarryBytes = _ttsPacketSize * 3;
-  static const int _maxBufferedEvents = 400;
+  static const int _maxBufferedEvents = 2400;
   static const int _maxPesBytes = 64 * 1024;
   static const int _maxPsiBytes = 4096;
 
@@ -415,9 +504,18 @@ class AribTsCaptionTap {
     }
     final event = _parseCaptionPesPayload(payload, ptsSeconds: pts);
     if (event != null) {
-      _events.add(event);
-      if (_events.length > _maxBufferedEvents) {
-        _events.removeRange(0, _events.length - _maxBufferedEvents);
+      final dupIdx = _events.indexWhere(
+        (e) =>
+            (e.ptsSeconds - event.ptsSeconds).abs() < 0.02 &&
+            e.isClearOnly == event.isClearOnly,
+      );
+      if (dupIdx >= 0) {
+        _events[dupIdx] = event;
+      } else {
+        _events.add(event);
+        if (_events.length > _maxBufferedEvents) {
+          _events.removeRange(0, _events.length - _maxBufferedEvents);
+        }
       }
     }
   }
@@ -520,19 +618,24 @@ class AribTsCaptionTap {
 
     // ISO-2022 state: G0=Kanji(2B), G1=Alnum(1B), G2=Hiragana(1B), G3=Macro(1B).
     final gBytes = [2, 1, 1, 1];
+    final gFinal = [0x42, 0x4A, 0x30, 0x70];
     final gIsMosaic = [false, false, false, false];
+    final gIsDrcs = [false, false, false, false];
     var g3IsMacro = true;
     var gl = 0;
     var gr = 2;
     int? singleShift;
     var repeatCount = 1;
+    var curColorArgb = 0xFFFFFFFF;
+    var colPalette = 0;
 
     var hasClear = false;
+    var startsWithClear = false;
     var timeWaitSeconds = 0.0;
     double? clearAfterSeconds;
     final lines = <_MutableLineBucket>[];
 
-    void recordVisibleGlyph(double width) {
+    void recordVisibleGlyph(double width, String text) {
       if (curX >= dispRight && width > 0) {
         curX = dispLeft;
         curY += charStepY();
@@ -547,26 +650,31 @@ class AribTsCaptionTap {
       final threshold = math.max(10.0, (fontH + verInt) * 0.45);
       _MutableLineBucket? target;
       for (final bucket in lines) {
-        if ((bucket.baselineY - baselineY).abs() <= threshold) {
+        if ((bucket.baselineY - baselineY).abs() <= threshold &&
+            glyphStartX - bucket.maxEndX <= fontW * 3.0 &&
+            bucket.minX - glyphEndX <= fontW * 3.0) {
           target = bucket;
           break;
         }
       }
       if (target == null) {
-        lines.add(
-          _MutableLineBucket(
-            baselineY: baselineY,
-            centerY: centerY,
-            minX: glyphStartX,
-            maxEndX: glyphEndX,
-            charCount: 1,
-          ),
+        target = _MutableLineBucket(
+          baselineY: baselineY,
+          centerY: centerY,
+          minX: glyphStartX,
+          maxEndX: glyphEndX,
+          charCount: 1,
         );
+        lines.add(target);
       } else {
+        if (glyphStartX - target.maxEndX >= fontW * 0.45) {
+          target.pendingSpace = true;
+        }
         if (glyphStartX < target.minX) target.minX = glyphStartX;
         if (glyphEndX > target.maxEndX) target.maxEndX = glyphEndX;
         target.charCount += 1;
       }
+      target.appendText(text, curColorArgb, 1.0);
     }
 
     var i = 0;
@@ -594,6 +702,7 @@ class AribTsCaptionTap {
               break;
             }
             lines.clear();
+            startsWithClear = true;
             curX = dispLeft;
             curY = dispTop + charStepY() - 1.0;
             hasExplicitCursorPos = false;
@@ -635,13 +744,18 @@ class AribTsCaptionTap {
                   if (i < body.length && body[i] == 0x20) {
                     i++;
                     if (i < body.length) i++;
-                    gIsMosaic[target] = false; // 2-byte DRCS glyph
+                    gIsMosaic[target] = false;
+                    gIsDrcs[target] = true;
                   } else if (i < body.length) {
                     final fin = body[i++];
+                    gFinal[target] = fin;
+                    gIsDrcs[target] = false;
                     gIsMosaic[target] = fin >= 0x32 && fin <= 0x35;
                   }
                 } else {
                   gBytes[0] = 2;
+                  gFinal[0] = e2;
+                  gIsDrcs[0] = false;
                   gIsMosaic[0] = e2 >= 0x32 && e2 <= 0x35;
                 }
               default:
@@ -653,10 +767,13 @@ class AribTsCaptionTap {
                     if (i < body.length) i++;
                     gBytes[target] = 1;
                     gIsMosaic[target] = false;
+                    gIsDrcs[target] = true;
                     if (target == 3) g3IsMacro = false;
                   } else if (i < body.length) {
                     final fin = body[i++];
                     gBytes[target] = _isTwoByteFinal(fin) ? 2 : 1;
+                    gFinal[target] = fin;
+                    gIsDrcs[target] = false;
                     gIsMosaic[target] = fin >= 0x32 && fin <= 0x35;
                     if (target == 3) g3IsMacro = fin == 0x70;
                   }
@@ -684,6 +801,10 @@ class AribTsCaptionTap {
       // --- C1 Controls (0x80..0xA0) -----------------------------------------
       if (b >= 0x80 && b <= 0xA0) {
         i++;
+        if (b >= 0x80 && b <= 0x87) {
+          curColorArgb = _aribClutColorArgb(b - 0x80);
+          continue;
+        }
         switch (b) {
           case 0x88: // SSZ (half-width & half-height; ruby/small)
             curFontW = fontW / 2.0;
@@ -719,6 +840,19 @@ class AribTsCaptionTap {
               }
             }
           case 0x90: // COL
+            if (i < body.length) {
+              if (body[i] == 0x20 && i + 1 < body.length) {
+                colPalette = body[i + 1] & 0x0F;
+                i += 2;
+              } else {
+                final p = body[i++];
+                if (p >= 0x40 && p <= 0x4F) {
+                  curColorArgb = _aribClutColorArgb(
+                    ((colPalette & 0x0F) << 4) | (p - 0x40),
+                  );
+                }
+              }
+            }
           case 0x92: // CDC
             if (i < body.length) {
               if (body[i] == 0x20 && i + 1 < body.length) {
@@ -861,24 +995,23 @@ class AribTsCaptionTap {
       final area = singleShift ?? (b >= 0xA1 ? gr : gl);
       singleShift = null;
       final byteCount = gBytes[area];
+      final finalByte = gFinal[area];
       final isMosaic = gIsMosaic[area];
+      final isDrcs = gIsDrcs[area];
       final first = b & 0x7F;
       var second = 0;
       i++;
       if (area == 3 && g3IsMacro && first >= 0x60 && first <= 0x6F) {
-        if (first == 0x60) {
-          // ARIB default macro 0x60: reset G0..G3, GL=0, GR=2.
-          gBytes[0] = 2;
-          gBytes[1] = 1;
-          gBytes[2] = 1;
-          gBytes[3] = 1;
-          for (var k = 0; k < 4; k++) {
-            gIsMosaic[k] = false;
-          }
-          g3IsMacro = true;
-          gl = 0;
-          gr = 2;
-        }
+        _applyAribDefaultMacro(
+          first,
+          gBytes: gBytes,
+          gFinal: gFinal,
+          gIsMosaic: gIsMosaic,
+          gIsDrcs: gIsDrcs,
+        );
+        g3IsMacro = true;
+        gl = 0;
+        gr = 2;
         repeatCount = 1;
         continue;
       }
@@ -893,11 +1026,28 @@ class AribTsCaptionTap {
           (byteCount == 1 && first == 0x20);
       final count = repeatCount;
       repeatCount = 1;
+      String? decodedChar;
+      if (!isSpaceCell && !isMosaic) {
+        if (isDrcs) {
+          decodedChar = '〓';
+        } else if (byteCount == 2) {
+          decodedChar = decodeAribB24TwoByteCell(
+            (first << 8) | second,
+            finalByte,
+          );
+        } else {
+          decodedChar = decodeAribB24OneByteCell(
+            first,
+            finalByte,
+            halfWidth: curFontW < fontW,
+          );
+        }
+      }
       for (var r = 0; r < count; r++) {
         if (isSpaceCell || isMosaic) {
           curX += charStepX();
         } else {
-          recordVisibleGlyph(charStepX());
+          recordVisibleGlyph(charStepX(), decodedChar ?? '');
         }
       }
     }
@@ -910,10 +1060,15 @@ class AribTsCaptionTap {
         planeHeight: planeH,
         lines: const [],
         isClearOnly: true,
+        startsWithClear: true,
       );
     }
 
-    lines.sort((a, b) => a.baselineY.compareTo(b.baselineY));
+    lines.sort((a, b) {
+      final yCmp = a.baselineY.compareTo(b.baselineY);
+      if (yCmp != 0) return yCmp;
+      return a.minX.compareTo(b.minX);
+    });
     final safeW = planeW > 0 ? planeW : 960.0;
     final safeH = planeH > 0 ? planeH : 540.0;
     return AribCaptionLayoutEvent(
@@ -927,11 +1082,118 @@ class AribTsCaptionTap {
             normalizedY: (line.centerY / safeH).clamp(0.02, 0.98).toDouble(),
             endNormalizedX: (line.maxEndX / safeW).clamp(0.05, 0.98).toDouble(),
             charCount: line.charCount,
+            runs: line.buildTrimmedRuns(),
           ),
       ],
       isClearOnly: false,
       clearAfterSeconds: clearAfterSeconds,
+      startsWithClear: startsWithClear,
     );
+  }
+
+  static int _aribClutColorArgb(int index) {
+    const clut = <int>[
+      0xFFFFFFFF, // 0: BKF guarded to white for contrast on dark pills
+      0xFFFF0000, // 1: RDF
+      0xFF00FF00, // 2: GRF
+      0xFFFFFF00, // 3: YLF
+      0xFF0000FF, // 4: BLF
+      0xFFFF00FF, // 5: MGF
+      0xFF00FFFF, // 6: CNF
+      0xFFFFFFFF, // 7: WHF
+      0xFFFFFFFF, // 8: half black -> white
+      0xFFFF6666, // 9: light red
+      0xFF80FF80, // 10: light green
+      0xFFFFFF80, // 11: light yellow
+      0xFF80A0FF, // 12: light blue
+      0xFFFF80FF, // 13: light magenta
+      0xFF80FFFF, // 14: light cyan
+      0xFFCCCCCC, // 15: light gray
+    ];
+    return clut[index & 0x0F];
+  }
+
+  static void _applyAribDefaultMacro(
+    int macroByte, {
+    required List<int> gBytes,
+    required List<int> gFinal,
+    required List<bool> gIsMosaic,
+    required List<bool> gIsDrcs,
+  }) {
+    void setSlot(int slot, int bytes, int fin, {bool mosaic = false, bool drcs = false}) {
+      gBytes[slot] = bytes;
+      gFinal[slot] = fin;
+      gIsMosaic[slot] = mosaic;
+      gIsDrcs[slot] = drcs;
+    }
+
+    setSlot(3, 1, 0x70); // G3 = Macro
+    switch (macroByte) {
+      case 0x60:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x4A);
+        setSlot(2, 1, 0x30);
+      case 0x61:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x31);
+        setSlot(2, 1, 0x30);
+      case 0x62:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x41, drcs: true);
+        setSlot(2, 1, 0x30);
+      case 0x63:
+        setSlot(0, 1, 0x32, mosaic: true);
+        setSlot(1, 1, 0x33, mosaic: true);
+        setSlot(2, 1, 0x34, mosaic: true);
+      case 0x64:
+        setSlot(0, 1, 0x32, mosaic: true);
+        setSlot(1, 1, 0x35, mosaic: true);
+        setSlot(2, 1, 0x34, mosaic: true);
+      case 0x65:
+        setSlot(0, 1, 0x32, mosaic: true);
+        setSlot(1, 1, 0x4A);
+        setSlot(2, 1, 0x30);
+      case 0x66:
+        setSlot(0, 1, 0x33, mosaic: true);
+        setSlot(1, 1, 0x31);
+        setSlot(2, 1, 0x30);
+      case 0x67:
+        setSlot(0, 1, 0x35, mosaic: true);
+        setSlot(1, 1, 0x30);
+        setSlot(2, 2, 0x42);
+      case 0x68:
+        setSlot(0, 1, 0x36);
+        setSlot(1, 1, 0x34, mosaic: true);
+        setSlot(2, 1, 0x35, mosaic: true);
+      case 0x69:
+        setSlot(0, 1, 0x37);
+        setSlot(1, 1, 0x4A);
+        setSlot(2, 1, 0x30);
+      case 0x6A:
+        setSlot(0, 1, 0x38);
+        setSlot(1, 1, 0x31);
+        setSlot(2, 2, 0x42);
+      case 0x6B:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x41, drcs: true);
+        setSlot(2, 1, 0x31);
+      case 0x6C:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x42, drcs: true);
+        setSlot(2, 1, 0x43, drcs: true);
+      case 0x6D:
+        setSlot(0, 2, 0x40, drcs: true);
+        setSlot(1, 1, 0x41, drcs: true);
+        setSlot(2, 1, 0x42, drcs: true);
+      case 0x6E:
+        setSlot(0, 2, 0x42);
+        setSlot(1, 1, 0x30);
+        setSlot(2, 1, 0x31);
+      case 0x6F:
+        setSlot(0, 1, 0x4A);
+        setSlot(1, 1, 0x31);
+        setSlot(2, 2, 0x42);
+    }
   }
 
   static bool _isTwoByteFinal(int fin) =>
