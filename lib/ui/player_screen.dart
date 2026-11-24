@@ -185,6 +185,7 @@ import '../app/firetv_helper.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import 'format.dart';
+import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
 import 'multi_nasne_policy.dart';
 import 'widgets.dart';
@@ -228,30 +229,33 @@ String? formatProgramDetailBody({
   return '$short\n\n$long';
 }
 
-/// Unified rectangular status badge used in the player OSD header so `録画中`
-/// matches `LIVE` in corner radius, padding, height, and font size.
+/// Unified rectangular status badge used in the player OSD header so `録画中`,
+/// `バッファ`, and `LIVE` share matching corner radius, padding, height, and font size.
 Widget buildPlayerOsdStatusBadge({
   required String label,
   required Color color,
   IconData? icon,
+  Color textColor = Colors.white,
+  Border? border,
 }) {
   return Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
     decoration: BoxDecoration(
       color: color,
       borderRadius: BorderRadius.circular(4),
+      border: border,
     ),
     child: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         if (icon != null) ...[
-          Icon(icon, size: 10, color: Colors.white),
+          Icon(icon, size: 10, color: textColor),
           const SizedBox(width: 4),
         ],
         Text(
           label,
-          style: const TextStyle(
-            color: Colors.white,
+          style: TextStyle(
+            color: textColor,
             fontSize: 12,
             fontWeight: FontWeight.bold,
             height: 1.2,
@@ -260,6 +264,320 @@ Widget buildPlayerOsdStatusBadge({
       ],
     ),
   );
+}
+
+/// Returns whether the top-right corner notice overlay should be visible.
+bool shouldShowPlayerCornerNotice({
+  required LiveRecordingCornerNotice? cornerRecordingNotice,
+  required String? customCornerNoticeText,
+  required bool osdOpen,
+  required bool detailOpen,
+  required bool interrupted,
+  required String? error,
+  required bool switchingChannel,
+}) =>
+    (cornerRecordingNotice != null || customCornerNoticeText != null) &&
+    !osdOpen &&
+    !detailOpen &&
+    !interrupted &&
+    error == null &&
+    !switchingChannel;
+
+/// Reconciles the player's local reservation snapshot and stopped-id guard
+/// after a live-OSD start or stop action so delayed nasne XSRS deletes never
+/// resurrect stale active-recording badges.
+({List<RecordSchedule> schedules, Set<String> stoppedIds})
+reconcileLiveRecordingSchedules({
+  required List<RecordSchedule> currentSchedules,
+  required Set<String> currentStoppedIds,
+  required bool isStopAction,
+  required bool actionSucceeded,
+  String? targetScheduleId,
+  List<RecordSchedule>? updatedSchedules,
+}) {
+  final nextStopped = Set<String>.of(currentStoppedIds);
+  if (isStopAction) {
+    if (actionSucceeded && targetScheduleId != null) {
+      nextStopped.add(targetScheduleId);
+    }
+    final nextList = schedulesExcludingIds(
+      updatedSchedules ?? currentSchedules,
+      nextStopped,
+    );
+    return (schedules: nextList, stoppedIds: nextStopped);
+  }
+  if (actionSucceeded && updatedSchedules != null) {
+    for (final s in updatedSchedules) {
+      nextStopped.remove(s.id);
+    }
+  }
+  final nextList = updatedSchedules == null
+      ? schedulesExcludingIds(currentSchedules, nextStopped)
+      : schedulesExcludingIds(updatedSchedules, nextStopped);
+  return (schedules: nextList, stoppedIds: nextStopped);
+}
+
+/// Returns whether a paused live stream can catch up to live edge seamlessly
+/// within mpv's in-memory/disk demuxer cache without dropping to proxy reset.
+bool canSeekWithinLiveCache({
+  required bool useCache,
+  required int configuredBufferSeconds,
+  required double totalPauseLagSeconds,
+  required double cacheDurationSeconds,
+  required double cacheTimeSeconds,
+  required double timePosSeconds,
+}) {
+  if (!useCache || configuredBufferSeconds <= 0) return false;
+  if (!cacheDurationSeconds.isFinite ||
+      !cacheTimeSeconds.isFinite ||
+      !timePosSeconds.isFinite) {
+    return false;
+  }
+  return cacheDurationSeconds >= 1.5 &&
+      cacheTimeSeconds > timePosSeconds + 1.0 &&
+      totalPauseLagSeconds <= configuredBufferSeconds;
+}
+
+/// Top-right overlay notice for custom live messages or recording start/end.
+class PlayerCornerNotice extends StatelessWidget {
+  const PlayerCornerNotice({
+    super.key,
+    this.customText,
+    this.recordingNotice,
+  });
+
+  final String? customText;
+  final LiveRecordingCornerNotice? recordingNotice;
+
+  @override
+  Widget build(BuildContext context) {
+    if (customText != null) {
+      return Positioned(
+        top: 16,
+        right: 20,
+        child: IgnorePointer(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xCC1E3A5F),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.swap_horiz, size: 14, color: Colors.white),
+                const SizedBox(width: 4),
+                Text(
+                  customText!,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    final notice = recordingNotice;
+    if (notice == null) return const SizedBox.shrink();
+    final ended = notice == LiveRecordingCornerNotice.ended;
+    return Positioned(
+      top: 16,
+      right: 20,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: ended ? const Color(0xCC263238) : const Color(0xFFC62828),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                ended ? Icons.stop : Icons.fiber_manual_record,
+                size: 13,
+                color: Colors.white,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                ended ? '録画終了' : '録画中',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Slide-in card anchored to the left or right screen edge for two-step D-pad
+/// channel switching during live TV playback.
+class LiveChannelSwitchPreviewCard extends StatelessWidget {
+  const LiveChannelSwitchPreviewCard({
+    super.key,
+    required this.direction,
+    required this.visible,
+    required this.entry,
+    required this.onTap,
+  });
+
+  final ChannelSwitchDirection direction;
+  final bool visible;
+  final LiveChannelSwitchEntry? entry;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final isNext = direction == ChannelSwitchDirection.next;
+    final alignment = isNext ? Alignment.centerRight : Alignment.centerLeft;
+    final hiddenOffset = isNext ? const Offset(1.15, 0) : const Offset(-1.15, 0);
+    final edgePadding = isNext
+        ? const EdgeInsets.only(right: 20)
+        : const EdgeInsets.only(left: 20);
+    final cardKey = ValueKey(
+      isNext ? 'live_channel_preview_next' : 'live_channel_preview_previous',
+    );
+    final data = entry;
+    final timeRange = data?.broadcastTimeRange;
+    return Positioned.fill(
+      child: IgnorePointer(
+        ignoring: !visible,
+        child: Align(
+          alignment: alignment,
+          child: Padding(
+            padding: edgePadding,
+            child: AnimatedSlide(
+              offset: visible ? Offset.zero : hiddenOffset,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: AnimatedOpacity(
+                opacity: visible && data != null ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 180),
+                child: data == null
+                    ? const SizedBox.shrink()
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          minWidth: 260,
+                          maxWidth: 340,
+                        ),
+                        child: GestureDetector(
+                          onTap: onTap,
+                          child: Container(
+                            key: cardKey,
+                            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+                            decoration: BoxDecoration(
+                              color: const Color(0xD90D1117),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: Colors.amberAccent.withValues(
+                                  alpha: 0.9,
+                                ),
+                                width: 1.5,
+                              ),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Colors.black54,
+                                  blurRadius: 16,
+                                  offset: Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (!isNext) ...[
+                                      const Icon(
+                                        Icons.chevron_left,
+                                        size: 16,
+                                        color: Colors.amberAccent,
+                                      ),
+                                      const SizedBox(width: 2),
+                                    ],
+                                    Text(
+                                      isNext ? '次のチャンネル' : '前のチャンネル',
+                                      style: const TextStyle(
+                                        color: Colors.amberAccent,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    if (isNext) ...[
+                                      const SizedBox(width: 2),
+                                      const Icon(
+                                        Icons.chevron_right,
+                                        size: 16,
+                                        color: Colors.amberAccent,
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  data.displayChannelName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 17,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  data.programTitle,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    height: 1.3,
+                                  ),
+                                ),
+                                if (timeRange != null) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    timeRange,
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 8),
+                                Text(
+                                  isNext
+                                      ? 'もう一度 ▶ / 決定 で切替'
+                                      : 'もう一度 ◀ / 決定 で切替',
+                                  style: const TextStyle(
+                                    color: Colors.white60,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// High-contrast button style for [PlayerOsdButtonBar] items so D-pad focus is
@@ -426,6 +744,7 @@ enum PlayerBackOutcome {
   suppressed,
   closeDetail,
   closeOsd,
+  closeChannelPreview,
   confirmExit,
   popPlayer,
 }
@@ -435,6 +754,7 @@ enum PlayerBackOutcome {
 PlayerBackOutcome resolvePlayerBackOutcome({
   required bool detailOpen,
   required bool osdOpen,
+  bool channelPreviewOpen = false,
   bool errorOpen = false,
   bool exitConfirmOpen = false,
   DateTime? suppressUntil,
@@ -447,6 +767,7 @@ PlayerBackOutcome resolvePlayerBackOutcome({
   }
   if (detailOpen) return PlayerBackOutcome.closeDetail;
   if (osdOpen) return PlayerBackOutcome.closeOsd;
+  if (channelPreviewOpen) return PlayerBackOutcome.closeChannelPreview;
   if (errorOpen) return PlayerBackOutcome.popPlayer;
   return PlayerBackOutcome.confirmExit;
 }
@@ -808,6 +1129,10 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.programDetailBody,
     this.currentLiveChannel,
     this.initialRecordingSchedules = const [],
+    this.liveUseMobile = false,
+    this.liveSwitchChannels = const [],
+    this.currentLiveSwitchIndex = -1,
+    this.onSwitchLiveChannel,
     this.onCheckRecordingConflict,
     this.onBuildRecordingChannelPlayer,
     this.onBuildFailoverPlayer,
@@ -890,6 +1215,24 @@ class PlayerScreen extends ConsumerStatefulWidget {
   /// Snapshot of reservations captured when opening live playback.
   final List<RecordSchedule> initialRecordingSchedules;
 
+  /// Whether live playback is using the lower-bitrate mobile transcode.
+  final bool liveUseMobile;
+
+  /// Ordered live channel entries within the current band for D-pad switching.
+  final List<LiveChannelSwitchEntry> liveSwitchChannels;
+
+  /// Index of [currentLiveChannel] inside [liveSwitchChannels].
+  final int currentLiveSwitchIndex;
+
+  /// Switches to another live channel, calling [stopCurrentSession] only after
+  /// any conflict prompt is accepted so cancelled switches keep playing cleanly.
+  final Future<Widget?> Function(
+    BuildContext context,
+    LiveChannelSwitchEntry target,
+    Future<void> Function() stopCurrentSession,
+  )?
+  onSwitchLiveChannel;
+
   /// Called when live playback stalls/reconnects repeatedly to detect whether a
   /// scheduled recording on another channel claimed the single tuner.
   final Future<LiveRecordingConflict?> Function()? onCheckRecordingConflict;
@@ -958,6 +1301,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// Live recording tracking (same-channel OSD/corner notice and other-channel
   /// tuner conflict preemption).
   late List<RecordSchedule> _recordingSchedules;
+  final Set<String> _stoppedScheduleIds = <String>{};
   RecordSchedule? _activeSameChannelSchedule;
   bool _recordingActionBusy = false;
   bool _sameChannelRecording = false;
@@ -970,7 +1314,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   bool _checkingConflict = false;
   bool _conflictHandled = false;
   bool _switchingChannel = false;
+  String? _switchingChannelLabel;
   Timer? _liveConflictPollTimer;
+  DateTime? _livePausedAt;
+  double _accumulatedLivePauseSeconds = 0.0;
+  bool _catchingUpLive = false;
+  int _liveEdgeSeq = 0;
+  ChannelSwitchDirection? _channelPreviewDirection;
+  Timer? _channelPreviewTimer;
+  Stopwatch? _openStartedAt;
 
   /// The latest value of the playing stream (unlike
   /// [_playing], which latches once playback has started),
@@ -1131,6 +1483,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (!ready) return false;
     _initialPlaybackStarted = true;
     _stopPreBufferPoller();
+    final startedAt = _openStartedAt;
+    if (startedAt != null && startedAt.isRunning) {
+      startedAt.stop();
+      _diag(
+        DiagCategory.playback,
+        'player: initial playback started in ${startedAt.elapsedMilliseconds} ms '
+        '(live=${widget.live}, mobile=${widget.liveUseMobile})',
+      );
+    }
     return true;
   }
 
@@ -1272,6 +1633,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         _diag(DiagCategory.playback, 'player: playing=$playing');
         _wakelockSession.setPlaying(playing);
         final wasPlaying = _playingNow;
+        if (widget.live && _playing) {
+          if (!playing) {
+            _livePausedAt ??= _now();
+          } else if (_livePausedAt != null) {
+            final pauseDelta =
+                _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
+            if (pauseDelta > 0) _accumulatedLivePauseSeconds += pauseDelta;
+            _livePausedAt = null;
+          }
+        }
         if (mounted) {
           setState(() {
             _playingNow = playing;
@@ -1709,8 +2080,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   void _updateSameChannelRecordingStatus() {
     final channel = widget.currentLiveChannel;
     if (!mounted || !widget.live || channel == null) return;
-    final active = findActiveSameChannelRecording(
+    final effectiveSchedules = schedulesExcludingIds(
       _recordingSchedules,
+      _stoppedScheduleIds,
+    );
+    final active = findActiveSameChannelRecording(
+      effectiveSchedules,
       currentChannel: channel,
       now: _now(),
     );
@@ -1799,9 +2174,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       if (mounted) setState(() => _recordingActionBusy = false);
     }
     if (!mounted) return;
-    if (result.updatedSchedules != null) {
-      _recordingSchedules = List<RecordSchedule>.of(result.updatedSchedules!);
-    }
+    final reconciled = reconcileLiveRecordingSchedules(
+      currentSchedules: _recordingSchedules,
+      currentStoppedIds: _stoppedScheduleIds,
+      isStopAction: false,
+      actionSucceeded: result.success,
+      updatedSchedules: result.updatedSchedules,
+    );
+    _stoppedScheduleIds
+      ..clear()
+      ..addAll(reconciled.stoppedIds);
+    _recordingSchedules = reconciled.schedules;
     final before = _sameChannelRecording;
     _updateSameChannelRecordingStatus();
     if (!result.success || _sameChannelRecording == before) {
@@ -1850,9 +2233,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       if (mounted) setState(() => _recordingActionBusy = false);
     }
     if (!mounted) return;
-    if (result.updatedSchedules != null) {
-      _recordingSchedules = List<RecordSchedule>.of(result.updatedSchedules!);
-    }
+    final reconciled = reconcileLiveRecordingSchedules(
+      currentSchedules: _recordingSchedules,
+      currentStoppedIds: _stoppedScheduleIds,
+      isStopAction: true,
+      actionSucceeded: result.success,
+      targetScheduleId: active.id,
+      updatedSchedules: result.updatedSchedules,
+    );
+    _stoppedScheduleIds
+      ..clear()
+      ..addAll(reconciled.stoppedIds);
+    _recordingSchedules = reconciled.schedules;
     final before = _sameChannelRecording;
     _updateSameChannelRecordingStatus();
     if (!result.success || _sameChannelRecording == before) {
@@ -2325,6 +2717,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   Future<void> _open() async {
+    _openStartedAt = Stopwatch()..start();
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
     try {
       final bufferSeconds = !widget.live
@@ -2367,6 +2760,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           '${plan.networkTimeoutSeconds}',
         );
         await platform.setProperty('sid', 'no');
+        if (widget.live) {
+          final probeSize = liveDemuxerProbeSizeBytes(
+            useMobile: widget.liveUseMobile,
+          );
+          await platform.setProperty(
+            'demuxer-lavf-analyzeduration',
+            '$liveDemuxerAnalyzeDurationSeconds',
+          );
+          await platform.setProperty('demuxer-lavf-probesize', '$probeSize');
+        }
         await platform.setProperty('cache', plan.useCache ? 'yes' : 'no');
         if (plan.useCache) {
           await platform.setProperty(
@@ -2566,6 +2969,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           run: () => _customCornerNoticeTimer?.cancel(),
         ),
         (
+          name: 'channel preview timer',
+          run: () => _channelPreviewTimer?.cancel(),
+        ),
+        (
           name: 'live conflict poller',
           run: () => _liveConflictPollTimer?.cancel(),
         ),
@@ -2716,7 +3123,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _openOsd() {
-    setState(() => _osdOpen = true);
+    _channelPreviewTimer?.cancel();
+    setState(() {
+      _channelPreviewDirection = null;
+      _osdOpen = true;
+    });
     unawaited(_pollMpvBufferProperties());
     _resetOsdTimer();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2861,6 +3272,226 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
+  bool get _canSwitchLiveChannel =>
+      widget.live &&
+      widget.onSwitchLiveChannel != null &&
+      widget.liveSwitchChannels.length > 1 &&
+      widget.currentLiveSwitchIndex >= 0 &&
+      widget.currentLiveSwitchIndex < widget.liveSwitchChannels.length;
+
+  LiveChannelSwitchEntry? _previewTargetFor(ChannelSwitchDirection? dir) {
+    if (dir == null || !_canSwitchLiveChannel) return null;
+    final idx = adjacentLiveChannelIndex(
+      currentIndex: widget.currentLiveSwitchIndex,
+      count: widget.liveSwitchChannels.length,
+      direction: dir,
+    );
+    if (idx < 0 || idx >= widget.liveSwitchChannels.length) return null;
+    return widget.liveSwitchChannels[idx];
+  }
+
+  void _showChannelPreview(ChannelSwitchDirection direction) {
+    if (!_canSwitchLiveChannel) {
+      _showHudMessage(Icons.live_tv, '切り替え可能なチャンネルがありません');
+      return;
+    }
+    _channelPreviewTimer?.cancel();
+    setState(() => _channelPreviewDirection = direction);
+    _channelPreviewTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && _channelPreviewDirection != null) {
+        setState(() => _channelPreviewDirection = null);
+      }
+    });
+  }
+
+  void _dismissChannelPreview({bool fromBackKey = false}) {
+    if (fromBackKey) {
+      _suppressBackPopUntil = DateTime.now().add(
+        const Duration(milliseconds: 300),
+      );
+    }
+    _channelPreviewTimer?.cancel();
+    if (_channelPreviewDirection == null) return;
+    setState(() => _channelPreviewDirection = null);
+  }
+
+  Future<void> _executeLiveChannelSwitch(LiveChannelSwitchEntry target) async {
+    final switcher = widget.onSwitchLiveChannel;
+    if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
+      return;
+    }
+    _dismissChannelPreview();
+    _switchingChannelLabel = target.displayChannelName;
+
+    var sessionStopped = false;
+    Future<void> stopCurrentSession() async {
+      if (sessionStopped) return;
+      sessionStopped = true;
+      _autoResumeDisabled = true;
+      _stopLiveConflictPoller();
+      _stopPreBufferPoller();
+      _watchdog?.cancel();
+      _stallTimer?.cancel();
+      _autoResumeTimer?.cancel();
+      _resumeWatchdogTimer?.cancel();
+      _recordingStatusTimer?.cancel();
+      _cornerNoticeTimer?.cancel();
+      _customCornerNoticeTimer?.cancel();
+      _channelPreviewTimer?.cancel();
+      _osdTimer?.cancel();
+      _hudTimer?.cancel();
+
+      for (final subscription in _subscriptions) {
+        unawaited(subscription.cancel());
+      }
+      _subscriptions.clear();
+
+      if (mounted) {
+        setState(() {
+          _switchingChannel = true;
+          _error = null;
+          _interrupted = false;
+          _interruptDetail = null;
+          _autoResumeCountdown = 0;
+          _osdOpen = false;
+          _detailOpen = false;
+          _hudText = null;
+          _cornerRecordingNotice = null;
+          _customCornerNoticeText = null;
+        });
+      }
+
+      await _player.stop().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      ).catchError((_) {});
+      await widget.session.stop().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      ).catchError((_) {});
+    }
+
+    try {
+      final nextPlayer = await switcher(context, target, stopCurrentSession);
+      if (!mounted) return;
+      if (nextPlayer == null) {
+        _switchingChannelLabel = null;
+        return;
+      }
+      await Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(builder: (_) => nextPlayer),
+      );
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: live channel switch failed: $e');
+      if (!mounted) return;
+      if (sessionStopped) {
+        setState(() => _switchingChannel = false);
+        _setStartError(
+          '${target.displayChannelName} への切り替えに失敗しました。',
+          allowAfterConflict: true,
+        );
+      } else {
+        _switchingChannelLabel = null;
+        _showCustomCornerNotice('チャンネルを切り替えできませんでした');
+      }
+    }
+  }
+
+  double _currentLivePauseLagSeconds() {
+    var total = _accumulatedLivePauseSeconds;
+    if (_livePausedAt != null) {
+      total += _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
+    }
+    return total < 0 ? 0.0 : total;
+  }
+
+  Future<void> _catchUpToLiveEdge() async {
+    if (!widget.live || !mounted || _catchingUpLive || _switchingChannel) return;
+    _catchingUpLive = true;
+    _closeOsd();
+    _showHudMessage(Icons.skip_next, '最新に追いついています…');
+    try {
+      final plan = _bufferPlan;
+      final platform = _player.platform;
+      final totalLagSec = _currentLivePauseLagSeconds();
+      if (plan != null && plan.useCache && platform is NativePlayer) {
+        try {
+          final rawDur = await platform.getProperty('demuxer-cache-duration');
+          final rawCacheTime = await platform.getProperty('demuxer-cache-time');
+          final rawPos = await platform.getProperty('time-pos');
+          final cacheDur = double.tryParse(rawDur);
+          final cacheTime = double.tryParse(rawCacheTime);
+          final timePos = double.tryParse(rawPos);
+          if (cacheDur != null &&
+              cacheTime != null &&
+              timePos != null &&
+              canSeekWithinLiveCache(
+                useCache: plan.useCache,
+                configuredBufferSeconds: plan.configuredSeconds,
+                totalPauseLagSeconds: totalLagSec,
+                cacheDurationSeconds: cacheDur,
+                cacheTimeSeconds: cacheTime,
+                timePosSeconds: timePos,
+              )) {
+            final targetMs = math.max(0, ((cacheTime - 0.5) * 1000).round());
+            await _player.play();
+            await _player.seek(Duration(milliseconds: targetMs));
+            _accumulatedLivePauseSeconds = 0.0;
+            _livePausedAt = null;
+            if (mounted) {
+              _showHudMessage(Icons.skip_next, '最新に追いつきました');
+            }
+            return;
+          }
+        } catch (e) {
+          _diag(
+            DiagCategory.playback,
+            'player: seamless live catch-up unavailable, falling back: $e',
+          );
+        }
+      }
+
+      if (widget.session case final LiveEdgeResettable resettable) {
+        await resettable.resetToLiveEdge();
+      }
+      _accumulatedLivePauseSeconds = 0.0;
+      _livePausedAt = null;
+      if (!mounted) return;
+      setState(() {
+        _buffering = true;
+        _bufferingPercentage = 0.0;
+        _bufferedAheadSeconds = 0.0;
+        _bufferEndPosition = Duration.zero;
+        _initialBufferPosition = null;
+        _positionAtFirstFrame = null;
+        _lastObservedServedBytes = 0;
+        _lastLiveTransferTickAt = null;
+        _liveTransferAccumulatedSeconds = 0.0;
+      });
+      if (_isPreBuffering) {
+        _startPreBufferPoller();
+      }
+      final uri = widget.session.mediaUri.replace(
+        queryParameters: {'live_edge': '${++_liveEdgeSeq}'},
+      );
+      await _player.open(Media(uri.toString()));
+      if (!mounted) return;
+      await _player.setVolume(100.0);
+      await _player.play();
+      await _applySubtitleSelection();
+      if (mounted) {
+        _showHudMessage(Icons.skip_next, '最新に追いつきました');
+      }
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: live catch-up failed: $e');
+      if (mounted) {
+        _showCustomCornerNotice('最新位置への移動に失敗しました');
+      }
+    } finally {
+      _catchingUpLive = false;
+    }
+  }
+
   void _cyclePlaybackRate() {
     if (!canChangePlaybackSpeed(live: widget.live)) return;
     final idx = playbackSpeeds.indexOf(_playbackRate);
@@ -2921,11 +3552,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       return KeyEventResult.ignored;
     }
     final isRepeat = event is KeyRepeatEvent;
+    if (_channelPreviewDirection != null &&
+        !isRepeat &&
+        (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack)) {
+      _dismissChannelPreview(fromBackKey: true);
+      return KeyEventResult.handled;
+    }
     if (key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.mediaRewind) {
       if (widget.live) {
         if (!isRepeat) {
-          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+          if (_channelPreviewDirection == ChannelSwitchDirection.previous) {
+            final target = _previewTargetFor(ChannelSwitchDirection.previous);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else {
+            _showChannelPreview(ChannelSwitchDirection.previous);
+          }
         }
       } else {
         _queueRelativeSeek(_rewindStep);
@@ -2936,7 +3578,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         key == LogicalKeyboardKey.mediaFastForward) {
       if (widget.live) {
         if (!isRepeat) {
-          _showHudMessage(Icons.live_tv, 'ライブ放送中はシークできません');
+          if (_channelPreviewDirection == ChannelSwitchDirection.next) {
+            final target = _previewTargetFor(ChannelSwitchDirection.next);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else {
+            _showChannelPreview(ChannelSwitchDirection.next);
+          }
         }
       } else {
         _queueRelativeSeek(_forwardStep);
@@ -2951,6 +3598,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         key == LogicalKeyboardKey.space ||
         key == LogicalKeyboardKey.gameButtonA ||
         key == LogicalKeyboardKey.mediaPlayPause) {
+      if (_channelPreviewDirection != null &&
+          key != LogicalKeyboardKey.space &&
+          key != LogicalKeyboardKey.mediaPlayPause) {
+        final target = _previewTargetFor(_channelPreviewDirection);
+        if (target != null) {
+          unawaited(_executeLiveChannelSwitch(target));
+          return KeyEventResult.handled;
+        }
+      }
       _togglePlayPauseWithHud();
       return KeyEventResult.handled;
     }
@@ -2998,6 +3654,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         switch (resolvePlayerBackOutcome(
           detailOpen: _detailOpen,
           osdOpen: _osdOpen,
+          channelPreviewOpen: _channelPreviewDirection != null,
           errorOpen: _error != null,
           exitConfirmOpen: _exitConfirmOpen,
           suppressUntil: _suppressBackPopUntil,
@@ -3010,6 +3667,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           case PlayerBackOutcome.closeOsd:
             _closeOsd(fromBackKey: true);
             return;
+          case PlayerBackOutcome.closeChannelPreview:
+            _dismissChannelPreview(fromBackKey: true);
+            return;
           case PlayerBackOutcome.confirmExit:
             unawaited(_confirmExitPlayback());
             return;
@@ -3021,15 +3681,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       child: Scaffold(
         backgroundColor: Colors.black,
         body: _switchingChannel
-            ? const Center(
+            ? Center(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    CircularProgressIndicator(color: Colors.white),
-                    SizedBox(height: 16),
+                    const CircularProgressIndicator(color: Colors.white),
+                    const SizedBox(height: 16),
                     Text(
-                      '録画中のチャンネルに切り替えています…',
-                      style: TextStyle(color: Colors.white, fontSize: 16),
+                      '${_switchingChannelLabel ?? '録画中のチャンネル'} に切り替えています…',
+                      style: const TextStyle(color: Colors.white, fontSize: 16),
                     ),
                   ],
                 ),
@@ -3109,13 +3769,27 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                               (!_interrupted && _isPreBuffering)))
                         _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
                       if (_hudText != null && !_osdOpen) _buildStatusHud(),
-                      if (_cornerRecordingNotice != null &&
+                      if (shouldShowPlayerCornerNotice(
+                        cornerRecordingNotice: _cornerRecordingNotice,
+                        customCornerNoticeText: _customCornerNoticeText,
+                        osdOpen: _osdOpen,
+                        detailOpen: _detailOpen,
+                        interrupted: _interrupted,
+                        error: _error,
+                        switchingChannel: _switchingChannel,
+                      ))
+                        PlayerCornerNotice(
+                          customText: _customCornerNoticeText,
+                          recordingNotice: _cornerRecordingNotice,
+                        ),
+                      if (widget.live &&
                           !_osdOpen &&
                           !_detailOpen &&
                           !_interrupted &&
                           _error == null &&
-                          !_switchingChannel)
-                        _buildCornerRecordingNotice(),
+                          !_switchingChannel &&
+                          _canSwitchLiveChannel)
+                        ..._buildChannelSwitchPreviewCards(),
                       if (_seekHudVisible && !_osdOpen && !widget.live)
                         _buildSeekHud(),
                       if (_osdOpen) _buildRemoteOsd(),
@@ -3214,92 +3888,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
   }
 
-  Widget _buildRecordingPillBadge({
-    required String label,
-    required bool ended,
-    double fontSize = 12,
-    EdgeInsetsGeometry padding = const EdgeInsets.symmetric(
-      horizontal: 8,
-      vertical: 3,
-    ),
-  }) {
-    return Container(
-      padding: padding,
-      decoration: BoxDecoration(
-        color: ended ? const Color(0xCC263238) : const Color(0xFFC62828),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            ended ? Icons.stop : Icons.fiber_manual_record,
-            size: fontSize,
-            color: Colors.white,
-          ),
-          const SizedBox(width: 4),
-          Text(
-            label,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: fontSize,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCornerRecordingNotice() {
-    final customText = _customCornerNoticeText;
-    if (customText != null) {
-      return Positioned(
-        top: 16,
-        right: 20,
-        child: IgnorePointer(
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xCC1E3A5F),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.swap_horiz, size: 14, color: Colors.white),
-                const SizedBox(width: 4),
-                Text(
-                  customText,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-    final notice = _cornerRecordingNotice;
-    if (notice == null) return const SizedBox.shrink();
-    final ended = notice == LiveRecordingCornerNotice.ended;
-    return Positioned(
-      top: 16,
-      right: 20,
-      child: IgnorePointer(
-        child: _buildRecordingPillBadge(
-          label: ended ? '録画終了' : '録画中',
-          ended: ended,
-          fontSize: 13,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        ),
-      ),
-    );
-  }
-
   Widget _buildBufferBadge() {
     final plan = _bufferPlan;
     final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
@@ -3308,17 +3896,35 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     final text = targetSec > 0
         ? 'バッファ: ${_formatShortDurationSeconds(aheadSec)} / 設定 ${_formatShortDurationSeconds(targetSec)}'
         : 'バッファ: ${_formatShortDurationSeconds(aheadSec)}';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: Colors.white12,
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        text,
-        style: const TextStyle(color: Colors.white70, fontSize: 12),
-      ),
+    return buildPlayerOsdStatusBadge(
+      label: text,
+      color: const Color(0xB3000000),
+      textColor: Colors.white,
+      border: Border.all(color: Colors.white24),
     );
+  }
+
+  List<Widget> _buildChannelSwitchPreviewCards() {
+    final prevEntry = _previewTargetFor(ChannelSwitchDirection.previous);
+    final nextEntry = _previewTargetFor(ChannelSwitchDirection.next);
+    return [
+      LiveChannelSwitchPreviewCard(
+        direction: ChannelSwitchDirection.previous,
+        visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
+        entry: prevEntry,
+        onTap: prevEntry == null
+            ? null
+            : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
+      ),
+      LiveChannelSwitchPreviewCard(
+        direction: ChannelSwitchDirection.next,
+        visible: _channelPreviewDirection == ChannelSwitchDirection.next,
+        entry: nextEntry,
+        onTap: nextEntry == null
+            ? null
+            : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
+      ),
+    ];
   }
 
   Widget _buildSeekBarSection({required bool isSeekingPreview}) {
@@ -3647,6 +4253,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       _resetOsdTimer();
                     },
                   ),
+                  if (widget.live)
+                    _osdButton(
+                      icon: Icons.skip_next,
+                      label: '最新に追いつく',
+                      onPressed: _catchingUpLive
+                          ? null
+                          : () => unawaited(_catchUpToLiveEdge()),
+                    ),
                   if (!widget.live) ...[
                     _osdButton(
                       icon: Icons.replay_10,

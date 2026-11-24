@@ -206,6 +206,13 @@ abstract interface class StreamTransferMetrics {
   int get consecutiveReconnectErrors;
 }
 
+/// Optional live-edge flush hook exposed by a loopback [PlaybackSession] so the
+/// player can discard paused backlog and reconnect upstream at the latest
+/// broadcast edge without redoing DTCP-IP AKE.
+abstract interface class LiveEdgeResettable {
+  Future<void> resetToLiveEdge();
+}
+
 /// Playback boundary (plan 5.7). v1 shipped only the stub, which
 /// reports [NasneErrorCategory.unsupported]; Phase 5 substitutes
 /// the DTCP-IP engine (plan 26) behind the same boundary.

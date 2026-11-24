@@ -84,6 +84,13 @@ const int maxDiskCacheBytes = 1200 * 1024 * 1024;
 /// Upper bound on backward disk cache size (~8-10 min for offline rewind).
 const int maxDiskBackCacheBytes = 150 * 1024 * 1024;
 
+/// Initial FFmpeg/mpv stream-analysis duration cap for live MPEG-TS startup.
+const double liveDemuxerAnalyzeDurationSeconds = 1.5;
+
+/// Initial FFmpeg/mpv probe-size cap for live MPEG-TS startup by quality tier.
+int liveDemuxerProbeSizeBytes({required bool useMobile}) =>
+    useMobile ? 512 * 1024 : 2 * 1024 * 1024;
+
 /// Human-readable Japanese label for a buffer duration in seconds.
 String formatBufferDurationLabel(int seconds) {
   if (seconds <= 0) return '標準 (0秒)';

@@ -22,6 +22,7 @@ import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/format.dart';
 import 'package:tmhb/ui/home_screen.dart';
+import 'package:tmhb/ui/live_channel_switch_policy.dart';
 import 'package:tmhb/ui/live_recording_policy.dart';
 import 'package:tmhb/ui/live_screen.dart';
 import 'package:tmhb/ui/multi_nasne_policy.dart';
@@ -5807,6 +5808,500 @@ void main() {
         await tester.tap(find.widgetWithText(FilledButton, 'すべて削除'));
         await tester.pumpAndSettle();
         expect(find.text('録画失敗はありません'), findsOneWidget);
+      },
+    );
+  });
+
+  group('Phase 24: live startup speed, buffer badge, stop sync, catch-up & Left/Right switch', () {
+    test('live demuxer probe limits and schedule/channel switch helpers behave accurately', () {
+      expect(liveDemuxerAnalyzeDurationSeconds, 1.5);
+      expect(liveDemuxerProbeSizeBytes(useMobile: true), 512 * 1024);
+      expect(liveDemuxerProbeSizeBytes(useMobile: false), 2 * 1024 * 1024);
+
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 0,
+          count: 1,
+          direction: ChannelSwitchDirection.next,
+        ),
+        -1,
+      );
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 0,
+          count: 3,
+          direction: ChannelSwitchDirection.previous,
+        ),
+        2,
+      );
+      expect(
+        adjacentLiveChannelIndex(
+          currentIndex: 2,
+          count: 3,
+          direction: ChannelSwitchDirection.next,
+        ),
+        0,
+      );
+
+      final s1 = RecordSchedule(
+        id: '101',
+        start: DateTime.utc(2026, 11, 24, 1, 0),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x0400,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7880,0x0001',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      final s2 = RecordSchedule(
+        id: '102',
+        start: DateTime.utc(2026, 11, 24, 2, 0),
+        durationSeconds: 1800,
+        conditionId: '1',
+        channel: const ScheduleChannel(
+          broadcastingType: 2,
+          channelType: 2,
+          serviceId: 0x0408,
+        ),
+        desiredQualityMode: 100,
+        desiredMatchingId: ',,0x7881,0x0002',
+        reservationCreatorId: '2000',
+        priorityFlag: 0,
+        recordDestinationId: 'HDD',
+      );
+      expect(schedulesWithoutId([s1, s2], '101').map((s) => s.id), ['102']);
+      expect(
+        schedulesExcludingIds([s1, s2], {'102'}).map((s) => s.id),
+        ['101'],
+      );
+      expect(ensureSchedulePresent([s1], s2).map((s) => s.id), ['101', '102']);
+      expect(ensureSchedulePresent([s1, s2], s2).length, 2);
+
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: false,
+          channelPreviewOpen: true,
+        ),
+        PlayerBackOutcome.closeChannelPreview,
+      );
+      expect(
+        resolvePlayerBackOutcome(
+          detailOpen: false,
+          osdOpen: true,
+          channelPreviewOpen: true,
+        ),
+        PlayerBackOutcome.closeOsd,
+      );
+    });
+
+    testWidgets(
+      'PlayerOsdStatusBadge dark translucent style matches LIVE badge geometry',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  buildPlayerOsdStatusBadge(
+                    label: 'バッファ: 15秒',
+                    color: const Color(0xB3000000),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  const SizedBox(width: 8),
+                  buildPlayerOsdStatusBadge(
+                    label: 'LIVE',
+                    color: Colors.redAccent,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final bufFinder = find.ancestor(
+          of: find.text('バッファ: 15秒'),
+          matching: find.byType(Container),
+        );
+        final liveFinder = find.ancestor(
+          of: find.text('LIVE'),
+          matching: find.byType(Container),
+        );
+        final bufRect = tester.getRect(bufFinder);
+        final liveRect = tester.getRect(liveFinder);
+        expect((bufRect.height - liveRect.height).abs(), lessThanOrEqualTo(2.1));
+
+        final bufDec = tester.widget<Container>(bufFinder).decoration
+            as BoxDecoration;
+        expect(bufDec.color, const Color(0xB3000000));
+        expect(bufDec.borderRadius, BorderRadius.circular(4));
+
+        final bufText = tester.widget<Text>(find.text('バッファ: 15秒'));
+        expect(bufText.style?.color, Colors.white);
+        expect(bufText.style?.fontSize, 12);
+        expect(bufText.style?.height, 1.2);
+      },
+    );
+
+    test(
+      'reconcileLiveRecordingSchedules suppresses stale stopped ids and canSeekWithinLiveCache enforces hybrid catch-up bounds',
+      () {
+        final now = DateTime.now();
+        final active = RecordSchedule(
+          id: 'sched-stale-9',
+          start: now.subtract(const Duration(minutes: 5)),
+          durationSeconds: 3600,
+          conditionId: '1',
+          channel: const ScheduleChannel(
+            broadcastingType: 2,
+            channelType: 2,
+            serviceId: 0x0408,
+          ),
+          desiredQualityMode: 100,
+          desiredMatchingId: ',,0x7fe1,0x0009',
+          reservationCreatorId: '2000',
+          priorityFlag: 0,
+          recordDestinationId: 'HDD',
+          title: '現在の番組',
+        );
+        final chCur = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/2',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: 'Eテレ',
+          programTitle: '現在の番組',
+          serviceId: 0x0408,
+          networkId: 0x7FE1,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/cur',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+
+        // Stop succeeded, even if nasne immediately returns the stale schedule -> stays hidden.
+        final afterStop = reconcileLiveRecordingSchedules(
+          currentSchedules: [active],
+          currentStoppedIds: const {},
+          isStopAction: true,
+          actionSucceeded: true,
+          targetScheduleId: active.id,
+          updatedSchedules: [active],
+        );
+        expect(afterStop.stoppedIds, {'sched-stale-9'});
+        expect(afterStop.schedules, isEmpty);
+        expect(
+          findActiveSameChannelRecording(
+            afterStop.schedules,
+            currentChannel: chCur,
+            now: now,
+          ),
+          isNull,
+        );
+
+        // Even if background polling returns [active] again, schedulesExcludingIds hides it.
+        expect(
+          schedulesExcludingIds([active], afterStop.stoppedIds),
+          isEmpty,
+        );
+
+        // Starting a fresh schedule clears the id guard when it appears in updatedSchedules.
+        final afterRestart = reconcileLiveRecordingSchedules(
+          currentSchedules: afterStop.schedules,
+          currentStoppedIds: afterStop.stoppedIds,
+          isStopAction: false,
+          actionSucceeded: true,
+          updatedSchedules: [active],
+        );
+        expect(afterRestart.stoppedIds, isEmpty);
+        expect(afterRestart.schedules, [active]);
+
+        // Hybrid catch-up: buffer=0 -> always resets upstream via proxy.
+        expect(
+          canSeekWithinLiveCache(
+            useCache: false,
+            configuredBufferSeconds: 0,
+            totalPauseLagSeconds: 5,
+            cacheDurationSeconds: 10,
+            cacheTimeSeconds: 20,
+            timePosSeconds: 10,
+          ),
+          isFalse,
+        );
+        // Short pause within 60s buffer -> seamless cache seek!
+        expect(
+          canSeekWithinLiveCache(
+            useCache: true,
+            configuredBufferSeconds: 60,
+            totalPauseLagSeconds: 12,
+            cacheDurationSeconds: 15,
+            cacheTimeSeconds: 45,
+            timePosSeconds: 30,
+          ),
+          isTrue,
+        );
+        // Long pause exceeding configured buffer -> falls back to proxy live-edge reset.
+        expect(
+          canSeekWithinLiveCache(
+            useCache: true,
+            configuredBufferSeconds: 30,
+            totalPauseLagSeconds: 45,
+            cacheDurationSeconds: 15,
+            cacheTimeSeconds: 45,
+            timePosSeconds: 30,
+          ),
+          isFalse,
+        );
+      },
+    );
+
+    testWidgets(
+      'PlayerCornerNotice and shouldShowPlayerCornerNotice display custom notices even when recordingNotice is null',
+      (tester) async {
+        expect(
+          shouldShowPlayerCornerNotice(
+            cornerRecordingNotice: null,
+            customCornerNoticeText: 'フェイルオーバー通知',
+            osdOpen: false,
+            detailOpen: false,
+            interrupted: false,
+            error: null,
+            switchingChannel: false,
+          ),
+          isTrue,
+        );
+        expect(
+          shouldShowPlayerCornerNotice(
+            cornerRecordingNotice: LiveRecordingCornerNotice.recording,
+            customCornerNoticeText: null,
+            osdOpen: true,
+            detailOpen: false,
+            interrupted: false,
+            error: null,
+            switchingChannel: false,
+          ),
+          isFalse,
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  PlayerCornerNotice(
+                    customText: 'フェイルオーバー通知',
+                    recordingNotice: null,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        expect(find.text('フェイルオーバー通知'), findsOneWidget);
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  PlayerCornerNotice(
+                    customText: null,
+                    recordingNotice: LiveRecordingCornerNotice.ended,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        expect(find.text('録画終了'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'LiveChannelSwitchPreviewCard slides from left/right edges, displays programme info, and triggers switch on tap',
+      (tester) async {
+        await tester.binding.setSurfaceSize(const Size(1280, 720));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        const reg = RegisteredNasne(
+          host: '192.0.2.55',
+          udn: 'uuid:p24',
+          friendlyName: 'nasne-p24',
+          macAddr: '00:11:22:33:44:55',
+        );
+        final prevStart = DateTime(2026, 11, 24, 11, 0);
+        final prevEnd = DateTime(2026, 11, 24, 12, 0);
+        final start = DateTime(2026, 11, 24, 12, 0);
+        final end = DateTime(2026, 11, 24, 13, 0);
+        final chPrev = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/1',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: 'NHK総合',
+          programTitle: '前の番組',
+          programStart: prevStart,
+          programEnd: prevEnd,
+          serviceId: 0x0400,
+          networkId: 0x7FE0,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/prev',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+        final chNext = LiveChannel(
+          id: '0/video/LiveTuner/DTTB/3',
+          bandId: '0/video/LiveTuner/DTTB',
+          channelName: '日本テレビ',
+          programTitle: '次のニュース番組',
+          programStart: start,
+          programEnd: end,
+          serviceId: 0x0410,
+          networkId: 0x7FE8,
+          res: const [
+            TitleRes(
+              url: 'http://127.0.0.1:1/next',
+              protocolInfo: 'http-get:*:video/vnd.dlna.mpeg-tts:*',
+              quality: 'mobile',
+            ),
+          ],
+        );
+        final prevEntry = LiveChannelSwitchEntry(
+          channel: chPrev,
+          primaryReg: reg,
+          candidates: [OwnedLiveChannel(reg: reg, channel: chPrev)],
+        );
+        final nextEntry = LiveChannelSwitchEntry(
+          channel: chNext,
+          primaryReg: reg,
+          candidates: [OwnedLiveChannel(reg: reg, channel: chNext)],
+        );
+
+        final tapped = <String>[];
+        Widget buildHarness(ChannelSwitchDirection? activeDir) => MaterialApp(
+          home: Scaffold(
+            body: Stack(
+              children: [
+                LiveChannelSwitchPreviewCard(
+                  direction: ChannelSwitchDirection.previous,
+                  visible: activeDir == ChannelSwitchDirection.previous,
+                  entry: prevEntry,
+                  onTap: () => tapped.add(prevEntry.displayChannelName),
+                ),
+                LiveChannelSwitchPreviewCard(
+                  direction: ChannelSwitchDirection.next,
+                  visible: activeDir == ChannelSwitchDirection.next,
+                  entry: nextEntry,
+                  onTap: () => tapped.add(nextEntry.displayChannelName),
+                ),
+              ],
+            ),
+          ),
+        );
+
+        // Next card visible at right edge.
+        await tester.pumpWidget(buildHarness(ChannelSwitchDirection.next));
+        await tester.pump(const Duration(milliseconds: 250));
+        final nextFinder = find.byKey(
+          const ValueKey('live_channel_preview_next'),
+        );
+        final prevFinder = find.byKey(
+          const ValueKey('live_channel_preview_previous'),
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          1.0,
+        );
+        expect(
+          tester
+              .widget<AnimatedSlide>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedSlide),
+                ),
+              )
+              .offset,
+          Offset.zero,
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
+        expect(find.text('次のチャンネル'), findsOneWidget);
+        expect(find.text('日本テレビ'), findsOneWidget);
+        expect(find.text('次のニュース番組'), findsOneWidget);
+        expect(find.text(nextEntry.broadcastTimeRange!), findsOneWidget);
+        expect(tester.getRect(nextFinder).right, greaterThan(900));
+
+        // Tapping next card triggers switch.
+        await tester.tap(nextFinder);
+        expect(tapped, ['日本テレビ']);
+
+        // Switch to Previous card visible at left edge.
+        await tester.pumpWidget(buildHarness(ChannelSwitchDirection.previous));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          1.0,
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: nextFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
+        expect(tester.getRect(prevFinder).left, lessThan(100));
+
+        // Dismiss both cards.
+        await tester.pumpWidget(buildHarness(null));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.ancestor(
+                  of: prevFinder,
+                  matching: find.byType(AnimatedOpacity),
+                ),
+              )
+              .opacity,
+          0.0,
+        );
       },
     );
   });

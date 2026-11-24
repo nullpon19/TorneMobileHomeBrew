@@ -279,7 +279,8 @@ class DtcpPlaybackEngine implements PlaybackEngine {
   }
 }
 
-class _DtcpPlaybackSession implements PlaybackSession, StreamTransferMetrics {
+class _DtcpPlaybackSession
+    implements PlaybackSession, StreamTransferMetrics, LiveEdgeResettable {
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
 
   final DtcpProxy _proxy;
@@ -301,6 +302,9 @@ class _DtcpPlaybackSession implements PlaybackSession, StreamTransferMetrics {
 
   @override
   int get consecutiveReconnectErrors => _proxy.consecutiveReconnectErrors;
+
+  @override
+  Future<void> resetToLiveEdge() => _proxy.resetToLiveEdge();
 
   @override
   Future<void> stop() async {

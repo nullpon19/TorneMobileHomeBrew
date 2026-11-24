@@ -179,6 +179,38 @@ bool isScheduleCurrentlyRecording(RecordSchedule schedule, {DateTime? now}) {
   return !current.isBefore(schedule.start) && current.isBefore(schedule.end);
 }
 
+/// Returns [schedules] with any entry matching [excludedId] removed.
+List<RecordSchedule> schedulesWithoutId(
+  List<RecordSchedule> schedules,
+  String excludedId,
+) => [
+  for (final s in schedules)
+    if (s.id != excludedId) s,
+];
+
+/// Returns [schedules] with any entry whose id is in [excludedIds] removed.
+List<RecordSchedule> schedulesExcludingIds(
+  List<RecordSchedule> schedules,
+  Set<String> excludedIds,
+) {
+  if (excludedIds.isEmpty) return schedules;
+  return [
+    for (final s in schedules)
+      if (!excludedIds.contains(s.id)) s,
+  ];
+}
+
+/// Ensures [fallback] is present in [schedules] if no item with the same `id`
+/// exists yet (compensating for slow nasne schedule-list visibility right after
+/// creation).
+List<RecordSchedule> ensureSchedulePresent(
+  List<RecordSchedule> schedules,
+  RecordSchedule fallback,
+) {
+  if (schedules.any((s) => s.id == fallback.id)) return schedules;
+  return [...schedules, fallback];
+}
+
 /// Outcome returned by live-OSD recording start/stop callbacks.
 class LiveRecordingActionResult {
   const LiveRecordingActionResult({
