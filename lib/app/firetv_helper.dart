@@ -129,6 +129,18 @@ class FireTvHelper {
     }
   }
 
+  /// Returns Android `Build.VERSION.SDK_INT`, or `null` on non-Android platforms.
+  Future<int?> getAndroidSdkInt() async {
+    if (!isAndroid) return null;
+    try {
+      return await _channel.invokeMethod<int>('getAndroidSdkInt');
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
   /// Returns free bytes available on Android's internal cache partition, or
   /// `null` on non-Android platforms / errors.
   Future<int?> getCacheAvailableBytes() async {

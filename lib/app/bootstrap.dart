@@ -35,6 +35,7 @@ const debugLogsDirectoryName = 'debug_logs';
 ProviderContainer fileStoreContainer(
   Directory storeDirectory, {
   Directory? mpvCacheDirectory,
+  int? androidSdkInt,
 }) {
   File file(String name) => File('${storeDirectory.path}/$name');
   return ProviderContainer(
@@ -57,6 +58,8 @@ ProviderContainer fileStoreContainer(
       storeDirectoryProvider.overrideWithValue(storeDirectory),
       if (mpvCacheDirectory != null)
         mpvCacheDirectoryProvider.overrideWithValue(mpvCacheDirectory),
+      if (androidSdkInt != null)
+        androidSdkIntProvider.overrideWithValue(androidSdkInt),
     ],
   );
 }

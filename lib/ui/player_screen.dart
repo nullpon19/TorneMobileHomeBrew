@@ -182,6 +182,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../app/firetv_helper.dart';
+import '../app/mpv_compat.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
@@ -1813,6 +1814,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   late final Player _player;
   late final VideoController _videoController;
   late final WakelockSession _wakelockSession;
+  late final int? _androidSdkInt;
+  late final bool _useLegacySyncMpvInit;
+  late final VideoHwdecMode _hwdecMode;
+  bool _decodeStatusLogged = false;
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _watchdog;
   bool _playing = false;
@@ -2238,15 +2243,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
+    _androidSdkInt = ref.read(androidSdkIntProvider);
+    _useLegacySyncMpvInit = shouldUseLegacySyncMpvInit(
+      isAndroid: Platform.isAndroid,
+      androidSdkInt: _androidSdkInt,
+    );
+    _hwdecMode = ref.read(videoHwdecModeProvider);
     _subtitlesOn = ref.read(subtitlesEnabledProvider);
     _liveGuideEvents = List<EpgEvent>.of(widget.initialLiveGuideEvents);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
     unawaited(_fireTvHelper.setMediaVolumeMax());
-    _player = Player();
+    _player = _useLegacySyncMpvInit
+        ? Player(configuration: const PlayerConfiguration(async: false))
+        : Player();
     unawaited(_player.setVolume(100.0));
-    _videoController = VideoController(_player);
+    _videoController = _hwdecMode == VideoHwdecMode.software
+        ? VideoController(
+            _player,
+            configuration: const VideoControllerConfiguration(
+              enableHardwareAcceleration: false,
+            ),
+          )
+        : VideoController(_player);
+    if (_useLegacySyncMpvInit) {
+      unawaited(_kickLegacyMpvAfterInit());
+    }
     _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
@@ -2324,6 +2347,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         if (!buffering && _playingNow) {
           _autoResumeAttempts = 0;
+          if (!_decodeStatusLogged) {
+            _decodeStatusLogged = true;
+            unawaited(_logDecodeStatus());
+          }
         }
         if (widget.live &&
             widget.onCheckRecordingConflict != null &&
@@ -2458,6 +2485,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
         }
         if (mounted) setState(() => _tracks = tracks);
+        if (!_decodeStatusLogged &&
+            (realTrackIds([for (final t in tracks.video) t.id]).isNotEmpty ||
+                realTrackIds([
+                  for (final t in tracks.audio) t.id,
+                ]).isNotEmpty)) {
+          _decodeStatusLogged = true;
+          unawaited(_logDecodeStatus());
+        }
         // Re-resolve the caption selection against the settled
         // track list: applies the forced-off default, or the
         // track the user asked for before the list arrived.
@@ -3871,6 +3906,45 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
+  Future<void> _kickLegacyMpvAfterInit() async {
+    try {
+      final handle = await _player.handle;
+      if (!mounted) return;
+      final kicked = kickMpvEventLoop(handle);
+      _diag(
+        DiagCategory.playback,
+        'player: legacy mpv wakeup kick ok=$kicked (sdk=$_androidSdkInt)',
+      );
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: legacy mpv wakeup kick failed: $e');
+    }
+  }
+
+  Future<void> _logDecodeStatus() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer || !mounted) return;
+    Future<String> safeProp(String key) async {
+      try {
+        final v = (await platform.getProperty(key)).trim();
+        return v.isEmpty ? '(empty)' : v;
+      } catch (_) {
+        return '(err)';
+      }
+    }
+
+    final hwdecCurrent = await safeProp('hwdec-current');
+    if (!mounted) return;
+    final videoCodec = await safeProp('video-codec');
+    if (!mounted) return;
+    final voConfigured = await safeProp('vo-configured');
+    if (!mounted) return;
+    _diag(
+      DiagCategory.playback,
+      'player: decode status: mode=${_hwdecMode.name} '
+      'hwdec-current=$hwdecCurrent codec=$videoCodec vo=$voConfigured',
+    );
+  }
+
   Future<void> _open() async {
     _openStartedAt = Stopwatch()..start();
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
@@ -3910,11 +3984,47 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
 
       final platform = _player.platform;
+      _decodeStatusLogged = false;
       if (platform is NativePlayer) {
+        _diag(
+          DiagCategory.playback,
+          'player: awaiting mpv init (sdk=$_androidSdkInt, '
+          'legacySync=$_useLegacySyncMpvInit, hwdec=${_hwdecMode.name})',
+        );
+        final initWatch = Stopwatch()..start();
         await platform.setProperty(
           'network-timeout',
           '${plan.networkTimeoutSeconds}',
         );
+        _diag(
+          DiagCategory.playback,
+          'player: mpv init ready in ${initWatch.elapsedMilliseconds} ms',
+        );
+        if (_useLegacySyncMpvInit) {
+          try {
+            final handle = await _player.handle;
+            final kicked = kickMpvEventLoop(handle);
+            _diag(
+              DiagCategory.playback,
+              'player: legacy pre-open wakeup kick=$kicked',
+            );
+          } catch (e) {
+            _diag(
+              DiagCategory.playback,
+              'player: legacy pre-open wakeup kick failed: $e',
+            );
+          }
+        }
+        if (_hwdecMode == VideoHwdecMode.mpeg2Software) {
+          await platform.setProperty('hwdec-codecs', mpeg2SoftwareHwdecCodecs);
+          _diag(
+            DiagCategory.playback,
+            'player: hwdec-codecs=$mpeg2SoftwareHwdecCodecs',
+          );
+        } else if (_hwdecMode == VideoHwdecMode.software) {
+          await platform.setProperty('hwdec', 'no');
+          _diag(DiagCategory.playback, 'player: hwdec=no (software)');
+        }
         await platform.setProperty('sid', _subtitlesOn ? 'auto' : 'no');
         await platform.setProperty('sub-ass', 'yes');
         await platform.setProperty('sub-visibility', 'no');

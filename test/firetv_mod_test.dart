@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/app/bs_epg_providers.dart';
 import 'package:tmhb/app/firetv_helper.dart';
+import 'package:tmhb/app/mpv_compat.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
@@ -52,6 +53,7 @@ class _FakeFireTvHelper extends FireTvHelper {
     this.connectSucceeds = false,
     this.candidates = const [],
     this.fileBytesMap = const {},
+    this.availableDiskBytes,
   }) : super(isAndroidOverride: true);
 
   bool reachable;
@@ -60,6 +62,7 @@ class _FakeFireTvHelper extends FireTvHelper {
   bool connectSucceeds;
   List<CredentialCandidateFile> candidates;
   Map<String, Uint8List> fileBytesMap;
+  int? availableDiskBytes;
 
   int volumeMaxCalls = 0;
   int tryConnectCalls = 0;
@@ -109,6 +112,9 @@ class _FakeFireTvHelper extends FireTvHelper {
 
   @override
   Future<Uint8List?> readFileBytes(String path) async => fileBytesMap[path];
+
+  @override
+  Future<int?> getCacheAvailableBytes() async => availableDiskBytes;
 }
 
 void main() {
@@ -471,23 +477,28 @@ void main() {
       expect(hour.demuxerMaxBackBytes, maxDiskBackCacheBytes);
       expect(hour.networkTimeoutSeconds, 600);
 
-      // Clamps when available disk is tight, leaving >= 512 MiB free.
+      // Clamps when available disk is tight, leaving >= 1 GiB (1024 MiB) free
+      // after both forward and backward disk cache layers.
+      const tightAvail = 1400 * 1024 * 1024;
       final tight = computeMpvBufferPlan(
         live: false,
         bufferSeconds: 3600,
         isAndroid: true,
-        availableDiskBytes: 800 * 1024 * 1024,
+        availableDiskBytes: tightAvail,
         cacheDirPath: '/tmp/mpv_cache',
       );
       expect(tight.useDiskCache, isTrue);
-      expect(tight.demuxerMaxBytes, 288 * 1024 * 1024);
+      expect(
+        tight.demuxerMaxBytes + tight.demuxerMaxBackBytes,
+        lessThanOrEqualTo(tightAvail - minFreeDiskReserveBytes),
+      );
 
-      // Falls back to RAM when free storage is below reserve + 16 MiB.
+      // Falls back to RAM when free storage is below 1 GiB reserve + 20 MiB.
       final tiny = computeMpvBufferPlan(
         live: false,
         bufferSeconds: 3600,
         isAndroid: true,
-        availableDiskBytes: 400 * 1024 * 1024,
+        availableDiskBytes: 900 * 1024 * 1024,
         cacheDirPath: '/tmp/mpv_cache',
       );
       expect(tiny.useDiskCache, isFalse);
@@ -510,11 +521,12 @@ void main() {
       expect(liveOff.readaheadSeconds, livePauseTimeshiftSeconds);
       expect(liveOff.demuxerMaxBytes, 105 * 1024 * 1024);
 
+      const liveTightAvail = 1400 * 1024 * 1024;
       final liveDrTight = computeMpvBufferPlan(
         live: true,
         bufferSeconds: 0,
         isAndroid: true,
-        availableDiskBytes: 800 * 1024 * 1024,
+        availableDiskBytes: liveTightAvail,
         cacheDirPath: '/tmp/mpv_cache',
         liveUseMobile: false,
       );
@@ -522,13 +534,16 @@ void main() {
       expect(liveDrTight.useDiskCache, isTrue);
       expect(liveDrTight.cachePauseInitial, isFalse);
       expect(liveDrTight.cachePause, isFalse);
-      expect(liveDrTight.demuxerMaxBytes, 288 * 1024 * 1024);
+      expect(
+        liveDrTight.demuxerMaxBytes + liveDrTight.demuxerMaxBackBytes,
+        lessThanOrEqualTo(liveTightAvail - minFreeDiskReserveBytes),
+      );
 
       final liveDrTiny = computeMpvBufferPlan(
         live: true,
         bufferSeconds: 0,
         isAndroid: true,
-        availableDiskBytes: 400 * 1024 * 1024,
+        availableDiskBytes: 900 * 1024 * 1024,
         cacheDirPath: '/tmp/mpv_cache',
         liveUseMobile: false,
       );
@@ -9211,6 +9226,230 @@ void main() {
       );
     },
   );
+
+  group('Phase 34: Fire OS <= 28 compat, DR storage guard & HW decode mode', () {
+    test('shouldUseLegacySyncMpvInit targets Android API <= 28 only', () {
+      for (final sdk in [24, 25, 28]) {
+        expect(
+          shouldUseLegacySyncMpvInit(isAndroid: true, androidSdkInt: sdk),
+          isTrue,
+        );
+      }
+      for (final sdk in [29, 30, 36]) {
+        expect(
+          shouldUseLegacySyncMpvInit(isAndroid: true, androidSdkInt: sdk),
+          isFalse,
+        );
+      }
+      expect(
+        shouldUseLegacySyncMpvInit(isAndroid: true, androidSdkInt: null),
+        isFalse,
+      );
+      expect(
+        shouldUseLegacySyncMpvInit(isAndroid: false, androidSdkInt: 25),
+        isFalse,
+      );
+    });
+
+    test(
+      'estimateBufferDiskBytes and evaluateBufferOptions enforce strict 1 GiB DR guard',
+      () {
+        expect(estimateBufferDiskBytes(live: false, bufferSeconds: 0), 0);
+        expect(estimateBufferDiskBytes(live: false, bufferSeconds: 30), 0);
+        // 5 min recorded DR: 550 MiB forward + 137.5 MiB back = 687.5 MiB
+        expect(
+          estimateBufferDiskBytes(live: false, bufferSeconds: 300),
+          (550 * 1024 * 1024) + (137 * 1024 * 1024 + 512 * 1024),
+        );
+        expect(estimateBufferDiskBytes(live: true, bufferSeconds: 0), 0);
+        // 3 min live DR: 330 MiB forward + 2 MiB back = 332 MiB
+        expect(
+          estimateBufferDiskBytes(live: true, bufferSeconds: 180),
+          332 * 1024 * 1024,
+        );
+
+        // 800 MiB free (< 1 GiB): only RAM-only recorded options are selectable.
+        final rec800 = evaluateBufferOptions(
+          options: recordedBufferOptionsSeconds,
+          live: false,
+          availableDiskBytes: 800 * 1024 * 1024,
+        );
+        expect(
+          rec800.where((e) => e.selectable).map((e) => e.seconds),
+          [0, 30],
+        );
+        expect(
+          rec800.singleWhere((e) => e.isRecommended).seconds,
+          30,
+        );
+
+        // 1500 MiB free: 0..180s selectable; 300s+ blocked; 30s recommended (< 1.5 GiB headroom).
+        final rec1500 = evaluateBufferOptions(
+          options: recordedBufferOptionsSeconds,
+          live: false,
+          availableDiskBytes: 1500 * 1024 * 1024,
+        );
+        expect(
+          rec1500.where((e) => e.selectable).map((e) => e.seconds),
+          [0, 30, 60, 180],
+        );
+        expect(
+          rec1500.where((e) => !e.selectable).map((e) => e.seconds),
+          [300, 600, 900, 1800, 2700, 3600],
+        );
+        expect(rec1500.singleWhere((e) => e.isRecommended).seconds, 30);
+
+        final live1500 = evaluateBufferOptions(
+          options: liveBufferOptionsSeconds,
+          live: true,
+          availableDiskBytes: 1500 * 1024 * 1024,
+        );
+        expect(
+          live1500.where((e) => e.selectable).map((e) => e.seconds),
+          [0, 15, 30, 60, 180],
+        );
+        expect(live1500.singleWhere((e) => e.isRecommended).seconds, 0);
+
+        // 2500 MiB free: 5 min (687.5 MiB) leaves ~1812.5 MiB >= 1.5 GiB -> recommended!
+        final rec2500 = evaluateBufferOptions(
+          options: recordedBufferOptionsSeconds,
+          live: false,
+          availableDiskBytes: 2500 * 1024 * 1024,
+        );
+        expect(
+          rec2500.where((e) => e.selectable).map((e) => e.seconds),
+          [0, 30, 60, 180, 300, 600],
+        );
+        expect(rec2500.singleWhere((e) => e.isRecommended).seconds, 300);
+
+        // 8 GiB free: all recorded options selectable, 5 min recommended.
+        final rec8g = evaluateBufferOptions(
+          options: recordedBufferOptionsSeconds,
+          live: false,
+          availableDiskBytes: 8 * 1024 * 1024 * 1024,
+        );
+        expect(rec8g.every((e) => e.selectable), isTrue);
+        expect(rec8g.singleWhere((e) => e.isRecommended).seconds, 300);
+
+        // Unknown disk space (null): all options remain selectable.
+        final recNull = evaluateBufferOptions(
+          options: recordedBufferOptionsSeconds,
+          live: false,
+          availableDiskBytes: null,
+        );
+        expect(recNull.every((e) => e.selectable), isTrue);
+        expect(recNull.where((e) => e.isRecommended), isEmpty);
+      },
+    );
+
+    test('VideoHwdecModeNotifier persists auto / mpeg2Software / software', () async {
+      final kv = InMemoryKeyValueStore();
+      final container = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container.dispose);
+
+      expect(container.read(videoHwdecModeProvider), VideoHwdecMode.auto);
+      await container
+          .read(videoHwdecModeProvider.notifier)
+          .set(VideoHwdecMode.mpeg2Software);
+      expect(
+        container.read(videoHwdecModeProvider),
+        VideoHwdecMode.mpeg2Software,
+      );
+      expect(await kv.read('firetv_video_hwdec_mode'), 'mpeg2Software');
+
+      final container2 = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container2.dispose);
+      container2.read(videoHwdecModeProvider);
+      await Future<void>.delayed(Duration.zero);
+      expect(
+        container2.read(videoHwdecModeProvider),
+        VideoHwdecMode.mpeg2Software,
+      );
+
+      await container2
+          .read(videoHwdecModeProvider.notifier)
+          .set(VideoHwdecMode.software);
+      expect(await kv.read('firetv_video_hwdec_mode'), 'software');
+    });
+
+    testWidgets(
+      'SettingsScreen enforces 1 GiB storage guard in buffer picker and persists VideoHwdecMode',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final kv = InMemoryKeyValueStore();
+        final fakeHelper = _FakeFireTvHelper(
+          availableDiskBytes: 1500 * 1024 * 1024,
+        );
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kv),
+              fireTvHelperProvider.overrideWithValue(fakeHelper),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.scrollUntilVisible(
+          find.text('録画のバッファ時間（先読み）'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.tap(find.text('録画のバッファ時間（先読み）'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('1.5 GB'), findsOneWidget);
+        expect(find.text('おすすめ'), findsOneWidget);
+        expect(find.textContaining('容量不足'), findsWidgets);
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(SettingsScreen)),
+        );
+        // Tapping disabled over-budget options (5分, 60分) does nothing.
+        await tester.tap(find.text('5分').last);
+        await tester.pumpAndSettle();
+        expect(find.byType(SimpleDialog), findsOneWidget);
+        await tester.tap(find.text('60分'));
+        await tester.pumpAndSettle();
+        expect(find.byType(SimpleDialog), findsOneWidget);
+        expect(
+          container.read(recordedBufferSecondsProvider),
+          defaultRecordedBufferSeconds,
+        );
+
+        // Tapping selectable option (1分) updates provider and closes dialog.
+        await tester.tap(find.text('1分'));
+        await tester.pumpAndSettle();
+        expect(find.byType(SimpleDialog), findsNothing);
+        expect(container.read(recordedBufferSecondsProvider), 60);
+        expect(await kv.read('firetv_recorded_buffer_seconds'), '60');
+
+        // Switching video decode mode persists selection.
+        await tester.scrollUntilVisible(
+          find.text('映像デコード方式'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.tap(find.text('映像デコード方式'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text(videoHwdecModeLabel(VideoHwdecMode.mpeg2Software)));
+        await tester.pumpAndSettle();
+        expect(
+          container.read(videoHwdecModeProvider),
+          VideoHwdecMode.mpeg2Software,
+        );
+        expect(await kv.read('firetv_video_hwdec_mode'), 'mpeg2Software');
+      },
+    );
+  });
 }
 
 class _DeletableScheduleService implements ScheduleService {

@@ -53,6 +53,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final storeDir = ref.watch(storeDirectoryProvider);
     final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
     final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
+    final videoHwdecMode = ref.watch(videoHwdecModeProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(
@@ -324,6 +325,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               title: 'Live のバッファ時間（遅延再生）',
               description:
                   '再生開始前に指定時間分を貯めてから流し、トンネルや短い圏外での途切れを防ぎます。',
+              live: true,
               options: liveBufferOptionsSeconds,
               current: liveBufferSeconds,
               onSelected: (value) =>
@@ -350,12 +352,32 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             onTap: () => _pickBufferDuration(
               title: '録画のバッファ時間（先読み）',
               description:
-                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低512MB空き残存）。',
+                  '再生をすぐ始めつつ、裏で設定時間分まで先読みします（1分以上はストレージ一時保存、最低1GB空き残存・元画質基準）。',
+              live: false,
               options: recordedBufferOptionsSeconds,
               current: recordedBufferSeconds,
               onSelected: (value) =>
                   ref.read(recordedBufferSecondsProvider.notifier).set(value),
             ),
+          ),
+          ListTile(
+            title: const Text('映像デコード方式'),
+            subtitle: Text(
+              '${videoHwdecModeShortLabel(videoHwdecMode)} '
+              '（${videoHwdecModeDescription(videoHwdecMode)}）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  videoHwdecModeShortLabel(videoHwdecMode),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickVideoHwdecMode(videoHwdecMode),
           ),
           ListTile(
             title: const Text('字幕表示設定'),
@@ -603,10 +625,45 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Future<void> _pickBufferDuration({
     required String title,
     required String description,
+    required bool live,
     required List<int> options,
     required int current,
     required Future<void> Function(int value) onSelected,
   }) async {
+    final availableBytes = await ref
+        .read(fireTvHelperProvider)
+        .getCacheAvailableBytes();
+    if (!mounted) return;
+    final evals = evaluateBufferOptions(
+      options: options,
+      live: live,
+      availableDiskBytes: availableBytes,
+    );
+    BufferOptionEvaluation? currentEval;
+    for (final e in evals) {
+      if (e.seconds == current) {
+        currentEval = e;
+        break;
+      }
+    }
+    int autofocusTarget = current;
+    if (currentEval == null || !currentEval.selectable) {
+      BufferOptionEvaluation? fallback;
+      for (final e in evals) {
+        if (e.isRecommended && e.selectable) {
+          fallback = e;
+          break;
+        }
+      }
+      fallback ??= evals.cast<BufferOptionEvaluation?>().firstWhere(
+        (e) => e!.selectable,
+        orElse: () => null,
+      );
+      if (fallback != null) {
+        autofocusTarget = fallback.seconds;
+      }
+    }
+
     final chosen = await showDialog<int>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
@@ -614,23 +671,86 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
-            child: Text(
-              description,
-              style: Theme.of(dialogContext).textTheme.bodySmall,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  description,
+                  style: Theme.of(dialogContext).textTheme.bodySmall,
+                ),
+                if (availableBytes != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    '端末の空き容量: ${formatStorageBytes(availableBytes)}'
+                    '（安全のため 1.0 GB 以上を残します・元画質基準）',
+                    style: Theme.of(dialogContext).textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+                if (currentEval != null && !currentEval.selectable) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    '現在の設定は空き容量不足のため再生時に自動縮小されます。安全な範囲を選択してください。',
+                    style: Theme.of(dialogContext).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(dialogContext).colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
-          for (final opt in options)
+          for (final e in evals)
             _BufferOptionTile(
-              label: formatBufferDurationLabel(opt),
-              selected: opt == current,
-              autofocus: opt == current,
-              onTap: () => Navigator.of(dialogContext).pop(opt),
+              label: formatBufferDurationLabel(e.seconds),
+              selected: e.seconds == current,
+              autofocus: e.seconds == autofocusTarget,
+              enabled: e.selectable,
+              isRecommended: e.isRecommended,
+              badge: e.isRecommended ? 'おすすめ' : null,
+              detailText: availableBytes == null
+                  ? null
+                  : (!e.selectable
+                        ? '${formatStorageBytes(e.estimatedDiskBytes)} ・ 容量不足'
+                        : (e.estimatedDiskBytes > 0
+                              ? '約 ${formatStorageBytes(e.estimatedDiskBytes)}'
+                              : null)),
+              onTap: () => Navigator.of(dialogContext).pop(e.seconds),
             ),
         ],
       ),
     );
     if (chosen != null) {
       await onSelected(chosen);
+    }
+  }
+
+  Future<void> _pickVideoHwdecMode(VideoHwdecMode current) async {
+    final chosen = await showDialog<VideoHwdecMode>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('映像デコード方式'),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'Fire TV 第1世代などで元画質 (DR) が黒画面のまま進まない場合に切り替えます。',
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final mode in VideoHwdecMode.values)
+            _BufferOptionTile(
+              label: videoHwdecModeLabel(mode),
+              subtitleText: videoHwdecModeDescription(mode),
+              selected: mode == current,
+              autofocus: mode == current,
+              onTap: () => Navigator.of(dialogContext).pop(mode),
+            ),
+        ],
+      ),
+    );
+    if (chosen != null) {
+      await ref.read(videoHwdecModeProvider.notifier).set(chosen);
     }
   }
 
@@ -722,9 +842,19 @@ class _BufferOptionTile extends StatefulWidget {
     required this.selected,
     required this.autofocus,
     required this.onTap,
+    this.subtitleText,
+    this.badge,
+    this.isRecommended = false,
+    this.detailText,
+    this.enabled = true,
   });
 
   final String label;
+  final String? subtitleText;
+  final String? badge;
+  final bool isRecommended;
+  final String? detailText;
+  final bool enabled;
   final bool selected;
   final bool autofocus;
   final VoidCallback onTap;
@@ -738,37 +868,96 @@ class _BufferOptionTileState extends State<_BufferOptionTile> {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
     final focusColor = isDark ? Colors.amberAccent : Colors.amber;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
       child: InkWell(
-        autofocus: widget.autofocus,
+        autofocus: widget.autofocus && widget.enabled,
+        canRequestFocus: widget.enabled,
         borderRadius: BorderRadius.circular(8),
         onFocusChange: (focused) {
           if (_focused != focused) setState(() => _focused = focused);
         },
-        onTap: widget.onTap,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-              color: _focused ? focusColor : Colors.transparent,
-              width: 2.5,
-            ),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                widget.selected
-                    ? Icons.check_circle
-                    : Icons.radio_button_unchecked,
-                size: 20,
+        onTap: widget.enabled ? widget.onTap : null,
+        child: Opacity(
+          opacity: widget.enabled ? 1.0 : 0.45,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: _focused ? focusColor : Colors.transparent,
+                width: 2.5,
               ),
-              const SizedBox(width: 12),
-              Expanded(child: Text(widget.label)),
-            ],
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  widget.selected
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  size: 20,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(child: Text(widget.label)),
+                          if (widget.badge != null) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: widget.isRecommended
+                                    ? theme.colorScheme.primaryContainer
+                                    : theme.colorScheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                widget.badge!,
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: widget.isRecommended
+                                      ? theme.colorScheme.onPrimaryContainer
+                                      : theme.colorScheme.onSurfaceVariant,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      if (widget.subtitleText != null) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          widget.subtitleText!,
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (widget.detailText != null) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    widget.detailText!,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: widget.enabled
+                          ? theme.colorScheme.onSurfaceVariant
+                          : theme.colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
         ),
       ),
