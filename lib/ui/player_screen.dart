@@ -3364,7 +3364,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       for (var j = 0; j < sa.length; j++) {
         if (sa[j].text != sb[j].text ||
             sa[j].color != sb[j].color ||
-            sa[j].scale != sb[j].scale) {
+            sa[j].scale != sb[j].scale ||
+            sa[j].drcsGlyph != sb[j].drcsGlyph) {
           return false;
         }
       }

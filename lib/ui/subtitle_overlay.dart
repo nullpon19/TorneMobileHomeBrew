@@ -8,6 +8,7 @@ import 'dart:math' as math;
 import 'package:flutter/rendering.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../core/dtcp/arib_ts_caption_tap.dart';
 import 'subtitle_style_policy.dart';
 
 /// Renders active [cues] over video or inside the settings preview box.
@@ -127,6 +128,12 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     forceStrutHeight: true,
   );
 
+  Size _drcsGlyphDisplaySize(AribDrcsGlyph glyph, double effectiveFontSize) {
+    final aspect = (glyph.width / glyph.height).clamp(0.4, 2.0);
+    final h = effectiveFontSize * 0.96;
+    return Size(h * aspect, h);
+  }
+
   TextSpan _buildCueSpan({
     required SubtitleCue cue,
     required double fontSize,
@@ -137,34 +144,50 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     return TextSpan(
       children: [
         for (final run in cue.spans)
-          TextSpan(
-            text: run.text,
-            style: TextStyle(
-              fontFamily: settings.font.fontFamily,
-              fontFamilyFallback: settings.font.fontFamilyFallback,
-              fontWeight: settings.font.fontWeight,
-              fontSize: fontSize * run.scale,
-              height: 1.20,
-              locale: const Locale('ja', 'JP'),
-              color: isStroke ? null : run.color,
-              foreground: isStroke
-                  ? (Paint()
-                      ..style = PaintingStyle.stroke
-                      ..strokeWidth = edgeWidth
-                      ..strokeJoin = StrokeJoin.round
-                      ..color = Colors.black)
-                  : null,
-              shadows: isStroke
-                  ? const [
-                      Shadow(
-                        color: Colors.black87,
-                        blurRadius: 3.0,
-                        offset: Offset(0, 1),
-                      ),
-                    ]
-                  : (textShadows.isEmpty ? null : textShadows),
+          if (run.drcsGlyph != null)
+            WidgetSpan(
+              alignment: PlaceholderAlignment.middle,
+              child: AribDrcsGlyphWidget(
+                glyph: run.drcsGlyph!,
+                color: run.color,
+                size: _drcsGlyphDisplaySize(
+                  run.drcsGlyph!,
+                  fontSize * run.scale,
+                ),
+                edgeWidth: edgeWidth,
+                textShadows: textShadows,
+                isStroke: isStroke,
+              ),
+            )
+          else
+            TextSpan(
+              text: run.text,
+              style: TextStyle(
+                fontFamily: settings.font.fontFamily,
+                fontFamilyFallback: settings.font.fontFamilyFallback,
+                fontWeight: settings.font.fontWeight,
+                fontSize: fontSize * run.scale,
+                height: 1.20,
+                locale: const Locale('ja', 'JP'),
+                color: isStroke ? null : run.color,
+                foreground: isStroke
+                    ? (Paint()
+                        ..style = PaintingStyle.stroke
+                        ..strokeWidth = edgeWidth
+                        ..strokeJoin = StrokeJoin.round
+                        ..color = Colors.black)
+                    : null,
+                shadows: isStroke
+                    ? const [
+                        Shadow(
+                          color: Colors.black87,
+                          blurRadius: 3.0,
+                          offset: Offset(0, 1),
+                        ),
+                      ]
+                    : (textShadows.isEmpty ? null : textShadows),
+              ),
             ),
-          ),
       ],
     );
   }
@@ -190,6 +213,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
                 text: chunk,
                 color: span.color,
                 scale: span.scale,
+                drcsGlyph: span.drcsGlyph,
               ),
             );
           }
@@ -200,6 +224,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     }
     while (out.isNotEmpty) {
       final last = out.last;
+      if (last.drcsGlyph != null) break;
       final trimmed = last.text.replaceFirst(RegExp(r'[\r\n]+$'), '');
       if (trimmed == last.text) break;
       out.removeLast();
@@ -209,6 +234,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
             text: trimmed,
             color: last.color,
             scale: last.scale,
+            drcsGlyph: last.drcsGlyph,
           ),
         );
         break;
@@ -225,9 +251,19 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     required TextScaler textScaler,
   }) {
     final fullText = cue.plainText;
-    if (fullText.isEmpty) {
+    final hasAnyContent =
+        cue.spans.any((s) => s.drcsGlyph != null) || fullText.isNotEmpty;
+    if (!hasAnyContent) {
       return (lines: [cue], maxLineWidth: 0.0);
     }
+    final placeholderDims = <PlaceholderDimensions>[
+      for (final run in cue.spans)
+        if (run.drcsGlyph != null)
+          PlaceholderDimensions(
+            size: _drcsGlyphDisplaySize(run.drcsGlyph!, fontSize * run.scale),
+            alignment: PlaceholderAlignment.middle,
+          ),
+    ];
     final painter = TextPainter(
       text: _buildCueSpan(
         cue: cue,
@@ -241,14 +277,18 @@ class PlayerSubtitleOverlay extends StatelessWidget {
       textScaler: textScaler,
       strutStyle: strut,
       textHeightBehavior: _textHeightBehavior,
-    )..layout(maxWidth: maxTextWidth);
+    );
+    if (placeholderDims.isNotEmpty) {
+      painter.setPlaceholderDimensions(placeholderDims);
+    }
+    painter.layout(maxWidth: maxTextWidth);
 
     try {
       final lineMetrics = painter.computeLineMetrics();
       final maxLineW = lineMetrics.isEmpty
           ? painter.width
           : lineMetrics.map((m) => m.width).reduce(math.max);
-      if (lineMetrics.length <= 1) {
+      if (lineMetrics.length <= 1 || fullText.isEmpty) {
         return (lines: [cue], maxLineWidth: maxLineW);
       }
 
@@ -260,8 +300,10 @@ class PlayerSubtitleOverlay extends StatelessWidget {
         if (nextEnd <= offset) break;
         final sliceStart = math.max(offset, range.start);
         final sliced = _sliceCueSpans(cue.spans, sliceStart, nextEnd);
-        final slicedText = [for (final s in sliced) s.text].join().trim();
-        if (slicedText.isNotEmpty) {
+        final hasLineContent =
+            sliced.any((s) => s.drcsGlyph != null) ||
+            [for (final s in sliced) s.text].join().trim().isNotEmpty;
+        if (hasLineContent) {
           visualLines.add(
             SubtitleCue(
               spans: sliced,
@@ -493,6 +535,182 @@ class PlayerSubtitleOverlay extends StatelessWidget {
         fillText,
       ],
     );
+  }
+}
+
+/// Renders one broadcast ARIB DRCS bitmap [glyph] inline inside a subtitle line
+/// with matching speaker [color], multi-gradation alpha, outline stroke, or shadow.
+class AribDrcsGlyphWidget extends StatelessWidget {
+  const AribDrcsGlyphWidget({
+    super.key,
+    required this.glyph,
+    required this.color,
+    required this.size,
+    required this.edgeWidth,
+    required this.textShadows,
+    required this.isStroke,
+  });
+
+  final AribDrcsGlyph glyph;
+  final Color color;
+  final Size size;
+  final double edgeWidth;
+  final List<Shadow> textShadows;
+  final bool isStroke;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size.width,
+      height: size.height,
+      child: CustomPaint(
+        size: size,
+        painter: _AribDrcsGlyphPainter(
+          glyph: glyph,
+          color: color,
+          edgeWidth: edgeWidth,
+          textShadows: textShadows,
+          isStroke: isStroke,
+        ),
+      ),
+    );
+  }
+}
+
+class _AribDrcsGlyphPainter extends CustomPainter {
+  const _AribDrcsGlyphPainter({
+    required this.glyph,
+    required this.color,
+    required this.edgeWidth,
+    required this.textShadows,
+    required this.isStroke,
+  });
+
+  final AribDrcsGlyph glyph;
+  final Color color;
+  final double edgeWidth;
+  final List<Shadow> textShadows;
+  final bool isStroke;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (glyph.width <= 0 || glyph.height <= 0 || size.isEmpty) return;
+    final pxW = size.width / glyph.width;
+    final pxH = size.height / glyph.height;
+    const bleed = 0.30;
+
+    final levelPaths = <int, Path>{};
+    final silhouette = Path();
+    for (var y = 0; y < glyph.height; y++) {
+      final top = y * pxH;
+      final bottom = math.min(size.height, (y + 1) * pxH + bleed);
+      var x = 0;
+      while (x < glyph.width) {
+        final level = glyph.levels[y * glyph.width + x];
+        if (level <= 0) {
+          x++;
+          continue;
+        }
+        var runEnd = x + 1;
+        while (runEnd < glyph.width &&
+            glyph.levels[y * glyph.width + runEnd] == level) {
+          runEnd++;
+        }
+        final left = x * pxW;
+        final right = math.min(size.width, runEnd * pxW + bleed);
+        final rect = Rect.fromLTRB(left, top, right, bottom);
+        (levelPaths[level] ??= Path()).addRect(rect);
+        silhouette.addRect(rect);
+        x = runEnd;
+      }
+    }
+    if (levelPaths.isEmpty) return;
+
+    if (isStroke) {
+      canvas.save();
+      canvas.translate(0.0, 1.0);
+      canvas.drawPath(
+        silhouette,
+        Paint()
+          ..color = Colors.black87
+          ..style = PaintingStyle.fill
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1.5),
+      );
+      canvas.restore();
+      if (edgeWidth > 0) {
+        canvas.drawPath(
+          silhouette,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = edgeWidth
+            ..strokeJoin = StrokeJoin.round
+            ..strokeCap = StrokeCap.round
+            ..color = Colors.black
+            ..isAntiAlias = true,
+        );
+      }
+      canvas.drawPath(
+        silhouette,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..color = Colors.black
+          ..isAntiAlias = true,
+      );
+      return;
+    }
+
+    for (final s in textShadows) {
+      canvas.save();
+      canvas.translate(s.offset.dx, s.offset.dy);
+      for (final entry in levelPaths.entries) {
+        final alphaScale = (entry.key / glyph.maxLevel).clamp(0.0, 1.0);
+        canvas.drawPath(
+          entry.value,
+          Paint()
+            ..style = PaintingStyle.fill
+            ..color = s.color.withValues(
+              alpha: (s.color.a * alphaScale).clamp(0.0, 1.0),
+            )
+            ..maskFilter = s.blurRadius > 0
+                ? MaskFilter.blur(BlurStyle.normal, s.blurRadius * 0.5)
+                : null
+            ..isAntiAlias = true,
+        );
+      }
+      canvas.restore();
+    }
+
+    for (final entry in levelPaths.entries) {
+      final alphaScale = (entry.key / glyph.maxLevel).clamp(0.0, 1.0);
+      canvas.drawPath(
+        entry.value,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..color = color.withValues(
+            alpha: (color.a * alphaScale).clamp(0.0, 1.0),
+          )
+          ..isAntiAlias = true,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_AribDrcsGlyphPainter oldDelegate) {
+    if (glyph != oldDelegate.glyph ||
+        color != oldDelegate.color ||
+        edgeWidth != oldDelegate.edgeWidth ||
+        isStroke != oldDelegate.isStroke ||
+        textShadows.length != oldDelegate.textShadows.length) {
+      return true;
+    }
+    for (var i = 0; i < textShadows.length; i++) {
+      if (textShadows[i].color != oldDelegate.textShadows[i].color ||
+          textShadows[i].offset != oldDelegate.textShadows[i].offset ||
+          textShadows[i].blurRadius != oldDelegate.textShadows[i].blurRadius) {
+        return true;
+      }
+    }
+    return false;
   }
 }
 

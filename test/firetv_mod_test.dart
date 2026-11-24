@@ -8636,6 +8636,450 @@ void main() {
       );
     },
   );
+
+  group(
+    'Phase 32: ARIB DRCS bitmap decoding & inline subtitle rendering',
+    () {
+      Uint8List wrapTsPacket188({
+        required int pid,
+        required bool pusi,
+        required List<int> payload,
+      }) {
+        final pkt = Uint8List(188);
+        pkt[0] = 0x47;
+        pkt[1] = (pusi ? 0x40 : 0x00) | ((pid >> 8) & 0x1F);
+        pkt[2] = pid & 0xFF;
+        pkt[3] = 0x10;
+        final copyLen = payload.length < 184 ? payload.length : 184;
+        pkt.setRange(4, 4 + copyLen, payload);
+        for (var i = 4 + copyLen; i < 188; i++) {
+          pkt[i] = 0xFF;
+        }
+        return pkt;
+      }
+
+      List<int> encodePts(double seconds) {
+        final pts = (seconds * 90000.0).round();
+        return [
+          0x21 | (((pts >> 30) & 0x07) << 1),
+          (pts >> 22) & 0xFF,
+          0x01 | (((pts >> 15) & 0x7F) << 1),
+          (pts >> 7) & 0xFF,
+          0x01 | ((pts & 0x7F) << 1),
+        ];
+      }
+
+      List<int> buildPat({required int pmtPid}) => [
+        0x00,
+        0x00,
+        0xB0, 0x0D,
+        0x00, 0x01, 0xC1, 0x00, 0x00,
+        0x00, 0x01, 0xE0 | ((pmtPid >> 8) & 0x1F), pmtPid & 0xFF,
+        0x00, 0x00, 0x00, 0x00,
+      ];
+
+      List<int> buildPmt({required int videoPid, required int captionPid}) => [
+        0x00,
+        0x02,
+        0xB0, 0x1E,
+        0x00, 0x01, 0xC1, 0x00, 0x00,
+        0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF,
+        0xF0, 0x00,
+        0x02, 0xE0 | ((videoPid >> 8) & 0x1F), videoPid & 0xFF, 0xF0, 0x00,
+        0x06,
+        0xE0 | ((captionPid >> 8) & 0x1F),
+        captionPid & 0xFF,
+        0xF0,
+        0x07,
+        0x52, 0x01, 0x30,
+        0xFD, 0x02, 0x00, 0x08,
+        0x00, 0x00, 0x00, 0x00,
+      ];
+
+      List<int> wrapPesPacket({
+        required List<int> dataGroupPayload,
+        double? ptsSeconds,
+      }) {
+        final aribPes = [0x80, 0xFF, 0x00, ...dataGroupPayload];
+        if (ptsSeconds != null) {
+          final pesLen = 8 + aribPes.length;
+          return [
+            0x00, 0x00, 0x01, 0xBD,
+            (pesLen >> 8) & 0xFF,
+            pesLen & 0xFF,
+            0x80, 0x80, 0x05,
+            ...encodePts(ptsSeconds),
+            ...aribPes,
+          ];
+        }
+        final pesLen = 3 + aribPes.length;
+        return [
+          0x00, 0x00, 0x01, 0xBD,
+          (pesLen >> 8) & 0xFF,
+          pesLen & 0xFF,
+          0x80, 0x00, 0x00,
+          ...aribPes,
+        ];
+      }
+
+      List<int> buildDataUnit(int param, List<int> body) => [
+        0x1F,
+        param,
+        (body.length >> 16) & 0xFF,
+        (body.length >> 8) & 0xFF,
+        body.length & 0xFF,
+        ...body,
+      ];
+
+      test(
+        'AribTsCaptionTap decodes 1-byte/2-byte DRCS across management & statement PES, resolves direct cues, and falls back on undefined codes',
+        () {
+          // 1-byte DRCS-1 0x4121: 1bpp (mode=0), 8x8 border frame
+          final drcs1Unit = <int>[
+            0x01, // number_of_code
+            0x41, 0x21, // character_code (DRCS-1, cell 0x21)
+            0x01, // number_of_font
+            0x00, // font_id=0, mode=0 (1bpp uncompressed)
+            0x00, // depth=0
+            0x08, 0x08, // width=8, height=8
+            0xFF, 0x81, 0xBD, 0xA5, 0xA5, 0xBD, 0x81, 0xFF,
+          ];
+
+          // Caption management group (data_group_id=0x00), no PTS
+          final mgmtUnits = buildDataUnit(0x30, drcs1Unit);
+          final mgmtGroupBody = <int>[
+            0x00, // TMD = 0
+            0x01, // num_languages = 1
+            0x00, // lang_tag=0, dmf=0 (no DC)
+            0x6A, 0x70, 0x6E, // "jpn"
+            0x00, // format/tcs/rollup
+            (mgmtUnits.length >> 16) & 0xFF,
+            (mgmtUnits.length >> 8) & 0xFF,
+            mgmtUnits.length & 0xFF,
+            ...mgmtUnits,
+          ];
+          final mgmtGroup = <int>[
+            0x00, // data_group_id=0, version=0
+            0x00,
+            0x00,
+            (mgmtGroupBody.length >> 8) & 0xFF,
+            mgmtGroupBody.length & 0xFF,
+            ...mgmtGroupBody,
+          ];
+
+          // 2-byte DRCS-0 0x2121: 2bpp (mode=1, depth=2 => 4 gradations), 4x4
+          final drcs2Unit = <int>[
+            0x01, // number_of_code
+            0x21, 0x21, // character_code (2-byte DRCS-0)
+            0x01, // number_of_font
+            0x01, // font_id=0, mode=1 (multi-gradation uncompressed)
+            0x02, // depth=2 (4 gradations = 2bpp)
+            0x04, 0x04, // width=4, height=4
+            0x1B, // row 0: [0, 1, 2, 3]
+            0xE4, // row 1: [3, 2, 1, 0]
+            0x0F, // row 2: [0, 0, 3, 3]
+            0xF0, // row 3: [3, 3, 0, 0]
+          ];
+
+          List<int> ascii(String s) => s.codeUnits;
+          final statementBody = <int>[
+            0x0C, // CS
+            0x9B, ...ascii('7'), 0x20, 0x53, // SWF 7 (960x540)
+            0x9B, ...ascii('100;460'), 0x61, // ACPS(100,460)
+            0x83, // Yellow
+            0x1B, 0x28, 0x30, // G0 = Hiragana
+            0x22, 0x24, // あ い
+            0x1B, 0x28, 0x20, 0x41, // G0 = 1-byte DRCS-1
+            0x21, // 0x4121 (defined in management data)
+            0x1B, 0x24, 0x28, 0x20, 0x40, // G0 = 2-byte DRCS-0
+            0x21, 0x21, // 0x2121 (defined in this PES)
+            0x1B, 0x28, 0x20, 0x41, // G0 = 1-byte DRCS-1
+            0x22, // 0x4122 (undefined -> fallback '〓')
+          ];
+
+          final stmtUnits = [
+            ...buildDataUnit(0x31, drcs2Unit),
+            ...buildDataUnit(0x20, statementBody),
+          ];
+          final stmtGroupBody = <int>[
+            0x00, // TMD = 0
+            (stmtUnits.length >> 16) & 0xFF,
+            (stmtUnits.length >> 8) & 0xFF,
+            stmtUnits.length & 0xFF,
+            ...stmtUnits,
+          ];
+          final stmtGroup = <int>[
+            0x04, // data_group_id=1 (0x01 << 2)
+            0x00,
+            0x00,
+            (stmtGroupBody.length >> 8) & 0xFF,
+            stmtGroupBody.length & 0xFF,
+            ...stmtGroupBody,
+          ];
+
+          List<Uint8List> chunkPesPackets(int pid, List<int> pesBytes) {
+            final pkts = <Uint8List>[];
+            for (var i = 0; i < pesBytes.length; i += 184) {
+              final end = i + 184 < pesBytes.length ? i + 184 : pesBytes.length;
+              pkts.add(
+                wrapTsPacket188(
+                  pid: pid,
+                  pusi: i == 0,
+                  payload: pesBytes.sublist(i, end),
+                ),
+              );
+            }
+            return pkts;
+          }
+
+          final tap = AribTsCaptionTap();
+          final pat = wrapTsPacket188(pid: 0, pusi: true, payload: buildPat(pmtPid: 0x0100));
+          final pmt = wrapTsPacket188(
+            pid: 0x0100,
+            pusi: true,
+            payload: buildPmt(videoPid: 0x0111, captionPid: 0x0120),
+          );
+          final mgmtPesPkts = chunkPesPackets(
+            0x0120,
+            wrapPesPacket(dataGroupPayload: mgmtGroup),
+          );
+          final stmtPesPkts = chunkPesPackets(
+            0x0120,
+            wrapPesPacket(dataGroupPayload: stmtGroup, ptsSeconds: 40.0),
+          );
+
+          final builder = BytesBuilder()
+            ..add(pat)
+            ..add(pmt);
+          for (final p in mgmtPesPkts) {
+            builder.add(p);
+          }
+          for (final p in stmtPesPkts) {
+            builder.add(p);
+          }
+          // Duplicate PAT triggers flush/verify stream without trailing PES pending.
+          builder.add(pat);
+
+          tap.feed(builder.takeBytes());
+
+          expect(tap.drcsGlyphs, hasLength(2));
+          final key1b = AribTsCaptionTap.drcsOneByteKey(0x41, 0x21);
+          final key2b = AribTsCaptionTap.drcsTwoByteKey(0x2121);
+          expect(tap.drcsGlyphs.containsKey(key1b), isTrue);
+          expect(tap.drcsGlyphs.containsKey(key2b), isTrue);
+
+          final g1b = tap.drcsGlyphs[key1b]!;
+          expect(g1b.width, 8);
+          expect(g1b.height, 8);
+          expect(g1b.maxLevel, 1);
+          expect(g1b.levels.sublist(0, 8), [1, 1, 1, 1, 1, 1, 1, 1]);
+          expect(g1b.levels.sublist(8, 16), [1, 0, 0, 0, 0, 0, 0, 1]);
+
+          final g2b = tap.drcsGlyphs[key2b]!;
+          expect(g2b.width, 4);
+          expect(g2b.height, 4);
+          expect(g2b.maxLevel, 3);
+          expect(
+            g2b.levels,
+            [0, 1, 2, 3, 3, 2, 1, 0, 0, 0, 3, 3, 3, 3, 0, 0],
+          );
+
+          // Management PES without PTS should not emit a layout event; statement emits 1.
+          expect(tap.events, hasLength(1));
+          final ev = tap.events.single;
+          expect(ev.hasDecodedText, isTrue);
+          expect(ev.lines, hasLength(1));
+          final runs = ev.lines.single.runs;
+          expect(runs, hasLength(4));
+          expect(runs[0].text, 'あい');
+          expect(runs[0].drcsGlyph, isNull);
+          expect(runs[0].colorArgb, 0xFFFFFF00);
+
+          expect(runs[1].text, '\uFFFC');
+          expect(runs[1].drcsGlyph, equals(g1b));
+          expect(runs[1].colorArgb, 0xFFFFFF00);
+
+          expect(runs[2].text, '\uFFFC');
+          expect(runs[2].drcsGlyph, equals(g2b));
+          expect(runs[2].colorArgb, 0xFFFFFF00);
+
+          expect(runs[3].text, '〓');
+          expect(runs[3].drcsGlyph, isNull);
+          expect(runs[3].colorArgb, 0xFFFFFF00);
+
+          final direct = resolveDirectAribTsSubtitleCues(
+            events: tap.events,
+            currentPlaybackMpvPts: 41.0,
+            ptsOffset: 0.0,
+          );
+          expect(direct.handled, isTrue);
+          expect(direct.cues, hasLength(1));
+          expect(direct.cues.single.spans, hasLength(4));
+          expect(direct.cues.single.spans[1].drcsGlyph, equals(g1b));
+          expect(direct.cues.single.spans[1].color, const Color(0xFFFFFF00));
+          expect(direct.cues.single.spans[2].drcsGlyph, equals(g2b));
+          expect(direct.cues.single.spans[3].text, '〓');
+
+          final cueCopyDifferentGlyph = SubtitleCue(
+            spans: [
+              const SubtitleStyledSpan(text: 'あい'),
+              SubtitleStyledSpan(text: '\uFFFC', drcsGlyph: g2b),
+            ],
+          );
+          final cueCopyOriginalGlyph = SubtitleCue(
+            spans: [
+              const SubtitleStyledSpan(text: 'あい'),
+              SubtitleStyledSpan(text: '\uFFFC', drcsGlyph: g1b),
+            ],
+          );
+          expect(
+            cueCopyDifferentGlyph.dedupeKey,
+            isNot(equals(cueCopyOriginalGlyph.dedupeKey)),
+          );
+
+          tap.resetFraming();
+          expect(tap.drcsGlyphs, hasLength(2));
+          tap.resetAll();
+          expect(tap.drcsGlyphs, isEmpty);
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay renders AribDrcsGlyphWidget across outline, centerShadow, wrapping, and unified polygon box',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final squareGlyph = AribDrcsGlyph.fromLevels(
+            width: 4,
+            height: 4,
+            maxLevel: 1,
+            levels: Uint8List.fromList([
+              1, 1, 1, 1,
+              1, 0, 0, 1,
+              1, 0, 0, 1,
+              1, 1, 1, 1,
+            ]),
+          );
+          final narrowGlyph = AribDrcsGlyph.fromLevels(
+            width: 2,
+            height: 4,
+            maxLevel: 3,
+            levels: Uint8List.fromList([
+              3, 2,
+              3, 2,
+              1, 0,
+              3, 3,
+            ]),
+          );
+
+          final cue = SubtitleCue(
+            normalizedX: 0.18,
+            endNormalizedX: 0.80,
+            normalizedY: 0.85,
+            alignment: 1,
+            spans: [
+              const SubtitleStyledSpan(
+                text: 'さあ 9時発の このバスで',
+                color: Color(0xFFFFFF00),
+              ),
+              SubtitleStyledSpan(
+                text: '\uFFFC',
+                color: const Color(0xFFFFFF00),
+                drcsGlyph: squareGlyph,
+              ),
+              const SubtitleStyledSpan(text: ' 次へ'),
+              SubtitleStyledSpan(
+                text: '\uFFFC',
+                color: const Color(0xFF00FFFF),
+                drcsGlyph: narrowGlyph,
+              ),
+            ],
+          );
+
+          // 1) Outline edge mode renders both stroke & fill widget layers per glyph.
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    edge: SubtitleEdgeStyle.thin,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [cue],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(4));
+          expect(find.byType(SubtitleUnifiedBackgroundBox), findsOneWidget);
+
+          // 2) Shadow-only mode renders single fill+shadow widget layer per glyph.
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    edge: SubtitleEdgeStyle.thickShadow,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [cue],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(2));
+
+          // 3) Narrow viewport forces multi-line wrapping with trailing DRCS glyph.
+          tester.view.physicalSize = const Size(320, 540);
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings.defaults.copyWith(
+                    size: SubtitleSizePreset.large,
+                    edge: SubtitleEdgeStyle.thin,
+                    backgroundOpacityPercent: 65,
+                  ),
+                  cues: [
+                    SubtitleCue(
+                      normalizedX: 0.15,
+                      endNormalizedX: 0.88,
+                      normalizedY: 0.85,
+                      alignment: 1,
+                      spans: [
+                        const SubtitleStyledSpan(
+                          text: 'とても長い駅前から9時発のバスで旅に出かけます',
+                          color: Color(0xFFFFFF00),
+                        ),
+                        SubtitleStyledSpan(
+                          text: '\uFFFC',
+                          color: const Color(0xFFFFFF00),
+                          drcsGlyph: squareGlyph,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final boxRender = tester.renderObject<RenderSubtitleUnifiedBackgroundBox>(
+            find.byType(SubtitleUnifiedBackgroundBox),
+          );
+          expect(boxRender.lineRects.length, greaterThanOrEqualTo(2));
+          expect(find.byType(AribDrcsGlyphWidget), findsNWidgets(2));
+        },
+      );
+    },
+  );
 }
 
 class _DeletableScheduleService implements ScheduleService {

@@ -444,11 +444,13 @@ class SubtitleStyledSpan {
     required this.text,
     this.color = Colors.white,
     this.scale = 1.0,
+    this.drcsGlyph,
   });
 
   final String text;
   final Color color;
   final double scale;
+  final AribDrcsGlyph? drcsGlyph;
 }
 
 /// Positioned, color-annotated subtitle cue decoded from ARIB ASS or plain text.
@@ -474,7 +476,12 @@ class SubtitleCue {
   String get dedupeKey {
     final posKey =
         '${normalizedX?.toStringAsFixed(2) ?? '-'},${normalizedY?.toStringAsFixed(2) ?? '-'},$alignment';
-    return '$posKey|${plainText.trim()}';
+    final drcsSigs = [
+      for (final s in spans)
+        if (s.drcsGlyph != null) s.drcsGlyph!.signature,
+    ];
+    final drcsSuffix = drcsSigs.isEmpty ? '' : '|drcs:${drcsSigs.join(',')}';
+    return '$posKey|${plainText.trim()}$drcsSuffix';
   }
 }
 
@@ -486,7 +493,8 @@ bool _spansVisuallyEqual(
   for (var i = 0; i < a.length; i++) {
     if (a[i].text != b[i].text ||
         a[i].color != b[i].color ||
-        a[i].scale != b[i].scale) {
+        a[i].scale != b[i].scale ||
+        a[i].drcsGlyph != b[i].drcsGlyph) {
       return false;
     }
   }
@@ -771,13 +779,17 @@ List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
 
   void flushLine() {
     final text = [for (final s in currentLine) s.text].join().trim();
-    if (text.isNotEmpty) {
+    if (currentLine.any((s) => s.drcsGlyph != null) || text.isNotEmpty) {
       lines.add(currentLine);
     }
     currentLine = <SubtitleStyledSpan>[];
   }
 
   for (final span in cue.spans) {
+    if (span.drcsGlyph != null) {
+      currentLine.add(span);
+      continue;
+    }
     final parts = span.text.split('\n');
     for (var i = 0; i < parts.length; i++) {
       if (i > 0) flushLine();
@@ -1239,7 +1251,9 @@ double? resolveDirectAribPtsOffset({
   for (final item in activeEvents) {
     for (final line in item.event.lines) {
       final hasVisibleRun = line.runs.any(
-        (r) => normalizeAribSubtitleSymbols(r.text).trim().isNotEmpty,
+        (r) =>
+            r.drcsGlyph != null ||
+            normalizeAribSubtitleSymbols(r.text).trim().isNotEmpty,
       );
       if (!hasVisibleRun) continue;
       mergedLines.removeWhere(
@@ -1256,6 +1270,17 @@ double? resolveDirectAribPtsOffset({
   for (final line in mergedLines) {
     final spans = <SubtitleStyledSpan>[];
     for (final run in line.runs) {
+      if (run.drcsGlyph != null) {
+        spans.add(
+          SubtitleStyledSpan(
+            text: '\uFFFC',
+            color: Color(run.colorArgb),
+            scale: run.scale,
+            drcsGlyph: run.drcsGlyph,
+          ),
+        );
+        continue;
+      }
       final normalized = normalizeAribSubtitleSymbols(run.text);
       if (normalized.isEmpty) continue;
       spans.add(

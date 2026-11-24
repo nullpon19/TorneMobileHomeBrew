@@ -8,17 +8,83 @@ import 'dart:typed_data';
 
 import '../arib_b24.dart';
 
+/// Decoded uncompressed ARIB STD-B24 DRCS bitmap glyph (`0x30` 1-byte / `0x31` 2-byte).
+class AribDrcsGlyph {
+  const AribDrcsGlyph._({
+    required this.width,
+    required this.height,
+    required this.maxLevel,
+    required this.levels,
+    required this.signature,
+  });
+
+  factory AribDrcsGlyph.fromLevels({
+    required int width,
+    required int height,
+    required int maxLevel,
+    required Uint8List levels,
+  }) {
+    var hash = 0x811C9DC5;
+    void mix(int byte) {
+      hash ^= byte & 0xFF;
+      hash = (hash * 0x01000193) & 0x7FFFFFFF;
+    }
+
+    mix(width);
+    mix(height);
+    mix(maxLevel);
+    for (final b in levels) {
+      mix(b);
+    }
+    return AribDrcsGlyph._(
+      width: width,
+      height: height,
+      maxLevel: maxLevel < 1 ? 1 : maxLevel,
+      levels: levels,
+      signature: hash,
+    );
+  }
+
+  final int width;
+  final int height;
+  final int maxLevel;
+  final Uint8List levels;
+  final int signature;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! AribDrcsGlyph) return false;
+    if (signature != other.signature ||
+        width != other.width ||
+        height != other.height ||
+        maxLevel != other.maxLevel ||
+        levels.length != other.levels.length) {
+      return false;
+    }
+    for (var i = 0; i < levels.length; i++) {
+      if (levels[i] != other.levels[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => signature;
+}
+
 /// One decoded styled span inside an ARIB caption line.
 class AribCaptionStyledRun {
   const AribCaptionStyledRun({
     required this.text,
     this.colorArgb = 0xFFFFFFFF,
     this.scale = 1.0,
+    this.drcsGlyph,
   });
 
   final String text;
   final int colorArgb;
   final double scale;
+  final AribDrcsGlyph? drcsGlyph;
 }
 
 /// Horizontal & vertical bounds and decoded styled text runs of one ARIB caption line.
@@ -67,8 +133,9 @@ class AribCaptionLayoutEvent {
   final double? clearAfterSeconds;
   final bool startsWithClear;
 
-  bool get hasDecodedText =>
-      lines.any((l) => l.runs.any((r) => r.text.trim().isNotEmpty));
+  bool get hasDecodedText => lines.any(
+    (l) => l.runs.any((r) => r.drcsGlyph != null || r.text.trim().isNotEmpty),
+  );
 }
 
 class _MutableLineBucket {
@@ -88,18 +155,30 @@ class _MutableLineBucket {
   bool pendingSpace = false;
   final List<AribCaptionStyledRun> runs = [];
 
-  void appendText(String text, int colorArgb, double scale) {
-    if (text.isEmpty) return;
+  void appendText(
+    String text,
+    int colorArgb,
+    double scale, {
+    AribDrcsGlyph? drcsGlyph,
+  }) {
+    if (text.isEmpty && drcsGlyph == null) return;
     if (pendingSpace && runs.isNotEmpty) {
       _appendMerged(' ', runs.last.colorArgb, runs.last.scale);
     }
     pendingSpace = false;
-    _appendMerged(text, colorArgb, scale);
+    _appendMerged(text, colorArgb, scale, drcsGlyph: drcsGlyph);
   }
 
-  void _appendMerged(String text, int colorArgb, double scale) {
-    if (text.isEmpty) return;
-    if (runs.isNotEmpty &&
+  void _appendMerged(
+    String text,
+    int colorArgb,
+    double scale, {
+    AribDrcsGlyph? drcsGlyph,
+  }) {
+    if (text.isEmpty && drcsGlyph == null) return;
+    if (drcsGlyph == null &&
+        runs.isNotEmpty &&
+        runs.last.drcsGlyph == null &&
         runs.last.colorArgb == colorArgb &&
         runs.last.scale == scale) {
       final prev = runs.removeLast();
@@ -113,7 +192,12 @@ class _MutableLineBucket {
       return;
     }
     runs.add(
-      AribCaptionStyledRun(text: text, colorArgb: colorArgb, scale: scale),
+      AribCaptionStyledRun(
+        text: text,
+        colorArgb: colorArgb,
+        scale: scale,
+        drcsGlyph: drcsGlyph,
+      ),
     );
   }
 
@@ -121,6 +205,7 @@ class _MutableLineBucket {
     if (runs.isEmpty) return const [];
     final out = List<AribCaptionStyledRun>.of(runs);
     while (out.isNotEmpty) {
+      if (out.first.drcsGlyph != null) break;
       final trimmed = out.first.text.replaceFirst(RegExp(r'^ +'), '');
       if (trimmed == out.first.text) break;
       if (trimmed.isEmpty) {
@@ -135,6 +220,7 @@ class _MutableLineBucket {
       }
     }
     while (out.isNotEmpty) {
+      if (out.last.drcsGlyph != null) break;
       final trimmed = out.last.text.replaceFirst(RegExp(r' +$'), '');
       if (trimmed == out.last.text) break;
       if (trimmed.isEmpty) {
@@ -159,6 +245,7 @@ class AribTsCaptionTap {
   static const int _ttsPacketSize = 192;
   static const int _maxCarryBytes = _ttsPacketSize * 3;
   static const int _maxBufferedEvents = 2400;
+  static const int _maxDrcsGlyphs = 512;
   static const int _maxPesBytes = 64 * 1024;
   static const int _maxPsiBytes = 4096;
 
@@ -182,13 +269,16 @@ class AribTsCaptionTap {
   int _captionExpectedPayloadBytes = 0;
 
   final List<AribCaptionLayoutEvent> _events = [];
+  final Map<int, AribDrcsGlyph> _drcsGlyphs = {};
 
   List<AribCaptionLayoutEvent> get events => List<AribCaptionLayoutEvent>.unmodifiable(_events);
+  Map<int, AribDrcsGlyph> get drcsGlyphs =>
+      Map<int, AribDrcsGlyph>.unmodifiable(_drcsGlyphs);
   double? get firstStreamPtsSeconds => _firstStreamPtsSeconds;
   int? get captionPid => _captionPid >= 0 ? _captionPid : null;
 
   /// Resets framing and partial PES buffers across seek jumps while preserving
-  /// discovered PIDs, anchor PTS, and buffered events.
+  /// discovered PIDs, anchor PTS, DRCS glyphs, and buffered events.
   void resetFraming() {
     _carry = Uint8List(0);
     _patSection = null;
@@ -200,7 +290,7 @@ class AribTsCaptionTap {
     _captionExpectedPayloadBytes = 0;
   }
 
-  /// Clears all framing, PIDs, stream PTS origin, and cached layout events.
+  /// Clears all framing, PIDs, stream PTS origin, DRCS glyphs, and cached layout events.
   void resetAll() {
     resetFraming();
     _packetStride = 0;
@@ -209,6 +299,7 @@ class AribTsCaptionTap {
     _captionComponentTag = 0xFF;
     _firstStreamPtsSeconds = null;
     _events.clear();
+    _drcsGlyphs.clear();
   }
 
   /// Feeds decrypted plaintext TS/TTS bytes into the tap.
@@ -457,7 +548,7 @@ class AribTsCaptionTap {
       if ((flags2 & 0x80) != 0 && pStart + 14 <= pEnd && hdrDataLen >= 5) {
         ptsSeconds = _decodePtsSeconds(buf, pStart + 9);
       }
-      if (ptsSeconds == null || pesPayloadOff > pEnd) return;
+      if (pesPayloadOff > pEnd) return;
       final expectedPayload = pesPacketLen > (3 + hdrDataLen)
           ? pesPacketLen - 3 - hdrDataLen
           : 0;
@@ -497,13 +588,17 @@ class AribTsCaptionTap {
     _captionPes = null;
     _captionPesPtsSeconds = null;
     _captionExpectedPayloadBytes = 0;
-    if (pes == null || pts == null) return;
+    if (pes == null) return;
     var payload = pes.takeBytes();
     if (expectedLen > 0 && payload.length > expectedLen) {
       payload = Uint8List.sublistView(payload, 0, expectedLen);
     }
-    final event = _parseCaptionPesPayload(payload, ptsSeconds: pts);
-    if (event != null) {
+    final event = _parseCaptionPesPayload(
+      payload,
+      ptsSeconds: pts ?? 0.0,
+      drcsGlyphs: _drcsGlyphs,
+    );
+    if (pts != null && event != null) {
       final dupIdx = _events.indexWhere(
         (e) =>
             (e.ptsSeconds - event.ptsSeconds).abs() < 0.02 &&
@@ -535,9 +630,99 @@ class AribTsCaptionTap {
     return pts90k / 90000.0;
   }
 
+  /// Namespaced cache key for 1-byte DRCS characters (`DRCS-1..15`, `0x41..0x4F`).
+  static int drcsOneByteKey(int setFinalByte, int code7Bit) =>
+      0x10000 | ((setFinalByte & 0x7F) << 8) | (code7Bit & 0x7F);
+
+  /// Namespaced cache key for 2-byte DRCS characters (`DRCS-0`).
+  static int drcsTwoByteKey(int code16) => 0x20000 | (code16 & 0x7F7F);
+
+  /// Bits per pixel for uncompressed ARIB DRCS bitmap (`mode == 0` or `1`).
+  static int drcsBitsPerPixel(int mode, int depth) {
+    if (mode == 0) return 1;
+    final gradations = depth + 2;
+    if (gradations <= 2) return 1;
+    if (gradations <= 4) return 2;
+    if (gradations <= 16) return 4;
+    return 8;
+  }
+
+  /// Parses an ARIB STD-B24 DRCS data unit (`0x30` 1-byte or `0x31` 2-byte)
+  /// and caches decoded uncompressed glyph bitmaps in [out].
+  static void parseAribDrcsDataUnit(
+    Uint8List data, {
+    required bool isTwoByte,
+    required Map<int, AribDrcsGlyph> out,
+  }) {
+    if (data.isEmpty) return;
+    final numberOfCode = data[0];
+    var off = 1;
+    for (var c = 0; c < numberOfCode; c++) {
+      if (off + 3 > data.length) break;
+      final charCode = (data[off] << 8) | data[off + 1];
+      final numberOfFont = data[off + 2];
+      off += 3;
+      final key = isTwoByte
+          ? drcsTwoByteKey(charCode)
+          : (0x10000 | (charCode & 0x7F7F));
+      var storedFont0 = false;
+      for (var f = 0; f < numberOfFont; f++) {
+        if (off >= data.length) break;
+        final fontAndMode = data[off++];
+        final fontId = (fontAndMode >> 4) & 0x0F;
+        final mode = fontAndMode & 0x0F;
+        if (mode == 0x00 || mode == 0x01) {
+          if (off + 3 > data.length) return;
+          final depth = data[off++];
+          final width = data[off++];
+          final height = data[off++];
+          final bpp = drcsBitsPerPixel(mode, depth);
+          final totalBits = width * height * bpp;
+          final byteLen = (totalBits + 7) >> 3;
+          if (off + byteLen > data.length) return;
+          if (width > 0 && height > 0 && (fontId == 0 || !storedFont0)) {
+            final pixelCount = width * height;
+            final levels = Uint8List(pixelCount);
+            final mask = (1 << bpp) - 1;
+            var bitPos = 0;
+            for (var p = 0; p < pixelCount; p++) {
+              final byteIdx = off + (bitPos >> 3);
+              final bitInByte = bitPos & 0x07;
+              final word =
+                  (data[byteIdx] << 8) |
+                  (byteIdx + 1 < data.length ? data[byteIdx + 1] : 0);
+              final shift = 16 - bpp - bitInByte;
+              levels[p] = (word >> shift) & mask;
+              bitPos += bpp;
+            }
+            final glyph = AribDrcsGlyph.fromLevels(
+              width: width,
+              height: height,
+              maxLevel: mask,
+              levels: levels,
+            );
+            out.remove(key);
+            out[key] = glyph;
+            while (out.length > _maxDrcsGlyphs) {
+              out.remove(out.keys.first);
+            }
+            if (fontId == 0) storedFont0 = true;
+          }
+          off += byteLen;
+        } else {
+          if (off + 4 > data.length) return;
+          final geoLen = (data[off + 2] << 8) | data[off + 3];
+          off += 4 + geoLen;
+          if (off > data.length) return;
+        }
+      }
+    }
+  }
+
   static AribCaptionLayoutEvent? _parseCaptionPesPayload(
     Uint8List payload, {
     required double ptsSeconds,
+    Map<int, AribDrcsGlyph>? drcsGlyphs,
   }) {
     if (payload.length < 10) return null;
     final dataIdentifier = payload[0];
@@ -549,10 +734,55 @@ class AribTsCaptionTap {
     if (off + 6 > payload.length) return null;
 
     final dataGroupId = (payload[off] >> 2) & 0x3F;
-    // Skip caption management groups (0x00 / 0x20) & secondary languages (!= 1).
-    if ((dataGroupId & 0x1F) != 1) return null;
+    final groupType = dataGroupId & 0x1F;
+    // Allow caption management (0) & primary language statement (1).
+    if (groupType != 0 && groupType != 1) return null;
 
     off += 5; // data_group_id+version(1), link(1), last_link(1), size(2)
+    final activeDrcs = drcsGlyphs ?? <int, AribDrcsGlyph>{};
+
+    if (groupType == 0) {
+      if (off + 2 > payload.length) return null;
+      final tmd = (payload[off++] >> 6) & 0x03;
+      if (tmd == 0x02) {
+        off += 5; // OTM(36 bits) + reserved(4 bits)
+      }
+      if (off >= payload.length) return null;
+      final numLanguages = payload[off++];
+      for (var l = 0; l < numLanguages; l++) {
+        if (off >= payload.length) return null;
+        final dmf = payload[off++] & 0x0F;
+        if (dmf == 0x0C || dmf == 0x0D || dmf == 0x0E) {
+          off += 1; // DC
+        }
+        off += 4; // ISO_639_language_code(3B) + Format/TCS/rollup_mode(1B)
+        if (off > payload.length) return null;
+      }
+      if (off + 3 > payload.length) return null;
+      final loopLen =
+          (payload[off] << 16) | (payload[off + 1] << 8) | payload[off + 2];
+      off += 3;
+      final loopEnd = math.min(payload.length, off + loopLen);
+      var u = off;
+      while (u + 5 <= loopEnd) {
+        if (payload[u] != 0x1F) break;
+        final unitParam = payload[u + 1];
+        final unitSize =
+            (payload[u + 2] << 16) | (payload[u + 3] << 8) | payload[u + 4];
+        u += 5;
+        if (u + unitSize > loopEnd) break;
+        if ((unitParam == 0x30 || unitParam == 0x31) && unitSize > 0) {
+          parseAribDrcsDataUnit(
+            Uint8List.sublistView(payload, u, u + unitSize),
+            isTwoByte: unitParam == 0x31,
+            out: activeDrcs,
+          );
+        }
+        u += unitSize;
+      }
+      return null;
+    }
+
     if (off + 4 > payload.length) return null;
     final tmd = (payload[off] >> 6) & 0x03;
     off += 1;
@@ -574,7 +804,13 @@ class AribTsCaptionTap {
           (payload[u + 2] << 16) | (payload[u + 3] << 8) | payload[u + 4];
       u += 5;
       if (u + unitSize > loopEnd) break;
-      if (unitParam == 0x20 && unitSize > 0) {
+      if ((unitParam == 0x30 || unitParam == 0x31) && unitSize > 0) {
+        parseAribDrcsDataUnit(
+          Uint8List.sublistView(payload, u, u + unitSize),
+          isTwoByte: unitParam == 0x31,
+          out: activeDrcs,
+        );
+      } else if (unitParam == 0x20 && unitSize > 0) {
         statementBytes.add(Uint8List.sublistView(payload, u, u + unitSize));
       }
       u += unitSize;
@@ -582,7 +818,11 @@ class AribTsCaptionTap {
 
     final body = statementBytes.takeBytes();
     if (body.isEmpty) return null;
-    return parseAribStatementBody(body, ptsSeconds: ptsSeconds);
+    return parseAribStatementBody(
+      body,
+      ptsSeconds: ptsSeconds,
+      drcsGlyphs: activeDrcs,
+    );
   }
 
   /// Parses an ARIB STD-B24 caption statement body (`data_unit_parameter == 0x20`)
@@ -590,6 +830,7 @@ class AribTsCaptionTap {
   static AribCaptionLayoutEvent? parseAribStatementBody(
     Uint8List body, {
     required double ptsSeconds,
+    Map<int, AribDrcsGlyph>? drcsGlyphs,
   }) {
     // Default Profile A writing plane & character geometry (960x540).
     var planeW = 960.0;
@@ -635,7 +876,11 @@ class AribTsCaptionTap {
     double? clearAfterSeconds;
     final lines = <_MutableLineBucket>[];
 
-    void recordVisibleGlyph(double width, String text) {
+    void recordVisibleGlyph(
+      double width,
+      String text, {
+      AribDrcsGlyph? drcsGlyph,
+    }) {
       if (curX >= dispRight && width > 0) {
         curX = dispLeft;
         curY += charStepY();
@@ -674,7 +919,7 @@ class AribTsCaptionTap {
         if (glyphEndX > target.maxEndX) target.maxEndX = glyphEndX;
         target.charCount += 1;
       }
-      target.appendText(text, curColorArgb, 1.0);
+      target.appendText(text, curColorArgb, 1.0, drcsGlyph: drcsGlyph);
     }
 
     var i = 0;
@@ -743,7 +988,7 @@ class AribTsCaptionTap {
                   if (target == 3) g3IsMacro = false;
                   if (i < body.length && body[i] == 0x20) {
                     i++;
-                    if (i < body.length) i++;
+                    gFinal[target] = i < body.length ? body[i++] : 0x40;
                     gIsMosaic[target] = false;
                     gIsDrcs[target] = true;
                   } else if (i < body.length) {
@@ -752,6 +997,11 @@ class AribTsCaptionTap {
                     gIsDrcs[target] = false;
                     gIsMosaic[target] = fin >= 0x32 && fin <= 0x35;
                   }
+                } else if (e2 == 0x20) {
+                  gBytes[0] = 2;
+                  gFinal[0] = i < body.length ? body[i++] : 0x40;
+                  gIsMosaic[0] = false;
+                  gIsDrcs[0] = true;
                 } else {
                   gBytes[0] = 2;
                   gFinal[0] = e2;
@@ -764,8 +1014,8 @@ class AribTsCaptionTap {
                   if (i < body.length && body[i] == 0x20) {
                     // 1-byte DRCS
                     i++;
-                    if (i < body.length) i++;
                     gBytes[target] = 1;
+                    gFinal[target] = i < body.length ? body[i++] : 0x41;
                     gIsMosaic[target] = false;
                     gIsDrcs[target] = true;
                     if (target == 3) g3IsMacro = false;
@@ -1022,14 +1272,20 @@ class AribTsCaptionTap {
       }
 
       final isSpaceCell =
-          (byteCount == 2 && first == 0x21 && second == 0x21) ||
-          (byteCount == 1 && first == 0x20);
+          !isDrcs &&
+          ((byteCount == 2 && first == 0x21 && second == 0x21) ||
+              (byteCount == 1 && first == 0x20));
       final count = repeatCount;
       repeatCount = 1;
       String? decodedChar;
+      AribDrcsGlyph? drcsGlyph;
       if (!isSpaceCell && !isMosaic) {
         if (isDrcs) {
-          decodedChar = '〓';
+          final key = byteCount == 2
+              ? drcsTwoByteKey((first << 8) | second)
+              : drcsOneByteKey(finalByte, first);
+          drcsGlyph = drcsGlyphs?[key];
+          decodedChar = drcsGlyph != null ? '\uFFFC' : '〓';
         } else if (byteCount == 2) {
           decodedChar = decodeAribB24TwoByteCell(
             (first << 8) | second,
@@ -1047,7 +1303,11 @@ class AribTsCaptionTap {
         if (isSpaceCell || isMosaic) {
           curX += charStepX();
         } else {
-          recordVisibleGlyph(charStepX(), decodedChar ?? '');
+          recordVisibleGlyph(
+            charStepX(),
+            decodedChar ?? '',
+            drcsGlyph: drcsGlyph,
+          );
         }
       }
     }
