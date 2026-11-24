@@ -958,6 +958,31 @@ Future<LiveRecordingConflict?> resolveLiveRecordingConflictOrFailover(
   );
 }
 
+Future<List<LiveBand>?> _fetchLiveBandsForSwitch({
+  required ProviderContainer container,
+  required RegisteredNasne reg,
+  required String targetBandId,
+  required DateTime now,
+  required bool refreshIfStale,
+  required bool forceRefresh,
+}) async {
+  if (forceRefresh) {
+    container.invalidate(liveChannelsProvider(reg));
+  } else if (refreshIfStale) {
+    final cached = container.read(liveChannelsProvider(reg)).value;
+    if (cached != null && _hasStaleLiveBand(cached, targetBandId, now)) {
+      container.invalidate(liveChannelsProvider(reg));
+    }
+  }
+  try {
+    return await container
+        .read(liveChannelsProvider(reg).future)
+        .timeout(const Duration(seconds: 3));
+  } catch (_) {
+    return container.read(liveChannelsProvider(reg)).value;
+  }
+}
+
 Future<
   ({List<LiveChannelSwitchEntry> entries, int currentIndex})
 > _resolveLiveSwitchContext({
@@ -965,19 +990,24 @@ Future<
   required RegisteredNasne currentReg,
   required LiveChannel currentChannel,
   required List<RegisteredNasne> multiNasneRegs,
+  bool refreshIfStale = false,
+  bool forceRefresh = false,
 }) async {
   final showSubchannels = container.read(showSubchannelsProvider);
   final targetKey = liveServiceKey(currentChannel);
+  final now = DateTime.now();
 
   if (multiNasneRegs.length <= 1) {
-    List<LiveBand> rawBands = const [];
-    try {
-      rawBands = await container
-          .read(liveChannelsProvider(currentReg).future)
-          .timeout(const Duration(seconds: 3));
-    } catch (_) {
-      rawBands = container.read(liveChannelsProvider(currentReg)).value ?? const [];
-    }
+    final rawBands =
+        await _fetchLiveBandsForSwitch(
+          container: container,
+          reg: currentReg,
+          targetBandId: currentChannel.bandId,
+          now: now,
+          refreshIfStale: refreshIfStale,
+          forceRefresh: forceRefresh,
+        ) ??
+        const <LiveBand>[];
     final bands = liveBandsWithSubchannelSetting(rawBands, showSubchannels);
     for (final band in bands) {
       final idx = band.channels.indexWhere(
@@ -1002,14 +1032,14 @@ Future<
 
   final loadedSources = <({RegisteredNasne reg, List<LiveBand> bands})>[];
   for (final r in multiNasneRegs) {
-    List<LiveBand>? raw;
-    try {
-      raw = await container
-          .read(liveChannelsProvider(r).future)
-          .timeout(const Duration(seconds: 3));
-    } catch (_) {
-      raw = container.read(liveChannelsProvider(r)).value;
-    }
+    final raw = await _fetchLiveBandsForSwitch(
+      container: container,
+      reg: r,
+      targetBandId: currentChannel.bandId,
+      now: now,
+      refreshIfStale: refreshIfStale,
+      forceRefresh: forceRefresh,
+    );
     if (raw != null) {
       loadedSources.add((
         reg: r,
@@ -1038,6 +1068,93 @@ Future<
     }
   }
   return (entries: const <LiveChannelSwitchEntry>[], currentIndex: -1);
+}
+
+LiveChannel _resolveChannelFromSwitchContext(
+  ({List<LiveChannelSwitchEntry> entries, int currentIndex}) switchCtx, {
+  required RegisteredNasne ownerReg,
+  required LiveChannel fallback,
+}) {
+  if (switchCtx.currentIndex < 0 ||
+      switchCtx.currentIndex >= switchCtx.entries.length) {
+    return fallback;
+  }
+  final entry = switchCtx.entries[switchCtx.currentIndex];
+  final fallbackKey = liveServiceKey(fallback);
+  for (final candidate in entry.candidates) {
+    if (candidate.reg.host == ownerReg.host &&
+        (liveServiceKey(candidate.channel) == fallbackKey ||
+            candidate.channel.id == fallback.id)) {
+      return candidate.channel;
+    }
+  }
+  return entry.channel;
+}
+
+bool _hasStaleLiveBand(
+  List<LiveBand> bands,
+  String targetBandId,
+  DateTime now,
+) {
+  for (final band in bands) {
+    if (band.containerId != targetBandId) continue;
+    for (final ch in band.channels) {
+      final end = ch.programEnd;
+      if (end != null && !end.isAfter(now)) return true;
+    }
+  }
+  return false;
+}
+
+EpgGuide? _cachedEpgGuideForBand(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  int? bandType,
+) {
+  if (bandType == terrestrialBroadcastingType) {
+    return container.read(epgGuideProvider(reg)).value;
+  }
+  if (bandType == bsBroadcastingType) {
+    return container.read(bsEpgGuideProvider(reg)).value;
+  }
+  return null;
+}
+
+Future<EpgGuide?> _loadEpgGuideForBand(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  int? bandType,
+) async {
+  final provider = switch (bandType) {
+    terrestrialBroadcastingType => epgGuideProvider(reg),
+    bsBroadcastingType => bsEpgGuideProvider(reg),
+    _ => null,
+  };
+  if (provider == null) return null;
+  try {
+    return await container
+        .read(provider.future)
+        .timeout(const Duration(seconds: 10));
+  } catch (_) {
+    return null;
+  }
+}
+
+Map<String, List<EpgEvent>> _bandGuideEventsMap(
+  EpgGuide? guide,
+  Iterable<LiveChannel> channels,
+) {
+  if (guide == null) return const {};
+  final result = <String, List<EpgEvent>>{};
+  for (final ch in channels) {
+    final key = liveServiceKey(ch);
+    if (result.containsKey(key)) continue;
+    final events = _serviceEventsFromGuide(guide, ch);
+    if (events.isNotEmpty) {
+      result[key] = events;
+    }
+  }
+  return result;
 }
 
 List<EpgEvent> _serviceEventsFromGuide(EpgGuide? guide, LiveChannel channel) {
@@ -1087,11 +1204,16 @@ Widget _buildLivePlayerScreen({
       channel.mobileRes != null &&
       channel.originalRes != channel.mobileRes;
   final bandType = broadcastingTypeForLiveBandId(channel.bandId);
-  final isBs = bandType == bsBroadcastingType;
-  final cachedGuide = isBs
-      ? container.read(bsEpgGuideProvider(reg)).value
-      : container.read(epgGuideProvider(reg)).value;
+  final cachedGuide = _cachedEpgGuideForBand(container, reg, bandType);
+  final bandChannels = <LiveChannel>[
+    channel,
+    for (final entry in liveSwitchChannels) entry.channel,
+  ];
   final initialLiveGuideEvents = _serviceEventsFromGuide(cachedGuide, channel);
+  final initialLiveBandGuideEvents = _bandGuideEventsMap(
+    cachedGuide,
+    bandChannels,
+  );
   return PlayerScreen(
     title: channel.channelName ?? channel.programTitle,
     session: session,
@@ -1099,16 +1221,23 @@ Widget _buildLivePlayerScreen({
     liveUseMobile: useMobile,
     initialLiveGuideEvents: initialLiveGuideEvents,
     loadLiveGuideEvents: () async {
-      try {
-        final guide = await container
-            .read(
-              (isBs ? bsEpgGuideProvider(reg) : epgGuideProvider(reg)).future,
-            )
-            .timeout(const Duration(seconds: 10));
-        return _serviceEventsFromGuide(guide, channel);
-      } catch (_) {
-        return const [];
-      }
+      final guide = await _loadEpgGuideForBand(container, reg, bandType);
+      return _serviceEventsFromGuide(guide, channel);
+    },
+    initialLiveBandGuideEvents: initialLiveBandGuideEvents,
+    loadLiveBandGuideEvents: () async {
+      final guide = await _loadEpgGuideForBand(container, reg, bandType);
+      return _bandGuideEventsMap(guide, bandChannels);
+    },
+    onRefreshLiveChannels: () async {
+      final refreshed = await _resolveLiveSwitchContext(
+        container: container,
+        currentReg: reg,
+        currentChannel: channel,
+        multiNasneRegs: multiNasneRegs,
+        forceRefresh: true,
+      );
+      return refreshed.entries;
     },
     canSwitchQuality: canSwitchQuality,
     currentUseMobile: useMobile,
@@ -1160,11 +1289,17 @@ Widget _buildLivePlayerScreen({
               currentReg: reg,
               currentChannel: channel,
               multiNasneRegs: multiNasneRegs,
+              refreshIfStale: true,
+            );
+            final effectiveChannel = _resolveChannelFromSwitchContext(
+              switchCtx,
+              ownerReg: reg,
+              fallback: channel,
             );
             return _buildLivePlayerScreen(
               container: container,
               reg: reg,
-              channel: channel,
+              channel: effectiveChannel,
               session: nextSession,
               useMobile: actualUseMobile,
               initialSchedules: freshSchedules,
@@ -1221,17 +1356,23 @@ Widget _buildLivePlayerScreen({
               currentReg: targetReg,
               currentChannel: targetChannel,
               multiNasneRegs: multiNasneRegs,
+              refreshIfStale: true,
+            );
+            final effectiveChannel = _resolveChannelFromSwitchContext(
+              switchCtx,
+              ownerReg: targetReg,
+              fallback: targetChannel,
             );
             final targetSession = await _startLiveSession(
               services.playback,
-              targetChannel,
+              effectiveChannel,
               useMobile: useMobile,
               allowQualityFallback: true,
             );
             return _buildLivePlayerScreen(
               container: container,
               reg: targetReg,
-              channel: targetChannel,
+              channel: effectiveChannel,
               session: targetSession,
               useMobile: useMobile,
               initialSchedules: targetSchedules,
@@ -1250,17 +1391,23 @@ Widget _buildLivePlayerScreen({
         currentReg: reg,
         currentChannel: target,
         multiNasneRegs: multiNasneRegs,
+        refreshIfStale: true,
+      );
+      final effectiveTarget = _resolveChannelFromSwitchContext(
+        switchCtx,
+        ownerReg: reg,
+        fallback: target,
       );
       final targetSession = await _startLiveSession(
         services.playback,
-        target,
+        effectiveTarget,
         useMobile: useMobile,
         allowQualityFallback: true,
       );
       return _buildLivePlayerScreen(
         container: container,
         reg: reg,
-        channel: target,
+        channel: effectiveTarget,
         session: targetSession,
         useMobile: useMobile,
         initialSchedules: targetSchedules,
@@ -1386,11 +1533,17 @@ Future<Widget?> _switchLivePlayerToChannel({
     currentReg: chosenReg,
     currentChannel: chosenChannel,
     multiNasneRegs: multiNasneRegs,
+    refreshIfStale: true,
+  );
+  final effectiveChannel = _resolveChannelFromSwitchContext(
+    switchCtx,
+    ownerReg: chosenReg,
+    fallback: chosenChannel,
   );
   return _buildLivePlayerScreen(
     container: container,
     reg: chosenReg,
-    channel: chosenChannel,
+    channel: effectiveChannel,
     session: targetSession,
     useMobile: useMobile,
     initialSchedules: chosenSchedules,
@@ -1409,17 +1562,20 @@ Future<LiveRecordingActionResult> _startCurrentLiveRecording({
 }) async {
   final now = DateTime.now();
   final bandType = broadcastingTypeForLiveBandId(channel.bandId);
-  final isBs = bandType == bsBroadcastingType;
 
   Future<Channel?> resolveMatchingChannel(RegisteredNasne owner) async {
-    var list = isBs
-        ? (container.read(bsChannelsProvider(owner)).value ?? const <Channel>[])
-        : (container.read(channelsProvider(owner)).value ?? const <Channel>[]);
+    final provider = switch (bandType) {
+      terrestrialBroadcastingType => channelsProvider(owner),
+      bsBroadcastingType => bsChannelsProvider(owner),
+      _ => null,
+    };
+    if (provider == null) return null;
+    var list = container.read(provider).value ?? const <Channel>[];
     if (list.isEmpty && channel.networkId == null) {
       try {
-        list = await container.read(
-          (isBs ? bsChannelsProvider(owner) : channelsProvider(owner)).future,
-        );
+        list = await container
+            .read(provider.future)
+            .timeout(const Duration(seconds: 3));
       } catch (_) {}
     }
     for (final c in list) {
@@ -1432,26 +1588,36 @@ Future<LiveRecordingActionResult> _startCurrentLiveRecording({
   }
 
   final matchingChannel = await resolveMatchingChannel(reg);
-  final guide = isBs
-      ? container.read(bsEpgGuideProvider(reg)).value
-      : container.read(epgGuideProvider(reg)).value;
+  final guide = _cachedEpgGuideForBand(container, reg, bandType);
   EpgEvent? matchingEvent;
-  if (guide != null && channel.serviceId != null) {
-    for (final svc in guide.services) {
-      if (svc.channel.serviceId != channel.serviceId) continue;
-      for (final ev in svc.events) {
-        if (!now.isBefore(ev.start) && ev.end.isAfter(now)) {
-          matchingEvent = ev;
-          break;
+  if (guide != null) {
+    final svcEvents = _serviceEventsFromGuide(guide, channel);
+    matchingEvent = findActiveEpgEvent(sortEpgEventsByStart(svcEvents), now);
+  }
+
+  var effectiveChannel = channel;
+  if (matchingEvent == null &&
+      (channel.programEnd == null || !channel.programEnd!.isAfter(now))) {
+    try {
+      container.invalidate(liveChannelsProvider(reg));
+      final bands = await container
+          .read(liveChannelsProvider(reg).future)
+          .timeout(const Duration(seconds: 3));
+      final targetKey = liveServiceKey(channel);
+      for (final b in bands) {
+        for (final ch in b.channels) {
+          if (liveServiceKey(ch) == targetKey || ch.id == channel.id) {
+            effectiveChannel = ch;
+            break;
+          }
         }
       }
-      if (matchingEvent != null) break;
-    }
+    } catch (_) {}
   }
 
   final quality = container.read(defaultRecordingQualityProvider);
   final candidate = buildImmediateLiveRecordingSchedule(
-    channel: channel,
+    channel: effectiveChannel,
     now: now,
     desiredQualityMode: quality,
     matchingEpgEvent: matchingEvent,
@@ -1723,6 +1889,12 @@ Future<void> _launchLiveChannel({
     currentReg: chosenReg,
     currentChannel: chosenChannel,
     multiNasneRegs: multiNasneRegs,
+    refreshIfStale: true,
+  );
+  final effectiveChannel = _resolveChannelFromSwitchContext(
+    switchCtx,
+    ownerReg: chosenReg,
+    fallback: chosenChannel,
   );
   if (!context.mounted) return;
   await startPlaybackAndShowPlayer(
@@ -1730,14 +1902,14 @@ Future<void> _launchLiveChannel({
     ref: ref,
     start: () => _startLiveSession(
       engine,
-      chosenChannel,
+      effectiveChannel,
       useMobile: useMobile,
       allowQualityFallback: allowQualityFallback || sameChannelRecording,
     ),
     buildPlayer: (session) => _buildLivePlayerScreen(
       container: container,
       reg: chosenReg,
-      channel: chosenChannel,
+      channel: effectiveChannel,
       session: session,
       useMobile: useMobile,
       initialSchedules: chosenSchedules,

@@ -9450,6 +9450,395 @@ void main() {
       },
     );
   });
+
+  group(
+    'Phase 35: Live TV programme freshness, channel switch EPG sync, and on-demand OSD detail',
+    () {
+      DateTime jst(int h, int m) => DateTime.utc(2026, 11, 25, h, m).subtract(
+        const Duration(hours: 9),
+      );
+
+      const reg = RegisteredNasne(
+        host: '192.0.2.35',
+        udn: 'uuid:p35',
+        friendlyName: 'nasne-p35',
+        macAddr: '00:11:22:33:44:55',
+      );
+
+      test(
+        'resolveLiveSwitchEntryProgram resolves active EPG programme across boundaries and flags stale snapshots when EPG misses',
+        () {
+          final entry = LiveChannelSwitchEntry(
+            channel: LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+              bandId: '0/video/LiveTuner/DTTB',
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0400,
+              channelName: '日テレ１',
+              programTitle: '初期番組',
+              programStart: jst(19, 0),
+              programEnd: jst(20, 0),
+            ),
+            primaryReg: reg,
+          );
+          final events = [
+            EpgEvent(
+              eventId: 10,
+              start: jst(19, 0),
+              duration: const Duration(minutes: 60),
+              title: '初期番組',
+            ),
+            EpgEvent(
+              eventId: 11,
+              start: jst(20, 0),
+              duration: const Duration(minutes: 54),
+              title: '次の特番',
+            ),
+            EpgEvent(
+              eventId: 12,
+              start: jst(20, 54),
+              duration: const Duration(minutes: 6),
+              title: 'ミニ天気',
+            ),
+          ];
+
+          final at1930 = resolveLiveSwitchEntryProgram(
+            entry: entry,
+            guideEvents: events,
+            now: jst(19, 30),
+          );
+          expect(at1930.programTitle, '初期番組');
+          expect(at1930.broadcastTimeRange, '19:00–20:00');
+          expect(at1930.isStale, isFalse);
+
+          final at2015 = resolveLiveSwitchEntryProgram(
+            entry: entry,
+            guideEvents: events,
+            now: jst(20, 15),
+          );
+          expect(at2015.programTitle, '次の特番');
+          expect(at2015.broadcastTimeRange, '20:00–20:54');
+          expect(at2015.isStale, isFalse);
+
+          final at2055 = resolveLiveSwitchEntryProgram(
+            entry: entry,
+            guideEvents: events,
+            now: jst(20, 55),
+          );
+          expect(at2055.programTitle, 'ミニ天気');
+          expect(at2055.broadcastTimeRange, '20:54–21:00');
+          expect(at2055.isStale, isFalse);
+
+          final csFresh = resolveLiveSwitchEntryProgram(
+            entry: entry,
+            guideEvents: const [],
+            now: jst(19, 59),
+          );
+          expect(csFresh.programTitle, '初期番組');
+          expect(csFresh.broadcastTimeRange, '19:00–20:00');
+          expect(csFresh.isStale, isFalse);
+
+          final csExpired = resolveLiveSwitchEntryProgram(
+            entry: entry,
+            guideEvents: const [],
+            now: jst(20, 0),
+          );
+          expect(csExpired.programTitle, '初期番組');
+          expect(csExpired.isStale, isTrue);
+
+          final noEndEntry = LiveChannelSwitchEntry(
+            channel: const LiveChannel(
+              id: '0/video/LiveTuner/CS/ch?nid=0006&tsid=0001&svid=0100',
+              bandId: '0/video/LiveTuner/CS',
+              channelName: 'CS チャンネル',
+              programTitle: '終了時刻不明',
+            ),
+            primaryReg: reg,
+          );
+          final csNoEnd = resolveLiveSwitchEntryProgram(
+            entry: noEndEntry,
+            guideEvents: const [],
+            now: jst(19, 30),
+          );
+          expect(csNoEnd.isStale, isTrue);
+        },
+      );
+
+      testWidgets(
+        'LiveChannelSwitchPreviewCard prefers resolvedProgram when supplied and preserves entry defaults when omitted',
+        (tester) async {
+          final entry = LiveChannelSwitchEntry(
+            channel: LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+              bandId: '0/video/LiveTuner/DTTB',
+              channelName: 'ＮＨＫ総合',
+              programTitle: '古いスナップショット番組',
+              programStart: jst(19, 0),
+              programEnd: jst(19, 30),
+            ),
+            primaryReg: reg,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 960,
+                  height: 540,
+                  child: Stack(
+                    children: [
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.previous,
+                        visible: true,
+                        entry: entry,
+                        onTap: () {},
+                      ),
+                      LiveChannelSwitchPreviewCard(
+                        direction: ChannelSwitchDirection.next,
+                        visible: true,
+                        entry: entry,
+                        resolvedProgram: const ResolvedLiveSwitchProgram(
+                          programTitle: '更新後の現在番組',
+                          broadcastTimeRange: '20:00–21:00',
+                          isStale: false,
+                        ),
+                        onTap: () {},
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('古いスナップショット番組'), findsOneWidget);
+          expect(find.text('19:00–19:30'), findsOneWidget);
+          expect(find.text('更新後の現在番組'), findsOneWidget);
+          expect(find.text('20:00–21:00'), findsOneWidget);
+        },
+      );
+
+      test(
+        'formatEpgEventDetailBody, resolveLiveProgramDetail, and resolveLiveOsdProgramInfo update across boundaries without leaking stale descriptions',
+        () {
+          final initialChannel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            channelName: 'ＮＨＫＥテレ',
+            genre: '情報／ワイドショー',
+            programTitle: '前番組',
+            description: '前番組の古い概要です。',
+            longDescription: '前番組の古い長文詳細です。',
+            programStart: jst(19, 0),
+            programEnd: jst(20, 0),
+          );
+
+          final evFull = EpgEvent(
+            eventId: 202,
+            start: jst(20, 0),
+            duration: const Duration(minutes: 60),
+            title: '新番組ドラマ',
+            shortText: '第5話あらすじ',
+            description: '第5話あらすじの詳細内容です。',
+            cast: '山田太郎、鈴木花子',
+            extendedItems: const [
+              EpgExtendedItem(label: '制作', value: '東京テレビジョン'),
+              EpgExtendedItem(label: '', value: '解説放送あり'),
+            ],
+            extendedText: '次回は来週水曜夜8時。',
+            genreLevel1: 3,
+          );
+          final evNoDesc = EpgEvent(
+            eventId: 203,
+            start: jst(21, 0),
+            duration: const Duration(minutes: 15),
+            title: '定時ニュース',
+            genreLevel1: 0,
+          );
+
+          // Deduplicates shortText when description starts with it.
+          final bodyText = formatEpgEventDetailBody(evFull);
+          expect(bodyText, isNotNull);
+          expect(bodyText, contains('【番組内容】\n第5話あらすじの詳細内容です。'));
+          expect(
+            '【番組内容】'.allMatches(bodyText!).length,
+            1,
+          );
+          expect(
+            RegExp('^第5話あらすじ\$', multiLine: true).hasMatch(bodyText),
+            isFalse,
+          );
+          expect(bodyText, contains('【出演者】\n山田太郎、鈴木花子'));
+          expect(bodyText, contains('【制作】\n東京テレビジョン'));
+          expect(bodyText, contains('解説放送あり'));
+          expect(bodyText, contains('次回は来週水曜夜8時。'));
+
+          final infoAt2010 = resolveLiveOsdProgramInfo(
+            channel: initialChannel,
+            guideEvents: [evFull, evNoDesc],
+            now: jst(20, 10),
+          );
+          expect(infoAt2010.currentEvent?.eventId, 202);
+          expect(infoAt2010.currentTitle, '新番組ドラマ');
+
+          final detailAt2010 = resolveLiveProgramDetail(
+            channel: initialChannel,
+            guideEvents: [evFull, evNoDesc],
+            now: jst(20, 10),
+            fallbackTitle: '前番組',
+            fallbackMeta: 'ＮＨＫＥテレ ・ 古いメタ',
+            fallbackBody: '前番組の古い概要です。\n\n前番組の古い長文詳細です。',
+          );
+          expect(detailAt2010.title, '新番組ドラマ');
+          expect(
+            detailAt2010.meta,
+            'ＮＨＫＥテレ ・ ${formatDateTimeWithWeekdayJst(evFull.start)}–21:00 ・ ドラマ',
+          );
+          expect(detailAt2010.hasBody, isTrue);
+          expect(detailAt2010.body, contains('山田太郎'));
+          expect(detailAt2010.body, isNot(contains('前番組')));
+          expect(detailAt2010.programEnd, jst(21, 0));
+
+          // New EPG event with no description must NOT leak previous fallbackBody.
+          final detailAt2105 = resolveLiveProgramDetail(
+            channel: initialChannel,
+            guideEvents: [evFull, evNoDesc],
+            now: jst(21, 5),
+            fallbackTitle: '前番組',
+            fallbackMeta: '古いメタ',
+            fallbackBody: '前番組の古い概要です。',
+          );
+          expect(detailAt2105.title, '定時ニュース');
+          expect(
+            detailAt2105.meta,
+            'ＮＨＫＥテレ ・ ${formatDateTimeWithWeekdayJst(evNoDesc.start)}–21:15 ・ ニュース・報道',
+          );
+          expect(detailAt2105.hasBody, isFalse);
+          expect(detailAt2105.body, isNull);
+
+          // Unmatched EPG (e.g. CS) sets currentEvent null and clears expired programEnd.
+          final csExpiredDetail = resolveLiveProgramDetail(
+            channel: initialChannel,
+            guideEvents: const [],
+            now: jst(20, 10),
+          );
+          final infoMiss = resolveLiveOsdProgramInfo(
+            channel: initialChannel,
+            guideEvents: const [],
+            now: jst(20, 10),
+          );
+          expect(infoMiss.currentEvent, isNull);
+          expect(csExpiredDetail.programEnd, isNull);
+          expect(csExpiredDetail.title, '前番組');
+
+          final refreshedCsChannel = LiveChannel(
+            id: initialChannel.id,
+            bandId: '0/video/LiveTuner/CS',
+            channelName: 'CS 映画ch',
+            genre: '映画',
+            programTitle: '更新後のCS映画',
+            description: 'CS更新概要',
+            longDescription: 'CS更新詳細本文',
+            programStart: jst(20, 0),
+            programEnd: jst(22, 0),
+          );
+          final csFreshDetail = resolveLiveProgramDetail(
+            channel: refreshedCsChannel,
+            guideEvents: const [],
+            now: jst(20, 10),
+          );
+          expect(csFreshDetail.title, '更新後のCS映画');
+          expect(csFreshDetail.body, 'CS更新概要\n\nCS更新詳細本文');
+          expect(csFreshDetail.programEnd, jst(22, 0));
+        },
+      );
+
+      test(
+        'shouldCloseLiveDetailOnBoundary stays false within event and returns true at end or event change',
+        () {
+          final channel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            channelName: 'ＮＨＫＥテレ',
+            programTitle: '番組A',
+            programStart: jst(19, 0),
+            programEnd: jst(20, 0),
+          );
+          final evA = EpgEvent(
+            eventId: 301,
+            start: jst(19, 0),
+            duration: const Duration(minutes: 60),
+            title: '番組A',
+          );
+          final evB = EpgEvent(
+            eventId: 302,
+            start: jst(20, 0),
+            duration: const Duration(minutes: 30),
+            title: '番組B',
+          );
+          final evAltSameTime = EpgEvent(
+            eventId: 399,
+            start: jst(19, 0),
+            duration: const Duration(minutes: 60),
+            title: '差し替え特番',
+          );
+
+          final opened = resolveLiveProgramDetail(
+            channel: channel,
+            guideEvents: [evA, evB],
+            now: jst(19, 30),
+          );
+
+          expect(
+            shouldCloseLiveDetailOnBoundary(
+              now: jst(19, 59),
+              openedProgramEnd: opened.programEnd,
+              openedIdentityKey: opened.identityKey,
+              currentInfo: resolveLiveOsdProgramInfo(
+                channel: channel,
+                guideEvents: [evA, evB],
+                now: jst(19, 59),
+              ),
+            ),
+            isFalse,
+          );
+
+          expect(
+            shouldCloseLiveDetailOnBoundary(
+              now: jst(20, 0),
+              openedProgramEnd: opened.programEnd,
+              openedIdentityKey: opened.identityKey,
+              currentInfo: resolveLiveOsdProgramInfo(
+                channel: channel,
+                guideEvents: [evA, evB],
+                now: jst(20, 0),
+              ),
+            ),
+            isTrue,
+          );
+
+          expect(
+            shouldCloseLiveDetailOnBoundary(
+              now: jst(19, 45),
+              openedProgramEnd: opened.programEnd,
+              openedIdentityKey: opened.identityKey,
+              currentInfo: resolveLiveOsdProgramInfo(
+                channel: channel,
+                guideEvents: [evAltSameTime],
+                now: jst(19, 45),
+              ),
+            ),
+            isTrue,
+          );
+        },
+      );
+    },
+  );
 }
 
 class _DeletableScheduleService implements ScheduleService {

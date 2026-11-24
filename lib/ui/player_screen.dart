@@ -186,6 +186,7 @@ import '../app/mpv_compat.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
+import 'epg_genre.dart';
 import 'format.dart';
 import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
@@ -461,12 +462,14 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     required this.direction,
     required this.visible,
     required this.entry,
+    this.resolvedProgram,
     required this.onTap,
   });
 
   final ChannelSwitchDirection direction;
   final bool visible;
   final LiveChannelSwitchEntry? entry;
+  final ResolvedLiveSwitchProgram? resolvedProgram;
   final VoidCallback? onTap;
 
   @override
@@ -497,7 +500,10 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
       isNext ? 'live_channel_preview_next' : 'live_channel_preview_previous',
     );
     final data = entry;
-    final timeRange = data?.broadcastTimeRange;
+    final timeRange = resolvedProgram != null
+        ? resolvedProgram!.broadcastTimeRange
+        : data?.broadcastTimeRange;
+    final programTitle = resolvedProgram?.programTitle ?? data?.programTitle;
     return Positioned.fill(
       child: IgnorePointer(
         ignoring: !visible,
@@ -579,7 +585,7 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                data.programTitle,
+                                programTitle ?? data.programTitle,
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
@@ -759,6 +765,7 @@ class LiveOsdProgramInfo {
     this.nextTitle,
     this.nextStart,
     this.nextEnd,
+    this.currentEvent,
   });
 
   final String currentTitle;
@@ -769,6 +776,7 @@ class LiveOsdProgramInfo {
   final String? nextTitle;
   final DateTime? nextStart;
   final DateTime? nextEnd;
+  final EpgEvent? currentEvent;
 
   String? get currentTimeRange => (currentStart != null && currentEnd != null)
       ? '${formatTimeJst(currentStart!)}–${formatTimeJst(currentEnd!)}'
@@ -786,19 +794,8 @@ LiveOsdProgramInfo resolveLiveOsdProgramInfo({
   required List<EpgEvent> guideEvents,
   required DateTime now,
 }) {
-  final sorted = [
-    for (final ev in guideEvents) ev,
-  ]..sort((a, b) => a.start.compareTo(b.start));
-
-  EpgEvent? currentEv;
-  for (final ev in sorted) {
-    if (!now.isBefore(ev.start) && ev.end.isAfter(now)) {
-      if ((ev.title ?? '').trim().isNotEmpty || currentEv == null) {
-        currentEv = ev;
-        if ((ev.title ?? '').trim().isNotEmpty) break;
-      }
-    }
-  }
+  final sorted = sortEpgEventsByStart(guideEvents);
+  final currentEv = findActiveEpgEvent(sorted, now);
 
   final fallbackTitle = channel.programTitle.trim().isNotEmpty
       ? channel.programTitle.trim()
@@ -860,7 +857,175 @@ LiveOsdProgramInfo resolveLiveOsdProgramInfo({
     nextTitle: nextEv?.title?.trim(),
     nextStart: nextEv?.start,
     nextEnd: nextEv?.end,
+    currentEvent: currentEv,
   );
+}
+
+/// On-demand resolved content for the in-player OSD programme detail overlay.
+class ResolvedProgramDetail {
+  const ResolvedProgramDetail({
+    required this.title,
+    this.meta,
+    this.body,
+    this.programEnd,
+    this.identityKey,
+  });
+
+  final String title;
+  final String? meta;
+  final String? body;
+  final DateTime? programEnd;
+  final String? identityKey;
+
+  bool get hasBody => body != null && body!.trim().isNotEmpty;
+}
+
+/// Formats full programme detail text from an [EpgEvent] for the OSD viewer.
+String? formatEpgEventDetailBody(EpgEvent event) {
+  final sections = <String>[];
+  final short = event.shortText?.trim() ?? '';
+  final desc = event.description?.trim() ?? '';
+  if (short.isNotEmpty &&
+      (desc.isEmpty || (desc != short && !desc.startsWith(short)))) {
+    sections.add(short);
+  }
+  if (desc.isNotEmpty) {
+    sections.add('【番組内容】\n$desc');
+  }
+  final cast = event.cast?.trim() ?? '';
+  if (cast.isNotEmpty) {
+    sections.add('【出演者】\n$cast');
+  }
+  for (final item in event.extendedItems) {
+    final val = item.value.trim();
+    if (val.isEmpty) continue;
+    final label = item.label.trim();
+    sections.add(label.isNotEmpty ? '【$label】\n$val' : val);
+  }
+  final ext = event.extendedText?.trim() ?? '';
+  if (ext.isNotEmpty) {
+    sections.add(ext);
+  }
+  return sections.isEmpty ? null : sections.join('\n\n');
+}
+
+/// Formats single-line detail metadata (channel, broadcast range, genre) for
+/// a [LiveChannel] snapshot.
+String? formatLiveChannelDetailMeta(LiveChannel channel) {
+  final parts = <String>[];
+  final channelName = channel.channelName?.trim() ?? '';
+  if (channelName.isNotEmpty) parts.add(channelName);
+  final start = channel.programStart;
+  final end = channel.programEnd;
+  if (start != null && end != null) {
+    parts.add('${formatDateTimeWithWeekdayJst(start)}–${formatTimeJst(end)}');
+  }
+  final genre = channel.genre?.trim() ?? '';
+  if (genre.isNotEmpty) parts.add(genre);
+  return parts.isEmpty ? null : parts.join(' ・ ');
+}
+
+/// Resolves programme detail metadata and body for a live broadcast at [now] on
+/// demand, using the active EPG event when available and never leaking an
+/// earlier programme's [fallbackBody] into a new event that lacks descriptions.
+ResolvedProgramDetail resolveLiveProgramDetail({
+  required LiveChannel channel,
+  required List<EpgEvent> guideEvents,
+  required DateTime now,
+  String? fallbackTitle,
+  String? fallbackMeta,
+  String? fallbackBody,
+}) {
+  final info = resolveLiveOsdProgramInfo(
+    channel: channel,
+    guideEvents: guideEvents,
+    now: now,
+  );
+  final currentEv = info.currentEvent;
+  if (currentEv != null) {
+    final evTitle = (currentEv.title ?? '').trim();
+    final title = evTitle.isNotEmpty
+        ? evTitle
+        : (info.currentTitle.isNotEmpty
+            ? info.currentTitle
+            : (fallbackTitle ?? ''));
+    final sameAsChannel =
+        channel.programStart != null &&
+        channel.programEnd != null &&
+        channel.programStart!.isAtSameMomentAs(currentEv.start) &&
+        channel.programEnd!.isAtSameMomentAs(currentEv.end);
+    final channelName = channel.channelName?.trim() ?? '';
+    final genre =
+        epgGenreLabel(currentEv.genreLevel1) ??
+        (sameAsChannel ? channel.genre?.trim() : null) ??
+        '';
+    final metaParts = <String>[
+      if (channelName.isNotEmpty) channelName,
+      '${formatDateTimeWithWeekdayJst(currentEv.start)}–'
+          '${formatTimeJst(currentEv.end)}',
+      if (genre.isNotEmpty) genre,
+    ];
+    final epgBody = formatEpgEventDetailBody(currentEv);
+    final channelBody = formatProgramDetailBody(
+      description: channel.description,
+      longDescription: channel.longDescription,
+    );
+    final body =
+        epgBody ?? (sameAsChannel ? (channelBody ?? fallbackBody) : null);
+    return ResolvedProgramDetail(
+      title: title,
+      meta: metaParts.isEmpty ? null : metaParts.join(' ・ '),
+      body: body,
+      programEnd: currentEv.end,
+      identityKey:
+          'epg:${currentEv.eventId}:${currentEv.start.millisecondsSinceEpoch}',
+    );
+  }
+
+  final channelBody = formatProgramDetailBody(
+    description: channel.description,
+    longDescription: channel.longDescription,
+  );
+  final channelMeta = formatLiveChannelDetailMeta(channel);
+  final chTitle = channel.programTitle.trim();
+  final chName = channel.channelName?.trim() ?? '';
+  final resolvedTitle = chTitle.isNotEmpty
+      ? chTitle
+      : ((fallbackTitle?.trim().isNotEmpty ?? false)
+          ? fallbackTitle!.trim()
+          : chName);
+  final chEnd = channel.programEnd;
+  return ResolvedProgramDetail(
+    title: resolvedTitle,
+    meta: channelMeta ?? fallbackMeta,
+    body: channelBody ?? fallbackBody,
+    programEnd: (chEnd != null && chEnd.isAfter(now)) ? chEnd : null,
+    identityKey:
+        'ch:${channel.programStart?.millisecondsSinceEpoch ?? 0}:'
+        '${channel.programEnd?.millisecondsSinceEpoch ?? 0}:'
+        '${channel.programTitle}',
+  );
+}
+
+/// Returns whether an open live programme detail panel has crossed a programme
+/// boundary and should auto-close so reopening loads the new programme.
+bool shouldCloseLiveDetailOnBoundary({
+  required DateTime now,
+  DateTime? openedProgramEnd,
+  String? openedIdentityKey,
+  required LiveOsdProgramInfo currentInfo,
+}) {
+  if (openedProgramEnd != null && !now.isBefore(openedProgramEnd)) {
+    return true;
+  }
+  if (openedIdentityKey != null &&
+      openedIdentityKey.startsWith('epg:') &&
+      currentInfo.currentEvent != null) {
+    final ev = currentInfo.currentEvent!;
+    final curKey = 'epg:${ev.eventId}:${ev.start.millisecondsSinceEpoch}';
+    if (curKey != openedIdentityKey) return true;
+  }
+  return false;
 }
 
 /// Minimum interval between OSD buffer-badge text refreshes while the OSD is open.
@@ -1633,6 +1798,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.liveUseMobile = false,
     this.initialLiveGuideEvents = const [],
     this.loadLiveGuideEvents,
+    this.initialLiveBandGuideEvents = const {},
+    this.loadLiveBandGuideEvents,
+    this.onRefreshLiveChannels,
     this.liveSwitchChannels = const [],
     this.currentLiveSwitchIndex = -1,
     this.onSwitchLiveChannel,
@@ -1735,6 +1903,16 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Background EPG loader for the active live channel when not cached yet.
   final Future<List<EpgEvent>> Function()? loadLiveGuideEvents;
+
+  /// Pre-loaded EPG events keyed by [liveServiceKey] across the active live band.
+  final Map<String, List<EpgEvent>> initialLiveBandGuideEvents;
+
+  /// Background EPG loader across the active live band when not cached yet.
+  final Future<Map<String, List<EpgEvent>>> Function()? loadLiveBandGuideEvents;
+
+  /// Refreshes the active band's [LiveChannelSwitchEntry] snapshots when EPG is
+  /// unavailable (such as CS) or existing programme snapshots have expired.
+  final Future<List<LiveChannelSwitchEntry>> Function()? onRefreshLiveChannels;
 
   /// Ordered live channel entries within the current band for D-pad switching.
   final List<LiveChannelSwitchEntry> liveSwitchChannels;
@@ -1936,6 +2114,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   DateTime? _lastAribDecoderResetAt;
   bool _resettingAribDecoder = false;
   List<EpgEvent> _liveGuideEvents = const [];
+  Map<String, List<EpgEvent>> _liveBandGuideEvents = const {};
+  LiveChannel? _currentLiveChannel;
+  List<LiveChannelSwitchEntry> _liveSwitchChannels = const [];
+  int _currentLiveSwitchIndex = -1;
+  bool _liveGuideLoading = false;
+  DateTime? _lastLiveGuideAttemptAt;
+  bool _liveChannelsRefreshing = false;
+  DateTime? _lastLiveChannelsRefreshAt;
+  ResolvedProgramDetail? _openedLiveDetail;
+  bool _liveDetailLoading = false;
+  int _liveDetailRequestSeq = 0;
   Timer? _osdClockTimer;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
@@ -2250,7 +2439,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _hwdecMode = ref.read(videoHwdecModeProvider);
     _subtitlesOn = ref.read(subtitlesEnabledProvider);
+    _currentLiveChannel = widget.currentLiveChannel;
+    _liveSwitchChannels = List<LiveChannelSwitchEntry>.of(
+      widget.liveSwitchChannels,
+    );
+    _currentLiveSwitchIndex = widget.currentLiveSwitchIndex;
+    _liveBandGuideEvents = {
+      for (final entry in widget.initialLiveBandGuideEvents.entries)
+        entry.key: List<EpgEvent>.of(entry.value),
+    };
     _liveGuideEvents = List<EpgEvent>.of(widget.initialLiveGuideEvents);
+    if (_liveGuideEvents.isEmpty && _currentLiveChannel != null) {
+      final seeded = _liveBandGuideEvents[liveServiceKey(_currentLiveChannel!)];
+      if (seeded != null && seeded.isNotEmpty) {
+        _liveGuideEvents = List<EpgEvent>.of(seeded);
+      }
+    }
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -2576,9 +2780,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _open();
     _loadChapters();
     if (widget.live &&
-        _liveGuideEvents.isEmpty &&
-        widget.loadLiveGuideEvents != null) {
-      unawaited(_loadLiveGuideEvents());
+        ((_liveBandGuideEvents.isEmpty && widget.loadLiveBandGuideEvents != null) ||
+            (_liveGuideEvents.isEmpty && widget.loadLiveGuideEvents != null))) {
+      unawaited(_loadLiveGuideEvents(force: true));
     }
     _recordingSchedules = List<RecordSchedule>.of(
       widget.initialRecordingSchedules,
@@ -2587,7 +2791,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         widget.initialCornerNotice!.isNotEmpty) {
       _showCustomCornerNotice(widget.initialCornerNotice!);
     }
-    if (widget.live && widget.currentLiveChannel != null) {
+    if (widget.live && _activeLiveChannel != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _updateSameChannelRecordingStatus();
       });
@@ -2784,8 +2988,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     });
   }
 
+  LiveChannel? get _activeLiveChannel =>
+      _currentLiveChannel ?? widget.currentLiveChannel;
+
+  List<EpgEvent> _guideEventsForChannel(LiveChannel channel) {
+    final key = liveServiceKey(channel);
+    final bandEvents = _liveBandGuideEvents[key];
+    if (bandEvents != null && bandEvents.isNotEmpty) return bandEvents;
+    final active = _activeLiveChannel;
+    if (active != null && liveServiceKey(active) == key) {
+      return _liveGuideEvents;
+    }
+    return const [];
+  }
+
   void _updateSameChannelRecordingStatus() {
-    final channel = widget.currentLiveChannel;
+    final channel = _activeLiveChannel;
     if (!mounted || !widget.live || channel == null) return;
     final effectiveSchedules = schedulesExcludingIds(
       _recordingSchedules,
@@ -2840,7 +3058,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     _osdTimer?.cancel();
     final quality = ref.read(defaultRecordingQualityProvider);
-    final titleText = widget.programDetailTitle ?? widget.title;
+    final activeChannel = _activeLiveChannel;
+    final resolvedTitle = activeChannel != null
+        ? resolveLiveOsdProgramInfo(
+            channel: activeChannel,
+            guideEvents: _guideEventsForChannel(activeChannel),
+            now: _now(),
+          ).currentTitle
+        : '';
+    final titleText = resolvedTitle.isNotEmpty
+        ? resolvedTitle
+        : (widget.programDetailTitle ?? widget.title);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -3038,6 +3266,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _osdOpen = false;
       _osdFadeController.value = 0.0;
       _detailOpen = false;
+      _openedLiveDetail = null;
+      _liveDetailLoading = false;
+      _liveDetailRequestSeq++;
       _hudText = null;
       _cornerRecordingNotice = null;
       _customCornerNoticeText = null;
@@ -3828,15 +4059,103 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
-  Future<void> _loadLiveGuideEvents() async {
-    final loader = widget.loadLiveGuideEvents;
-    if (loader == null || !widget.live) return;
+  Future<void> _loadLiveGuideEvents({bool force = false}) async {
+    if (!widget.live || _liveGuideLoading) return;
+    final bandLoader = widget.loadLiveBandGuideEvents;
+    final singleLoader = widget.loadLiveGuideEvents;
+    if (bandLoader == null && singleLoader == null) return;
+    final now = _now();
+    if (!force &&
+        _lastLiveGuideAttemptAt != null &&
+        now.difference(_lastLiveGuideAttemptAt!) <
+            const Duration(seconds: 30)) {
+      return;
+    }
+    _liveGuideLoading = true;
+    _lastLiveGuideAttemptAt = now;
     try {
-      final events = await loader();
-      if (mounted && events.isNotEmpty) {
-        setState(() => _liveGuideEvents = events);
+      if (bandLoader != null) {
+        final map = await bandLoader();
+        if (mounted && map.isNotEmpty) {
+          final active = _activeLiveChannel;
+          final activeEvents = active != null
+              ? map[liveServiceKey(active)]
+              : null;
+          setState(() {
+            _liveBandGuideEvents = {
+              for (final entry in map.entries)
+                entry.key: List<EpgEvent>.of(entry.value),
+            };
+            if (activeEvents != null && activeEvents.isNotEmpty) {
+              _liveGuideEvents = List<EpgEvent>.of(activeEvents);
+            }
+          });
+        }
       }
-    } catch (_) {}
+      if (singleLoader != null &&
+          (_liveGuideEvents.isEmpty || (force && bandLoader == null))) {
+        final events = await singleLoader();
+        if (mounted && events.isNotEmpty) {
+          final active = _activeLiveChannel;
+          setState(() {
+            _liveGuideEvents = List<EpgEvent>.of(events);
+            if (active != null) {
+              _liveBandGuideEvents = {
+                ..._liveBandGuideEvents,
+                liveServiceKey(active): List<EpgEvent>.of(events),
+              };
+            }
+          });
+        }
+      }
+    } catch (_) {
+    } finally {
+      _liveGuideLoading = false;
+    }
+  }
+
+  Future<void> _refreshLiveChannelSnapshots({bool force = false}) async {
+    final refresher = widget.onRefreshLiveChannels;
+    if (!widget.live || refresher == null || _liveChannelsRefreshing) return;
+    final now = _now();
+    if (!force &&
+        _lastLiveChannelsRefreshAt != null &&
+        now.difference(_lastLiveChannelsRefreshAt!) <
+            const Duration(seconds: 20)) {
+      return;
+    }
+    _liveChannelsRefreshing = true;
+    _lastLiveChannelsRefreshAt = now;
+    try {
+      final refreshed = await refresher();
+      if (!mounted || refreshed.isEmpty) return;
+      final cur = _activeLiveChannel;
+      final curKey = cur != null ? liveServiceKey(cur) : null;
+      final nextIdx = cur == null
+          ? -1
+          : refreshed.indexWhere(
+              (e) =>
+                  liveServiceKey(e.channel) == curKey || e.channel.id == cur.id,
+            );
+      setState(() {
+        _liveSwitchChannels = refreshed;
+        if (nextIdx >= 0 && cur != null) {
+          _currentLiveSwitchIndex = nextIdx;
+          final entry = refreshed[nextIdx];
+          var matched = entry.channel;
+          for (final c in entry.candidates) {
+            if (c.channel.id == cur.id) {
+              matched = c.channel;
+              break;
+            }
+          }
+          _currentLiveChannel = matched;
+        }
+      });
+    } catch (_) {
+    } finally {
+      _liveChannelsRefreshing = false;
+    }
   }
 
   /// Loads the recording's chapter points once (plan
@@ -4349,13 +4668,84 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     });
   }
 
-  bool get _hasProgramDetail =>
-      (widget.programDetailBody?.trim().isNotEmpty ?? false);
+  bool get _hasProgramDetail => widget.live
+      ? (_activeLiveChannel != null ||
+            (widget.programDetailBody?.trim().isNotEmpty ?? false))
+      : (widget.programDetailBody?.trim().isNotEmpty ?? false);
+
+  ResolvedProgramDetail _resolveLiveDetailSnapshot(
+    LiveChannel ch,
+    DateTime now,
+  ) {
+    final isInitialFresh =
+        identical(ch, widget.currentLiveChannel) &&
+        (ch.programEnd == null || ch.programEnd!.isAfter(now));
+    return resolveLiveProgramDetail(
+      channel: ch,
+      guideEvents: _guideEventsForChannel(ch),
+      now: now,
+      fallbackTitle: widget.programDetailTitle ?? widget.title,
+      fallbackMeta: isInitialFresh ? widget.programDetailMeta : null,
+      fallbackBody: isInitialFresh ? widget.programDetailBody : null,
+    );
+  }
 
   void _openDetail() {
     if (!_hasProgramDetail) return;
     _osdTimer?.cancel();
-    setState(() => _detailOpen = true);
+    if (!widget.live) {
+      setState(() => _detailOpen = true);
+    } else {
+      final reqSeq = ++_liveDetailRequestSeq;
+      final ch = _activeLiveChannel;
+      if (ch == null) {
+        setState(() {
+          _detailOpen = true;
+          _openedLiveDetail = ResolvedProgramDetail(
+            title: widget.programDetailTitle ?? widget.title,
+            meta: widget.programDetailMeta,
+            body: widget.programDetailBody,
+          );
+          _liveDetailLoading = false;
+        });
+      } else {
+        final now = _now();
+        final guideEvents = _guideEventsForChannel(ch);
+        final info = resolveLiveOsdProgramInfo(
+          channel: ch,
+          guideEvents: guideEvents,
+          now: now,
+        );
+        final detail = _resolveLiveDetailSnapshot(ch, now);
+        final hasRefresher =
+            widget.loadLiveBandGuideEvents != null ||
+            widget.loadLiveGuideEvents != null ||
+            widget.onRefreshLiveChannels != null;
+        final isSnapshotExpired =
+            ch.programEnd != null && !ch.programEnd!.isAfter(now);
+        final needsFetch =
+            hasRefresher &&
+            info.currentEvent == null &&
+            (isSnapshotExpired || !detail.hasBody);
+        final initialOpened = (needsFetch && isSnapshotExpired)
+            ? ResolvedProgramDetail(
+                title: detail.title,
+                meta: detail.meta,
+                body: null,
+                programEnd: null,
+                identityKey: detail.identityKey,
+              )
+            : detail;
+        setState(() {
+          _detailOpen = true;
+          _openedLiveDetail = initialOpened;
+          _liveDetailLoading = needsFetch;
+        });
+        if (needsFetch) {
+          unawaited(_loadLiveDetailOnDemand(reqSeq));
+        }
+      }
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_detailOpen) return;
       if (_detailScrollController.hasClients) {
@@ -4367,6 +4757,40 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     });
   }
 
+  Future<void> _loadLiveDetailOnDemand(int reqSeq) async {
+    try {
+      if (widget.loadLiveBandGuideEvents != null ||
+          widget.loadLiveGuideEvents != null) {
+        await _loadLiveGuideEvents(force: true);
+      }
+      if (!mounted || !_detailOpen || _liveDetailRequestSeq != reqSeq) return;
+      final chAfterGuide = _activeLiveChannel;
+      var stillMissingEvent = true;
+      if (chAfterGuide != null) {
+        final infoAfterGuide = resolveLiveOsdProgramInfo(
+          channel: chAfterGuide,
+          guideEvents: _guideEventsForChannel(chAfterGuide),
+          now: _now(),
+        );
+        stillMissingEvent = infoAfterGuide.currentEvent == null;
+      }
+      if (stillMissingEvent && widget.onRefreshLiveChannels != null) {
+        await _refreshLiveChannelSnapshots(force: true);
+      }
+    } finally {
+      if (mounted && _detailOpen && _liveDetailRequestSeq == reqSeq) {
+        final ch = _activeLiveChannel;
+        final updated = ch != null
+            ? _resolveLiveDetailSnapshot(ch, _now())
+            : _openedLiveDetail;
+        setState(() {
+          _openedLiveDetail = updated;
+          _liveDetailLoading = false;
+        });
+      }
+    }
+  }
+
   void _closeDetail({bool fromBackKey = false}) {
     if (fromBackKey) {
       _suppressBackPopUntil = DateTime.now().add(
@@ -4374,7 +4798,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
     }
     if (!_detailOpen) return;
-    setState(() => _detailOpen = false);
+    _liveDetailRequestSeq++;
+    setState(() {
+      _detailOpen = false;
+      _openedLiveDetail = null;
+      _liveDetailLoading = false;
+    });
     if (_osdOpen) {
       _resetOsdTimer();
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4436,11 +4865,50 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _channelPreviewDirection = null;
       _osdOpen = true;
     });
+    if (widget.live && _activeLiveChannel != null) {
+      final cur = _activeLiveChannel!;
+      final now = _now();
+      final info = resolveLiveOsdProgramInfo(
+        channel: cur,
+        guideEvents: _guideEventsForChannel(cur),
+        now: now,
+      );
+      if (info.currentEvent == null) {
+        unawaited(_loadLiveGuideEvents());
+        if (cur.programEnd == null || !cur.programEnd!.isAfter(now)) {
+          unawaited(_refreshLiveChannelSnapshots());
+        }
+      }
+    }
     _osdFadeController.forward();
     _osdClockTimer?.cancel();
     _osdClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || !_osdOpen) return;
       _syncDisplayedBufferBadge();
+      if (widget.live && _activeLiveChannel != null) {
+        final cur = _activeLiveChannel!;
+        final now = _now();
+        final info = resolveLiveOsdProgramInfo(
+          channel: cur,
+          guideEvents: _guideEventsForChannel(cur),
+          now: now,
+        );
+        if (_detailOpen &&
+            _openedLiveDetail != null &&
+            shouldCloseLiveDetailOnBoundary(
+              now: now,
+              openedProgramEnd: _openedLiveDetail!.programEnd,
+              openedIdentityKey: _openedLiveDetail!.identityKey,
+              currentInfo: info,
+            )) {
+          _closeDetail();
+          return;
+        }
+        if (info.currentEvent == null &&
+            (cur.programEnd == null || !cur.programEnd!.isAfter(now))) {
+          unawaited(_refreshLiveChannelSnapshots());
+        }
+      }
       setState(() {});
     });
     unawaited(_pollMpvBufferProperties());
@@ -4462,9 +4930,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _osdClockTimer?.cancel();
     _osdClockTimer = null;
     if (!_osdOpen && !_detailOpen) return;
+    _liveDetailRequestSeq++;
     setState(() {
       _osdOpen = false;
       _detailOpen = false;
+      _openedLiveDetail = null;
+      _liveDetailLoading = false;
     });
     _osdFadeController.reverse();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4596,19 +5067,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool get _canSwitchLiveChannel =>
       widget.live &&
       widget.onSwitchLiveChannel != null &&
-      widget.liveSwitchChannels.length > 1 &&
-      widget.currentLiveSwitchIndex >= 0 &&
-      widget.currentLiveSwitchIndex < widget.liveSwitchChannels.length;
+      _liveSwitchChannels.length > 1 &&
+      _currentLiveSwitchIndex >= 0 &&
+      _currentLiveSwitchIndex < _liveSwitchChannels.length;
 
   LiveChannelSwitchEntry? _previewTargetFor(ChannelSwitchDirection? dir) {
     if (dir == null || !_canSwitchLiveChannel) return null;
     final idx = adjacentLiveChannelIndex(
-      currentIndex: widget.currentLiveSwitchIndex,
-      count: widget.liveSwitchChannels.length,
+      currentIndex: _currentLiveSwitchIndex,
+      count: _liveSwitchChannels.length,
       direction: dir,
     );
-    if (idx < 0 || idx >= widget.liveSwitchChannels.length) return null;
-    return widget.liveSwitchChannels[idx];
+    if (idx < 0 || idx >= _liveSwitchChannels.length) return null;
+    return _liveSwitchChannels[idx];
   }
 
   void _showChannelPreview(ChannelSwitchDirection direction) {
@@ -4618,6 +5089,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     _channelPreviewTimer?.cancel();
     setState(() => _channelPreviewDirection = direction);
+    final now = _now();
+    final prevEntry = _previewTargetFor(ChannelSwitchDirection.previous);
+    final nextEntry = _previewTargetFor(ChannelSwitchDirection.next);
+    final prevResolved = prevEntry == null
+        ? null
+        : resolveLiveSwitchEntryProgram(
+            entry: prevEntry,
+            guideEvents: _guideEventsForChannel(prevEntry.channel),
+            now: now,
+          );
+    final nextResolved = nextEntry == null
+        ? null
+        : resolveLiveSwitchEntryProgram(
+            entry: nextEntry,
+            guideEvents: _guideEventsForChannel(nextEntry.channel),
+            now: now,
+          );
+    if (_liveBandGuideEvents.isEmpty && widget.loadLiveBandGuideEvents != null) {
+      unawaited(_loadLiveGuideEvents());
+    }
+    if ((prevResolved?.isStale ?? false) || (nextResolved?.isStale ?? false)) {
+      unawaited(_refreshLiveChannelSnapshots());
+    }
     _channelPreviewTimer = Timer(const Duration(seconds: 5), () {
       if (mounted && _channelPreviewDirection != null) {
         setState(() => _channelPreviewDirection = null);
@@ -4671,6 +5165,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _osdOpen = false;
         _osdFadeController.value = 0.0;
         _detailOpen = false;
+        _openedLiveDetail = null;
+        _liveDetailLoading = false;
+        _liveDetailRequestSeq++;
         _hudText = null;
         _cornerRecordingNotice = null;
         _customCornerNoticeText = null;
@@ -5367,14 +5864,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           top: 20,
                           left: 28,
                           right: 28,
-                          child: ProgramDetailOverlayPanel(
-                            title: widget.programDetailTitle ?? widget.title,
-                            meta: widget.programDetailMeta,
-                            body: widget.programDetailBody!,
-                            scrollController: _detailScrollController,
-                            focusNode: _detailFocusNode,
-                            onClose: () => _closeDetail(fromBackKey: true),
-                            onScrollDelta: _scrollDetailBy,
+                          child: Builder(
+                            builder: (_) {
+                              if (!widget.live) {
+                                return ProgramDetailOverlayPanel(
+                                  title: widget.programDetailTitle ?? widget.title,
+                                  meta: widget.programDetailMeta,
+                                  body: widget.programDetailBody!,
+                                  scrollController: _detailScrollController,
+                                  focusNode: _detailFocusNode,
+                                  onClose: () => _closeDetail(fromBackKey: true),
+                                  onScrollDelta: _scrollDetailBy,
+                                );
+                              }
+                              final opened = _openedLiveDetail;
+                              final detailBody = (_liveDetailLoading &&
+                                      !(opened?.hasBody ?? false))
+                                  ? '番組詳細を読み込み中…'
+                                  : ((opened?.hasBody ?? false)
+                                      ? opened!.body!
+                                      : '番組詳細情報はありません');
+                              return ProgramDetailOverlayPanel(
+                                title:
+                                    opened?.title ??
+                                    widget.programDetailTitle ??
+                                    widget.title,
+                                meta: opened != null
+                                    ? opened.meta
+                                    : widget.programDetailMeta,
+                                body: detailBody,
+                                scrollController: _detailScrollController,
+                                focusNode: _detailFocusNode,
+                                onClose: () => _closeDetail(fromBackKey: true),
+                                onScrollDelta: _scrollDetailBy,
+                              );
+                            },
                           ),
                         ),
                       if (_interrupted && !_conflictHandled && !_switchingChannel)
@@ -5474,13 +5998,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   List<Widget> _buildChannelSwitchPreviewCards() {
+    final now = _now();
     final prevEntry = _previewTargetFor(ChannelSwitchDirection.previous);
     final nextEntry = _previewTargetFor(ChannelSwitchDirection.next);
+    final prevResolved = prevEntry == null
+        ? null
+        : resolveLiveSwitchEntryProgram(
+            entry: prevEntry,
+            guideEvents: _guideEventsForChannel(prevEntry.channel),
+            now: now,
+          );
+    final nextResolved = nextEntry == null
+        ? null
+        : resolveLiveSwitchEntryProgram(
+            entry: nextEntry,
+            guideEvents: _guideEventsForChannel(nextEntry.channel),
+            now: now,
+          );
     return [
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.previous,
         visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
         entry: prevEntry,
+        resolvedProgram: prevResolved,
         onTap: prevEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
@@ -5489,6 +6029,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         direction: ChannelSwitchDirection.next,
         visible: _channelPreviewDirection == ChannelSwitchDirection.next,
         entry: nextEntry,
+        resolvedProgram: nextResolved,
         onTap: nextEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
@@ -5754,11 +6295,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       PlayerOsdClockOverlay(now: _now(), opacity: _osdFadeAnimation);
 
   Widget _buildLiveOsdProgramSection() {
-    final channel = widget.currentLiveChannel;
+    final channel = _activeLiveChannel;
     if (channel == null) return const SizedBox.shrink();
     final info = resolveLiveOsdProgramInfo(
       channel: channel,
-      guideEvents: _liveGuideEvents,
+      guideEvents: _guideEventsForChannel(channel),
       now: _now(),
     );
     return LiveOsdProgramSection(info: info);
@@ -5834,7 +6375,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ],
               ],
             ),
-            if (widget.live && widget.currentLiveChannel != null) ...[
+            if (widget.live && _activeLiveChannel != null) ...[
               const SizedBox(height: 6),
               _buildLiveOsdProgramSection(),
             ] else if (!widget.live) ...[
