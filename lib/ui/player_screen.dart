@@ -197,6 +197,8 @@ import 'player_seek_policy.dart';
 import 'player_speed_policy.dart';
 import 'player_teardown_policy.dart';
 import 'player_track_policy.dart';
+import 'subtitle_overlay.dart';
+import 'subtitle_style_policy.dart';
 
 /// Returns the overlay spinner caption while waiting for initial video frames
 /// or recovering from mid-stream buffering, or `null` once ready/paused.
@@ -1422,6 +1424,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   /// The caption toggle (plan 53). Default off, per the
   /// owner's spec; kept in this state only, never persisted.
   bool _subtitlesOn = false;
+  final SubtitleActiveWindowTracker _subtitleTracker =
+      SubtitleActiveWindowTracker();
+  List<SubtitleCue> _visibleSubtitleCues = const [];
+  List<String> _plainSubtitleLines = const [];
+  String _rawAssSubtitle = '';
+  double _assPlayResWidth = 960.0;
+  double _assPlayResHeight = 540.0;
+  bool _assExtradataLoaded = false;
+  bool _loggedAssSample = false;
+  Timer? _subtitleSyncTimer;
+  bool _pollingSubtitleSync = false;
+  Duration _subtitlePlaybackClock = Duration.zero;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
   /// normal speed. Offered for recordings only (see
@@ -1899,6 +1913,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       }),
     );
     _subscriptions.add(
+      _player.stream.subtitle.listen((lines) {
+        if (_conflictHandled || _switchingChannel) return;
+        final nonEmpty = [
+          for (final line in lines)
+            if (line.trim().isNotEmpty) line,
+        ];
+        if (nonEmpty.isEmpty) {
+          _clearDisplayedSubtitles();
+          return;
+        }
+        _plainSubtitleLines = nonEmpty;
+        _recomputeVisibleSubtitles();
+        if (_subtitlesOn) {
+          unawaited(_refreshAssSubtitleSnapshot());
+        }
+      }),
+    );
+    _subscriptions.add(
       _player.stream.error.listen((error) {
         if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: error: $error');
@@ -1942,6 +1974,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     _observeSeekable();
     _observeCacheDuration();
+    _observeAssSubtitle();
     _open();
     _loadChapters();
     _recordingSchedules = List<RecordSchedule>.of(
@@ -1976,6 +2009,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
+    _clearDisplayedSubtitles();
     _wakelockSession.setPlaying(false);
     _diag(DiagCategory.playback, 'player: recorded playback finished ($reason)');
     if (mounted && (_interrupted || _autoResumeCountdown != 0 || _buffering)) {
@@ -2372,10 +2406,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _autoResumeDisabled = true;
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
+    _stopSubtitleSyncTimer();
     _watchdog?.cancel();
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
+    _clearDisplayedSubtitles();
     _resetLiveCatchUpState(resetPlayerRate: false);
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
@@ -2536,6 +2572,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
+    _clearDisplayedSubtitles();
     if (widget.live) {
       _resetLiveCatchUpState(resetPlayerRate: true);
     }
@@ -2603,6 +2640,178 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
+  void _stopSubtitleSyncTimer() {
+    _subtitleSyncTimer?.cancel();
+    _subtitleSyncTimer = null;
+  }
+
+  void _startSubtitleSyncTimer() {
+    if (_subtitleSyncTimer != null) return;
+    _subtitleSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => unawaited(_syncSubtitleTick()),
+    );
+  }
+
+  void _clearDisplayedSubtitles({bool notify = true}) {
+    _stopSubtitleSyncTimer();
+    _subtitleTracker.reset();
+    _plainSubtitleLines = const [];
+    _rawAssSubtitle = '';
+    if (_visibleSubtitleCues.isEmpty) return;
+    _visibleSubtitleCues = const [];
+    if (notify && mounted) {
+      setState(() {});
+    }
+  }
+
+  void _recomputeVisibleSubtitles() {
+    if (!_subtitlesOn) {
+      _clearDisplayedSubtitles();
+      return;
+    }
+    final rawCues = resolveRawSubtitleCues(
+      rawAss: _rawAssSubtitle,
+      plainLines: _plainSubtitleLines,
+      playResWidth: _assPlayResWidth,
+      playResHeight: _assPlayResHeight,
+    );
+    final nextCues = _subtitleTracker.update(rawCues, _subtitlePlaybackClock);
+    if (nextCues.isEmpty) {
+      _stopSubtitleSyncTimer();
+    } else {
+      _startSubtitleSyncTimer();
+    }
+    final changed = !_cuesEqual(_visibleSubtitleCues, nextCues);
+    _visibleSubtitleCues = nextCues;
+    if (changed && mounted) {
+      setState(() {});
+    }
+  }
+
+  bool _cuesEqual(List<SubtitleCue> a, List<SubtitleCue> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].dedupeKey != b[i].dedupeKey) return false;
+      final sa = a[i].spans;
+      final sb = b[i].spans;
+      if (sa.length != sb.length) return false;
+      for (var j = 0; j < sa.length; j++) {
+        if (sa[j].text != sb[j].text ||
+            sa[j].color != sb[j].color ||
+            sa[j].scale != sb[j].scale) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  Future<void> _ensureAssExtradataLoaded(NativePlayer platform) async {
+    if (_assExtradataLoaded) return;
+    _assExtradataLoaded = true;
+    try {
+      final extradata = await platform.getProperty('sub-ass-extradata');
+      final res = parseAssPlayRes(extradata);
+      _assPlayResWidth = res.width;
+      _assPlayResHeight = res.height;
+    } catch (_) {}
+  }
+
+  Future<void> _refreshAssSubtitleSnapshot() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer || !_subtitlesOn || !mounted) return;
+    try {
+      await _ensureAssExtradataLoaded(platform);
+      final rawAss = await platform.getProperty('sub-text-ass');
+      if (!mounted || !_subtitlesOn) return;
+      if (rawAss != _rawAssSubtitle) {
+        _rawAssSubtitle = rawAss;
+        if (!_loggedAssSample && rawAss.trim().isNotEmpty) {
+          _loggedAssSample = true;
+          _diag(
+            DiagCategory.playback,
+            'player: ass subtitle sample '
+            '(${_assPlayResWidth.toInt()}x${_assPlayResHeight.toInt()}): '
+            '${rawAss.replaceAll('\n', ' | ')}',
+          );
+        }
+        _recomputeVisibleSubtitles();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _observeAssSubtitle() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      await platform.observeProperty('sub-text-ass', (value) async {
+        if (!mounted || _conflictHandled || _switchingChannel) return;
+        await _ensureAssExtradataLoaded(platform);
+        _rawAssSubtitle = value;
+        if (!_loggedAssSample && value.trim().isNotEmpty) {
+          _loggedAssSample = true;
+          _diag(
+            DiagCategory.playback,
+            'player: ass subtitle sample '
+            '(${_assPlayResWidth.toInt()}x${_assPlayResHeight.toInt()}): '
+            '${value.replaceAll('\n', ' | ')}',
+          );
+        }
+        if (!_subtitlesOn) return;
+        if (value.trim().isEmpty && _plainSubtitleLines.isEmpty) {
+          _clearDisplayedSubtitles();
+          return;
+        }
+        _recomputeVisibleSubtitles();
+      });
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: sub-text-ass observation failed: $e');
+    }
+  }
+
+  Future<void> _syncSubtitleTick() async {
+    if (_pollingSubtitleSync || !mounted || !_subtitlesOn) {
+      if (!_subtitlesOn) _stopSubtitleSyncTimer();
+      return;
+    }
+    _pollingSubtitleSync = true;
+    try {
+      if (_playingNow && !_buffering) {
+        _subtitlePlaybackClock += const Duration(milliseconds: 250);
+      }
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        await _ensureAssExtradataLoaded(platform);
+        String plainNow = '';
+        try {
+          plainNow = await platform.getProperty('sub-text');
+        } catch (_) {
+          plainNow = '';
+        }
+        if (!mounted || !_subtitlesOn) return;
+        final nextPlain = [
+          for (final line in plainNow.split('\n'))
+            if (line.trim().isNotEmpty) line,
+        ];
+        if (nextPlain.isEmpty) {
+          _clearDisplayedSubtitles();
+          return;
+        }
+        String rawAssNow = _rawAssSubtitle;
+        try {
+          rawAssNow = await platform.getProperty('sub-text-ass');
+        } catch (_) {}
+        if (!mounted || !_subtitlesOn) return;
+        _plainSubtitleLines = nextPlain;
+        _rawAssSubtitle = rawAssNow;
+      }
+      _recomputeVisibleSubtitles();
+    } finally {
+      _pollingSubtitleSync = false;
+    }
+  }
+
   /// Applies the caption selection for the current toggle
   /// state (plan 53): the first caption track when on, and
   /// mpv's no-track selection when off — the off case is what
@@ -2615,11 +2824,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     );
     try {
       if (id == null) {
+        _clearDisplayedSubtitles();
         await _player.setSubtitleTrack(SubtitleTrack.no());
       } else {
+        _assExtradataLoaded = false;
         await _player.setSubtitleTrack(
           _realSubtitleTracks.firstWhere((track) => track.id == id),
         );
+        Future.delayed(const Duration(milliseconds: 250), () {
+          if (mounted && _subtitlesOn) {
+            unawaited(_syncSubtitleTick());
+          }
+        });
       }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: subtitle selection failed: $e');
@@ -2632,6 +2848,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       DiagCategory.playback,
       'player: subtitles ${_subtitlesOn ? 'on' : 'off'} (user toggle)',
     );
+    if (!_subtitlesOn) {
+      _clearDisplayedSubtitles();
+    }
     _applySubtitleSelection();
   }
 
@@ -2782,6 +3001,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       forward ? Icons.fast_forward : Icons.fast_rewind,
       forward ? '次チャプター' : '前チャプター',
     );
+    _clearDisplayedSubtitles();
     try {
       await _player.seek(target);
     } catch (e) {
@@ -2834,6 +3054,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           '${plan.networkTimeoutSeconds}',
         );
         await platform.setProperty('sid', 'no');
+        await platform.setProperty('sub-ass', 'yes');
+        await platform.setProperty('sub-visibility', 'no');
+        await platform.setProperty('sub-fix-timing', 'yes');
+        await platform.setProperty('sub-clear-on-seek', 'yes');
         if (widget.live) {
           final probeSize = liveDemuxerProbeSizeBytes(
             useMobile: widget.liveUseMobile,
@@ -3058,6 +3282,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         (
           name: 'live catch-up monitor',
           run: () => _liveCatchUpTimer?.cancel(),
+        ),
+        (
+          name: 'subtitle sync timer',
+          run: () => _subtitleSyncTimer?.cancel(),
         ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
@@ -3349,6 +3577,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
       DiagCategory.playback,
       'player: dpad seek by ${offset.inSeconds}s to ${target.inSeconds}s',
     );
+    _clearDisplayedSubtitles();
     try {
       await _player.seek(target);
     } catch (e) {
@@ -3408,6 +3637,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
+    _clearDisplayedSubtitles();
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
     _customCornerNoticeTimer?.cancel();
@@ -3699,6 +3929,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Future<void> _catchUpToLiveEdge() async {
     if (!widget.live || !mounted || _catchingUpLive || _switchingChannel) return;
     _catchingUpLive = true;
+    _clearDisplayedSubtitles();
     _closeOsd();
     _showHudMessage(Icons.skip_next, '現在位置へ移動しています…');
     try {
@@ -4071,7 +4302,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       Video(
                         controller: _videoController,
                         controls: NoVideoControls,
+                        subtitleViewConfiguration:
+                            const SubtitleViewConfiguration(visible: false),
                       ),
+                      if (_subtitlesOn &&
+                          _visibleSubtitleCues.isNotEmpty &&
+                          !_switchingChannel &&
+                          _error == null)
+                        PlayerSubtitleOverlay(
+                          settings: ref.watch(subtitleSettingsProvider),
+                          cues: _visibleSubtitleCues,
+                          bottomSafePadding: _osdOpen ? 148.0 : 24.0,
+                        ),
                       if (!_conflictHandled &&
                           (loadingLabel != null ||
                               (!_interrupted && _isPreBuffering)))

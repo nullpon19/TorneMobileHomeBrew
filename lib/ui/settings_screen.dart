@@ -20,6 +20,7 @@ import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'player_cache_policy.dart';
+import 'subtitle_settings_screen.dart';
 import 'widgets.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -354,6 +355,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               current: recordedBufferSeconds,
               onSelected: (value) =>
                   ref.read(recordedBufferSecondsProvider.notifier).set(value),
+            ),
+          ),
+          ListTile(
+            title: const Text('字幕表示設定'),
+            subtitle: Text(ref.watch(subtitleSettingsProvider).summaryLabel),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => const SubtitleSettingsScreen(),
+              ),
             ),
           ),
           const Divider(),

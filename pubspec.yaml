@@ -34,6 +34,13 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  fonts:
+    - family: LINESeedJP
+      fonts:
+        - asset: assets/fonts/LINESeedJP-Regular.ttf
+    - family: KosugiMaru
+      fonts:
+        - asset: assets/fonts/KosugiMaru-Regular.ttf
 
 # App icon generation (dart run flutter_launcher_icons).
 # Source art: assets/icon/app_icon_source.webp; the 1024 PNG is the

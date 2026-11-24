@@ -32,6 +32,9 @@ import 'package:tmhb/ui/player_screen.dart';
 import 'package:tmhb/ui/schedule_form.dart';
 import 'package:tmhb/ui/schedules_screen.dart';
 import 'package:tmhb/ui/settings_screen.dart';
+import 'package:tmhb/ui/subtitle_overlay.dart';
+import 'package:tmhb/ui/subtitle_settings_screen.dart';
+import 'package:tmhb/ui/subtitle_style_policy.dart';
 import 'package:tmhb/ui/tailscale_guard.dart';
 import 'package:tmhb/ui/title_list_filter.dart';
 import 'package:tmhb/ui/titles_screen.dart';
@@ -6433,6 +6436,506 @@ void main() {
       },
     );
   });
+
+  group(
+    'Phase 26: TV-sized subtitle customization, ARIB symbols/ASS parser, and clear timing',
+    () {
+      test(
+        'SubtitleSettings defaults, JSON persistence fallback, size, and edge helpers',
+        () {
+          const defaults = SubtitleSettings.defaults;
+          expect(defaults.size, SubtitleSizePreset.medium);
+          expect(defaults.font, SubtitleFontFamily.gothicBold);
+          expect(defaults.edge, SubtitleEdgeStyle.thin);
+          expect(defaults.backgroundColor, SubtitleBackgroundColorPreset.black);
+          expect(defaults.backgroundOpacityPercent, 65);
+          expect(
+            defaults.effectiveBackgroundColor.a,
+            closeTo(0.65, 0.01),
+          );
+
+          const transparent = SubtitleSettings(
+            backgroundColor: SubtitleBackgroundColorPreset.navy,
+            backgroundOpacityPercent: 0,
+          );
+          expect(transparent.effectiveBackgroundColor, Colors.transparent);
+
+          final custom = const SubtitleSettings(
+            size: SubtitleSizePreset.large,
+            font: SubtitleFontFamily.lineSeedJp,
+            edge: SubtitleEdgeStyle.thick,
+            backgroundColor: SubtitleBackgroundColorPreset.darkGray,
+            backgroundOpacityPercent: 85,
+          );
+          final roundtripped = SubtitleSettings.fromJsonString(
+            custom.toJsonString(),
+          );
+          expect(roundtripped, custom);
+
+          expect(SubtitleSettings.fromJsonString(null), defaults);
+          expect(SubtitleSettings.fromJsonString('not-json'), defaults);
+          expect(
+            SubtitleSettings.fromJsonString(
+              '{"size":"unknown","bgOpacity":33,"font":"kosugiMaru"}',
+            ),
+            const SubtitleSettings(font: SubtitleFontFamily.kosugiMaru),
+          );
+
+          // 540dp Fire TV viewport yields TV-sized glyphs across 3 presets.
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.small, 540),
+            closeTo(25.92, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.medium, 540),
+            closeTo(34.56, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(SubtitleSizePreset.large, 540),
+            closeTo(44.28, 0.05),
+          );
+          expect(
+            resolveSubtitleFontSize(
+              SubtitleSizePreset.small,
+              200,
+              minSize: 16.0,
+            ),
+            16.0,
+          );
+
+          expect(resolveSubtitleEdgeWidth(SubtitleEdgeStyle.none, 36), 0.0);
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thin, 36),
+            closeTo(3.96, 0.01),
+          );
+          expect(
+            resolveSubtitleEdgeWidth(SubtitleEdgeStyle.thick, 36),
+            closeTo(6.48, 0.01),
+          );
+          expect(subtitleBackgroundOpacityLabel(0), 'なし (0%)');
+          expect(subtitleBackgroundOpacityLabel(65), '標準 (65%)');
+          expect(SubtitleFontFamily.lineSeedJp.fontFamily, 'LINESeedJP');
+          expect(SubtitleFontFamily.kosugiMaru.fontFamily, 'KosugiMaru');
+        },
+      );
+
+      test(
+        'normalizeAribSubtitleSymbols maps enclosed symbols/arrows and strips replacement chars',
+        () {
+          expect(
+            normalizeAribSubtitleSymbols(
+              '♪\u{1F211} ニュース \u{1F214} \u{1F14A} \u{1F240} 続けます\u27A1',
+            ),
+            '♪[字] ニュース [二] [HV] 〔本〕 続けます→',
+          );
+          expect(
+            normalizeAribSubtitleSymbols(
+              '\u2B05左 \u2B06上 \u2B07下 バックヤー\uFFFD\uFE0F\u200B',
+            ),
+            '←左 ↑上 ↓下 バックヤー',
+          );
+          expect(
+            normalizeAribSubtitleSymbols('外字\uE001と\uE123'),
+            '外字〓と〓',
+          );
+        },
+      );
+
+      test(
+        'parseAssPlayRes and parseAribAssSubtitle extract coordinates, colors, and strip vector drawings',
+        () {
+          final defaultRes = parseAssPlayRes(null);
+          expect(defaultRes.width, 960.0);
+          expect(defaultRes.height, 540.0);
+
+          final customRes = parseAssPlayRes(
+            '[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n',
+          );
+          expect(customRes.width, 1920.0);
+          expect(customRes.height, 1080.0);
+
+          final parsed = parseAribAssSubtitle(
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,'
+            '{\\an1\\pos(192,432)\\1c&H00FFFF&}こんにちは{\\c&HFFFFFF&}\\Nお元気ですか\n'
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,'
+            '{\\p1}m 0 0 l 100 0 100 20{\\p0}通常字幕',
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(parsed, hasLength(2));
+          expect(parsed[0].alignment, 1);
+          expect(parsed[0].normalizedX, closeTo(0.2, 0.001));
+          expect(parsed[0].normalizedY, closeTo(0.8, 0.001));
+          expect(parsed[0].spans, hasLength(2));
+          expect(parsed[0].spans[0].text, 'こんにちは');
+          expect(parsed[0].spans[0].color, const Color(0xFFFFFF00));
+          expect(parsed[0].spans[1].text, '\nお元気ですか');
+          expect(parsed[0].spans[1].color, Colors.white);
+          expect(parsed[1].plainText, '通常字幕');
+
+          // Same-Y segments placed separately along X merge left-to-right.
+          final merged = parseAribAssSubtitle(
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\pos(600,450)\\c&H00FF00&}後半\n'
+            'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\pos(200,450)\\c&HFFFF00&}前半',
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(merged, hasLength(1));
+          expect(merged.single.spans.map((s) => s.text).toList(), ['前半', '後半']);
+          expect(merged.single.spans[0].color, const Color(0xFF00FFFF));
+          expect(merged.single.spans[1].color, const Color(0xFF00FF00));
+          expect(merged.single.normalizedX, closeTo(200 / 960.0, 0.001));
+        },
+      );
+
+      test(
+        'resolveRawSubtitleCues pairs matching ASS markup and falls back safely on mismatch or clear',
+        () {
+          final matched = resolveRawSubtitleCues(
+            rawAss: '{\\an7\\pos(120,70)\\c&H00FF00&}ニュース\u{1F211}',
+            plainLines: const ['ニュース\u{1F211}'],
+            playResWidth: 960.0,
+            playResHeight: 540.0,
+          );
+          expect(matched, hasLength(1));
+          expect(matched.single.alignment, 7);
+          expect(matched.single.plainText, 'ニュース[字]');
+          expect(matched.single.spans.single.color, const Color(0xFF00FF00));
+
+          final mismatched = resolveRawSubtitleCues(
+            rawAss: '{\\pos(120,70)}古い字幕',
+            plainLines: const ['新しい字幕\u27A1'],
+          );
+          expect(mismatched, hasLength(1));
+          expect(mismatched.single.normalizedY, isNull);
+          expect(mismatched.single.plainText, '新しい字幕→');
+
+          expect(
+            resolveRawSubtitleCues(
+              rawAss: '{\\pos(120,70)}残骸',
+              plainLines: const [],
+            ),
+            isEmpty,
+          );
+        },
+      );
+
+      test(
+        'SubtitleActiveWindowTracker prevents 7-line lingering, handles bursts/prefix/upgrade, and clears on playback clock',
+        () {
+          SubtitleCue cue(String text, {double? y}) => SubtitleCue(
+            spans: [SubtitleStyledSpan(text: text)],
+            normalizedY: y,
+          );
+
+          final tracker = SubtitleActiveWindowTracker();
+
+          // Initial attach with >2 accumulated lines keeps only last 2.
+          final initial = tracker.update(
+            [cue('行1'), cue('行2'), cue('行3'), cue('行4')],
+            const Duration(seconds: 1),
+          );
+          expect(initial.map((c) => c.plainText).toList(), ['行3', '行4']);
+
+          // Subsequent 7-line mpv accumulation (>900ms spacing) shows only newest line.
+          tracker.reset();
+          var lines = <SubtitleCue>[];
+          for (var i = 1; i <= 7; i++) {
+            lines = [...lines, cue('発話$i')];
+            final shown = tracker.update(
+              lines,
+              Duration(seconds: i * 2),
+            );
+            expect(shown.map((c) => c.plainText).toList(), ['発話$i']);
+          }
+
+          // Two-line burst within <=900ms merges both lines.
+          tracker.reset();
+          expect(
+            tracker
+                .update([cue('1行目')], const Duration(milliseconds: 1000))
+                .map((c) => c.plainText)
+                .toList(),
+            ['1行目'],
+          );
+          expect(
+            tracker
+                .update(
+                  [cue('1行目'), cue('2行目')],
+                  const Duration(milliseconds: 1400),
+                )
+                .map((c) => c.plainText)
+                .toList(),
+            ['1行目', '2行目'],
+          );
+
+          // Progressive prefix line and plain->ASS upgrade within <=900ms do not duplicate.
+          tracker.reset();
+          tracker.update([cue('バック')], const Duration(milliseconds: 1000));
+          final expanded = tracker.update(
+            [cue('バックヤード')],
+            const Duration(milliseconds: 1300),
+          );
+          expect(expanded.map((c) => c.plainText).toList(), ['バックヤード']);
+
+          tracker.reset();
+          tracker.update([cue('おはよう')], const Duration(milliseconds: 1000));
+          final upgraded = tracker.update(
+            [cue('おはよう', y: 0.8)],
+            const Duration(milliseconds: 1200),
+          );
+          expect(upgraded, hasLength(1));
+          expect(upgraded.single.normalizedY, 0.8);
+
+          // Frozen playback clock (paused) preserves subtitle; advancing past expiry clears it.
+          final pausedCues = [cue('一時停止中の字幕')];
+          final clearAt = computeSubtitleAutoClearDuration(pausedCues);
+          expect(clearAt, const Duration(milliseconds: 5500));
+          expect(
+            tracker.update(pausedCues, const Duration(seconds: 20)),
+            hasLength(1),
+          );
+          for (var i = 0; i < 5; i++) {
+            expect(
+              tracker.update(pausedCues, const Duration(seconds: 20)),
+              hasLength(1),
+            );
+          }
+          expect(
+            tracker.update(
+              pausedCues,
+              const Duration(seconds: 20) + clearAt,
+            ),
+            isEmpty,
+          );
+
+          // Empty packet clears immediately.
+          tracker.update([cue('即消去テスト')], const Duration(seconds: 30));
+          expect(tracker.update(const [], const Duration(seconds: 31)), isEmpty);
+        },
+      );
+
+      test(
+        'SubtitleSettingsNotifier restores stored preferences, persists updates, and resets defaults',
+        () async {
+          final kv = InMemoryKeyValueStore();
+          await kv.write(
+            'firetv_subtitle_settings',
+            const SubtitleSettings(
+              size: SubtitleSizePreset.large,
+              font: SubtitleFontFamily.kosugiMaru,
+              edge: SubtitleEdgeStyle.none,
+              backgroundColor: SubtitleBackgroundColorPreset.navy,
+              backgroundOpacityPercent: 85,
+            ).toJsonString(),
+          );
+
+          final container = ProviderContainer(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          );
+          addTearDown(container.dispose);
+
+          // Trigger provider build, then let microtask restore stored settings.
+          container.read(subtitleSettingsProvider);
+          await Future<void>.delayed(Duration.zero);
+          final restored = container.read(subtitleSettingsProvider);
+          expect(restored.size, SubtitleSizePreset.large);
+          expect(restored.font, SubtitleFontFamily.kosugiMaru);
+          expect(restored.edge, SubtitleEdgeStyle.none);
+          expect(restored.backgroundColor, SubtitleBackgroundColorPreset.navy);
+          expect(restored.backgroundOpacityPercent, 85);
+
+          await container
+              .read(subtitleSettingsProvider.notifier)
+              .setFont(SubtitleFontFamily.lineSeedJp);
+          final savedRaw = await kv.read('firetv_subtitle_settings');
+          expect(
+            SubtitleSettings.fromJsonString(savedRaw).font,
+            SubtitleFontFamily.lineSeedJp,
+          );
+
+          await container.read(subtitleSettingsProvider.notifier).resetDefaults();
+          expect(
+            container.read(subtitleSettingsProvider),
+            SubtitleSettings.defaults,
+          );
+        },
+      );
+
+      testWidgets(
+        'SettingsScreen opens SubtitleSettingsScreen and SubtitleSettingsScreen edits & resets live settings',
+        (tester) async {
+          tester.view.physicalSize = const Size(1280, 720);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final kv = InMemoryKeyValueStore();
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                keyValueStoreProvider.overrideWithValue(kv),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const []),
+                ),
+                debugLogSharerProvider.overrideWithValue(null),
+                debugLogFolderOpenerProvider.overrideWithValue(null),
+              ],
+              child: const MaterialApp(home: SettingsScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.scrollUntilVisible(
+            find.text('字幕表示設定'),
+            200,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('中（標準）・太字ゴシック'),
+            findsOneWidget,
+          );
+
+          await tester.tap(find.text('字幕表示設定'));
+          await tester.pumpAndSettle();
+          expect(find.byType(SubtitleSettingsScreen), findsOneWidget);
+          expect(find.text('プレビュー'), findsOneWidget);
+          expect(
+            find.textContaining('テレビ並みに見やすい字幕 →'),
+            findsAtLeastNWidgets(1),
+          );
+
+          await tester.tap(find.text('LINE Seed JP'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('丸ゴシック (Kosugi Maru)'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('大'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('太め'));
+          await tester.pumpAndSettle();
+
+          await tester.scrollUntilVisible(
+            find.text('なし (0%)'),
+            150,
+            scrollable: find.byType(Scrollable).first,
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('濃紺'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('なし (0%)'));
+          await tester.pumpAndSettle();
+
+          final edited = SubtitleSettings.fromJsonString(
+            await kv.read('firetv_subtitle_settings'),
+          );
+          expect(edited.font, SubtitleFontFamily.kosugiMaru);
+          expect(edited.size, SubtitleSizePreset.large);
+          expect(edited.edge, SubtitleEdgeStyle.thick);
+          expect(edited.backgroundColor, SubtitleBackgroundColorPreset.navy);
+          expect(edited.backgroundOpacityPercent, 0);
+
+          await tester.tap(find.text('初期設定に戻す'));
+          await tester.pumpAndSettle();
+          final reset = SubtitleSettings.fromJsonString(
+            await kv.read('firetv_subtitle_settings'),
+          );
+          expect(reset, SubtitleSettings.defaults);
+        },
+      );
+
+      testWidgets(
+        'PlayerSubtitleOverlay positions ARIB cues cleanly without ragged TextStyle backgroundColor steps',
+        (tester) async {
+          Future<void> pumpOverlay(SubtitleSettings settings, List<SubtitleCue> cues) async {
+            await tester.pumpWidget(
+              MaterialApp(
+                home: Scaffold(
+                  body: Center(
+                    child: SizedBox(
+                      width: 960,
+                      height: 540,
+                      child: PlayerSubtitleOverlay(
+                        settings: settings,
+                        cues: cues,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            await tester.pump();
+          }
+
+          const cues = [
+            SubtitleCue(
+              normalizedX: 0.14,
+              normalizedY: 0.14,
+              alignment: 7,
+              spans: [SubtitleStyledSpan(text: '左上字幕')],
+            ),
+            SubtitleCue(
+              normalizedX: 0.50,
+              normalizedY: 0.88,
+              alignment: 2,
+              spans: [SubtitleStyledSpan(text: '下中央字幕')],
+            ),
+            SubtitleCue(
+              normalizedX: 0.86,
+              normalizedY: 0.50,
+              alignment: 6,
+              spans: [SubtitleStyledSpan(text: '右中央字幕')],
+            ),
+          ];
+
+          // Default thin edge: 2 RichText layers per cue (stroke + fill), step-free StrutStyle.
+          await pumpOverlay(SubtitleSettings.defaults, cues);
+          final richWithEdge = tester.widgetList<RichText>(find.byType(RichText)).toList();
+          expect(richWithEdge, hasLength(6));
+          for (final rt in richWithEdge) {
+            expect(rt.strutStyle?.forceStrutHeight, isTrue);
+            rt.text.visitChildren((span) {
+              if (span is TextSpan) {
+                expect(span.style?.backgroundColor, isNull);
+              }
+              return true;
+            });
+          }
+
+          final topLeftRect = tester.getRect(find.text('左上字幕').first);
+          final bottomCenterRect = tester.getRect(find.text('下中央字幕').first);
+          final midRightRect = tester.getRect(find.text('右中央字幕').first);
+          expect(topLeftRect.top, lessThan(midRightRect.top));
+          expect(midRightRect.top, lessThan(bottomCenterRect.top));
+          expect(topLeftRect.left, lessThan(bottomCenterRect.center.dx));
+          expect(midRightRect.right, greaterThan(bottomCenterRect.center.dx));
+
+          // Zero edge & zero opacity omits stroke layer and background container.
+          await pumpOverlay(
+            const SubtitleSettings(
+              edge: SubtitleEdgeStyle.none,
+              backgroundOpacityPercent: 0,
+            ),
+            const [
+              SubtitleCue(
+                normalizedX: 0.50,
+                normalizedY: 0.88,
+                alignment: 2,
+                spans: [SubtitleStyledSpan(text: '縁なし透明')],
+              ),
+            ],
+          );
+          expect(tester.widgetList<RichText>(find.byType(RichText)), hasLength(1));
+          final containers = tester.widgetList<Container>(find.byType(Container));
+          for (final c in containers) {
+            final dec = c.decoration;
+            if (dec is BoxDecoration) {
+              expect(dec.color, isNot(Colors.black.withValues(alpha: 0.65)));
+            }
+          }
+        },
+      );
+    },
+  );
 }
 
 class _DeletableScheduleService implements ScheduleService {

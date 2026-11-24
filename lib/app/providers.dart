@@ -13,6 +13,7 @@ import 'package:http/http.dart' as http;
 
 import '../core/core.dart';
 import '../ui/player_cache_policy.dart';
+import '../ui/subtitle_style_policy.dart';
 import 'ake_socket.dart';
 import 'debug_log.dart';
 import 'file_pick.dart';
@@ -465,7 +466,7 @@ class DismissedRecNgKeysNotifier extends Notifier<Set<String>> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty || raw == null || raw.isEmpty) return;
+      if (!ref.mounted || _dirty || raw == null || raw.isEmpty) return;
       final restored = _decode(raw);
       if (restored.isNotEmpty) {
         state = {...state, ...restored};
@@ -516,6 +517,66 @@ class DismissedRecNgKeysNotifier extends Notifier<Set<String>> {
 final dismissedRecNgKeysProvider =
     NotifierProvider<DismissedRecNgKeysNotifier, Set<String>>(
       DismissedRecNgKeysNotifier.new,
+    );
+
+/// Persisted subtitle visual customization settings (font, size, edge, and
+/// background color/opacity).
+class SubtitleSettingsNotifier extends Notifier<SubtitleSettings> {
+  static const _key = 'firetv_subtitle_settings';
+  bool _dirty = false;
+
+  @override
+  SubtitleSettings build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null || raw.isEmpty) return;
+      final restored = SubtitleSettings.fromJsonString(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return SubtitleSettings.defaults;
+  }
+
+  Future<void> _update(SubtitleSettings next) async {
+    if (next == state) return;
+    _dirty = true;
+    state = next;
+    await ref.read(keyValueStoreProvider).write(_key, next.toJsonString());
+  }
+
+  Future<void> setSize(SubtitleSizePreset size) =>
+      _update(state.copyWith(size: size));
+
+  Future<void> setFont(SubtitleFontFamily font) =>
+      _update(state.copyWith(font: font));
+
+  Future<void> setEdge(SubtitleEdgeStyle edge) =>
+      _update(state.copyWith(edge: edge));
+
+  Future<void> setBackgroundColor(SubtitleBackgroundColorPreset color) =>
+      _update(state.copyWith(backgroundColor: color));
+
+  Future<void> setBackgroundOpacity(int opacityPercent) {
+    if (!subtitleBackgroundOpacityOptions.contains(opacityPercent)) {
+      return Future.value();
+    }
+    return _update(state.copyWith(backgroundOpacityPercent: opacityPercent));
+  }
+
+  Future<void> resetDefaults() async {
+    if (state == SubtitleSettings.defaults) return;
+    _dirty = true;
+    state = SubtitleSettings.defaults;
+    await ref.read(keyValueStoreProvider).write(_key, state.toJsonString());
+  }
+}
+
+final subtitleSettingsProvider =
+    NotifierProvider<SubtitleSettingsNotifier, SubtitleSettings>(
+      SubtitleSettingsNotifier.new,
     );
 
 /// Debug mode settings (plan 28): the master switch and the
