@@ -427,6 +427,27 @@ String _encodeEpgGuideCacheJson(
       ],
     });
 
+/// Default retention window before station logos are refreshed from nasne.
+const Duration channelLogoCacheMaxAge = Duration(days: 7);
+
+/// Builds a deterministic signature of [channels] (`serviceId`, `channelNumber`,
+/// `serviceName`) so station lineup/name changes trigger a logo cache refresh.
+String buildChannelLogoSignature(List<Channel> channels) {
+  if (channels.isEmpty) return '';
+  final sorted = List<Channel>.of(channels)
+    ..sort((a, b) {
+      final bySid = a.serviceId.compareTo(b.serviceId);
+      if (bySid != 0) return bySid;
+      final byNum = a.channelNumber.compareTo(b.channelNumber);
+      if (byNum != 0) return byNum;
+      return a.serviceName.compareTo(b.serviceName);
+    });
+  return [
+    for (final c in sorted)
+      '${c.serviceId}:${c.channelNumber}:${c.serviceName.trim()}',
+  ].join('|');
+}
+
 /// Persistent disk cache for broadcast station logo PNGs, keyed per device and
 /// broadcasting type (`serviceId -> Uint8List`).
 class ChannelLogoCache {
@@ -441,13 +462,31 @@ class ChannelLogoCache {
 
   Future<Map<int, Uint8List>?> load(
     String host,
-    int broadcastingType,
-  ) async {
+    int broadcastingType, {
+    Duration? maxAge,
+    String? expectedChannelsSignature,
+    DateTime? now,
+  }) async {
     final raw = await _kv.read(_key(host, broadcastingType));
     if (raw == null || raw.isEmpty) return null;
     try {
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
+      if (maxAge != null) {
+        final savedRaw = decoded['savedAt'];
+        final savedAt =
+            savedRaw is String ? DateTime.tryParse(savedRaw) : null;
+        if (savedAt == null) return null;
+        final currentTime = now ?? DateTime.now();
+        if (currentTime.difference(savedAt) >= maxAge) return null;
+      }
+      if (expectedChannelsSignature != null &&
+          expectedChannelsSignature.isNotEmpty) {
+        final cachedSig = decoded['channelsSignature'];
+        if (cachedSig is! String || cachedSig != expectedChannelsSignature) {
+          return null;
+        }
+      }
       final logosRaw = decoded['logos'];
       if (logosRaw is! Map) return null;
       final out = <int, Uint8List>{};
@@ -469,27 +508,29 @@ class ChannelLogoCache {
   Future<void> save(
     String host,
     int broadcastingType,
-    Map<int, List<int>> logos,
-  ) async {
+    Map<int, List<int>> logos, {
+    String? channelsSignature,
+    DateTime? savedAt,
+  }) async {
     if (logos.isEmpty) return;
-    await _kv.write(
-      _key(host, broadcastingType),
-      jsonEncode({
-        'broadcastingType': broadcastingType,
-        'savedAt': DateTime.now().toIso8601String(),
-        'logos': {
-          for (final entry in logos.entries)
-            if (entry.value.isNotEmpty)
-              '${entry.key}': base64Encode(
-                normalizeAribLogoPng(
-                  entry.value is Uint8List
-                      ? entry.value as Uint8List
-                      : Uint8List.fromList(entry.value),
-                ),
+    final payload = <String, dynamic>{
+      'broadcastingType': broadcastingType,
+      'savedAt': (savedAt ?? DateTime.now()).toIso8601String(),
+      if (channelsSignature != null && channelsSignature.isNotEmpty)
+        'channelsSignature': channelsSignature,
+      'logos': {
+        for (final entry in logos.entries)
+          if (entry.value.isNotEmpty)
+            '${entry.key}': base64Encode(
+              normalizeAribLogoPng(
+                entry.value is Uint8List
+                    ? entry.value as Uint8List
+                    : Uint8List.fromList(entry.value),
               ),
-        },
-      }),
-    );
+            ),
+      },
+    };
+    await _kv.write(_key(host, broadcastingType), jsonEncode(payload));
   }
 
   Future<void> delete(String host, int broadcastingType) =>

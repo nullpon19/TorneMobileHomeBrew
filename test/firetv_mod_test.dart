@@ -11302,6 +11302,268 @@ void main() {
           expect(upgraded![56832], normalized8);
         },
       );
+
+      test(
+        'Phase 38.3: OSD cache tick polling, timeshift programme boundary sync, UPnP priority & logo TTL/signature',
+        () async {
+          // 1. OSD cache tick polling & display-change sensitivity
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: true,
+            ),
+            isFalse,
+          );
+          // Even if floor values remain equal (e.g. start=0.2, end=10.6 -> 10.9),
+          // rounded rewindable span crossing 10s -> 11s triggers rebuild.
+          expect(
+            hasLiveCacheRangeDisplayChanged(
+              prevStart: 0.2,
+              prevEnd: 10.6,
+              prevPos: 10.6,
+              nextStart: 0.2,
+              nextEnd: 10.9,
+              nextPos: 10.9,
+            ),
+            isTrue,
+          );
+          expect(
+            hasLiveCacheRangeDisplayChanged(
+              prevStart: 0.2,
+              prevEnd: 10.6,
+              prevPos: 10.6,
+              nextStart: 0.2,
+              nextEnd: 10.65,
+              nextPos: 10.65,
+            ),
+            isFalse,
+          );
+
+          // 2. Timeshift playback spanning programme boundary A -> B
+          final progStart = DateTime.utc(2026, 11, 25, 12, 0);
+          final progMid = DateTime.utc(2026, 11, 25, 12, 15);
+          final progEnd = DateTime.utc(2026, 11, 25, 12, 20);
+          final wallNow = DateTime.utc(2026, 11, 25, 12, 17);
+          final ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: '番組B',
+            programStart: progMid,
+            programEnd: progEnd,
+          );
+          final eventA = EpgEvent(
+            eventId: 701,
+            start: progStart,
+            duration: const Duration(minutes: 15),
+            title: '番組A',
+            shortText: '番組Aの内容',
+          );
+          final eventB = EpgEvent(
+            eventId: 702,
+            start: progMid,
+            duration: const Duration(minutes: 5),
+            title: '番組B',
+            shortText: '番組Bの内容',
+          );
+          final lagSec = resolveLivePlaybackLagSeconds(
+            liveDelayedByPause: true,
+            cacheStartSeconds: 60.0,
+            cacheEndSeconds: 540.0,
+            effectivePosSeconds: 240.0, // 300s behind -> 12:12:00
+          );
+          expect(lagSec, 300.0);
+          final playbackClock = resolveLivePlaybackClock(
+            now: wallNow,
+            lagSeconds: lagSec,
+          );
+          expect(playbackClock, DateTime.utc(2026, 11, 25, 12, 12));
+          final infoA = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: playbackClock,
+          );
+          expect(infoA.currentTitle, '番組A');
+          expect(infoA.remainingMinutes, 3);
+          expect(infoA.nextTitle, '番組B');
+          final barA = resolveLiveTimeshiftBarState(
+            info: infoA,
+            now: wallNow,
+            cacheStartSeconds: 60.0,
+            cacheEndSeconds: 540.0,
+            effectivePosSeconds: 240.0,
+            liveDelayedByPause: true,
+          );
+          expect(barA.liveEdgeFraction, 1.0);
+          expect(barA.playbackFraction, closeTo(0.80, 0.001));
+          expect(barA.lagSeconds, 300);
+          expect(barA.rewindableSeconds, 480);
+          final detailA = resolveLiveProgramDetail(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: playbackClock,
+          );
+          expect(detailA.title, '番組A');
+          expect(detailA.body, contains('番組Aの内容'));
+
+          // Moving forward into B's window switches title/detail to B
+          final clockB = resolveLivePlaybackClock(
+            now: wallNow,
+            lagSeconds: 60.0, // 12:16:00
+          );
+          final infoB = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: clockB,
+          );
+          expect(infoB.currentTitle, '番組B');
+
+          expect(
+            shouldRefreshPlayerLiveGuide(
+              lastUpdatedAt: wallNow.subtract(const Duration(minutes: 9)),
+              now: wallNow,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldRefreshPlayerLiveGuide(
+              lastUpdatedAt: wallNow.subtract(const Duration(minutes: 10)),
+              now: wallNow,
+            ),
+            isTrue,
+          );
+
+          // 3. Emergency UPnP active schedule overrides stale EPG slot without leaking EPG text
+          final emergencyCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            genre: 'ニュース',
+            programTitle: '緊急ニュース特番',
+            description: '緊急報道',
+            programStart: DateTime.utc(2026, 11, 25, 12, 0),
+            programEnd: DateTime.utc(2026, 11, 25, 12, 30),
+          );
+          final staleScheduledA = EpgEvent(
+            eventId: 801,
+            start: DateTime.utc(2026, 11, 25, 12, 0),
+            duration: const Duration(hours: 1),
+            title: '通常番組A',
+            shortText: '通常番組Aの概要',
+            description: '通常番組Aの詳細',
+          );
+          final laterEvent = EpgEvent(
+            eventId: 802,
+            start: DateTime.utc(2026, 11, 25, 13, 0),
+            duration: const Duration(hours: 1),
+            title: '後続番組C',
+          );
+          final emergencyDisplay = resolveLiveChannelDisplay(
+            channel: emergencyCh,
+            guideEvents: [staleScheduledA, laterEvent],
+            now: DateTime.utc(2026, 11, 25, 12, 10),
+          );
+          expect(emergencyDisplay.programTitle, '緊急ニュース特番');
+          expect(emergencyDisplay.programEnd, DateTime.utc(2026, 11, 25, 12, 30));
+          expect(emergencyDisplay.shortDescription, '緊急報道');
+          expect(emergencyDisplay.longDescription, isNull);
+          expect(emergencyDisplay.nextProgramTitle, '後続番組C');
+
+          // 4. ChannelLogoCache TTL & channel lineup signature validation
+          final logoKv = InMemoryKeyValueStore();
+          final logoCache = ChannelLogoCache(logoKv);
+          const chList1 = [
+            Channel(
+              broadcastingType: 2,
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0400,
+              serviceType: 1,
+              channelNumber: 41,
+              serviceName: '旧局名',
+            ),
+          ];
+          const chListRenamed = [
+            Channel(
+              broadcastingType: 2,
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0400,
+              serviceType: 1,
+              channelNumber: 41,
+              serviceName: '新局名',
+            ),
+          ];
+          final sig1 = buildChannelLogoSignature(chList1);
+          final sig2 = buildChannelLogoSignature(chListRenamed);
+          expect(sig1, isNot(sig2));
+          final savedAt = DateTime.utc(2026, 11, 18, 12, 0);
+          final sampleLogo = Uint8List.fromList([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3,
+          ]);
+          await logoCache.save(
+            '192.0.2.1',
+            2,
+            {0x0400: sampleLogo},
+            channelsSignature: sig1,
+            savedAt: savedAt,
+          );
+          // Within 7 days & matching signature -> hit
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig1,
+              now: savedAt.add(const Duration(days: 6)),
+            ),
+            isNotNull,
+          );
+          // 7+ days -> expired (null)
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig1,
+              now: savedAt.add(const Duration(days: 7)),
+            ),
+            isNull,
+          );
+          // Channel lineup/name changed -> mismatch (null)
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig2,
+              now: savedAt.add(const Duration(days: 1)),
+            ),
+            isNull,
+          );
+          // Offline stale fallback (no constraints) still returns cached PNG
+          expect(await logoCache.load('192.0.2.1', 2), isNotNull);
+        },
+      );
     },
   );
 }

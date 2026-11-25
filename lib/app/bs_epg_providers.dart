@@ -44,8 +44,18 @@ final bsEpgGuideProvider = FutureProvider.family<EpgGuide, RegisteredNasne>(
 
 final bsChannelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) =>
-      loadCachedOrFetchChannelLogos(ref, reg, bsBroadcastingType),
+  (ref, reg) async {
+    List<Channel> channels = const [];
+    try {
+      channels = await ref.watch(bsChannelsProvider(reg).future);
+    } catch (_) {}
+    return loadCachedOrFetchChannelLogos(
+      ref,
+      reg,
+      bsBroadcastingType,
+      channels: channels,
+    );
+  },
 );
 
 /// CS channel list, persisted through [channelCacheProvider]. Falls back to an
@@ -69,20 +79,30 @@ final csChannelsProvider = FutureProvider.family<List<Channel>, RegisteredNasne>
 /// Station logos for CS (best-effort; degrades to an empty map if unsupported).
 final csChannelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) =>
-      loadCachedOrFetchChannelLogos(ref, reg, csBroadcastingType),
+  (ref, reg) async {
+    List<Channel> channels = const [];
+    try {
+      channels = await ref.watch(csChannelsProvider(reg).future);
+    } catch (_) {}
+    return loadCachedOrFetchChannelLogos(
+      ref,
+      reg,
+      csBroadcastingType,
+      channels: channels,
+    );
+  },
 );
 
-/// Clears persisted station logos for [reg] and invalidates the corresponding
-/// Riverpod logo providers (all bands when [broadcastingType] is omitted).
-void invalidateChannelLogosWithCacheReset(
+/// Clears persisted station logos for [reg] and awaits deletion before
+/// invalidating the corresponding Riverpod logo providers (all bands when
+/// [broadcastingType] is omitted) so stale disk logos are never re-read.
+Future<void> invalidateChannelLogosWithCacheReset(
   WidgetRef ref,
   RegisteredNasne reg, {
   int? broadcastingType,
-}) {
-  unawaited(
-    clearChannelLogoCache(ref, reg, broadcastingType: broadcastingType),
-  );
+}) async {
+  await clearChannelLogoCache(ref, reg, broadcastingType: broadcastingType);
+  if (!ref.context.mounted) return;
   if (broadcastingType == null ||
       broadcastingType == terrestrialBroadcastingType) {
     ref.invalidate(channelLogosProvider(reg));

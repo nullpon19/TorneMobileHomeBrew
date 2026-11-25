@@ -211,16 +211,25 @@ final epgGuideProvider = FutureProvider.family<EpgGuide, RegisteredNasne>((
       .getProgrammeGuide(terrestrialBroadcastingType, channels);
 });
 
-/// Loads persisted station logos from disk cache or fetches them once from
-/// nasne and saves them to [channelLogoCacheProvider]. Returns an empty map
-/// when the device has no logos or returns an error.
+/// Loads persisted station logos from disk cache or fetches them from nasne
+/// when expired ([channelLogoCacheMaxAge]) or when the channel lineup signature
+/// changes, saving refreshed logos to [channelLogoCacheProvider]. Falls back to
+/// any cached logos on [NasneError] so offline browsing retains existing icons.
 Future<Map<int, List<int>>> loadCachedOrFetchChannelLogos(
   Ref ref,
   RegisteredNasne reg,
-  int broadcastingType,
-) async {
+  int broadcastingType, {
+  List<Channel> channels = const [],
+}) async {
   final cache = ref.watch(channelLogoCacheProvider);
-  final cached = await cache.load(reg.host, broadcastingType);
+  final sig = buildChannelLogoSignature(channels);
+  final expectedSig = sig.isNotEmpty ? sig : null;
+  final cached = await cache.load(
+    reg.host,
+    broadcastingType,
+    maxAge: channelLogoCacheMaxAge,
+    expectedChannelsSignature: expectedSig,
+  );
   if (cached != null && cached.isNotEmpty) {
     return cached;
   }
@@ -238,14 +247,20 @@ Future<Map<int, List<int>>> loadCachedOrFetchChannelLogos(
     };
     if (normalized.isNotEmpty) {
       try {
-        await cache.save(reg.host, broadcastingType, normalized);
+        await cache.save(
+          reg.host,
+          broadcastingType,
+          normalized,
+          channelsSignature: expectedSig,
+        );
       } catch (_) {
         // Cache persistence is best-effort; never fail logo rendering.
       }
     }
     return normalized;
   } on NasneError {
-    return const <int, List<int>>{};
+    final staleCached = await cache.load(reg.host, broadcastingType);
+    return staleCached ?? const <int, List<int>>{};
   }
 }
 
@@ -265,8 +280,18 @@ Future<void> clearChannelLogoCache(
 /// [channelLogoCacheProvider].
 final channelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-      (ref, reg) =>
-          loadCachedOrFetchChannelLogos(ref, reg, terrestrialBroadcastingType),
+      (ref, reg) async {
+        List<Channel> channels = const [];
+        try {
+          channels = await ref.watch(channelsProvider(reg).future);
+        } catch (_) {}
+        return loadCachedOrFetchChannelLogos(
+          ref,
+          reg,
+          terrestrialBroadcastingType,
+          channels: channels,
+        );
+      },
     );
 
 /// Reservations in chronological order (the device returns them in

@@ -119,20 +119,28 @@ class WebApiEpgService {
       '${fresh.services.fold<int>(0, (sum, s) => sum + s.events.length)} '
       'events in ${stopwatch.elapsedMilliseconds} ms',
     );
+    final fetchedAt = DateTime.now();
+    final stampedFresh = EpgGuide(
+      broadcastingType: fresh.broadcastingType,
+      services: fresh.services,
+      fetchedAt: fetchedAt,
+    );
     final cache = _guideCache;
     final host = _cacheHost;
-    if (cache == null || host == null) return fresh;
+    if (cache == null || host == null) return stampedFresh;
     // Accumulation is best-effort: a cache failure must never break
     // the guide itself.
     try {
       final cached = await cache.load(host, broadcastingType);
-      final merged = (cached.isNotEmpty && fresh.eventCount >= 200)
-          ? await Isolate.run(() => mergeEpgGuideWithCache(fresh, cached))
-          : mergeEpgGuideWithCache(fresh, cached);
+      final merged = (cached.isNotEmpty && stampedFresh.eventCount >= 200)
+          ? await Isolate.run(
+              () => mergeEpgGuideWithCache(stampedFresh, cached),
+            )
+          : mergeEpgGuideWithCache(stampedFresh, cached);
       await cache.save(host, broadcastingType, merged);
       return merged;
     } catch (_) {
-      return fresh;
+      return stampedFresh;
     }
   }
 
@@ -147,6 +155,21 @@ class WebApiEpgService {
   }
 }
 
+/// Returns `true` when [guide] is missing, expired, or older than [maxAge]
+/// so schedule updates (e.g. emergency news) are picked up promptly.
+bool shouldRefreshStaleEpgGuide(
+  EpgGuide? guide,
+  DateTime now, {
+  Duration maxAge = const Duration(minutes: 15),
+}) {
+  if (guide == null) return true;
+  final guideTo = guide.to;
+  if (guideTo != null && !guideTo.isAfter(now)) return true;
+  final fetchedAt = guide.fetchedAt;
+  if (fetchedAt != null && now.difference(fetchedAt) >= maxAge) return true;
+  return false;
+}
+
 /// Merges a freshly fetched [fresh] guide with the accumulated
 /// [cached] events (serviceId -> events, from [EpgGuideCache]).
 ///
@@ -154,22 +177,44 @@ class WebApiEpgService {
 /// events form the base. For an event present in both (same eventId
 /// and start), fields the fresh copy lacks are filled from the
 /// cached copy; fresh values always win. Cached events absent from
-/// the fresh guide are carried over, except ones that ended more
-/// than a day before the fresh guide starts (past data the UI no
-/// longer shows; this also bounds the cache size). The result is
-/// sorted by start within each service.
+/// the fresh guide are carried over only when they do not overlap any
+/// fresh event in time and do not represent a rescheduled duplicate of
+/// a fresh event (`eventId` shifted within ±24h), and when they ended
+/// less than a day before the fresh guide starts. The result is sorted
+/// by start within each service.
 EpgGuide mergeEpgGuideWithCache(
   EpgGuide fresh,
-  Map<int, List<EpgEvent>> cached,
-) {
-  if (cached.isEmpty || fresh.services.isEmpty) return fresh;
+  Map<int, List<EpgEvent>> cached, {
+  DateTime? fetchedAt,
+}) {
+  final effectiveFetchedAt = fetchedAt ?? fresh.fetchedAt;
+  if (cached.isEmpty || fresh.services.isEmpty) {
+    if (effectiveFetchedAt == null || fresh.fetchedAt == effectiveFetchedAt) {
+      return fresh;
+    }
+    return EpgGuide(
+      broadcastingType: fresh.broadcastingType,
+      services: fresh.services,
+      fetchedAt: effectiveFetchedAt,
+    );
+  }
   final freshFrom = fresh.from;
-  if (freshFrom == null) return fresh;
+  if (freshFrom == null) {
+    if (effectiveFetchedAt == null || fresh.fetchedAt == effectiveFetchedAt) {
+      return fresh;
+    }
+    return EpgGuide(
+      broadcastingType: fresh.broadcastingType,
+      services: fresh.services,
+      fetchedAt: effectiveFetchedAt,
+    );
+  }
   final cutoff = freshFrom.subtract(const Duration(days: 1));
   (int, int) keyOf(EpgEvent e) =>
       (e.eventId, e.start.microsecondsSinceEpoch);
   return EpgGuide(
     broadcastingType: fresh.broadcastingType,
+    fetchedAt: effectiveFetchedAt,
     services: [
       for (final service in fresh.services)
         EpgServiceGuide(
@@ -185,6 +230,29 @@ EpgGuide mergeEpgGuideWithCache(
   );
 }
 
+bool _shouldCarryOverCachedEvent(
+  EpgEvent cachedEvent,
+  List<EpgEvent> freshEvents,
+  Set<(int, int)> freshKeys,
+  DateTime cutoff,
+) {
+  final key = (cachedEvent.eventId, cachedEvent.start.microsecondsSinceEpoch);
+  if (freshKeys.contains(key)) return false;
+  if (!cachedEvent.end.isAfter(cutoff)) return false;
+  for (final f in freshEvents) {
+    if (cachedEvent.start.isBefore(f.end) && cachedEvent.end.isAfter(f.start)) {
+      return false;
+    }
+    if (cachedEvent.eventId != 0 &&
+        cachedEvent.eventId == f.eventId &&
+        cachedEvent.start.difference(f.start).abs() <=
+            const Duration(hours: 24)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 List<EpgEvent> _mergeEvents(
   List<EpgEvent> fresh,
   List<EpgEvent> cached,
@@ -197,7 +265,7 @@ List<EpgEvent> _mergeEvents(
   final merged = <EpgEvent>[
     for (final e in fresh) _fillFrom(e, cachedByKey[keyOf(e)]),
     for (final e in cached)
-      if (!freshKeys.contains(keyOf(e)) && e.end.isAfter(cutoff)) e,
+      if (_shouldCarryOverCachedEvent(e, fresh, freshKeys, cutoff)) e,
   ];
   merged.sort((a, b) {
     final byStart = a.start.compareTo(b.start);

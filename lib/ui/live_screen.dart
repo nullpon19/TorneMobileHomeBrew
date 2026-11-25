@@ -106,6 +106,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
   }
 
   void _refreshOnReveal() {
+    final now = DateTime.now();
     final regs =
         ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
     final selected = ref.read(selectedRegistrationProvider);
@@ -120,6 +121,18 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
       final sched = ref.read(schedulesProvider(r));
       if (sched.hasValue && !sched.isLoading) {
         ref.invalidate(schedulesProvider(r));
+      }
+      final epgAsync = ref.read(epgGuideProvider(r));
+      if (epgAsync.hasValue &&
+          !epgAsync.isLoading &&
+          shouldRefreshStaleEpgGuide(epgAsync.value, now)) {
+        ref.invalidate(epgGuideProvider(r));
+      }
+      final bsEpgAsync = ref.read(bsEpgGuideProvider(r));
+      if (bsEpgAsync.hasValue &&
+          !bsEpgAsync.isLoading &&
+          shouldRefreshStaleEpgGuide(bsEpgAsync.value, now)) {
+        ref.invalidate(bsEpgGuideProvider(r));
       }
     }
   }
@@ -149,7 +162,12 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                 for (final r in activeRegs) {
                   ref.invalidate(liveChannelsProvider(r));
                   ref.invalidate(schedulesProvider(r));
-                  invalidateChannelLogosWithCacheReset(ref, r);
+                  ref.invalidate(channelsProvider(r));
+                  ref.invalidate(bsChannelsProvider(r));
+                  ref.invalidate(csChannelsProvider(r));
+                  ref.invalidate(epgGuideProvider(r));
+                  ref.invalidate(bsEpgGuideProvider(r));
+                  unawaited(invalidateChannelLogosWithCacheReset(ref, r));
                 }
               },
             ),
@@ -487,16 +505,18 @@ class _LiveListState extends ConsumerState<_LiveList>
             ref.invalidate(schedulesProvider(r));
           }
           if (bandTypes.contains(terrestrialBroadcastingType)) {
-            final epg = ref.read(epgGuideProvider(r)).value;
-            final epgTo = epg?.to;
-            if (epg == null || (epgTo != null && !epgTo.isAfter(fireNow))) {
+            final epgAsync = ref.read(epgGuideProvider(r));
+            if (epgAsync.hasValue &&
+                !epgAsync.isLoading &&
+                shouldRefreshStaleEpgGuide(epgAsync.value, fireNow)) {
               ref.invalidate(epgGuideProvider(r));
             }
           }
           if (bandTypes.contains(bsBroadcastingType)) {
-            final bsEpg = ref.read(bsEpgGuideProvider(r)).value;
-            final bsTo = bsEpg?.to;
-            if (bsEpg == null || (bsTo != null && !bsTo.isAfter(fireNow))) {
+            final bsEpgAsync = ref.read(bsEpgGuideProvider(r));
+            if (bsEpgAsync.hasValue &&
+                !bsEpgAsync.isLoading &&
+                shouldRefreshStaleEpgGuide(bsEpgAsync.value, fireNow)) {
               ref.invalidate(bsEpgGuideProvider(r));
             }
           }
@@ -1034,6 +1054,42 @@ ResolvedLiveChannelDisplay resolveLiveChannelDisplay({
       channel.programEnd != null &&
       channel.programStart!.isAtSameMomentAs(ev.start) &&
       channel.programEnd!.isAtSameMomentAs(ev.end);
+  final channelActiveAtNow =
+      channel.programStart != null &&
+      channel.programEnd != null &&
+      !now.isBefore(channel.programStart!) &&
+      channel.programEnd!.isAfter(now);
+  if (!sameSlot &&
+      channelActiveAtNow &&
+      channel.programTitle.trim().isNotEmpty) {
+    final sorted = sortEpgEventsByStart(guideEvents);
+    final nextCutoff = channel.programEnd!.subtract(const Duration(minutes: 1));
+    EpgEvent? nextAfterChannel;
+    for (final candidate in sorted) {
+      final candidateTitle = candidate.title?.trim() ?? '';
+      if (candidateTitle.isEmpty || !candidate.end.isAfter(now)) continue;
+      if (!candidate.start.isBefore(nextCutoff)) {
+        nextAfterChannel = candidate;
+        break;
+      }
+    }
+    return ResolvedLiveChannelDisplay(
+      programTitle: channel.programTitle.trim(),
+      programStart: channel.programStart,
+      programEnd: channel.programEnd,
+      genre: channel.genre,
+      shortDescription: channel.description,
+      longDescription: channel.longDescription,
+      progress: _computeProgramProgress(
+        channel.programStart,
+        channel.programEnd,
+        now,
+      ),
+      nextProgramTitle: nextAfterChannel?.title?.trim() ?? info.nextTitle,
+      nextProgramStart: nextAfterChannel?.start ?? info.nextStart,
+      nextProgramEnd: nextAfterChannel?.end ?? info.nextEnd,
+    );
+  }
   final preserveChannelFields = sameSlot || !hasChannelTimes;
   final evTitle = (ev.title ?? '').trim();
   final evGenre = epgGenreLabel(ev.genreLevel1);
@@ -2002,14 +2058,25 @@ EpgGuide? _cachedEpgGuideForBand(
 Future<EpgGuide?> _loadEpgGuideForBand(
   ProviderContainer container,
   RegisteredNasne reg,
-  int? bandType,
-) async {
+  int? bandType, {
+  bool forceRefresh = false,
+}) async {
   final provider = switch (bandType) {
     terrestrialBroadcastingType => epgGuideProvider(reg),
     bsBroadcastingType => bsEpgGuideProvider(reg),
     _ => null,
   };
   if (provider == null) return null;
+  if (forceRefresh) {
+    final existing = container.read(provider).value;
+    final fetchedAt = existing?.fetchedAt;
+    if (existing != null &&
+        (fetchedAt == null ||
+            DateTime.now().difference(fetchedAt) >=
+                const Duration(seconds: 30))) {
+      container.invalidate(provider);
+    }
+  }
   try {
     return await container
         .read(provider.future)
@@ -2140,12 +2207,22 @@ Widget _buildLivePlayerScreen({
     liveUseMobile: useMobile,
     initialLiveGuideEvents: initialLiveGuideEvents,
     loadLiveGuideEvents: () async {
-      final guide = await _loadEpgGuideForBand(container, reg, bandType);
+      final guide = await _loadEpgGuideForBand(
+        container,
+        reg,
+        bandType,
+        forceRefresh: true,
+      );
       return _serviceEventsFromGuide(guide, channel);
     },
     initialLiveBandGuideEvents: initialLiveBandGuideEvents,
     loadLiveBandGuideEvents: () async {
-      final guide = await _loadEpgGuideForBand(container, reg, bandType);
+      final guide = await _loadEpgGuideForBand(
+        container,
+        reg,
+        bandType,
+        forceRefresh: true,
+      );
       return _bandGuideEventsMap(guide, bandChannels);
     },
     initialLiveChannelNumbers: initialMeta.numbers,

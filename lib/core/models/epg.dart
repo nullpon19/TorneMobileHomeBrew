@@ -73,10 +73,15 @@ class EpgServiceGuide {
 
 /// The whole programme guide for one broadcasting type.
 class EpgGuide {
-  const EpgGuide({required this.broadcastingType, required this.services});
+  const EpgGuide({
+    required this.broadcastingType,
+    required this.services,
+    this.fetchedAt,
+  });
 
   final int broadcastingType;
   final List<EpgServiceGuide> services;
+  final DateTime? fetchedAt;
 
   /// Earliest event start across all services (null when empty).
   DateTime? get from {

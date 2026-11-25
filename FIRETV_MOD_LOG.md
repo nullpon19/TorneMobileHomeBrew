@@ -426,8 +426,13 @@
    - ARIB 伝送仕様により `PLTE` / `tRNS` チャンクが省略された放送局ロゴ（Color Type 3）に対し、ARIB STD-B24 / TR-B14 規定の固定 129 色 CLUT から標準 `PLTE` + `tRNS`（PNG CRC-32 付き、ビット深度別エントリ上限対応）を補完する `normalizeAribLogoPng` を導入（既存 `ChannelLogoCache.load` 時も自動補完）。
    - `ChannelLogoCache` (`channel_logo_cache.json`) を新設し、取得済みロゴ PNG を永続保存（手動「更新」時のみキャッシュ削除＋再取得）。`csChannelsProvider` / `csChannelLogosProvider` もベストエフォート追加。
    - 共通部品 `ChannelLogoPlate`（背景枠・余白なしの `ClipRRect` 直接角丸描画）と `ChannelNumberBadge`（`031` / `101` 等の 3 桁番号、5 桁 UPnP `channelNr` 除外）を作成し、TV 視聴一覧ではロゴ直下へ背景・枠なしのシンプルテキスト（14.5dp 太字）表示、TV 視聴詳細／番組表 `_ChannelHeader`／プレイヤー OSD ヘッダー 1 行目／左右チャンネル切替カードへ統一展開。
-4. **検証 (`test/firetv_mod_test.dart`)**:
-   - 第25弾「一時停止」バッジ色アサーションを緑へ更新し、`liveStatusPresentation` 6パターン、`ChannelLogoCache`（レガシー自動補完含む）、3桁番号解決、`crc32Mpeg` テーブル検証、`normalizeAribLogoPng`（8bit/4bit `dart:ui` 実 PNG デコード＆RGBA 画素一致確認）、`LiveProgramProgressBar`・`LiveChannelSwitchPreviewCard`・`LiveScreen` EPG スピナー＆ロゴ直下番号描画テストを追加（`dart analyze` 問題なし、対象9スイート全214テスト合格）。
+4. **Live OSD リアルタイム更新・プレイバック番組またぎ同期・EPG 編成変更＆ロゴ更新耐性強化 (Phase 38.3 — `core/models/epg.dart`, `core/services/epg.dart`, `core/store/registration_store.dart`, `app/state.dart`, `app/bs_epg_providers.dart`, `ui/player_screen.dart`, `ui/live_screen.dart`, `ui/epg_screen.dart`)**:
+   - `_openOsd()` の 1 秒タイマーから `shouldPollLiveCacheOnOsdTick` 条件で mpv キャッシュ範囲を毎秒ポーリングし、`hasLiveCacheRangeDisplayChanged`（`.round()` 変化検知含む）と確定タイマー `_osdOpen` 対応により、OSD を閉じずに「戻れる範囲」とシークバーがリアルタイム更新されるように修正。
+   - `resolveLivePlaybackLagSeconds` / `resolveLivePlaybackClock` によりプレイバック・一時停止・追いかけ再生中の映像時刻を算出し、番組境界をまたいでも再生位置側の番組名・残り時間・次番組・シークバー・「番組詳細」（および自動クローズ判定）を正確に追従（録画確認ダイアログ・左上時計は現在時刻維持）。EPG 非対応バンド向けに視聴中番組履歴フォールバックも追加。
+   - `mergeEpgGuideWithCache` で新 EPG と重複／同一 `eventId` 時間移動（±24h）した旧キャッシュ番組を確実に破棄して編成変更時の亡霊残存を解消。TV 視聴一覧でもリアルタイム有効な UPnP 情報を旧 EPG より優先（`resolveLiveChannelDisplay`）し、更新ボタン・15 分間隔の境界/再表示・プレイヤー OSD 10 分超過時サイレント再取得を整備。
+   - `ChannelLogoCache` へ 7 日間 TTL（`channelLogoCacheMaxAge`）とチャンネル一覧署名（`buildChannelLogoSignature`：局追加・番号/局名変更検知）を導入しつつオフライン時フォールバックを維持し、`invalidateChannelLogosWithCacheReset` のキャッシュ削除先行 `await` と全更新ボタンでのチャンネル一覧無効化を修正。
+5. **検証 (`test/epg_guide_cache_test.dart`, `test/firetv_mod_test.dart`)**:
+   - 第25弾「一時停止」バッジ色アサーションを緑へ更新し、`liveStatusPresentation` 6パターン、`ChannelLogoCache`（レガシー自動補完・7日TTL・編成署名・オフラインフォールバック）、3桁番号解決、`crc32Mpeg` テーブル検証、`normalizeAribLogoPng`（8bit/4bit `dart:ui` 実 PNG デコード＆RGBA 画素一致確認）、`LiveProgramProgressBar`・`LiveChannelSwitchPreviewCard`・`LiveScreen` EPG スピナー＆ロゴ直下番号描画、Phase 38.3（OSD ポーリング・番組またぎシークバー＆詳細・UPnP 緊急編成優先・EPG マージ亡霊除去）テストを追加。
 
 ---
 

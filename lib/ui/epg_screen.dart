@@ -1048,19 +1048,24 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
                         for (final r in activeRegs) {
                           ref.invalidate(schedulesProvider(r));
                           if (_selectedBand == terrestrialBroadcastingType) {
+                            ref.invalidate(channelsProvider(r));
                             ref.invalidate(epgGuideProvider(r));
-                            invalidateChannelLogosWithCacheReset(
-                              ref,
-                              r,
-                              broadcastingType: terrestrialBroadcastingType,
+                            unawaited(
+                              invalidateChannelLogosWithCacheReset(
+                                ref,
+                                r,
+                                broadcastingType: terrestrialBroadcastingType,
+                              ),
                             );
                           } else {
                             ref.invalidate(bsChannelsProvider(r));
                             ref.invalidate(bsEpgGuideProvider(r));
-                            invalidateChannelLogosWithCacheReset(
-                              ref,
-                              r,
-                              broadcastingType: bsBroadcastingType,
+                            unawaited(
+                              invalidateChannelLogosWithCacheReset(
+                                ref,
+                                r,
+                                broadcastingType: bsBroadcastingType,
+                              ),
                             );
                           }
                         }
