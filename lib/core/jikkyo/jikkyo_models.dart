@@ -472,8 +472,11 @@ class JikkyoSettings {
     this.textSize = JikkyoTextSizePreset.normal,
     this.speed = JikkyoSpeedPreset.normal,
     this.maxConcurrentComments = 40,
-    this.avoidSubtitleArea = true,
+    this.avoidSubtitleArea = false,
     this.liveDelaySeconds = 5,
+    this.forceWhiteText = false,
+    this.hideFixedComments = false,
+    this.ngWords = const [],
     this.channelOverrides = const {},
     this.channelOverrideLabels = const {},
   });
@@ -486,11 +489,50 @@ class JikkyoSettings {
   final int maxConcurrentComments;
   final bool avoidSubtitleArea;
   final int liveDelaySeconds;
+  final bool forceWhiteText;
+  final bool hideFixedComments;
+  final List<String> ngWords;
   final Map<String, String> channelOverrides;
   final Map<String, String> channelOverrideLabels;
 
-  String get summaryLabel =>
-      '文字${textSize.label}・透過$opacityPercent%・速度${speed.label}・遅延+$liveDelaySeconds秒';
+  bool get hasActiveFilters =>
+      forceWhiteText || hideFixedComments || ngWords.isNotEmpty;
+
+  String get summaryLabel {
+    final base =
+        '文字${textSize.label}・透過$opacityPercent%・速度${speed.label}・遅延+$liveDelaySeconds秒';
+    return hasActiveFilters ? '$base・フィルタ' : base;
+  }
+
+  static String _foldForFilter(String raw) {
+    final sb = StringBuffer();
+    for (final rune in raw.runes) {
+      if (rune == 0x3000) {
+        sb.writeCharCode(0x20);
+      } else if (rune >= 0xFF01 && rune <= 0xFF5E) {
+        sb.writeCharCode(rune - 0xFEE0);
+      } else {
+        sb.writeCharCode(rune);
+      }
+    }
+    return sb.toString().toLowerCase();
+  }
+
+  bool matchesFilter(JikkyoComment comment) {
+    if (hideFixedComments && comment.position != JikkyoCommentPosition.naka) {
+      return false;
+    }
+    if (ngWords.isNotEmpty) {
+      final foldedText = _foldForFilter(comment.text);
+      for (final rawWord in ngWords) {
+        final w = _foldForFilter(rawWord).trim();
+        if (w.isNotEmpty && foldedText.contains(w)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   JikkyoSettings copyWith({
     int? opacityPercent,
@@ -499,6 +541,9 @@ class JikkyoSettings {
     int? maxConcurrentComments,
     bool? avoidSubtitleArea,
     int? liveDelaySeconds,
+    bool? forceWhiteText,
+    bool? hideFixedComments,
+    List<String>? ngWords,
     Map<String, String>? channelOverrides,
     Map<String, String>? channelOverrideLabels,
   }) {
@@ -510,11 +555,40 @@ class JikkyoSettings {
           maxConcurrentComments ?? this.maxConcurrentComments,
       avoidSubtitleArea: avoidSubtitleArea ?? this.avoidSubtitleArea,
       liveDelaySeconds: liveDelaySeconds ?? this.liveDelaySeconds,
+      forceWhiteText: forceWhiteText ?? this.forceWhiteText,
+      hideFixedComments: hideFixedComments ?? this.hideFixedComments,
+      ngWords: ngWords ?? this.ngWords,
       channelOverrides: channelOverrides ?? this.channelOverrides,
       channelOverrideLabels:
           channelOverrideLabels ?? this.channelOverrideLabels,
     );
   }
+
+  JikkyoSettings withAddedNgWord(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return this;
+    final foldedNew = _foldForFilter(trimmed);
+    for (final existing in ngWords) {
+      if (_foldForFilter(existing) == foldedNew) return this;
+    }
+    final next = <String>[...ngWords, trimmed];
+    if (next.length > 50) {
+      next.removeRange(0, next.length - 50);
+    }
+    return copyWith(ngWords: List.unmodifiable(next));
+  }
+
+  JikkyoSettings withoutNgWord(String word) {
+    final next = [
+      for (final existing in ngWords)
+        if (existing != word) existing,
+    ];
+    if (next.length == ngWords.length) return this;
+    return copyWith(ngWords: List.unmodifiable(next));
+  }
+
+  JikkyoSettings withoutAllNgWords() =>
+      ngWords.isEmpty ? this : copyWith(ngWords: const []);
 
   JikkyoSettings withChannelOverride(
     String key,
@@ -556,6 +630,9 @@ class JikkyoSettings {
     'maxConcurrentComments': maxConcurrentComments,
     'avoidSubtitleArea': avoidSubtitleArea,
     'liveDelaySeconds': liveDelaySeconds,
+    'forceWhiteText': forceWhiteText,
+    'hideFixedComments': hideFixedComments,
+    'ngWords': ngWords,
     'channelOverrides': channelOverrides,
     'channelOverrideLabels': channelOverrideLabels,
   });
@@ -570,6 +647,20 @@ class JikkyoSettings {
       final sizeName = decoded['textSize']?.toString();
       final speedName = decoded['speed']?.toString();
       final avoidSub = decoded['avoidSubtitleArea'];
+      final forceWhite = decoded['forceWhiteText'];
+      final hideFixed = decoded['hideFixedComments'];
+
+      final rawNgWords = decoded['ngWords'];
+      final ngWords = <String>[];
+      if (rawNgWords is List) {
+        final seen = <String>{};
+        for (final entry in rawNgWords) {
+          final w = entry.toString().trim();
+          if (w.isNotEmpty && seen.add(_foldForFilter(w))) {
+            ngWords.add(w);
+          }
+        }
+      }
 
       final rawOverrides = decoded['channelOverrides'];
       final overrides = <String, String>{};
@@ -617,6 +708,10 @@ class JikkyoSettings {
             (delay != null && jikkyoLiveDelayOptions.contains(delay))
             ? delay
             : defaults.liveDelaySeconds,
+        forceWhiteText: forceWhite is bool ? forceWhite : defaults.forceWhiteText,
+        hideFixedComments:
+            hideFixed is bool ? hideFixed : defaults.hideFixedComments,
+        ngWords: List.unmodifiable(ngWords),
         channelOverrides: Map.unmodifiable(overrides),
         channelOverrideLabels: Map.unmodifiable(labels),
       );
@@ -634,6 +729,15 @@ class JikkyoSettings {
     return true;
   }
 
+  static bool _listEquals(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   @override
   bool operator ==(Object other) {
     return identical(this, other) ||
@@ -644,6 +748,9 @@ class JikkyoSettings {
             other.maxConcurrentComments == maxConcurrentComments &&
             other.avoidSubtitleArea == avoidSubtitleArea &&
             other.liveDelaySeconds == liveDelaySeconds &&
+            other.forceWhiteText == forceWhiteText &&
+            other.hideFixedComments == hideFixedComments &&
+            _listEquals(other.ngWords, ngWords) &&
             _mapEquals(other.channelOverrides, channelOverrides) &&
             _mapEquals(other.channelOverrideLabels, channelOverrideLabels));
   }
@@ -656,6 +763,9 @@ class JikkyoSettings {
     maxConcurrentComments,
     avoidSubtitleArea,
     liveDelaySeconds,
+    forceWhiteText,
+    hideFixedComments,
+    Object.hashAll(ngWords),
     Object.hashAllUnordered(
       channelOverrides.entries.map((e) => '${e.key}=${e.value}'),
     ),

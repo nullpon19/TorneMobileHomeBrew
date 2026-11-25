@@ -408,3 +408,181 @@ List<TitleGroup> groupRecordedTitles(
   groups.sort((a, b) => _compareGroupsBySort(a, b, sort));
   return groups;
 }
+
+final RegExp _rebroadcastMarkerPattern = RegExp(
+  r'[\[［【(（]再[\]］】)）]',
+);
+
+bool isRebroadcastTitle(String rawTitle) =>
+    _rebroadcastMarkerPattern.hasMatch(rawTitle);
+
+String _asciiDigitsOnly(String input) {
+  final sb = StringBuffer();
+  for (final rune in input.runes) {
+    if (rune >= 0xFF10 && rune <= 0xFF19) {
+      sb.writeCharCode(rune - 0xFEE0);
+    } else {
+      sb.writeCharCode(rune);
+    }
+  }
+  return sb.toString();
+}
+
+int? _parseKanjiNumber(String raw) {
+  const digits = {
+    '〇': 0,
+    '零': 0,
+    '一': 1,
+    '二': 2,
+    '三': 3,
+    '四': 4,
+    '五': 5,
+    '六': 6,
+    '七': 7,
+    '八': 8,
+    '九': 9,
+  };
+  var total = 0;
+  var current = 0;
+  var seen = false;
+  for (final ch in raw.split('')) {
+    if (digits.containsKey(ch)) {
+      current = digits[ch]!;
+      seen = true;
+    } else if (ch == '十') {
+      total += (current == 0 ? 1 : current) * 10;
+      current = 0;
+      seen = true;
+    } else if (ch == '百') {
+      total += (current == 0 ? 1 : current) * 100;
+      current = 0;
+      seen = true;
+    } else {
+      return null;
+    }
+  }
+  if (!seen) return null;
+  return total + current;
+}
+
+final RegExp _epHashPattern = RegExp(r'[#＃]\s*([0-9]+(?:\.[0-9]+)?)');
+final RegExp _epDaiDigitPattern = RegExp(
+  r'第\s*([0-9]+(?:\.[0-9]+)?)\s*[話回弾章夜幕節]?',
+);
+final RegExp _epDaiKanjiPattern = RegExp(
+  r'第\s*([〇零一二三四五六七八九十百]{1,5})\s*[話回弾章夜幕節]',
+);
+final RegExp _epWordPattern = RegExp(
+  r'(?:Vol|VOL|Ep|EP|Episode|EPISODE|Part|PART)\.?\s*([0-9]+(?:\.[0-9]+)?)',
+);
+final RegExp _epBracketPattern = RegExp(
+  r'[\[(（［]\s*([0-9]{1,4})\s*[話回]?\s*[\])）］]',
+);
+final RegExp _epTrailingNumberPattern = RegExp(
+  r'[^0-9./\-]([0-9]{1,4})(?:\s*(?:話|回)|$)',
+);
+
+/// Extracts the primary episode number from a broadcast title, or `null` when
+/// the programme is unnumbered (e.g. variety shows / movies).
+double? extractEpisodeNumber(String rawTitle) {
+  final stripped = _asciiDigitsOnly(rawTitle.replaceAll(_aribBracketTagPattern, ''))
+      .replaceAll(RegExp(r'\d{1,2}月\d{1,2}日'), ' ')
+      .replaceAll(RegExp(r'\d{1,2}/\d{1,2}'), ' ');
+
+  for (final pattern in [_epHashPattern, _epDaiDigitPattern, _epWordPattern]) {
+    final m = pattern.firstMatch(stripped);
+    if (m != null) {
+      final v = double.tryParse(m.group(1)!);
+      if (v != null) return v;
+    }
+  }
+
+  final kanjiMatch = _epDaiKanjiPattern.firstMatch(stripped);
+  if (kanjiMatch != null) {
+    final kv = _parseKanjiNumber(kanjiMatch.group(1)!);
+    if (kv != null) return kv.toDouble();
+  }
+
+  for (final m in _epBracketPattern.allMatches(stripped)) {
+    final n = int.tryParse(m.group(1)!);
+    if (n != null && (n < 1900 || n > 2100)) {
+      return n.toDouble();
+    }
+  }
+
+  final tail = _epTrailingNumberPattern.firstMatch(stripped);
+  if (tail != null) {
+    final n = int.tryParse(tail.group(1)!);
+    if (n != null && (n < 1900 || n > 2100)) {
+      return n.toDouble();
+    }
+  }
+  return null;
+}
+
+int _compareDateAscThenId(RecordedTitle a, RecordedTitle b) {
+  final sa = a.scheduledStart;
+  final sb = b.scheduledStart;
+  if (sa == null && sb == null) {
+    final tc = a.title.compareTo(b.title);
+    return tc != 0 ? tc : a.id.compareTo(b.id);
+  }
+  if (sa == null) return 1;
+  if (sb == null) return -1;
+  final dc = sa.compareTo(sb);
+  if (dc != 0) return dc;
+  final tc = a.title.compareTo(b.title);
+  return tc != 0 ? tc : a.id.compareTo(b.id);
+}
+
+/// Resolves the next episode to auto-play after [current] within the same
+/// series folder.
+///
+/// - Regular broadcasts stay in the regular lane; rebroadcasts (`[再]`) stay in
+///   the rebroadcast lane.
+/// - When episode numbers exist, advances to the smallest strictly greater
+///   episode number (skipping duplicate recordings of the same episode).
+/// - Otherwise falls back to chronological broadcast-date ascending order.
+RecordedTitle? resolveNextEpisodeInSeries({
+  required RecordedTitle current,
+  required List<RecordedTitle> groupTitles,
+}) {
+  final currentRebroadcast = isRebroadcastTitle(current.title);
+  final seenIds = <String>{};
+  final lane = <RecordedTitle>[];
+  for (final item in groupTitles) {
+    if (item.res.isEmpty) continue;
+    if (!seenIds.add(item.id)) continue;
+    if (isRebroadcastTitle(item.title) == currentRebroadcast) {
+      lane.add(item);
+    }
+  }
+  if (lane.length < 2) return null;
+
+  final currentEp = extractEpisodeNumber(current.title);
+  if (currentEp != null) {
+    final numberedCandidates = <({RecordedTitle title, double ep})>[];
+    for (final item in lane) {
+      if (item.id == current.id) continue;
+      final ep = extractEpisodeNumber(item.title);
+      if (ep != null && ep > currentEp) {
+        numberedCandidates.add((title: item, ep: ep));
+      }
+    }
+    if (numberedCandidates.isNotEmpty) {
+      numberedCandidates.sort((a, b) {
+        final epCmp = a.ep.compareTo(b.ep);
+        if (epCmp != 0) return epCmp;
+        return _compareDateAscThenId(a.title, b.title);
+      });
+      return numberedCandidates.first.title;
+    }
+  }
+
+  lane.sort(_compareDateAscThenId);
+  final idx = lane.indexWhere((t) => t.id == current.id);
+  if (idx >= 0 && idx + 1 < lane.length) {
+    return lane[idx + 1];
+  }
+  return null;
+}

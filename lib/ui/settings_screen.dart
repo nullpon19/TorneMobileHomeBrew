@@ -405,6 +405,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
           ),
+          SwitchListTile(
+            title: const Text('まとめフォルダの次話を自動連続再生'),
+            subtitle: const Text(
+              '録画終了 15 秒前から次話案内を表示し、話数順／放送順で自動再生します（再放送は別レーン）',
+            ),
+            value: ref.watch(autoPlayNextEpisodeProvider),
+            onChanged: (value) =>
+                ref.read(autoPlayNextEpisodeProvider.notifier).set(value),
+          ),
           const Divider(),
           _sectionTitle(context, '録画再生 (DTCP-IP)'),
           ListTile(

@@ -776,6 +776,20 @@ class JikkyoSettingsNotifier extends Notifier<JikkyoSettings> {
     return _update(state.copyWith(liveDelaySeconds: seconds));
   }
 
+  Future<void> setForceWhiteText(bool enabled) =>
+      _update(state.copyWith(forceWhiteText: enabled));
+
+  Future<void> setHideFixedComments(bool enabled) =>
+      _update(state.copyWith(hideFixedComments: enabled));
+
+  Future<void> addNgWord(String word) =>
+      _update(state.withAddedNgWord(word));
+
+  Future<void> removeNgWord(String word) =>
+      _update(state.withoutNgWord(word));
+
+  Future<void> clearNgWords() => _update(state.withoutAllNgWords());
+
   Future<void> setChannelOverride(
     String key,
     String jkIdOrOff, {
@@ -838,6 +852,39 @@ final jikkyoClientProvider = Provider<JikkyoClient>((ref) {
   ref.onDispose(client.dispose);
   return client;
 });
+
+/// Persisted toggle for auto-playing the next episode inside a recorded series
+/// folder (Phase 41, defaults to ON).
+class AutoPlayNextEpisodeNotifier extends Notifier<bool> {
+  static const _key = 'firetv_auto_play_next_episode';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final autoPlayNextEpisodeProvider =
+    NotifierProvider<AutoPlayNextEpisodeNotifier, bool>(
+      AutoPlayNextEpisodeNotifier.new,
+    );
 
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.

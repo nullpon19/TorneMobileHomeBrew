@@ -159,8 +159,15 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
       widget.controller?._addListeners(_handleIncomingComments, _handleClear);
     }
     if (oldWidget.settings.opacityPercent != widget.settings.opacityPercent ||
-        oldWidget.settings.textSize != widget.settings.textSize) {
+        oldWidget.settings.textSize != widget.settings.textSize ||
+        oldWidget.settings.forceWhiteText != widget.settings.forceWhiteText) {
       _painterCache.clear();
+      _repaintTick.value++;
+    }
+    if (oldWidget.settings.hideFixedComments !=
+            widget.settings.hideFixedComments ||
+        oldWidget.settings.ngWords != widget.settings.ngWords) {
+      _active.removeWhere((item) => !widget.settings.matchesFilter(item.comment));
       _repaintTick.value++;
     }
     if (widget.isPlaying && !_ticker.isActive) {
@@ -214,15 +221,17 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
   _CachedTextPair _painterFor(JikkyoComment comment, double baseFontSize) {
     final fontSize = _commentFontSize(comment, baseFontSize);
     final opacity = (widget.settings.opacityPercent / 100.0).clamp(0.1, 1.0);
+    final effectiveColorValue =
+        widget.settings.forceWhiteText ? 0xFFFFFFFF : comment.colorValue;
     final key =
-        '${comment.text}|${comment.colorValue}|${fontSize.toStringAsFixed(1)}|${widget.settings.opacityPercent}';
+        '${comment.text}|$effectiveColorValue|${fontSize.toStringAsFixed(1)}|${widget.settings.opacityPercent}';
     final cached = _painterCache.remove(key);
     if (cached != null) {
       _painterCache[key] = cached;
       return cached;
     }
 
-    final fillColor = Color(comment.colorValue).withValues(alpha: opacity);
+    final fillColor = Color(effectiveColorValue).withValues(alpha: opacity);
     final strokeAlpha = (opacity * 0.92).clamp(0.1, 1.0);
     final strokeWidth = (fontSize * 0.14).clamp(1.8, 6.8);
 
@@ -365,6 +374,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     final maxCap = widget.settings.maxConcurrentComments;
 
     for (final comment in comments) {
+      if (!widget.settings.matchesFilter(comment)) continue;
       while (_active.length >= maxCap && _active.isNotEmpty) {
         _active.removeAt(0);
       }
