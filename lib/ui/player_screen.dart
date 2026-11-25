@@ -2899,6 +2899,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   double? _activeClearAfterSeconds;
   DateTime? _lastAribDecoderResetAt;
   bool _resettingAribDecoder = false;
+  Timer? _superimposeSyncTimer;
+  List<SubtitleCue> _visibleSuperimposeCues = const [];
+  int? _lastPlayedSuperimposeSoundSeq;
   List<EpgEvent> _liveGuideEvents = const [];
   Map<String, List<EpgEvent>> _liveBandGuideEvents = const {};
   final Map<String, List<EpgEvent>> _liveChannelProgramHistory = {};
@@ -3416,6 +3419,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
+    _superimposeSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) => _syncSuperimposeTick(),
+    );
     _subscriptions.add(
       _player.stream.playing.listen((playing) {
         if (_conflictHandled || _switchingChannel) return;
@@ -4684,7 +4691,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _cuesEqual(List<SubtitleCue> a, List<SubtitleCue> b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      if (a[i].dedupeKey != b[i].dedupeKey) return false;
+      if (a[i].dedupeKey != b[i].dedupeKey ||
+          a[i].backgroundColorOverride != b[i].backgroundColorOverride) {
+        return false;
+      }
       final sa = a[i].spans;
       final sb = b[i].spans;
       if (sa.length != sb.length) return false;
@@ -4698,6 +4708,66 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
     }
     return true;
+  }
+
+  void _syncSuperimposeTick() {
+    if (!mounted || _switchingChannel || _error != null) return;
+    final enabled = ref.read(superimposeEnabledProvider);
+    if (!enabled) {
+      if (_visibleSuperimposeCues.isNotEmpty) {
+        setState(() => _visibleSuperimposeCues = const []);
+      }
+      return;
+    }
+    if (widget.session case final AribCaptionLayoutSource source) {
+      final events = source.aribSuperimposeEvents;
+      if (events.isEmpty) {
+        if (_visibleSuperimposeCues.isNotEmpty) {
+          setState(() => _visibleSuperimposeCues = const []);
+        }
+        return;
+      }
+
+      final ptsOffset =
+          _aribPtsOffset ??
+          (_demuxerStartTimeSeconds != null
+              ? -_demuxerStartTimeSeconds!
+              : (source.firstStreamPtsSeconds != null
+                    ? -source.firstStreamPtsSeconds!
+                    : 0.0));
+      final playbackTime =
+          _lastPlaybackTimeSeconds ?? (_lastPosition.inMilliseconds / 1000.0);
+      final resolved = resolveActiveSuperimposeCues(
+        events: events,
+        isLive: widget.live,
+        now: _now(),
+        currentPlaybackMpvPts: playbackTime,
+        ptsOffset: ptsOffset,
+      );
+      if (!_cuesEqual(_visibleSuperimposeCues, resolved.cues)) {
+        setState(() => _visibleSuperimposeCues = resolved.cues);
+      }
+
+      final seq = resolved.soundSequence;
+      final soundId = resolved.builtinSoundId;
+      if (seq != null &&
+          soundId != null &&
+          seq != _lastPlayedSuperimposeSoundSeq) {
+        _lastPlayedSuperimposeSoundSeq = seq;
+        if (ref.read(superimposeSoundEnabledProvider) &&
+            _playingNow &&
+            !_buffering &&
+            !(_seekDebounceTimer?.isActive ?? false) &&
+            !(_liveSeekDebounceTimer?.isActive ?? false)) {
+          unawaited(
+            _fireTvHelper.playAribBuiltinSound(
+              soundId,
+              urgent: resolved.isUrgent,
+            ),
+          );
+        }
+      }
+    }
   }
 
   Future<void> _ensureAssExtradataLoaded(NativePlayer platform) async {
@@ -5720,6 +5790,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         (
           name: 'subtitle sync timer',
           run: () => _stopSubtitleSyncTimer(),
+        ),
+        (
+          name: 'superimpose sync timer',
+          run: () => _superimposeSyncTimer?.cancel(),
         ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'osd clock timer', run: () => _osdClockTimer?.cancel()),
@@ -7363,6 +7437,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         PlayerSubtitleOverlay(
                           settings: ref.watch(subtitleSettingsProvider),
                           cues: _visibleSubtitleCues,
+                          bottomSafePadding: _osdOpen
+                              ? (widget.live ? 250.0 : 176.0)
+                              : (_seekHudVisible ? 116.0 : 24.0),
+                        ),
+                      if (ref.watch(superimposeEnabledProvider) &&
+                          _visibleSuperimposeCues.isNotEmpty &&
+                          !_switchingChannel &&
+                          _error == null)
+                        PlayerSubtitleOverlay(
+                          settings: ref.watch(subtitleSettingsProvider),
+                          cues: _visibleSuperimposeCues,
                           bottomSafePadding: _osdOpen
                               ? (widget.live ? 250.0 : 176.0)
                               : (_seekHudVisible ? 116.0 : 24.0),

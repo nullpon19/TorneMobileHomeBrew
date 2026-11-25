@@ -326,6 +326,10 @@ class _DtcpPlaybackSession
       _proxy.aribCaptionEvents;
 
   @override
+  List<AribCaptionLayoutEvent> get aribSuperimposeEvents =>
+      _proxy.aribSuperimposeEvents;
+
+  @override
   double? get firstStreamPtsSeconds => _proxy.firstStreamPtsSeconds;
 
   @override

@@ -70,6 +70,7 @@ class _FakeFireTvHelper extends FireTvHelper {
   int volumeMaxCalls = 0;
   int tryConnectCalls = 0;
   int launchCalls = 0;
+  final List<({int soundId, bool urgent})> soundCalls = [];
 
   @override
   Future<bool> setMediaVolumeMax() async {
@@ -118,6 +119,12 @@ class _FakeFireTvHelper extends FireTvHelper {
 
   @override
   Future<int?> getCacheAvailableBytes() async => availableDiskBytes;
+
+  @override
+  Future<bool> playAribBuiltinSound(int soundId, {bool urgent = false}) async {
+    soundCalls.add((soundId: soundId, urgent: urgent));
+    return true;
+  }
 }
 
 void main() {
@@ -11793,6 +11800,298 @@ void main() {
       );
     },
   );
+
+  group('Phase 39: ARIB superimpose (0x38) & built-in chime', () {
+    test(
+      'AribTsCaptionTap parses ctag=0x38 stream_id=0xBF + data_id=0x81 separately from captions, including real nasne management PES and synthetic EEW red banner',
+      () {
+        final tap = AribTsCaptionTap();
+
+        // Real nasne pid=0x0138 management packet (stream_id=0xBF, data_id=0x81).
+        final realMgmtPes = Uint8List.fromList([
+          0x00, 0x00, 0x01, 0xBF, 0x00, 0x14,
+          0x81, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x0A,
+          0x3F, 0x01, 0x10, 0x6A, 0x70, 0x6E, 0x80, 0x00,
+          0x00, 0x00, 0x21, 0x04,
+        ]);
+        Uint8List wrapTs(int pid, List<int> payload, {bool psi = false}) {
+          final pkt = Uint8List(188)..fillRange(0, 188, 0xFF);
+          pkt[0] = 0x47;
+          pkt[1] = 0x40 | ((pid >> 8) & 0x1F);
+          pkt[2] = pid & 0xFF;
+          pkt[3] = 0x10;
+          var pos = 4;
+          if (psi) pkt[pos++] = 0x00;
+          pkt.setRange(pos, pos + payload.length, payload);
+          return pkt;
+        }
+
+        // Feed synthetic EEW TS stream first to discover PAT/PMT/AV PTS/PID 0x0138.
+        final eewTs = AribTsCaptionTap.buildSyntheticSuperimposeTsPacket(
+          text: '緊急地震速報',
+          bgColorIndex: 1,
+          fgColorIndex: 7,
+          builtinSoundId: 4,
+          clearAfterSeconds: 6.0,
+          xPos: 340,
+          yPos: 70,
+        );
+        tap.feed(eewTs);
+
+        expect(tap.superimposePid, 0x0138);
+        expect(tap.captionPid, isNull);
+        expect(tap.events, isEmpty);
+        expect(tap.superimposeEvents, hasLength(1));
+
+        final ev = tap.superimposeEvents.single;
+        expect(ev.isSuperimpose, isTrue);
+        expect(ev.isClearOnly, isFalse);
+        expect(ev.ptsSeconds, closeTo(10.0, 0.01));
+        expect(ev.builtinSoundId, 4);
+        expect(ev.clearAfterSeconds, closeTo(6.0, 0.01));
+        expect(ev.sequence, 1);
+        expect(ev.lines, hasLength(1));
+        expect(ev.lines.single.backgroundColorArgb, 0xEBFF0000);
+        expect(
+          [for (final r in ev.lines.single.runs) r.text].join(),
+          '緊急地震速報',
+        );
+
+        // Feeding real nasne management PES (groupType=0) must not crash or add events.
+        tap.feed(wrapTs(0x0138, realMgmtPes));
+        tap.feed(wrapTs(0x0138, realMgmtPes));
+        tap.feed(wrapTs(0x0138, realMgmtPes));
+        expect(tap.superimposeEvents, hasLength(1));
+      },
+    );
+
+    test(
+      'resolveActiveSuperimposeCues handles live immediate display/clear/stale timeout and recorded PTS sync',
+      () {
+        final t0 = DateTime(2026, 11, 25, 14, 0, 0);
+        final tap = AribTsCaptionTap();
+        tap.feed(
+          AribTsCaptionTap.buildSyntheticSuperimposeTsPacket(
+            text: '緊急地震速報',
+            bgColorIndex: 1,
+            fgColorIndex: 7,
+            builtinSoundId: 4,
+            clearAfterSeconds: 5.0,
+          ),
+        );
+        final ev = tap.superimposeEvents.single;
+        final fixedEvent = AribCaptionLayoutEvent(
+          ptsSeconds: 100.0,
+          planeWidth: ev.planeWidth,
+          planeHeight: ev.planeHeight,
+          lines: ev.lines,
+          isClearOnly: false,
+          clearAfterSeconds: 5.0,
+          builtinSoundId: 4,
+          sequence: 7,
+          receivedAt: t0,
+          isSuperimpose: true,
+        );
+
+        // Live: active within 5s, cleared after 5s.
+        final liveOn = resolveActiveSuperimposeCues(
+          events: [fixedEvent],
+          isLive: true,
+          now: t0.add(const Duration(seconds: 2)),
+        );
+        expect(liveOn.cues, hasLength(1));
+        expect(liveOn.cues.single.plainText, '緊急地震速報');
+        expect(
+          liveOn.cues.single.backgroundColorOverride,
+          const Color(0xEBFF0000),
+        );
+        expect(liveOn.soundSequence, 7);
+        expect(liveOn.builtinSoundId, 4);
+        expect(liveOn.isUrgent, isTrue);
+
+        final liveExpired = resolveActiveSuperimposeCues(
+          events: [fixedEvent],
+          isLive: true,
+          now: t0.add(const Duration(seconds: 6)),
+        );
+        expect(liveExpired.cues, isEmpty);
+
+        // Live: event without clearAfterSeconds auto-clears at superimposeStaleTimeout (20s).
+        final noClearEvent = AribCaptionLayoutEvent(
+          ptsSeconds: 120.0,
+          planeWidth: ev.planeWidth,
+          planeHeight: ev.planeHeight,
+          lines: ev.lines,
+          isClearOnly: false,
+          builtinSoundId: 0,
+          sequence: 8,
+          receivedAt: t0,
+          isSuperimpose: true,
+        );
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [noClearEvent],
+            isLive: true,
+            now: t0.add(const Duration(seconds: 19)),
+          ).cues,
+          hasLength(1),
+        );
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [noClearEvent],
+            isLive: true,
+            now: t0.add(superimposeStaleTimeout),
+          ).cues,
+          isEmpty,
+        );
+
+        // Recorded playback: hides before PTS, shows inside [100, 105), clears >= 105.
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: false,
+            now: t0,
+            currentPlaybackMpvPts: 98.0,
+            ptsOffset: 0.0,
+          ).cues,
+          isEmpty,
+        );
+        final recActive = resolveActiveSuperimposeCues(
+          events: [fixedEvent],
+          isLive: false,
+          now: t0,
+          currentPlaybackMpvPts: 102.0,
+          ptsOffset: 0.0,
+        );
+        expect(recActive.cues, hasLength(1));
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: false,
+            now: t0,
+            currentPlaybackMpvPts: 106.0,
+            ptsOffset: 0.0,
+          ).cues,
+          isEmpty,
+        );
+      },
+    );
+
+    testWidgets(
+      'PlayerSubtitleOverlay paints red backgroundColorOverride even when subtitle background opacity is 0%',
+      (tester) async {
+        const cue = SubtitleCue(
+          normalizedX: 0.35,
+          endNormalizedX: 0.65,
+          normalizedY: 0.14,
+          alignment: 1,
+          backgroundColorOverride: Color(0xEBFF0000),
+          spans: [SubtitleStyledSpan(text: '緊急地震速報')],
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 960,
+                height: 540,
+                child: PlayerSubtitleOverlay(
+                  settings: SubtitleSettings(backgroundOpacityPercent: 0),
+                  cues: [cue],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        final box = tester.widget<SubtitleUnifiedBackgroundBox>(
+          find.byType(SubtitleUnifiedBackgroundBox),
+        );
+        expect(box.backgroundColor, const Color(0xEBFF0000));
+        expect(find.text('緊急地震速報', findRichText: true), findsWidgets);
+      },
+    );
+
+    testWidgets(
+      'SubtitleSettingsScreen persists superimpose toggles (default ON) and 16:9 test buttons preview & play chime',
+      (tester) async {
+        final kv = InMemoryKeyValueStore();
+        final helper = _FakeFireTvHelper();
+        tester.view.physicalSize = const Size(1280, 960);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kv),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(home: SubtitleSettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final listScrollable = find.byType(Scrollable).first;
+        final mainSwitch = find.text('文字スーパー表示（緊急地震速報・BSニュース速報等）');
+        await tester.scrollUntilVisible(
+          mainSwitch,
+          250.0,
+          scrollable: listScrollable,
+        );
+        await tester.pumpAndSettle();
+        expect(mainSwitch, findsOneWidget);
+        expect(find.text('文字スーパーの内蔵チャイム音'), findsOneWidget);
+
+        final eewBtn = find.text('緊急地震速報をテスト');
+        await tester.scrollUntilVisible(
+          eewBtn,
+          250.0,
+          scrollable: listScrollable,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(eewBtn);
+        await tester.pump();
+
+        expect(find.text('緊急地震速報', findRichText: true), findsWidgets);
+        expect(helper.soundCalls, hasLength(1));
+        expect(helper.soundCalls.single.soundId, 4);
+        expect(helper.soundCalls.single.urgent, isTrue);
+
+        // Wait out the 4-second preview auto-clear timer cleanly.
+        await tester.pump(const Duration(seconds: 4));
+        expect(find.text('緊急地震速報', findRichText: true), findsNothing);
+
+        // BS news flash test triggers non-urgent soundId=0.
+        final newsBtn = find.text('BSニュース速報をテスト');
+        await tester.scrollUntilVisible(
+          newsBtn,
+          250.0,
+          scrollable: listScrollable,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(newsBtn);
+        await tester.pump();
+        expect(helper.soundCalls, hasLength(2));
+        expect(helper.soundCalls.last.soundId, 0);
+        expect(helper.soundCalls.last.urgent, isFalse);
+
+        await tester.pump(const Duration(seconds: 4));
+
+        // Disabling superimpose persists 'false'.
+        await tester.scrollUntilVisible(
+          mainSwitch,
+          -200.0,
+          scrollable: listScrollable,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(mainSwitch);
+        await tester.pumpAndSettle();
+        expect(await kv.read('firetv_superimpose_enabled'), 'false');
+      },
+    );
+  });
 }
 
 class _DeletableScheduleService implements ScheduleService {

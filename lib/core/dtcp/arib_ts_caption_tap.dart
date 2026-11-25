@@ -95,6 +95,7 @@ class AribCaptionLinePlacement {
     required this.endNormalizedX,
     required this.charCount,
     this.runs = const [],
+    this.backgroundColorArgb,
   });
 
   /// Normalized left edge (`0.0..1.0` across [AribCaptionLayoutEvent.planeWidth]).
@@ -111,9 +112,12 @@ class AribCaptionLinePlacement {
 
   /// Decoded ARIB STD-B24 styled text runs for direct rendering.
   final List<AribCaptionStyledRun> runs;
+
+  /// Optional ARIB background color specified via `COL 0x50..0x5F` / `RCS`.
+  final int? backgroundColorArgb;
 }
 
-/// Decoded caption positioning, styled text, and timing metadata from one ARIB PES.
+/// Decoded caption or superimpose positioning, styled text, and timing metadata from one ARIB PES.
 class AribCaptionLayoutEvent {
   const AribCaptionLayoutEvent({
     required this.ptsSeconds,
@@ -123,6 +127,10 @@ class AribCaptionLayoutEvent {
     required this.isClearOnly,
     this.clearAfterSeconds,
     this.startsWithClear = false,
+    this.builtinSoundId,
+    this.sequence = 0,
+    this.receivedAt,
+    this.isSuperimpose = false,
   });
 
   final double ptsSeconds;
@@ -132,6 +140,10 @@ class AribCaptionLayoutEvent {
   final bool isClearOnly;
   final double? clearAfterSeconds;
   final bool startsWithClear;
+  final int? builtinSoundId;
+  final int sequence;
+  final DateTime? receivedAt;
+  final bool isSuperimpose;
 
   bool get hasDecodedText => lines.any(
     (l) => l.runs.any((r) => r.drcsGlyph != null || r.text.trim().isNotEmpty),
@@ -145,6 +157,7 @@ class _MutableLineBucket {
     required this.minX,
     required this.maxEndX,
     required this.charCount,
+    this.backgroundColorArgb,
   });
 
   double baselineY;
@@ -152,6 +165,7 @@ class _MutableLineBucket {
   double minX;
   double maxEndX;
   int charCount;
+  int? backgroundColorArgb;
   bool pendingSpace = false;
   final List<AribCaptionStyledRun> runs = [];
 
@@ -245,6 +259,7 @@ class AribTsCaptionTap {
   static const int _ttsPacketSize = 192;
   static const int _maxCarryBytes = _ttsPacketSize * 3;
   static const int _maxBufferedEvents = 2400;
+  static const int _maxSuperimposeEvents = 256;
   static const int _maxDrcsGlyphs = 512;
   static const int _maxPesBytes = 64 * 1024;
   static const int _maxPsiBytes = 4096;
@@ -257,7 +272,10 @@ class AribTsCaptionTap {
   int _pmtPid = -1;
   int _captionPid = -1;
   int _captionComponentTag = 0xFF;
+  int _superimposePid = -1;
+  int _superimposeComponentTag = 0xFF;
   double? _firstStreamPtsSeconds;
+  double? _lastAvPtsSeconds;
 
   BytesBuilder? _patSection;
   int _patExpectedLen = 0;
@@ -268,14 +286,24 @@ class AribTsCaptionTap {
   double? _captionPesPtsSeconds;
   int _captionExpectedPayloadBytes = 0;
 
+  BytesBuilder? _superimposePes;
+  double? _superimposePesPtsSeconds;
+  int _superimposeExpectedPayloadBytes = 0;
+  int _superimposeSeqCounter = 0;
+
   final List<AribCaptionLayoutEvent> _events = [];
   final Map<int, AribDrcsGlyph> _drcsGlyphs = {};
+  final List<AribCaptionLayoutEvent> _superimposeEvents = [];
+  final Map<int, AribDrcsGlyph> _superimposeDrcsGlyphs = {};
 
   List<AribCaptionLayoutEvent> get events => List<AribCaptionLayoutEvent>.unmodifiable(_events);
+  List<AribCaptionLayoutEvent> get superimposeEvents =>
+      List<AribCaptionLayoutEvent>.unmodifiable(_superimposeEvents);
   Map<int, AribDrcsGlyph> get drcsGlyphs =>
       Map<int, AribDrcsGlyph>.unmodifiable(_drcsGlyphs);
   double? get firstStreamPtsSeconds => _firstStreamPtsSeconds;
   int? get captionPid => _captionPid >= 0 ? _captionPid : null;
+  int? get superimposePid => _superimposePid >= 0 ? _superimposePid : null;
 
   /// Resets framing and partial PES buffers across seek jumps while preserving
   /// discovered PIDs, anchor PTS, DRCS glyphs, and buffered events.
@@ -288,6 +316,9 @@ class AribTsCaptionTap {
     _captionPes = null;
     _captionPesPtsSeconds = null;
     _captionExpectedPayloadBytes = 0;
+    _superimposePes = null;
+    _superimposePesPtsSeconds = null;
+    _superimposeExpectedPayloadBytes = 0;
   }
 
   /// Clears all framing, PIDs, stream PTS origin, DRCS glyphs, and cached layout events.
@@ -297,9 +328,15 @@ class AribTsCaptionTap {
     _pmtPid = -1;
     _captionPid = -1;
     _captionComponentTag = 0xFF;
+    _superimposePid = -1;
+    _superimposeComponentTag = 0xFF;
     _firstStreamPtsSeconds = null;
+    _lastAvPtsSeconds = null;
+    _superimposeSeqCounter = 0;
     _events.clear();
     _drcsGlyphs.clear();
+    _superimposeEvents.clear();
+    _superimposeDrcsGlyphs.clear();
   }
 
   /// Feeds decrypted plaintext TS/TTS bytes into the tap.
@@ -374,11 +411,13 @@ class AribTsCaptionTap {
     final pid = ((b1 & 0x1F) << 8) | buf[tsOffset + 2];
     final pusi = (b1 & 0x40) != 0;
 
-    // Fast path: skip all irrelevant video/audio packets once origin PTS is set.
+    // Fast path: skip all irrelevant video/audio packets once origin PTS is set
+    // (unless superimpose PID is active, in which case track latest A/V PTS).
     if (pid != 0 &&
         pid != _pmtPid &&
         pid != _captionPid &&
-        (_firstStreamPtsSeconds != null || !pusi)) {
+        pid != _superimposePid &&
+        ((_firstStreamPtsSeconds != null && _superimposePid < 0) || !pusi)) {
       return;
     }
 
@@ -409,15 +448,24 @@ class AribTsCaptionTap {
       _feedCaptionPesSlice(buf, pStart, pEnd, pusi);
       return;
     }
+    if (pid == _superimposePid) {
+      _feedSuperimposePesSlice(buf, pStart, pEnd, pusi);
+      return;
+    }
 
-    // Record initial A/V stream PTS as fallback reference for relative offsets.
-    if (_firstStreamPtsSeconds == null && pusi && payloadLen >= 14) {
+    // Record initial A/V stream PTS as anchor and update latest PTS for
+    // headerless superimpose packets (`stream_id=0xBF`).
+    if ((_firstStreamPtsSeconds == null || _superimposePid >= 0) &&
+        pusi &&
+        payloadLen >= 14) {
       if (buf[pStart] == 0x00 &&
           buf[pStart + 1] == 0x00 &&
           buf[pStart + 2] == 0x01) {
         final streamId = buf[pStart + 3];
         if (streamId >= 0xC0 && streamId <= 0xEF && (buf[pStart + 7] & 0x80) != 0) {
-          _firstStreamPtsSeconds = _decodePtsSeconds(buf, pStart + 9);
+          final pts = _decodePtsSeconds(buf, pStart + 9);
+          _firstStreamPtsSeconds ??= pts;
+          _lastAvPtsSeconds = pts;
         }
       }
     }
@@ -498,7 +546,9 @@ class AribTsCaptionTap {
 
       if (streamType == 0x06) {
         var isAribCaption = false;
+        var isAribSuperimpose = false;
         var componentTag = 0xFE;
+        var superimposeTag = 0xFE;
         var d = descStart;
         while (d + 2 <= descEnd) {
           final tag = section[d];
@@ -512,13 +562,24 @@ class AribTsCaptionTap {
             }
           } else if (tag == 0x52 && dLen >= 1) {
             final cTag = section[dData];
-            // ARIB TR-B14 caption component tags: 0x30..0x37 (0x87 = 1seg).
+            // ARIB TR-B14 caption component tags: 0x30..0x37 (0x87 = 1seg),
+            // superimpose component tags: 0x38..0x3F.
             if ((cTag >= 0x30 && cTag <= 0x37) || cTag == 0x87) {
               isAribCaption = true;
               componentTag = cTag;
+            } else if (cTag >= 0x38 && cTag <= 0x3F) {
+              isAribSuperimpose = true;
+              superimposeTag = cTag;
             }
           }
           d = dData + dLen;
+        }
+        if (isAribSuperimpose) {
+          isAribCaption = false;
+          if (_superimposePid < 0 || superimposeTag < _superimposeComponentTag) {
+            _superimposePid = esPid;
+            _superimposeComponentTag = superimposeTag;
+          }
         }
         if (isAribCaption &&
             (_captionPid < 0 || componentTag < _captionComponentTag)) {
@@ -611,6 +672,104 @@ class AribTsCaptionTap {
         if (_events.length > _maxBufferedEvents) {
           _events.removeRange(0, _events.length - _maxBufferedEvents);
         }
+      }
+    }
+  }
+
+  void _feedSuperimposePesSlice(Uint8List buf, int pStart, int pEnd, bool pusi) {
+    if (pusi) {
+      _flushSuperimposePes();
+      if (pEnd - pStart < 6) return;
+      if (buf[pStart] != 0x00 ||
+          buf[pStart + 1] != 0x00 ||
+          buf[pStart + 2] != 0x01) {
+        return;
+      }
+      final streamId = buf[pStart + 3];
+      final pesPacketLen = (buf[pStart + 4] << 8) | buf[pStart + 5];
+      final int pesPayloadOff;
+      final int expectedPayload;
+      double? ptsSeconds;
+      if (streamId == 0xBF) {
+        // ARIB STD-B24 superimpose uses private_stream_2 (no optional PES header/PTS).
+        pesPayloadOff = pStart + 6;
+        expectedPayload = pesPacketLen;
+        ptsSeconds = _lastAvPtsSeconds ?? _firstStreamPtsSeconds ?? 0.0;
+      } else if (streamId == 0xBD) {
+        if (pEnd - pStart < 9) return;
+        final flags2 = buf[pStart + 7];
+        final hdrDataLen = buf[pStart + 8];
+        pesPayloadOff = pStart + 9 + hdrDataLen;
+        expectedPayload = pesPacketLen > (3 + hdrDataLen)
+            ? pesPacketLen - 3 - hdrDataLen
+            : 0;
+        if ((flags2 & 0x80) != 0 && pStart + 14 <= pEnd && hdrDataLen >= 5) {
+          ptsSeconds = _decodePtsSeconds(buf, pStart + 9);
+        } else {
+          ptsSeconds = _lastAvPtsSeconds ?? _firstStreamPtsSeconds ?? 0.0;
+        }
+      } else {
+        return;
+      }
+      if (pesPayloadOff > pEnd) return;
+      _superimposePesPtsSeconds = ptsSeconds;
+      _superimposeExpectedPayloadBytes = expectedPayload;
+      _superimposePes = BytesBuilder(copy: false)
+        ..add(Uint8List.sublistView(buf, pesPayloadOff, pEnd));
+      _maybeFlushCompleteSuperimposePes();
+      return;
+    }
+
+    final pes = _superimposePes;
+    if (pes == null) return;
+    if (pes.length + (pEnd - pStart) > _maxPesBytes) {
+      _superimposePes = null;
+      _superimposePesPtsSeconds = null;
+      _superimposeExpectedPayloadBytes = 0;
+      return;
+    }
+    pes.add(Uint8List.sublistView(buf, pStart, pEnd));
+    _maybeFlushCompleteSuperimposePes();
+  }
+
+  void _maybeFlushCompleteSuperimposePes() {
+    final pes = _superimposePes;
+    if (pes == null) return;
+    if (_superimposeExpectedPayloadBytes > 0 &&
+        pes.length >= _superimposeExpectedPayloadBytes) {
+      _flushSuperimposePes();
+    }
+  }
+
+  void _flushSuperimposePes() {
+    final pes = _superimposePes;
+    final pts = _superimposePesPtsSeconds;
+    final expectedLen = _superimposeExpectedPayloadBytes;
+    _superimposePes = null;
+    _superimposePesPtsSeconds = null;
+    _superimposeExpectedPayloadBytes = 0;
+    if (pes == null) return;
+    var payload = pes.takeBytes();
+    if (expectedLen > 0 && payload.length > expectedLen) {
+      payload = Uint8List.sublistView(payload, 0, expectedLen);
+    }
+    final nextSeq = _superimposeSeqCounter + 1;
+    final event = _parseCaptionPesPayload(
+      payload,
+      ptsSeconds: pts ?? 0.0,
+      drcsGlyphs: _superimposeDrcsGlyphs,
+      isSuperimpose: true,
+      sequence: nextSeq,
+      receivedAt: DateTime.now(),
+    );
+    if (event != null) {
+      _superimposeSeqCounter = nextSeq;
+      _superimposeEvents.add(event);
+      if (_superimposeEvents.length > _maxSuperimposeEvents) {
+        _superimposeEvents.removeRange(
+          0,
+          _superimposeEvents.length - _maxSuperimposeEvents,
+        );
       }
     }
   }
@@ -723,19 +882,24 @@ class AribTsCaptionTap {
     Uint8List payload, {
     required double ptsSeconds,
     Map<int, AribDrcsGlyph>? drcsGlyphs,
+    bool isSuperimpose = false,
+    int sequence = 0,
+    DateTime? receivedAt,
   }) {
     if (payload.length < 10) return null;
     final dataIdentifier = payload[0];
     final privateStreamId = payload[1];
-    // 0x80 = synchronized closed caption PES, 0xFF = private stream marker.
-    if (dataIdentifier != 0x80 || privateStreamId != 0xFF) return null;
+    // 0x80 = synchronized closed caption PES, 0x81 = superimpose PES,
+    // 0xFF = private stream marker.
+    final expectedDataId = isSuperimpose ? 0x81 : 0x80;
+    if (dataIdentifier != expectedDataId || privateStreamId != 0xFF) return null;
     final pesPrivateLen = payload[2] & 0x0F;
     var off = 3 + pesPrivateLen;
     if (off + 6 > payload.length) return null;
 
     final dataGroupId = (payload[off] >> 2) & 0x3F;
     final groupType = dataGroupId & 0x1F;
-    // Allow caption management (0) & primary language statement (1).
+    // Allow caption/superimpose management (0) & primary language statement (1).
     if (groupType != 0 && groupType != 1) return null;
 
     off += 5; // data_group_id+version(1), link(1), last_link(1), size(2)
@@ -822,15 +986,22 @@ class AribTsCaptionTap {
       body,
       ptsSeconds: ptsSeconds,
       drcsGlyphs: activeDrcs,
+      isSuperimpose: isSuperimpose,
+      sequence: sequence,
+      receivedAt: receivedAt,
     );
   }
 
-  /// Parses an ARIB STD-B24 caption statement body (`data_unit_parameter == 0x20`)
-  /// into positioned character line bounds and timed clear markers.
+  /// Parses an ARIB STD-B24 caption/superimpose statement body
+  /// (`data_unit_parameter == 0x20`) into positioned character line bounds and
+  /// timed clear markers.
   static AribCaptionLayoutEvent? parseAribStatementBody(
     Uint8List body, {
     required double ptsSeconds,
     Map<int, AribDrcsGlyph>? drcsGlyphs,
+    bool isSuperimpose = false,
+    int sequence = 0,
+    DateTime? receivedAt,
   }) {
     // Default Profile A writing plane & character geometry (960x540).
     var planeW = 960.0;
@@ -868,6 +1039,9 @@ class AribTsCaptionTap {
     int? singleShift;
     var repeatCount = 1;
     var curColorArgb = 0xFFFFFFFF;
+    int? curBgColorArgb;
+    int? rasterColorArgb;
+    int? builtinSoundId;
     var colPalette = 0;
 
     var hasClear = false;
@@ -909,6 +1083,9 @@ class AribTsCaptionTap {
           minX: glyphStartX,
           maxEndX: glyphEndX,
           charCount: 1,
+          backgroundColorArgb: isSuperimpose
+              ? (curBgColorArgb ?? rasterColorArgb)
+              : null,
         );
         lines.add(target);
       } else {
@@ -918,6 +1095,9 @@ class AribTsCaptionTap {
         if (glyphStartX < target.minX) target.minX = glyphStartX;
         if (glyphEndX > target.maxEndX) target.maxEndX = glyphEndX;
         target.charCount += 1;
+        if (isSuperimpose && target.backgroundColorArgb == null) {
+          target.backgroundColorArgb = curBgColorArgb ?? rasterColorArgb;
+        }
       }
       target.appendText(text, curColorArgb, 1.0, drcsGlyph: drcsGlyph);
     }
@@ -1092,13 +1272,18 @@ class AribTsCaptionTap {
           case 0x90: // COL
             if (i < body.length) {
               if (body[i] == 0x20 && i + 1 < body.length) {
-                colPalette = body[i + 1] & 0x0F;
+                colPalette = body[i + 1] & 0x07;
                 i += 2;
               } else {
                 final p = body[i++];
                 if (p >= 0x40 && p <= 0x4F) {
                   curColorArgb = _aribClutColorArgb(
                     ((colPalette & 0x0F) << 4) | (p - 0x40),
+                  );
+                } else if (p >= 0x50 && p <= 0x5F) {
+                  curBgColorArgb = _aribClutBackgroundColorArgb(
+                    colPalette,
+                    p - 0x50,
                   );
                 }
               }
@@ -1216,6 +1401,17 @@ class AribTsCaptionTap {
                   curY = params[1].toDouble();
                   hasExplicitCursorPos = true;
                 }
+              case 0x68: // PRA (Play Built-in Sound)
+                if (params.isNotEmpty) {
+                  builtinSoundId = params.first;
+                }
+              case 0x6E: // RCS (Raster Colour Command)
+                if (params.isNotEmpty) {
+                  rasterColorArgb = _aribClutBackgroundColorArgb(
+                    colPalette,
+                    params.first,
+                  );
+                }
             }
           case 0x9D: // TIME
             if (i < body.length) {
@@ -1313,14 +1509,18 @@ class AribTsCaptionTap {
     }
 
     if (lines.isEmpty) {
-      if (!hasClear) return null;
+      if (!hasClear && builtinSoundId == null) return null;
       return AribCaptionLayoutEvent(
         ptsSeconds: ptsSeconds,
         planeWidth: planeW,
         planeHeight: planeH,
         lines: const [],
-        isClearOnly: true,
-        startsWithClear: true,
+        isClearOnly: hasClear && builtinSoundId == null,
+        startsWithClear: startsWithClear,
+        builtinSoundId: builtinSoundId,
+        sequence: sequence,
+        receivedAt: receivedAt,
+        isSuperimpose: isSuperimpose,
       );
     }
 
@@ -1343,12 +1543,283 @@ class AribTsCaptionTap {
             endNormalizedX: (line.maxEndX / safeW).clamp(0.05, 0.98).toDouble(),
             charCount: line.charCount,
             runs: line.buildTrimmedRuns(),
+            backgroundColorArgb: line.backgroundColorArgb,
           ),
       ],
       isClearOnly: false,
       clearAfterSeconds: clearAfterSeconds,
       startsWithClear: startsWithClear,
+      builtinSoundId: builtinSoundId,
+      sequence: sequence,
+      receivedAt: receivedAt,
+      isSuperimpose: isSuperimpose,
     );
+  }
+
+  static int? _aribClutBackgroundColorArgb(int palette, int index) {
+    final idx = index & 0x0F;
+    if (idx == 8) return null; // Fully transparent in ARIB CLUT.
+    const rgbPalette = <int>[
+      0x000000, // 0: black
+      0xFF0000, // 1: red
+      0x00FF00, // 2: green
+      0xFFFF00, // 3: yellow
+      0x0000FF, // 4: blue
+      0xFF00FF, // 5: magenta
+      0x00FFFF, // 6: cyan
+      0xFFFFFF, // 7: white
+      0x000000, // 8: transparent (handled above)
+      0xAA0000, // 9: dark red
+      0x00AA00, // 10: dark green
+      0xAAAA00, // 11: dark yellow
+      0x0D1B4A, // 12: dark blue (news flash banner)
+      0xAA00AA, // 13: dark magenta
+      0x00AAAA, // 14: dark cyan
+      0x333333, // 15: dark gray
+    ];
+    final alpha = (palette & 0x07) >= 4 ? 0xCC : 0xEB;
+    return (alpha << 24) | rgbPalette[idx];
+  }
+
+  static Map<String, int>? _kanjiReverseCache;
+
+  static Map<String, int> _ensureKanjiReverseCache() {
+    final existing = _kanjiReverseCache;
+    if (existing != null) return existing;
+    final map = <String, int>{};
+    for (var row = 0x21; row <= 0x74; row++) {
+      for (var cell = 0x21; cell <= 0x7E; cell++) {
+        final code = (row << 8) | cell;
+        final ch = decodeAribB24TwoByteCell(code, 0x42);
+        if (ch.isNotEmpty && ch != '□') {
+          map.putIfAbsent(ch, () => code);
+        }
+      }
+    }
+    _kanjiReverseCache = map;
+    return map;
+  }
+
+  /// Builds valid 188-byte MPEG-TS packets (PAT + PMT with `ctag=0x38` +
+  /// `stream_id=0xBF` / `data_identifier=0x81` superimpose PES) for unit tests
+  /// and 16:9 settings preview verification.
+  static Uint8List buildSyntheticSuperimposeTsPacket({
+    required String text,
+    int bgColorIndex = 1,
+    int fgColorIndex = 7,
+    int builtinSoundId = 4,
+    double clearAfterSeconds = 6.0,
+    int yPos = 70,
+    int xPos = 340,
+    int superimposePid = 0x0138,
+    int pmtPid = 0x01F0,
+    bool includePtsAv = true,
+  }) {
+    final reverse = _ensureKanjiReverseCache();
+    final stmt = <int>[];
+
+    void addCsi(List<int> params, int finalByte) {
+      stmt.add(0x9B);
+      for (var p = 0; p < params.length; p++) {
+        if (p > 0) stmt.add(0x3B);
+        for (final unit in '${params[p]}'.codeUnits) {
+          stmt.add(unit);
+        }
+      }
+      stmt.add(0x20);
+      stmt.add(finalByte);
+    }
+
+    // Clear previous -> SWF 960x540 (7) -> SSM 36x36 -> ACPS (xPos, yPos)
+    stmt.add(0x0C);
+    addCsi([7], 0x53); // SWF 960x540
+    addCsi([36, 36], 0x57); // SSM 36x36
+    addCsi([xPos, yPos], 0x61); // ACPS
+    if (builtinSoundId >= 0) {
+      addCsi([builtinSoundId], 0x68); // PRA
+    }
+    // Foreground & Background color via COL
+    stmt.addAll([0x90, 0x40 | (fgColorIndex & 0x0F)]);
+    stmt.addAll([0x90, 0x50 | (bgColorIndex & 0x0F)]);
+
+    // Encode text using G0 (2B Kanji)
+    for (final rune in text.runes) {
+      final ch = String.fromCharCode(rune);
+      if (ch == ' ') {
+        stmt.addAll([0x21, 0x21]);
+        continue;
+      }
+      final code = reverse[ch];
+      if (code != null) {
+        stmt.add((code >> 8) & 0xFF);
+        stmt.add(code & 0xFF);
+      } else {
+        stmt.addAll([0x21, 0x21]);
+      }
+    }
+
+    // Timed clear at end: TIME WAIT(t) + CS
+    final tenths = (clearAfterSeconds * 10.0).round().clamp(1, 63);
+    stmt.addAll([0x9D, 0x20, 0x40 | tenths, 0x0C]);
+
+    // Data unit 0x20 (caption statement)
+    final unitLen = stmt.length;
+    final unit = <int>[
+      0x1F,
+      0x20,
+      (unitLen >> 16) & 0xFF,
+      (unitLen >> 8) & 0xFF,
+      unitLen & 0xFF,
+      ...stmt,
+    ];
+
+    // Data group (groupType=1 statement): TMD(0), loop_len(3) + unit
+    final dgBody = <int>[
+      0x00, // TMD = 00
+      (unit.length >> 16) & 0xFF,
+      (unit.length >> 8) & 0xFF,
+      unit.length & 0xFF,
+      ...unit,
+    ];
+    final dg = <int>[
+      0x80 | (0x01 << 2), // data_group_id = 1
+      0x00,
+      0x00,
+      (dgBody.length >> 8) & 0xFF,
+      dgBody.length & 0xFF,
+      ...dgBody,
+    ];
+
+    // Synchronized/superimpose PES payload: data_id=0x81, private=0xFF, hdrLen=0
+    final pesPayload = <int>[0x81, 0xFF, 0xF0, ...dg];
+    final pesPacket = <int>[
+      0x00,
+      0x00,
+      0x01,
+      0xBF, // private_stream_2
+      (pesPayload.length >> 8) & 0xFF,
+      pesPayload.length & 0xFF,
+      ...pesPayload,
+    ];
+
+    final out = BytesBuilder(copy: false);
+
+    List<int> wrapTsPackets(int pid, List<int> payload, {bool psi = false}) {
+      final result = <int>[];
+      var off = 0;
+      var first = true;
+      var cc = 0;
+      while (off < payload.length || first) {
+        final pkt = Uint8List(188)..fillRange(0, 188, 0xFF);
+        pkt[0] = 0x47;
+        pkt[1] = (first ? 0x40 : 0x00) | ((pid >> 8) & 0x1F);
+        pkt[2] = pid & 0xFF;
+        pkt[3] = 0x10 | (cc & 0x0F);
+        cc = (cc + 1) & 0x0F;
+        var pos = 4;
+        if (first && psi) {
+          pkt[pos++] = 0x00; // pointer_field
+        }
+        final take = math.min(188 - pos, payload.length - off);
+        for (var k = 0; k < take; k++) {
+          pkt[pos + k] = payload[off + k];
+        }
+        off += take;
+        first = false;
+        result.addAll(pkt);
+        if (off >= payload.length) break;
+      }
+      return result;
+    }
+
+    // PAT (PID 0): program 1 -> pmtPid
+    final patSec = <int>[
+      0x00,
+      0xB0,
+      13, // section_length = 9 + 4 CRC
+      0x00,
+      0x01,
+      0xC1,
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0xE0 | ((pmtPid >> 8) & 0x1F),
+      pmtPid & 0xFF,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+    ];
+    out.add(wrapTsPackets(0x0000, patSec, psi: true));
+
+    // PMT (pmtPid): stream_type 0x06 -> superimposePid with dcid=0x0008 + ctag=0x38
+    final esDesc = <int>[
+      0xFD,
+      0x02,
+      0x00,
+      0x08, // data_component_descriptor
+      0x52,
+      0x01,
+      0x38, // stream_identifier_descriptor ctag=0x38
+    ];
+    final pmtSecLen = 9 + 5 + esDesc.length + 4;
+    final pmtSec = <int>[
+      0x02,
+      0xB0 | ((pmtSecLen >> 8) & 0x0F),
+      pmtSecLen & 0xFF,
+      0x00,
+      0x01,
+      0xC1,
+      0x00,
+      0x00,
+      0xE1,
+      0x00,
+      0xF0,
+      0x00, // program_info_length = 0
+      0x06,
+      0xE0 | ((superimposePid >> 8) & 0x1F),
+      superimposePid & 0xFF,
+      (esDesc.length >> 8) & 0x0F,
+      esDesc.length & 0xFF,
+      ...esDesc,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+    ];
+    out.add(wrapTsPackets(pmtPid, pmtSec, psi: true));
+
+    if (includePtsAv) {
+      // One minimal A/V PES packet with PTS = 10.0s (900000) so anchor is set.
+      const pts90k = 900000;
+      final avPes = <int>[
+        0x00,
+        0x00,
+        0x01,
+        0xE0,
+        0x00,
+        0x0A,
+        0x80,
+        0x80,
+        0x05,
+        0x21 | (((pts90k >> 30) & 0x07) << 1),
+        (pts90k >> 22) & 0xFF,
+        0x01 | (((pts90k >> 15) & 0x7F) << 1),
+        (pts90k >> 7) & 0xFF,
+        0x01 | ((pts90k & 0x7F) << 1),
+        0x00,
+        0x00,
+      ];
+      out.add(wrapTsPackets(0x0100, avPes));
+    }
+
+    // Superimpose PES packets
+    out.add(wrapTsPackets(superimposePid, pesPacket));
+    // Emit 2nd packet repeat of PAT/PMT? Not needed; single TS is 188B aligned.
+    // Re-add PAT+PMT+AV if less than 3 packets? Feed handles 188B when 3 syncs exist;
+    // ensure >= 3 TS packets total (we already have PAT + PMT + AV + Superimpose >= 4).
+    return out.takeBytes();
   }
 
   static int _aribClutColorArgb(int index) {

@@ -201,6 +201,23 @@ class FireTvHelper {
     }
   }
 
+  /// Plays a synthesized ARIB STD-B24 built-in chime without stealing audio
+  /// focus from `mpv`. Safe no-op on non-Android platforms or unmocked tests.
+  Future<bool> playAribBuiltinSound(int soundId, {bool urgent = false}) async {
+    if (!isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('playAribBuiltinSound', {
+            'soundId': soundId,
+            'urgent': urgent,
+          }) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   /// Checks TCP reachability to [host] on nasne's WebAPI port (64210) or
   /// UPnP port (64220).
   Future<bool> isNasneReachable(

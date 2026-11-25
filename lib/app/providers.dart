@@ -655,6 +655,70 @@ final subtitlesEnabledProvider =
       SubtitlesEnabledNotifier.new,
     );
 
+/// Persisted ARIB superimpose (`0x38`) display toggle (defaults to ON).
+class SuperimposeEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_superimpose_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final superimposeEnabledProvider =
+    NotifierProvider<SuperimposeEnabledNotifier, bool>(
+      SuperimposeEnabledNotifier.new,
+    );
+
+/// Persisted ARIB superimpose built-in chime sound toggle (defaults to ON).
+class SuperimposeSoundEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_superimpose_sound_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final superimposeSoundEnabledProvider =
+    NotifierProvider<SuperimposeSoundEnabledNotifier, bool>(
+      SuperimposeSoundEnabledNotifier.new,
+    );
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {

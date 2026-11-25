@@ -5,7 +5,10 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -34,12 +37,18 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.PI
+import kotlin.math.exp
+import kotlin.math.sin
 
 class MainActivity : FlutterActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var akeEventSink: EventChannel.EventSink? = null
     private val akeConnections = mutableMapOf<Int, AkeSocketConnection>()
     private val akeExecutor = Executors.newCachedThreadPool()
+    private val soundExecutor = Executors.newSingleThreadExecutor()
+    private val soundGeneration = AtomicInteger(0)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingStoragePermissionResult: MethodChannel.Result? = null
 
@@ -172,6 +181,13 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                     }
+                    "playAribBuiltinSound" -> {
+                        val soundId = call.argument<Int>("soundId") ?: 0
+                        val urgent = call.argument<Boolean>("urgent") ?: false
+                        val gen = soundGeneration.incrementAndGet()
+                        soundExecutor.execute { playAribBuiltinSound(soundId, urgent, gen) }
+                        result.success(true)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -197,6 +213,8 @@ class MainActivity : FlutterActivity() {
             connection.close()
         }
         akeExecutor.shutdownNow()
+        soundGeneration.incrementAndGet()
+        soundExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -483,6 +501,128 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
             null
         }
+
+    private fun playAribBuiltinSound(soundId: Int, urgent: Boolean, gen: Int) {
+        if (gen != soundGeneration.get()) return
+        val sampleRate = 44100
+        val pcm: ShortArray
+        val totalMs: Long
+
+        if (urgent) {
+            totalMs = 4600L
+            val totalSamples = ((sampleRate * totalMs) / 1000L).toInt()
+            val mix = DoubleArray(totalSamples)
+            val strikeTimesMs = intArrayOf(0, 980, 1960, 2940)
+            val tailSamples = (sampleRate * 1660) / 1000
+            val attackSamples = 350
+            for (strikeMs in strikeTimesMs) {
+                val startSample = (sampleRate * strikeMs) / 1000
+                for (i in 0 until tailSamples) {
+                    val idx = startSample + i
+                    if (idx >= totalSamples) break
+                    val t = i.toDouble() / sampleRate
+                    val envAttack = if (i < attackSamples) i.toDouble() / attackSamples else 1.0
+                    val s = envAttack * (
+                        sin(2.0 * PI * 523.25 * t) * exp(-2.35 * t) * 1.00 +
+                            sin(2.0 * PI * 1046.50 * t) * exp(-4.2 * t) * 0.14 +
+                            sin(2.0 * PI * 2616.25 * t) * exp(-5.0 * t) * 0.22 +
+                            sin(2.0 * PI * 3662.75 * t) * exp(-5.5 * t) * 0.28 +
+                            sin(2.0 * PI * 5232.50 * t) * exp(-6.2 * t) * 0.32 +
+                            sin(2.0 * PI * 5755.75 * t) * exp(-6.5 * t) * 0.30 +
+                            sin(2.0 * PI * 6279.00 * t) * exp(-6.8 * t) * 0.26
+                        )
+                    mix[idx] += s
+                }
+            }
+            pcm = ShortArray(totalSamples)
+            val gain = 0.48
+            for (i in 0 until totalSamples) {
+                val scaled = (mix[i] * gain * Short.MAX_VALUE)
+                    .toInt()
+                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                pcm[i] = scaled.toShort()
+            }
+        } else {
+            data class ToneSeg(val freqs: DoubleArray, val durationMs: Int, val gain: Double)
+
+            val segments: List<ToneSeg> = when {
+                soundId == 13 -> listOf(
+                    ToneSeg(doubleArrayOf(880.0), 180, 0.40),
+                    ToneSeg(doubleArrayOf(659.25), 220, 0.40),
+                    ToneSeg(doubleArrayOf(880.0), 180, 0.40),
+                    ToneSeg(doubleArrayOf(659.25), 240, 0.40),
+                )
+                soundId in 0..4 -> listOf(
+                    ToneSeg(doubleArrayOf(659.25, 987.77), 240, 0.34),
+                    ToneSeg(doubleArrayOf(523.25, 783.99), 420, 0.34),
+                )
+                else -> listOf(
+                    ToneSeg(doubleArrayOf(880.0), 180, 0.24),
+                )
+            }
+
+            val totalSamples = segments.sumOf { (sampleRate * it.durationMs) / 1000 }
+            if (totalSamples <= 0) return
+            pcm = ShortArray(totalSamples)
+            var offset = 0
+            for (seg in segments) {
+                val count = (sampleRate * seg.durationMs) / 1000
+                val attackSamples = (sampleRate * 8) / 1000
+                for (i in 0 until count) {
+                    val t = i.toDouble() / sampleRate
+                    var sum = 0.0
+                    for (f in seg.freqs) {
+                        sum += sin(2.0 * PI * f * t)
+                    }
+                    val avg = sum / seg.freqs.size
+                    val envAttack = if (i < attackSamples) i.toDouble() / attackSamples else 1.0
+                    val envDecay = exp(-3.5 * i.toDouble() / count)
+                    val sample = (avg * envAttack * envDecay * seg.gain * Short.MAX_VALUE)
+                        .toInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    pcm[offset + i] = sample.toShort()
+                }
+                offset += count
+            }
+            totalMs = segments.sumOf { it.durationMs }.toLong()
+        }
+
+        if (gen != soundGeneration.get()) return
+        var track: AudioTrack? = null
+        try {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            val format = AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+            track = AudioTrack.Builder()
+                .setAudioAttributes(attrs)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(pcm.size * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+            track.write(pcm, 0, pcm.size)
+            track.play()
+            val deadline = System.currentTimeMillis() + totalMs + 60L
+            while (gen == soundGeneration.get() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50L)
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                track?.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                track?.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     companion object {
         private const val MULTICAST_LOCK_CHANNEL = "com.markun.tmhb/multicast_lock"
