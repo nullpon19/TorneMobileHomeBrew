@@ -311,6 +311,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
               endNormalizedX: cue.endNormalizedX,
               normalizedY: cue.normalizedY,
               alignment: cue.alignment,
+              backgroundColorOverride: cue.backgroundColorOverride,
             ),
           );
         }
@@ -362,7 +363,17 @@ class PlayerSubtitleOverlay extends StatelessWidget {
         ? null
         : positionedEndX.reduce(math.max);
 
-    final hasBackground = settings.backgroundOpacityPercent > 0;
+    final Color? overrideBg = () {
+      for (final cue in block) {
+        if (cue.backgroundColorOverride != null) {
+          return cue.backgroundColorOverride;
+        }
+      }
+      return null;
+    }();
+    final effectiveBg = overrideBg ?? settings.effectiveBackgroundColor;
+    final hasBackground =
+        overrideBg != null || settings.backgroundOpacityPercent > 0;
     final hPad = hasBackground ? fontSize * 0.34 : 0.0;
     final baseLeft = minX != null
         ? (minX * viewW).clamp(16.0, viewW * 0.58).toDouble()
@@ -467,7 +478,7 @@ class PlayerSubtitleOverlay extends StatelessWidget {
     final Widget content;
     if (hasBackground) {
       content = SubtitleUnifiedBackgroundBox(
-        backgroundColor: settings.effectiveBackgroundColor,
+        backgroundColor: effectiveBg,
         cornerRadius: 5.0,
         children: [
           for (var i = 0; i < visualLines.length; i++)

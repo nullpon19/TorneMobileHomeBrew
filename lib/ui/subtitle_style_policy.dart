@@ -461,6 +461,7 @@ class SubtitleCue {
     this.endNormalizedX,
     this.normalizedY,
     this.alignment = 2,
+    this.backgroundColorOverride,
   });
 
   final List<SubtitleStyledSpan> spans;
@@ -468,6 +469,7 @@ class SubtitleCue {
   final double? endNormalizedX;
   final double? normalizedY;
   final int alignment;
+  final Color? backgroundColorOverride;
 
   String get plainText => [for (final s in spans) s.text].join();
 
@@ -476,12 +478,15 @@ class SubtitleCue {
   String get dedupeKey {
     final posKey =
         '${normalizedX?.toStringAsFixed(2) ?? '-'},${normalizedY?.toStringAsFixed(2) ?? '-'},$alignment';
+    final bgSuffix = backgroundColorOverride == null
+        ? ''
+        : '|bg:${backgroundColorOverride!.toARGB32().toRadixString(16)}';
     final drcsSigs = [
       for (final s in spans)
         if (s.drcsGlyph != null) s.drcsGlyph!.signature,
     ];
     final drcsSuffix = drcsSigs.isEmpty ? '' : '|drcs:${drcsSigs.join(',')}';
-    return '$posKey|${plainText.trim()}$drcsSuffix';
+    return '$posKey|${plainText.trim()}$bgSuffix$drcsSuffix';
   }
 }
 
@@ -815,6 +820,7 @@ List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
         endNormalizedX: cue.endNormalizedX,
         normalizedY: cue.normalizedY,
         alignment: cue.alignment,
+        backgroundColorOverride: cue.backgroundColorOverride,
       ),
     ];
   }
@@ -829,6 +835,7 @@ List<SubtitleCue> splitSubtitleCueLines(SubtitleCue cue) {
             ? null
             : (cue.normalizedY! + idx * 0.055).clamp(0.02, 0.98).toDouble(),
         alignment: cue.alignment,
+        backgroundColorOverride: cue.backgroundColorOverride,
       ),
   ];
 }
@@ -1393,6 +1400,7 @@ List<SubtitleCue> applyAribLayoutToCues({
           endNormalizedX: line.endNormalizedX,
           normalizedY: line.normalizedY,
           alignment: 1,
+          backgroundColorOverride: flatCues[i].backgroundColorOverride,
         );
       }(),
   ];
@@ -1405,3 +1413,188 @@ double resolveSubtitleBlockGapThreshold() => 0.14;
 /// Keeps non-negative math dependency visible if needed by layout callers.
 double clampNormalizedCoordinate(double value, double minValue, double maxValue) =>
     math.max(minValue, math.min(maxValue, value));
+
+/// Fallback timeout when a superimpose stream misses its timed or explicit clear.
+const Duration superimposeStaleTimeout = Duration(seconds: 20);
+
+/// Resolves active ARIB superimpose (`0x38`) cues and optional built-in chime info.
+({
+  List<SubtitleCue> cues,
+  int? soundSequence,
+  int? builtinSoundId,
+  bool isUrgent,
+}) resolveActiveSuperimposeCues({
+  required List<AribCaptionLayoutEvent> events,
+  required bool isLive,
+  required DateTime now,
+  double? currentPlaybackMpvPts,
+  double? ptsOffset,
+}) {
+  if (events.isEmpty) {
+    return (
+      cues: const [],
+      soundSequence: null,
+      builtinSoundId: null,
+      isUrgent: false,
+    );
+  }
+
+  AribCaptionLayoutEvent? latestEvent;
+  if (isLive) {
+    latestEvent = events.last;
+    if (latestEvent.isClearOnly) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+    final ttlSeconds = (latestEvent.clearAfterSeconds != null &&
+            latestEvent.clearAfterSeconds! > 0)
+        ? latestEvent.clearAfterSeconds!
+        : superimposeStaleTimeout.inSeconds.toDouble();
+    final elapsedSeconds =
+        now.difference(latestEvent.receivedAt ?? now).inMilliseconds / 1000.0;
+    if (elapsedSeconds < -0.5 || elapsedSeconds >= ttlSeconds) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+  } else {
+    if (currentPlaybackMpvPts == null || ptsOffset == null) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+    final eligible = <({AribCaptionLayoutEvent event, double mapped})>[];
+    for (final e in events) {
+      final delta = wrapAwareAribPtsDelta(
+        e.ptsSeconds + ptsOffset,
+        currentPlaybackMpvPts,
+      );
+      final mapped = currentPlaybackMpvPts + delta;
+      final lag = currentPlaybackMpvPts - mapped;
+      if (lag >= -0.15 && lag <= 120.0) {
+        eligible.add((event: e, mapped: mapped));
+      }
+    }
+    if (eligible.isEmpty) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+    eligible.sort((a, b) {
+      final tCmp = a.mapped.compareTo(b.mapped);
+      if (tCmp != 0) return tCmp;
+      return a.event.sequence.compareTo(b.event.sequence);
+    });
+    final latest = eligible.last;
+    latestEvent = latest.event;
+    if (latestEvent.isClearOnly) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+    final ttlSeconds = (latestEvent.clearAfterSeconds != null &&
+            latestEvent.clearAfterSeconds! > 0)
+        ? latestEvent.clearAfterSeconds!
+        : superimposeStaleTimeout.inSeconds.toDouble();
+    if (currentPlaybackMpvPts - latest.mapped >= ttlSeconds) {
+      return (
+        cues: const [],
+        soundSequence: null,
+        builtinSoundId: null,
+        isUrgent: false,
+      );
+    }
+  }
+
+  final cues = <SubtitleCue>[];
+  final textBuffer = StringBuffer();
+  for (final line in latestEvent.lines) {
+    final spans = <SubtitleStyledSpan>[];
+    for (final run in line.runs) {
+      if (run.drcsGlyph != null) {
+        spans.add(
+          SubtitleStyledSpan(
+            text: '\uFFFC',
+            color: Color(run.colorArgb),
+            scale: run.scale,
+            drcsGlyph: run.drcsGlyph,
+          ),
+        );
+        continue;
+      }
+      final normalized = normalizeAribSubtitleSymbols(run.text);
+      if (normalized.isEmpty) continue;
+      textBuffer.write(normalized);
+      spans.add(
+        SubtitleStyledSpan(
+          text: normalized,
+          color: Color(run.colorArgb),
+          scale: run.scale,
+        ),
+      );
+    }
+    if (spans.isEmpty) continue;
+    final bgColor = line.backgroundColorArgb != null
+        ? Color(line.backgroundColorArgb!)
+        : const Color(0xD9000000);
+    cues.add(
+      SubtitleCue(
+        spans: spans,
+        normalizedX: line.normalizedX,
+        endNormalizedX: line.endNormalizedX,
+        normalizedY: line.normalizedY,
+        alignment: 1,
+        backgroundColorOverride: bgColor,
+      ),
+    );
+  }
+  final fullText = textBuffer.toString();
+  final soundId = latestEvent.builtinSoundId;
+  final isUrgent = soundId == 13 ||
+      fullText.contains('緊急地震速報') ||
+      fullText.contains('津波');
+  return (
+    cues: List<SubtitleCue>.unmodifiable(cues),
+    soundSequence: soundId != null ? latestEvent.sequence : null,
+    builtinSoundId: soundId,
+    isUrgent: isUrgent,
+  );
+}
+
+/// Builds and decodes a synthetic ARIB `0x38` superimpose TS packet stream for
+/// the 16:9 preview test buttons in subtitle settings.
+List<SubtitleCue> decodeSampleSuperimposeCues({required bool emergency}) {
+  final tap = AribTsCaptionTap();
+  final packet = AribTsCaptionTap.buildSyntheticSuperimposeTsPacket(
+    text: emergency ? '緊急地震速報' : 'ニュース速報：ＢＳ文字スーパーのテスト表示です',
+    bgColorIndex: emergency ? 1 : 12,
+    fgColorIndex: 7,
+    builtinSoundId: emergency ? 4 : 0,
+    clearAfterSeconds: 6.0,
+    xPos: emergency ? 340 : 120,
+    yPos: 70,
+  );
+  tap.feed(packet);
+  final resolved = resolveActiveSuperimposeCues(
+    events: tap.superimposeEvents,
+    isLive: true,
+    now: DateTime.now(),
+  );
+  return resolved.cues;
+}

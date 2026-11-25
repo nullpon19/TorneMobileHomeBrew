@@ -2,6 +2,8 @@
 /// live broadcast preview above the control list.
 library;
 
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -40,15 +42,54 @@ const List<SubtitleCue> _previewSampleCues = [
   ),
 ];
 
-/// Full-screen settings page for Fire TV subtitle appearance customization.
-class SubtitleSettingsScreen extends ConsumerWidget {
+/// Full-screen settings page for Fire TV subtitle & superimpose customization.
+class SubtitleSettingsScreen extends ConsumerStatefulWidget {
   const SubtitleSettingsScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<SubtitleSettingsScreen> createState() =>
+      _SubtitleSettingsScreenState();
+}
+
+class _SubtitleSettingsScreenState
+    extends ConsumerState<SubtitleSettingsScreen> {
+  List<SubtitleCue> _testSuperimposeCues = const [];
+  Timer? _testSuperimposeTimer;
+
+  @override
+  void dispose() {
+    _testSuperimposeTimer?.cancel();
+    super.dispose();
+  }
+
+  void _triggerSuperimposeTest({required bool emergency}) {
+    _testSuperimposeTimer?.cancel();
+    final cues = decodeSampleSuperimposeCues(emergency: emergency);
+    setState(() {
+      _testSuperimposeCues = cues;
+    });
+    _testSuperimposeTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      setState(() {
+        _testSuperimposeCues = const [];
+      });
+    });
+    if (ref.read(superimposeSoundEnabledProvider)) {
+      unawaited(
+        ref
+            .read(fireTvHelperProvider)
+            .playAribBuiltinSound(emergency ? 4 : 0, urgent: emergency),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final settings = ref.watch(subtitleSettingsProvider);
     final notifier = ref.read(subtitleSettingsProvider.notifier);
     final subtitlesOn = ref.watch(subtitlesEnabledProvider);
+    final superimposeOn = ref.watch(superimposeEnabledProvider);
+    final superimposeSoundOn = ref.watch(superimposeSoundEnabledProvider);
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -122,6 +163,12 @@ class SubtitleSettingsScreen extends ConsumerWidget {
                               cues: _previewSampleCues,
                               bottomSafePadding: 24.0,
                             ),
+                            if (_testSuperimposeCues.isNotEmpty)
+                              PlayerSubtitleOverlay(
+                                settings: settings,
+                                cues: _testSuperimposeCues,
+                                bottomSafePadding: 24.0,
+                              ),
                           ],
                         ),
                       ),
@@ -223,6 +270,46 @@ class SubtitleSettingsScreen extends ConsumerWidget {
                           if (selected) notifier.setBackgroundOpacity(opacity);
                         },
                       ),
+                  ],
+                ),
+                const Divider(height: 24),
+                _SectionHeader(title: '文字スーパー（速報テロップ）', theme: theme),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('文字スーパー表示（緊急地震速報・BSニュース速報等）'),
+                  subtitle: const Text('字幕オフ時でも速報テロップを自動表示します'),
+                  value: superimposeOn,
+                  onChanged: (value) =>
+                      ref.read(superimposeEnabledProvider.notifier).set(value),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('文字スーパーの内蔵チャイム音'),
+                  subtitle: const Text('速報テロップに内蔵音指定がある場合にテレビ音声へ重ねて鳴らします'),
+                  value: superimposeSoundOn,
+                  onChanged: superimposeOn
+                      ? (value) => ref
+                            .read(superimposeSoundEnabledProvider.notifier)
+                            .set(value)
+                      : null,
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: () => _triggerSuperimposeTest(emergency: true),
+                      icon: const Icon(Icons.warning_amber_rounded),
+                      label: const Text('緊急地震速報をテスト'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: () =>
+                          _triggerSuperimposeTest(emergency: false),
+                      icon: const Icon(Icons.campaign_outlined),
+                      label: const Text('BSニュース速報をテスト'),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 16),

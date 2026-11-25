@@ -655,6 +655,190 @@ final subtitlesEnabledProvider =
       SubtitlesEnabledNotifier.new,
     );
 
+/// Persisted ARIB superimpose (`0x38`) display toggle (defaults to ON).
+class SuperimposeEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_superimpose_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final superimposeEnabledProvider =
+    NotifierProvider<SuperimposeEnabledNotifier, bool>(
+      SuperimposeEnabledNotifier.new,
+    );
+
+/// Persisted ARIB superimpose built-in chime sound toggle (defaults to ON).
+class SuperimposeSoundEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_superimpose_sound_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return true;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final superimposeSoundEnabledProvider =
+    NotifierProvider<SuperimposeSoundEnabledNotifier, bool>(
+      SuperimposeSoundEnabledNotifier.new,
+    );
+
+/// Persisted Niconico Jikkyo visual & mapping settings (Phase 40).
+class JikkyoSettingsNotifier extends Notifier<JikkyoSettings> {
+  static const _key = 'firetv_jikkyo_settings';
+  bool _dirty = false;
+
+  @override
+  JikkyoSettings build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null || raw.isEmpty) return;
+      final restored = JikkyoSettings.fromJsonString(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return JikkyoSettings.defaults;
+  }
+
+  Future<void> _update(JikkyoSettings next) async {
+    if (next == state) return;
+    _dirty = true;
+    state = next;
+    await ref.read(keyValueStoreProvider).write(_key, next.toJsonString());
+  }
+
+  Future<void> setOpacity(int opacityPercent) {
+    if (!jikkyoOpacityOptions.contains(opacityPercent)) {
+      return Future.value();
+    }
+    return _update(state.copyWith(opacityPercent: opacityPercent));
+  }
+
+  Future<void> setTextSize(JikkyoTextSizePreset size) =>
+      _update(state.copyWith(textSize: size));
+
+  Future<void> setSpeed(JikkyoSpeedPreset speed) =>
+      _update(state.copyWith(speed: speed));
+
+  Future<void> setMaxConcurrent(int count) {
+    if (!jikkyoMaxConcurrentOptions.contains(count)) {
+      return Future.value();
+    }
+    return _update(state.copyWith(maxConcurrentComments: count));
+  }
+
+  Future<void> setAvoidSubtitleArea(bool avoid) =>
+      _update(state.copyWith(avoidSubtitleArea: avoid));
+
+  Future<void> setLiveDelaySeconds(int seconds) {
+    if (!jikkyoLiveDelayOptions.contains(seconds)) {
+      return Future.value();
+    }
+    return _update(state.copyWith(liveDelaySeconds: seconds));
+  }
+
+  Future<void> setChannelOverride(
+    String key,
+    String jkIdOrOff, {
+    String? label,
+  }) =>
+      _update(state.withChannelOverride(key, jkIdOrOff, label: label));
+
+  Future<void> removeChannelOverride(String key) =>
+      _update(state.withoutChannelOverride(key));
+
+  Future<void> clearChannelOverrides() =>
+      _update(state.withoutAllChannelOverrides());
+
+  Future<void> resetDefaults() async {
+    if (state == JikkyoSettings.defaults) return;
+    _dirty = true;
+    state = JikkyoSettings.defaults;
+    await ref.read(keyValueStoreProvider).write(_key, state.toJsonString());
+  }
+}
+
+final jikkyoSettingsProvider =
+    NotifierProvider<JikkyoSettingsNotifier, JikkyoSettings>(
+      JikkyoSettingsNotifier.new,
+    );
+
+/// Persisted Niconico Jikkyo ON/OFF toggle (defaults to OFF).
+class JikkyoEnabledNotifier extends Notifier<bool> {
+  static const _key = 'firetv_jikkyo_enabled';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool enabled) async {
+    _dirty = true;
+    state = enabled;
+    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+  }
+}
+
+final jikkyoEnabledProvider = NotifierProvider<JikkyoEnabledNotifier, bool>(
+  JikkyoEnabledNotifier.new,
+);
+
+final jikkyoClientProvider = Provider<JikkyoClient>((ref) {
+  final client = NxJikkyoClient();
+  ref.onDispose(client.dispose);
+  return client;
+});
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {

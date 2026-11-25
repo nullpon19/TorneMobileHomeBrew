@@ -428,6 +428,10 @@ class DtcpProxy {
   /// Extracted ARIB caption coordinates and clear events from plaintext TS/TTS.
   List<AribCaptionLayoutEvent> get aribCaptionEvents => _aribCaptionTap.events;
 
+  /// Extracted ARIB superimpose events (`component_tag 0x38..0x3F`) from plaintext TS/TTS.
+  List<AribCaptionLayoutEvent> get aribSuperimposeEvents =>
+      _aribCaptionTap.superimposeEvents;
+
   /// Initial A/V stream PTS observed by [_aribCaptionTap], if any.
   double? get firstStreamPtsSeconds => _aribCaptionTap.firstStreamPtsSeconds;
   bool _claimed = false;

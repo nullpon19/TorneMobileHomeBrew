@@ -227,6 +227,7 @@ abstract interface class LiveEdgeResettable {
 /// from the plaintext MPEG-TS/TTS stream in `DtcpProxy`.
 abstract interface class AribCaptionLayoutSource {
   List<AribCaptionLayoutEvent> get aribCaptionEvents;
+  List<AribCaptionLayoutEvent> get aribSuperimposeEvents;
   double? get firstStreamPtsSeconds;
 }
 
