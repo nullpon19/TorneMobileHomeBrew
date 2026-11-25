@@ -106,7 +106,6 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
   }
 
   void _refreshOnReveal() {
-    final now = DateTime.now();
     final regs =
         ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
     final selected = ref.read(selectedRegistrationProvider);
@@ -121,18 +120,6 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
       final sched = ref.read(schedulesProvider(r));
       if (sched.hasValue && !sched.isLoading) {
         ref.invalidate(schedulesProvider(r));
-      }
-      final epgAsync = ref.read(epgGuideProvider(r));
-      if (epgAsync.hasValue &&
-          !epgAsync.isLoading &&
-          shouldRefreshStaleEpgGuide(epgAsync.value, now)) {
-        ref.invalidate(epgGuideProvider(r));
-      }
-      final bsEpgAsync = ref.read(bsEpgGuideProvider(r));
-      if (bsEpgAsync.hasValue &&
-          !bsEpgAsync.isLoading &&
-          shouldRefreshStaleEpgGuide(bsEpgAsync.value, now)) {
-        ref.invalidate(bsEpgGuideProvider(r));
       }
     }
   }
@@ -505,18 +492,16 @@ class _LiveListState extends ConsumerState<_LiveList>
             ref.invalidate(schedulesProvider(r));
           }
           if (bandTypes.contains(terrestrialBroadcastingType)) {
-            final epgAsync = ref.read(epgGuideProvider(r));
-            if (epgAsync.hasValue &&
-                !epgAsync.isLoading &&
-                shouldRefreshStaleEpgGuide(epgAsync.value, fireNow)) {
+            final epg = ref.read(epgGuideProvider(r)).value;
+            final epgTo = epg?.to;
+            if (epg == null || (epgTo != null && !epgTo.isAfter(fireNow))) {
               ref.invalidate(epgGuideProvider(r));
             }
           }
           if (bandTypes.contains(bsBroadcastingType)) {
-            final bsEpgAsync = ref.read(bsEpgGuideProvider(r));
-            if (bsEpgAsync.hasValue &&
-                !bsEpgAsync.isLoading &&
-                shouldRefreshStaleEpgGuide(bsEpgAsync.value, fireNow)) {
+            final bsEpg = ref.read(bsEpgGuideProvider(r)).value;
+            final bsTo = bsEpg?.to;
+            if (bsEpg == null || (bsTo != null && !bsTo.isAfter(fireNow))) {
               ref.invalidate(bsEpgGuideProvider(r));
             }
           }
@@ -2058,25 +2043,14 @@ EpgGuide? _cachedEpgGuideForBand(
 Future<EpgGuide?> _loadEpgGuideForBand(
   ProviderContainer container,
   RegisteredNasne reg,
-  int? bandType, {
-  bool forceRefresh = false,
-}) async {
+  int? bandType,
+) async {
   final provider = switch (bandType) {
     terrestrialBroadcastingType => epgGuideProvider(reg),
     bsBroadcastingType => bsEpgGuideProvider(reg),
     _ => null,
   };
   if (provider == null) return null;
-  if (forceRefresh) {
-    final existing = container.read(provider).value;
-    final fetchedAt = existing?.fetchedAt;
-    if (existing != null &&
-        (fetchedAt == null ||
-            DateTime.now().difference(fetchedAt) >=
-                const Duration(seconds: 30))) {
-      container.invalidate(provider);
-    }
-  }
   try {
     return await container
         .read(provider.future)
@@ -2207,22 +2181,12 @@ Widget _buildLivePlayerScreen({
     liveUseMobile: useMobile,
     initialLiveGuideEvents: initialLiveGuideEvents,
     loadLiveGuideEvents: () async {
-      final guide = await _loadEpgGuideForBand(
-        container,
-        reg,
-        bandType,
-        forceRefresh: true,
-      );
+      final guide = await _loadEpgGuideForBand(container, reg, bandType);
       return _serviceEventsFromGuide(guide, channel);
     },
     initialLiveBandGuideEvents: initialLiveBandGuideEvents,
     loadLiveBandGuideEvents: () async {
-      final guide = await _loadEpgGuideForBand(
-        container,
-        reg,
-        bandType,
-        forceRefresh: true,
-      );
+      final guide = await _loadEpgGuideForBand(container, reg, bandType);
       return _bandGuideEventsMap(guide, bandChannels);
     },
     initialLiveChannelNumbers: initialMeta.numbers,

@@ -809,11 +809,15 @@ class LiveDemuxerCacheRange {
     required this.startSeconds,
     required this.endSeconds,
     this.cacheDurationSeconds,
+    this.liveEdgeSeconds,
+    this.earliestStartSeconds,
   });
 
   final double startSeconds;
   final double endSeconds;
   final double? cacheDurationSeconds;
+  final double? liveEdgeSeconds;
+  final double? earliestStartSeconds;
 
   double get spanSeconds => math.max(0.0, endSeconds - startSeconds);
 }
@@ -871,6 +875,12 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
       ranges.add((start: start, end: end));
     }
     if (ranges.isEmpty) return null;
+    var earliestStart = ranges.first.start;
+    var latestEnd = ranges.first.end;
+    for (final r in ranges) {
+      if (r.start < earliestStart) earliestStart = r.start;
+      if (r.end > latestEnd) latestEnd = r.end;
+    }
     if (currentPosSeconds != null && currentPosSeconds.isFinite) {
       for (final r in ranges) {
         if (currentPosSeconds >= r.start - 1.0 &&
@@ -879,6 +889,8 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
             startSeconds: r.start,
             endSeconds: r.end,
             cacheDurationSeconds: cacheDur,
+            liveEdgeSeconds: latestEnd,
+            earliestStartSeconds: earliestStart,
           );
         }
       }
@@ -888,6 +900,8 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
       startSeconds: chosen.start,
       endSeconds: chosen.end,
       cacheDurationSeconds: cacheDur,
+      liveEdgeSeconds: latestEnd,
+      earliestStartSeconds: earliestStart,
     );
   } catch (_) {
     return null;
@@ -998,12 +1012,37 @@ bool shouldPollLiveCacheOnOsdTick({
   required bool switchingChannel,
   required bool conflictHandled,
   required bool catchUpMonitorActive,
+  bool initialPlaybackStarted = true,
+  bool buffering = false,
 }) =>
     live &&
     osdOpen &&
+    initialPlaybackStarted &&
+    !buffering &&
     !switchingChannel &&
     !conflictHandled &&
     !catchUpMonitorActive;
+
+/// Merges [primary] EPG events with non-overlapping [fallback] history
+/// entries so programme metadata observed earlier stays available on rewind.
+List<EpgEvent> mergeLiveProgramEventLists(
+  List<EpgEvent> primary,
+  List<EpgEvent> fallback,
+) {
+  if (fallback.isEmpty) return primary;
+  if (primary.isEmpty) return fallback;
+  final merged = List<EpgEvent>.of(primary);
+  for (final fb in fallback) {
+    final overlaps = primary.any(
+      (p) => fb.start.isBefore(p.end) && fb.end.isAfter(p.start),
+    );
+    if (!overlaps) {
+      merged.add(fb);
+    }
+  }
+  merged.sort((a, b) => a.start.compareTo(b.start));
+  return merged;
+}
 
 int? _roundedCacheSpanSeconds(double? start, double? end) {
   if (start == null || end == null || !start.isFinite || !end.isFinite) {
@@ -1039,29 +1078,64 @@ bool hasLiveCacheRangeDisplayChanged({
 }
 
 /// Computes the active live playback delay (in seconds behind the live edge).
+///
+/// When [streamEpoch] and [now] are provided alongside a finite
+/// [effectivePosSeconds], delay is measured directly against the fixed stream
+/// epoch so paused playback stays locked on the paused programme even if mpv's
+/// cache end stalls at buffer capacity or EOS.
 double resolveLivePlaybackLagSeconds({
   required bool liveDelayedByPause,
   double? cacheStartSeconds,
   double? cacheEndSeconds,
+  double? liveEdgeSeconds,
   double? effectivePosSeconds,
   double fallbackLagSeconds = 0.0,
+  DateTime? streamEpoch,
+  DateTime? now,
+  double? bufferedAheadSeconds,
+  bool isScrubbing = false,
 }) {
   if (!liveDelayedByPause) return 0.0;
+  if (streamEpoch != null &&
+      now != null &&
+      effectivePosSeconds != null &&
+      effectivePosSeconds.isFinite) {
+    final fromEpoch = streamEpoch.add(
+      Duration(milliseconds: (effectivePosSeconds * 1000).round()),
+    );
+    final diff = now.difference(fromEpoch);
+    if (diff >= const Duration(seconds: -10) &&
+        diff <= const Duration(hours: 12)) {
+      return math.max(0.0, diff.inMilliseconds / 1000.0);
+    }
+  }
+  final effectiveLiveEdge = liveEdgeSeconds ?? cacheEndSeconds;
   final rewindableRaw =
       (cacheStartSeconds != null &&
-          cacheEndSeconds != null &&
+          effectiveLiveEdge != null &&
           cacheStartSeconds.isFinite &&
-          cacheEndSeconds.isFinite &&
-          cacheEndSeconds > cacheStartSeconds)
-      ? (cacheEndSeconds - cacheStartSeconds)
+          effectiveLiveEdge.isFinite &&
+          effectiveLiveEdge > cacheStartSeconds)
+      ? (effectiveLiveEdge - cacheStartSeconds)
       : 0.0;
-  if (cacheEndSeconds != null &&
+  if (effectiveLiveEdge != null &&
       effectivePosSeconds != null &&
-      cacheEndSeconds.isFinite &&
-      effectivePosSeconds.isFinite) {
-    return (cacheEndSeconds - effectivePosSeconds)
+      effectiveLiveEdge.isFinite &&
+      effectivePosSeconds.isFinite &&
+      effectivePosSeconds <= effectiveLiveEdge + 5.0 &&
+      (cacheStartSeconds == null ||
+          !cacheStartSeconds.isFinite ||
+          effectivePosSeconds >= cacheStartSeconds - 5.0)) {
+    final rangeLag = (effectiveLiveEdge - effectivePosSeconds)
         .clamp(0.0, rewindableRaw > 0 ? rewindableRaw : double.infinity)
         .toDouble();
+    if (!isScrubbing &&
+        bufferedAheadSeconds != null &&
+        bufferedAheadSeconds.isFinite &&
+        bufferedAheadSeconds > rangeLag) {
+      return math.max(rangeLag, bufferedAheadSeconds);
+    }
+    return rangeLag;
   }
   return math.max(0.0, fallbackLagSeconds);
 }
@@ -1071,7 +1145,23 @@ double resolveLivePlaybackLagSeconds({
 DateTime resolveLivePlaybackClock({
   required DateTime now,
   required double lagSeconds,
+  DateTime? streamEpoch,
+  double? effectivePosSeconds,
+  bool liveDelayedByPause = true,
 }) {
+  if (!liveDelayedByPause) return now;
+  if (streamEpoch != null &&
+      effectivePosSeconds != null &&
+      effectivePosSeconds.isFinite) {
+    final fromEpoch = streamEpoch.add(
+      Duration(milliseconds: (effectivePosSeconds * 1000).round()),
+    );
+    final diff = now.difference(fromEpoch);
+    if (diff >= const Duration(seconds: -10) &&
+        diff <= const Duration(hours: 12)) {
+      return fromEpoch.isAfter(now) ? now : fromEpoch;
+    }
+  }
   if (!lagSeconds.isFinite || lagSeconds <= 0.5) return now;
   return now.subtract(Duration(milliseconds: (lagSeconds * 1000).round()));
 }
@@ -1115,24 +1205,34 @@ LiveTimeshiftBarState resolveLiveTimeshiftBarState({
   required DateTime now,
   double? cacheStartSeconds,
   double? cacheEndSeconds,
+  double? liveEdgeSeconds,
   double? effectivePosSeconds,
   double fallbackLagSeconds = 0.0,
   required bool liveDelayedByPause,
+  DateTime? streamEpoch,
+  double? bufferedAheadSeconds,
+  bool isScrubbing = false,
 }) {
+  final effectiveLiveEdge = liveEdgeSeconds ?? cacheEndSeconds;
   final rewindableRaw =
       (cacheStartSeconds != null &&
-          cacheEndSeconds != null &&
+          effectiveLiveEdge != null &&
           cacheStartSeconds.isFinite &&
-          cacheEndSeconds.isFinite &&
-          cacheEndSeconds > cacheStartSeconds)
-      ? (cacheEndSeconds - cacheStartSeconds)
+          effectiveLiveEdge.isFinite &&
+          effectiveLiveEdge > cacheStartSeconds)
+      ? (effectiveLiveEdge - cacheStartSeconds)
       : 0.0;
   final rawLag = resolveLivePlaybackLagSeconds(
     liveDelayedByPause: liveDelayedByPause,
     cacheStartSeconds: cacheStartSeconds,
     cacheEndSeconds: cacheEndSeconds,
+    liveEdgeSeconds: liveEdgeSeconds,
     effectivePosSeconds: effectivePosSeconds,
     fallbackLagSeconds: fallbackLagSeconds,
+    streamEpoch: streamEpoch,
+    now: now,
+    bufferedAheadSeconds: bufferedAheadSeconds,
+    isScrubbing: isScrubbing,
   );
 
   final start = info?.currentStart;
@@ -2683,7 +2783,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   double _liveEstimatedLagSeconds = 0.0;
   double? _liveCacheStartSec;
   double? _liveCacheEndSec;
+  double? _liveCacheLiveEdgeSec;
   double? _liveTimePosSec;
+  DateTime? _liveStreamEpoch;
+  double? _liveMaxAdvancingCacheEndSec;
   double? _livePendingSeekBaseSec;
   double _livePendingSeekDeltaSec = 0.0;
   Timer? _liveSeekDebounceTimer;
@@ -2774,7 +2877,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _liveChannelMetaLoading = false;
   bool _liveGuideLoading = false;
   DateTime? _lastLiveGuideAttemptAt;
-  DateTime? _lastLiveGuideRefreshAt;
   bool _liveChannelsRefreshing = false;
   DateTime? _lastLiveChannelsRefreshAt;
   ResolvedProgramDetail? _openedLiveDetail;
@@ -2990,7 +3092,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final prevPct = _bufferingPercentage.round();
     final prevAheadFloor = _bufferedAheadSeconds.floor();
     final prevCacheStart = _liveCacheStartSec;
-    final prevCacheEnd = _liveCacheEndSec;
+    final prevCacheEnd = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final prevPos = _liveTimePosSec;
     try {
       if (platform is NativePlayer) {
@@ -3029,21 +3131,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 polledPlaybackTime ?? polledTimePos ?? _liveTimePosSec,
           );
           if (range != null) {
-            _liveCacheStartSec = range.startSeconds;
+            final earliestStart =
+                range.earliestStartSeconds ?? range.startSeconds;
+            final liveEdge = range.liveEdgeSeconds ?? range.endSeconds;
+            _liveCacheStartSec = earliestStart;
             _liveCacheEndSec = range.endSeconds;
+            _liveCacheLiveEdgeSec = liveEdge;
+            _updateLiveStreamEpochFromLiveEdge(liveEdge, _now());
             if (polledPlaybackTime != null ||
                 polledTimePos != null ||
                 _liveTimePosSec != null) {
               _liveTimePosSec = resolveLiveCacheCoordinatePos(
                 playbackTimeSeconds: polledPlaybackTime ?? _liveTimePosSec,
                 timePosSeconds: polledTimePos,
-                cacheStartSeconds: range.startSeconds,
-                cacheEndSeconds: range.endSeconds,
-                fallbackSeconds: range.endSeconds,
+                cacheStartSeconds: earliestStart,
+                cacheEndSeconds: liveEdge,
+                fallbackSeconds: liveEdge,
               );
             }
             final aheadFromRange = _liveTimePosSec != null
-                ? math.max(0.0, range.endSeconds - _liveTimePosSec!)
+                ? math.max(0.0, liveEdge - _liveTimePosSec!)
                 : null;
             final stateDur = range.cacheDurationSeconds;
             if (stateDur != null &&
@@ -3093,7 +3200,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         prevEnd: prevCacheEnd,
         prevPos: prevPos,
         nextStart: _liveCacheStartSec,
-        nextEnd: _liveCacheEndSec,
+        nextEnd: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
         nextPos: _liveTimePosSec,
       );
       if (latched ||
@@ -3183,9 +3290,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (seeded != null && seeded.isNotEmpty) {
         _liveGuideEvents = List<EpgEvent>.of(seeded);
       }
-    }
-    if (_liveGuideEvents.isNotEmpty || _liveBandGuideEvents.isNotEmpty) {
-      _lastLiveGuideRefreshAt = _now();
     }
     _recordLiveChannelProgramSnapshot(_activeLiveChannel);
     unawaited(
@@ -3759,15 +3863,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   List<EpgEvent> _guideEventsForChannel(LiveChannel channel) {
     final key = liveServiceKey(channel);
+    final history = _liveChannelProgramHistory[key] ?? const <EpgEvent>[];
     final bandEvents = _liveBandGuideEvents[key];
-    if (bandEvents != null && bandEvents.isNotEmpty) return bandEvents;
+    if (bandEvents != null && bandEvents.isNotEmpty) {
+      return mergeLiveProgramEventLists(bandEvents, history);
+    }
     final active = _activeLiveChannel;
     if (active != null &&
         liveServiceKey(active) == key &&
         _liveGuideEvents.isNotEmpty) {
-      return _liveGuideEvents;
+      return mergeLiveProgramEventLists(_liveGuideEvents, history);
     }
-    return _liveChannelProgramHistory[key] ?? const [];
+    return history;
   }
 
   void _updateSameChannelRecordingStatus() {
@@ -4206,7 +4313,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _initialBufferPosition = null;
       _liveCacheStartSec = null;
       _liveCacheEndSec = null;
+      _liveCacheLiveEdgeSec = null;
       _liveTimePosSec = null;
+      _liveStreamEpoch = null;
+      _liveMaxAdvancingCacheEndSec = null;
       _livePendingSeekBaseSec = null;
       _livePendingSeekDeltaSec = 0.0;
       _liveSeekDebounceTimer?.cancel();
@@ -4864,17 +4974,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final map = await bandLoader();
         if (mounted && map.isNotEmpty) {
           final active = _activeLiveChannel;
-          final activeEvents = active != null
-              ? map[liveServiceKey(active)]
-              : null;
-          _lastLiveGuideRefreshAt = _now();
           setState(() {
-            _liveBandGuideEvents = {
-              for (final entry in map.entries)
+            final nextBand = <String, List<EpgEvent>>{
+              for (final entry in _liveBandGuideEvents.entries)
                 entry.key: List<EpgEvent>.of(entry.value),
             };
-            if (activeEvents != null && activeEvents.isNotEmpty) {
-              _liveGuideEvents = List<EpgEvent>.of(activeEvents);
+            for (final entry in map.entries) {
+              nextBand[entry.key] = mergeLiveProgramEventLists(
+                List<EpgEvent>.of(entry.value),
+                nextBand[entry.key] ?? const [],
+              );
+            }
+            _liveBandGuideEvents = nextBand;
+            if (active != null) {
+              final activeEvents = nextBand[liveServiceKey(active)];
+              if (activeEvents != null && activeEvents.isNotEmpty) {
+                _liveGuideEvents = mergeLiveProgramEventLists(
+                  activeEvents,
+                  _liveGuideEvents,
+                );
+              }
             }
           });
         }
@@ -4884,13 +5003,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final events = await singleLoader();
         if (mounted && events.isNotEmpty) {
           final active = _activeLiveChannel;
-          _lastLiveGuideRefreshAt = _now();
           setState(() {
-            _liveGuideEvents = List<EpgEvent>.of(events);
+            final mergedSingle = mergeLiveProgramEventLists(
+              List<EpgEvent>.of(events),
+              _liveGuideEvents,
+            );
+            _liveGuideEvents = mergedSingle;
             if (active != null) {
+              final key = liveServiceKey(active);
               _liveBandGuideEvents = {
                 ..._liveBandGuideEvents,
-                liveServiceKey(active): List<EpgEvent>.of(events),
+                key: mergeLiveProgramEventLists(
+                  mergedSingle,
+                  _liveBandGuideEvents[key] ?? const [],
+                ),
               };
             }
           });
@@ -5115,7 +5241,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _initialBufferPosition = null;
       _liveCacheStartSec = null;
       _liveCacheEndSec = null;
+      _liveCacheLiveEdgeSec = null;
       _liveTimePosSec = null;
+      _liveStreamEpoch = null;
+      _liveMaxAdvancingCacheEndSec = null;
       _livePendingSeekBaseSec = null;
       _livePendingSeekDeltaSec = 0.0;
       _liveSeekDebounceTimer?.cancel();
@@ -5722,17 +5851,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         guideEvents: _guideEventsForChannel(cur),
         now: playbackNow,
       );
-      final shouldSilentRefresh =
-          info.currentEvent == null ||
-          shouldRefreshPlayerLiveGuide(
-            lastUpdatedAt: _lastLiveGuideRefreshAt,
-            now: now,
-          );
-      if (shouldSilentRefresh) {
-        unawaited(_loadLiveGuideEvents(force: info.currentEvent != null));
-        if (cur.programEnd == null ||
-            !cur.programEnd!.isAfter(now) ||
-            info.currentEvent != null) {
+      if (info.currentEvent == null) {
+        unawaited(_loadLiveGuideEvents());
+        if (cur.programEnd == null || !cur.programEnd!.isAfter(now)) {
           unawaited(_refreshLiveChannelSnapshots());
         }
       }
@@ -5748,6 +5869,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         switchingChannel: _switchingChannel,
         conflictHandled: _conflictHandled,
         catchUpMonitorActive: _liveCatchUpTimer != null,
+        initialPlaybackStarted: _initialPlaybackStarted,
+        buffering: _buffering,
       )) {
         unawaited(_pollMpvBufferProperties());
       }
@@ -5932,17 +6055,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     _liveDelayedByPause = true;
     _startLiveCatchUpMonitor();
+    final effectiveLiveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final base =
         _livePendingSeekBaseSec ??
         _liveCommittedSeekSec ??
         _liveTimePosSec ??
-        _liveCacheEndSec ??
+        effectiveLiveEdge ??
         (_lastPosition.inMilliseconds / 1000.0);
     final clamped = clampLivePendingSeekDelta(
       basePosSeconds: base,
       desiredDeltaSeconds: _livePendingSeekDeltaSec + deltaSec,
       cacheStartSeconds: _liveCacheStartSec,
-      cacheEndSeconds: _liveCacheEndSec,
+      cacheEndSeconds: effectiveLiveEdge,
     );
     if (!clamped.hasCache) {
       _livePendingSeekBaseSec = null;
@@ -5960,13 +6084,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         unawaited(_player.setRate(1.0));
       }
     }
-    _livePendingSeekBaseSec = base;
-    _livePendingSeekDeltaSec = clamped.clampedDelta;
+    if (clamped.clampedDelta == 0.0) {
+      _livePendingSeekBaseSec = null;
+      _livePendingSeekDeltaSec = 0.0;
+    } else {
+      _livePendingSeekBaseSec = base;
+      _livePendingSeekDeltaSec = clamped.clampedDelta;
+    }
     if (deltaSec < 0 && clamped.hitStart) {
-      final maxBack = _liveCacheEndSec != null
+      final maxBack = effectiveLiveEdge != null
           ? math.max(
               0,
-              (_liveCacheEndSec! - (base + clamped.clampedDelta)).round(),
+              (effectiveLiveEdge - (base + clamped.clampedDelta)).round(),
             )
           : 0;
       _showSeekHud(
@@ -6025,8 +6154,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           currentPosSeconds: playbackTime ?? timePos ?? _liveTimePosSec,
         );
         if (range != null) {
-          cacheStart = range.startSeconds;
-          cacheEnd = range.endSeconds;
+          cacheStart = range.earliestStartSeconds ?? range.startSeconds;
+          cacheEnd = range.liveEdgeSeconds ?? range.endSeconds;
           currentPos = resolveLiveCacheCoordinatePos(
             playbackTimeSeconds: playbackTime,
             timePosSeconds: timePos,
@@ -6073,6 +6202,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final actualDelta = res.targetSeconds - resolvedCurrent;
     _liveCacheStartSec = cacheStart;
     _liveCacheEndSec = cacheEnd;
+    _liveCacheLiveEdgeSec = cacheEnd;
+    _updateLiveStreamEpochFromLiveEdge(cacheEnd, _now());
     _liveCommittedSeekSec = res.targetSeconds;
     _liveTimePosSec = res.targetSeconds;
     _liveCommittedSeekHoldTimer?.cancel();
@@ -6427,8 +6558,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _liveRewoundByUser = false;
     final prevRate = _liveCatchUpRate;
     _liveCatchUpRate = 1.0;
+    _liveMaxAdvancingCacheEndSec = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     if (resetPlayerRate && prevRate != 1.0) {
       unawaited(_player.setRate(1.0));
+    }
+  }
+
+  void _updateLiveStreamEpochFromLiveEdge(double liveEdgeSec, DateTime now) {
+    if (!widget.live || !liveEdgeSec.isFinite) return;
+    if (_liveStreamEpoch == null) {
+      _liveMaxAdvancingCacheEndSec = liveEdgeSec;
+      _liveStreamEpoch = now.subtract(
+        Duration(milliseconds: (liveEdgeSec * 1000).round()),
+      );
+      return;
+    }
+    if (liveEdgeSec >
+        (_liveMaxAdvancingCacheEndSec ?? -double.infinity) + 0.5) {
+      _liveMaxAdvancingCacheEndSec = liveEdgeSec;
+      if (!_liveDelayedByPause) {
+        _liveStreamEpoch = now.subtract(
+          Duration(milliseconds: (liveEdgeSec * 1000).round()),
+        );
+      }
     }
   }
 
@@ -6437,6 +6589,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final wasDelayed = _liveDelayedByPause;
     _channelPreviewTimer?.cancel();
     _channelPreviewDirection = null;
+    if (_liveStreamEpoch == null) {
+      final anchorPos =
+          _liveTimePosSec ?? _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
+      if (anchorPos != null && anchorPos.isFinite) {
+        _liveStreamEpoch = _now().subtract(
+          Duration(milliseconds: (anchorPos * 1000).round()),
+        );
+        _liveMaxAdvancingCacheEndSec ??= anchorPos;
+      }
+    }
     _livePausedAt ??= _now();
     _liveDelayedByPause = true;
     if (!wasDelayed) {
@@ -6495,6 +6657,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _liveRewoundByUser = false;
     final prevRate = _liveCatchUpRate;
     _liveCatchUpRate = 1.0;
+    _liveMaxAdvancingCacheEndSec = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     if (prevRate != 1.0) {
       try {
         await _player.setRate(1.0);
@@ -6677,7 +6840,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _initialBufferPosition = null;
         _liveCacheStartSec = null;
         _liveCacheEndSec = null;
+        _liveCacheLiveEdgeSec = null;
         _liveTimePosSec = null;
+        _liveStreamEpoch = null;
+        _liveMaxAdvancingCacheEndSec = null;
         _livePendingSeekBaseSec = null;
         _livePendingSeekDeltaSec = 0.0;
         _liveCommittedSeekSec = null;
@@ -7401,10 +7567,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       liveDelayedByPause: _liveDelayedByPause,
       cacheStartSeconds: _liveCacheStartSec,
       cacheEndSeconds: _liveCacheEndSec,
+      liveEdgeSeconds: _liveCacheLiveEdgeSec,
       effectivePosSeconds: inputs.effectivePos,
       fallbackLagSeconds: inputs.fallbackLag,
+      streamEpoch: _liveStreamEpoch,
+      now: now,
+      bufferedAheadSeconds: _bufferedAheadSeconds,
+      isScrubbing: _livePendingSeekBaseSec != null,
     );
-    return resolveLivePlaybackClock(now: now, lagSeconds: lagSeconds);
+    return resolveLivePlaybackClock(
+      now: now,
+      lagSeconds: lagSeconds,
+      streamEpoch: _liveStreamEpoch,
+      effectivePosSeconds: inputs.effectivePos,
+      liveDelayedByPause: _liveDelayedByPause,
+    );
   }
 
   LiveTimeshiftBarState _currentLiveTimeshiftBarState(
@@ -7417,9 +7594,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       now: now,
       cacheStartSeconds: _liveCacheStartSec,
       cacheEndSeconds: _liveCacheEndSec,
+      liveEdgeSeconds: _liveCacheLiveEdgeSec,
       effectivePosSeconds: inputs.effectivePos,
       fallbackLagSeconds: inputs.fallbackLag,
       liveDelayedByPause: _liveDelayedByPause,
+      streamEpoch: _liveStreamEpoch,
+      bufferedAheadSeconds: _bufferedAheadSeconds,
+      isScrubbing: _livePendingSeekBaseSec != null,
     );
   }
 

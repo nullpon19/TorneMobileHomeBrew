@@ -280,18 +280,8 @@ Future<void> clearChannelLogoCache(
 /// [channelLogoCacheProvider].
 final channelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-      (ref, reg) async {
-        List<Channel> channels = const [];
-        try {
-          channels = await ref.watch(channelsProvider(reg).future);
-        } catch (_) {}
-        return loadCachedOrFetchChannelLogos(
-          ref,
-          reg,
-          terrestrialBroadcastingType,
-          channels: channels,
-        );
-      },
+      (ref, reg) =>
+          loadCachedOrFetchChannelLogos(ref, reg, terrestrialBroadcastingType),
     );
 
 /// Reservations in chronological order (the device returns them in

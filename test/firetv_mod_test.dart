@@ -11564,6 +11564,168 @@ void main() {
           expect(await logoCache.load('192.0.2.1', 2), isNotNull);
         },
       );
+
+      test(
+        'Phase 38.4: paused stream epoch locks past programme on frozen cache, supports multi-range & merges history',
+        () {
+          // 1. Paused on みんなのうた (12:45-12:50) at 12:48:30 (streamEpoch=12:47:30, pos=60s),
+          // left paused 6 minutes until 12:54:30 with cacheEnd frozen at 184s (EOS/cap)
+          final minnaStart = DateTime.utc(2026, 11, 25, 12, 45);
+          final minnaEnd = DateTime.utc(2026, 11, 25, 12, 50);
+          final shitenEnd = DateTime.utc(2026, 11, 25, 13, 0);
+          final streamEpoch = DateTime.utc(2026, 11, 25, 12, 47, 30);
+          final pausedWallNow = DateTime.utc(2026, 11, 25, 12, 54, 30);
+          const ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0408',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0408,
+            channelName: 'ＮＨＫＥテレ１秋田',
+            programTitle: '視点・論点',
+          );
+          final minnaEv = EpgEvent(
+            eventId: 901,
+            start: minnaStart,
+            duration: const Duration(minutes: 5),
+            title: 'みんなのうた',
+            shortText: 'みんなのうたの楽曲',
+          );
+          final shitenEv = EpgEvent(
+            eventId: 902,
+            start: minnaEnd,
+            duration: const Duration(minutes: 10),
+            title: '視点・論点',
+            shortText: '解説番組',
+          );
+
+          final frozenLag = resolveLivePlaybackLagSeconds(
+            liveDelayedByPause: true,
+            cacheStartSeconds: 0.0,
+            cacheEndSeconds: 184.0,
+            liveEdgeSeconds: 184.0,
+            effectivePosSeconds: 60.0, // 12:48:30
+            streamEpoch: streamEpoch,
+            now: pausedWallNow,
+          );
+          expect(frozenLag, 360.0);
+          final pausedClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: frozenLag,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 60.0,
+            liveDelayedByPause: true,
+          );
+          expect(pausedClock, DateTime.utc(2026, 11, 25, 12, 48, 30));
+          final pausedInfo = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [minnaEv, shitenEv],
+            now: pausedClock,
+          );
+          expect(pausedInfo.currentTitle, 'みんなのうた');
+          expect(pausedInfo.remainingMinutes, 2);
+          expect(pausedInfo.nextTitle, '視点・論点');
+
+          final pausedBar = resolveLiveTimeshiftBarState(
+            info: pausedInfo,
+            now: pausedWallNow,
+            cacheStartSeconds: 0.0,
+            cacheEndSeconds: 184.0,
+            liveEdgeSeconds: 184.0,
+            effectivePosSeconds: 60.0,
+            liveDelayedByPause: true,
+            streamEpoch: streamEpoch,
+          );
+          expect(pausedBar.liveEdgeFraction, 1.0);
+          expect(pausedBar.playbackFraction, closeTo(0.70, 0.001));
+          expect(pausedBar.lagSeconds, 360);
+
+          // 2. Seeking forward past 12:50 switches to 視点・論点; rewinding back switches back
+          final forwardClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: 0.0,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 160.0, // 12:50:10
+            liveDelayedByPause: true,
+          );
+          expect(
+            resolveLiveOsdProgramInfo(
+              channel: ch,
+              guideEvents: [minnaEv, shitenEv],
+              now: forwardClock,
+            ).currentTitle,
+            '視点・論点',
+          );
+          final backClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: 0.0,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 140.0, // 12:49:50
+            liveDelayedByPause: true,
+          );
+          expect(
+            resolveLiveOsdProgramInfo(
+              channel: ch,
+              guideEvents: [minnaEv, shitenEv],
+              now: backClock,
+            ).currentTitle,
+            'みんなのうた',
+          );
+
+          // 3. Multi-range seekable-ranges preserves overall liveEdgeSeconds & earliestStartSeconds
+          const jsonMulti =
+              '{"cache-duration":42.5,"seekable-ranges":[{"start":10.0,"end":40.0},{"start":120.0,"end":300.0}]}';
+          final multiRange = parseDemuxerCacheStateRange(
+            jsonMulti,
+            currentPosSeconds: 25.0,
+          );
+          expect(multiRange, isNotNull);
+          expect(multiRange!.startSeconds, 10.0);
+          expect(multiRange.endSeconds, 40.0);
+          expect(multiRange.earliestStartSeconds, 10.0);
+          expect(multiRange.liveEdgeSeconds, 300.0);
+
+          // 4. OSD cache tick polling suppressed during initial startup / buffering
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+              initialPlaybackStarted: false,
+              buffering: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+              initialPlaybackStarted: true,
+              buffering: true,
+            ),
+            isFalse,
+          );
+
+          // 5. History merge keeps みんなのうた when newer EPG list drops finished programme
+          final mergedHistory = mergeLiveProgramEventLists(
+            [
+              EpgEvent(
+                eventId: 902,
+                start: minnaEnd,
+                duration: shitenEnd.difference(minnaEnd),
+                title: '視点・論点',
+              ),
+            ],
+            [minnaEv],
+          );
+          expect(mergedHistory.map((e) => e.title), ['みんなのうた', '視点・論点']);
+        },
+      );
     },
   );
 }

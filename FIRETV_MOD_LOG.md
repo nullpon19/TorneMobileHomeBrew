@@ -431,7 +431,10 @@
    - `resolveLivePlaybackLagSeconds` / `resolveLivePlaybackClock` によりプレイバック・一時停止・追いかけ再生中の映像時刻を算出し、番組境界をまたいでも再生位置側の番組名・残り時間・次番組・シークバー・「番組詳細」（および自動クローズ判定）を正確に追従（録画確認ダイアログ・左上時計は現在時刻維持）。EPG 非対応バンド向けに視聴中番組履歴フォールバックも追加。
    - `mergeEpgGuideWithCache` で新 EPG と重複／同一 `eventId` 時間移動（±24h）した旧キャッシュ番組を確実に破棄して編成変更時の亡霊残存を解消。TV 視聴一覧でもリアルタイム有効な UPnP 情報を旧 EPG より優先（`resolveLiveChannelDisplay`）し、更新ボタン・15 分間隔の境界/再表示・プレイヤー OSD 10 分超過時サイレント再取得を整備。
    - `ChannelLogoCache` へ 7 日間 TTL（`channelLogoCacheMaxAge`）とチャンネル一覧署名（`buildChannelLogoSignature`：局追加・番号/局名変更検知）を導入しつつオフライン時フォールバックを維持し、`invalidateChannelLogosWithCacheReset` のキャッシュ削除先行 `await` と全更新ボタンでのチャンネル一覧無効化を修正。
-5. **検証 (`test/epg_guide_cache_test.dart`, `test/firetv_mod_test.dart`)**:
+5. **ライブ安定稼働復旧＆ストリーム基準時刻アンカー固定 (Phase 38.4 — `ui/live_screen.dart`, `ui/player_screen.dart`, `app/state.dart`, `app/bs_epg_providers.dart`, `core/store/registration_store.dart`)**:
+   - **安定稼働最優先の再設計**: ライブ再生開始直後や OSD 表示中・TV 視聴再表示・番組境界で走っていた自動 EPG 再取得（`forceRefresh: true`・10分/15分タイマー再取得）とロゴ取得の `channelsProvider` 依存チェーン（および `savedAt` 欠落キャッシュの即時ミス判定）を撤去し、Phase 38.2 時点の軽快・安定した DTCP-IP 再生挙動を復元。`shouldPollLiveCacheOnOsdTick` も再生開始後かつ非バッファ中のみへ制限。
+   - **一時停止・EOS 時の番組ズレ解消**: mpv の最新キャッシュ端が前進している間の実時刻からストリーム基準時刻 `_liveStreamEpoch` を記録・固定し、一時停止放置（バッファ満杯／上流 EOS）でキャッシュ端が停止しても `streamEpoch + 再生位置` から再生中の番組放送時刻を算出（例: 「みんなのうた」一時停止放置で「視点・論点」に変わらない）。併せてマルチ区間 `seekable-ranges` の全体最先端（`liveEdgeSeconds`）保持、`clampedDelta == 0` 時の `_livePendingSeekBaseSec` 残留解消、`mergeLiveProgramEventLists` による過去番組履歴の非破壊保持を実装。
+6. **検証 (`test/epg_guide_cache_test.dart`, `test/firetv_mod_test.dart`)**:
    - 第25弾「一時停止」バッジ色アサーションを緑へ更新し、`liveStatusPresentation` 6パターン、`ChannelLogoCache`（レガシー自動補完・7日TTL・編成署名・オフラインフォールバック）、3桁番号解決、`crc32Mpeg` テーブル検証、`normalizeAribLogoPng`（8bit/4bit `dart:ui` 実 PNG デコード＆RGBA 画素一致確認）、`LiveProgramProgressBar`・`LiveChannelSwitchPreviewCard`・`LiveScreen` EPG スピナー＆ロゴ直下番号描画、Phase 38.3（OSD ポーリング・番組またぎシークバー＆詳細・UPnP 緊急編成優先・EPG マージ亡霊除去）テストを追加。
 
 ---

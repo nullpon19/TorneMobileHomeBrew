@@ -44,18 +44,8 @@ final bsEpgGuideProvider = FutureProvider.family<EpgGuide, RegisteredNasne>(
 
 final bsChannelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) async {
-    List<Channel> channels = const [];
-    try {
-      channels = await ref.watch(bsChannelsProvider(reg).future);
-    } catch (_) {}
-    return loadCachedOrFetchChannelLogos(
-      ref,
-      reg,
-      bsBroadcastingType,
-      channels: channels,
-    );
-  },
+  (ref, reg) =>
+      loadCachedOrFetchChannelLogos(ref, reg, bsBroadcastingType),
 );
 
 /// CS channel list, persisted through [channelCacheProvider]. Falls back to an
@@ -79,18 +69,8 @@ final csChannelsProvider = FutureProvider.family<List<Channel>, RegisteredNasne>
 /// Station logos for CS (best-effort; degrades to an empty map if unsupported).
 final csChannelLogosProvider =
     FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) async {
-    List<Channel> channels = const [];
-    try {
-      channels = await ref.watch(csChannelsProvider(reg).future);
-    } catch (_) {}
-    return loadCachedOrFetchChannelLogos(
-      ref,
-      reg,
-      csBroadcastingType,
-      channels: channels,
-    );
-  },
+  (ref, reg) =>
+      loadCachedOrFetchChannelLogos(ref, reg, csBroadcastingType),
 );
 
 /// Clears persisted station logos for [reg] and awaits deletion before

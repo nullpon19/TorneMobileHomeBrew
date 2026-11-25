@@ -476,9 +476,10 @@ class ChannelLogoCache {
         final savedRaw = decoded['savedAt'];
         final savedAt =
             savedRaw is String ? DateTime.tryParse(savedRaw) : null;
-        if (savedAt == null) return null;
-        final currentTime = now ?? DateTime.now();
-        if (currentTime.difference(savedAt) >= maxAge) return null;
+        if (savedAt != null) {
+          final currentTime = now ?? DateTime.now();
+          if (currentTime.difference(savedAt) >= maxAge) return null;
+        }
       }
       if (expectedChannelsSignature != null &&
           expectedChannelsSignature.isNotEmpty) {
