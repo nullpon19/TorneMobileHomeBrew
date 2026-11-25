@@ -19,6 +19,7 @@ import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'jikkyo_settings_screen.dart';
 import 'player_cache_policy.dart';
 import 'subtitle_settings_screen.dart';
 import 'widgets.dart';
@@ -387,6 +388,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               context,
               MaterialPageRoute<void>(
                 builder: (_) => const SubtitleSettingsScreen(),
+              ),
+            ),
+          ),
+          ListTile(
+            title: const Text('ニコニコ実況設定'),
+            subtitle: Text(
+              '${ref.watch(jikkyoEnabledProvider) ? '既定ON' : '既定OFF'} / '
+              '${ref.watch(jikkyoSettingsProvider).summaryLabel}',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => const JikkyoSettingsScreen(),
               ),
             ),
           ),

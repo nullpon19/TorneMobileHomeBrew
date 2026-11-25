@@ -542,6 +542,44 @@ class MainActivity : FlutterActivity() {
                     .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                 pcm[i] = scaled.toShort()
             }
+        } else if (soundId in 0..4) {
+            totalMs = 1900L
+            val totalSamples = ((sampleRate * totalMs) / 1000L).toInt()
+            val mix = DoubleArray(totalSamples)
+            val strikeTimesMs = intArrayOf(0, 200, 400, 600, 800, 1000)
+            val strikeFreqs = doubleArrayOf(
+                1046.50,
+                1567.98,
+                2637.02,
+                1046.50,
+                1567.98,
+                2637.02,
+            )
+            val tailSamples = (sampleRate * 850) / 1000
+            val attackSamples = (sampleRate * 8) / 1000
+            for (n in strikeTimesMs.indices) {
+                val startSample = (sampleRate * strikeTimesMs[n]) / 1000
+                val freq = strikeFreqs[n]
+                for (i in 0 until tailSamples) {
+                    val idx = startSample + i
+                    if (idx >= totalSamples) break
+                    val t = i.toDouble() / sampleRate
+                    val envAttack = if (i < attackSamples) i.toDouble() / attackSamples else 1.0
+                    val s = envAttack * exp(-2.8 * t) * (
+                        sin(2.0 * PI * freq * t) +
+                            0.08 * sin(2.0 * PI * (3.0 * freq) * t)
+                        )
+                    mix[idx] += s
+                }
+            }
+            pcm = ShortArray(totalSamples)
+            val gain = 0.34
+            for (i in 0 until totalSamples) {
+                val scaled = (mix[i] * gain * Short.MAX_VALUE)
+                    .toInt()
+                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                pcm[i] = scaled.toShort()
+            }
         } else {
             data class ToneSeg(val freqs: DoubleArray, val durationMs: Int, val gain: Double)
 
@@ -551,10 +589,6 @@ class MainActivity : FlutterActivity() {
                     ToneSeg(doubleArrayOf(659.25), 220, 0.40),
                     ToneSeg(doubleArrayOf(880.0), 180, 0.40),
                     ToneSeg(doubleArrayOf(659.25), 240, 0.40),
-                )
-                soundId in 0..4 -> listOf(
-                    ToneSeg(doubleArrayOf(659.25, 987.77), 240, 0.34),
-                    ToneSeg(doubleArrayOf(523.25, 783.99), 420, 0.34),
                 )
                 else -> listOf(
                     ToneSeg(doubleArrayOf(880.0), 180, 0.24),

@@ -189,6 +189,8 @@ import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
 import 'epg_genre.dart';
 import 'format.dart';
+import 'jikkyo_momentum_graph.dart';
+import 'jikkyo_overlay.dart';
 import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
 import 'multi_nasne_policy.dart';
@@ -2546,6 +2548,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.programDetailBody,
     this.recordedChannelName,
     this.recordedBroadcastTimeRange,
+    this.recordedScheduledStart,
+    this.recordedBroadcastingType,
+    this.recordedServiceId,
     this.currentLiveChannel,
     this.initialRecordingSchedules = const [],
     this.liveUseMobile = false,
@@ -2644,6 +2649,13 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Formatted recorded broadcast date/time range displayed beside the programme title.
   final String? recordedBroadcastTimeRange;
+
+  /// Scheduled broadcast start time for recorded Niconico Jikkyo Kakolog sync.
+  final DateTime? recordedScheduledStart;
+
+  /// Recorded channel metadata for automatic/manual Niconico Jikkyo mapping.
+  final int? recordedBroadcastingType;
+  final int? recordedServiceId;
 
   /// Channel metadata for live viewing so same-channel recording status and
   /// other-channel recording conflicts can be detected.
@@ -2902,6 +2914,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   Timer? _superimposeSyncTimer;
   List<SubtitleCue> _visibleSuperimposeCues = const [];
   int? _lastPlayedSuperimposeSoundSeq;
+  bool _jikkyoOn = false;
+  int _jikkyoManualOffsetSeconds = 0;
+  final JikkyoDanmakuController _jikkyoOverlayController =
+      JikkyoDanmakuController();
+  JikkyoPlaybackController? _jikkyoController;
+  JikkyoChannelMatch? _jikkyoMatch;
+  Timer? _jikkyoSyncTimer;
   List<EpgEvent> _liveGuideEvents = const [];
   Map<String, List<EpgEvent>> _liveBandGuideEvents = const {};
   final Map<String, List<EpgEvent>> _liveChannelProgramHistory = {};
@@ -3369,6 +3388,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _hwdecMode = ref.read(videoHwdecModeProvider);
     _subtitlesOn = ref.read(subtitlesEnabledProvider);
+    _jikkyoOn = ref.read(jikkyoEnabledProvider);
     _currentLiveChannel = widget.currentLiveChannel;
     _liveSwitchChannels = List<LiveChannelSwitchEntry>.of(
       widget.liveSwitchChannels,
@@ -3423,6 +3443,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(milliseconds: 500),
       (_) => _syncSuperimposeTick(),
     );
+    if (_jikkyoOn) {
+      _startOrRestartJikkyo();
+    }
     _subscriptions.add(
       _player.stream.playing.listen((playing) {
         if (_conflictHandled || _switchingChannel) return;
@@ -4770,6 +4793,368 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
+  JikkyoChannelMatch _resolveCurrentJikkyoMatch(JikkyoSettings settings) {
+    if (widget.live) {
+      final ch = _activeLiveChannel;
+      final chNum = ch != null ? _liveChannelNumbers[liveServiceKey(ch)] : null;
+      return resolveJikkyoChannel(
+        settings: settings,
+        bandId: ch?.bandId,
+        networkId: ch?.networkId,
+        serviceId: ch?.serviceId,
+        channelNumber: chNum,
+        channelName: ch?.channelName ?? widget.title,
+      );
+    }
+    return resolveJikkyoChannel(
+      settings: settings,
+      broadcastingType: widget.recordedBroadcastingType,
+      serviceId: widget.recordedServiceId,
+      channelName: widget.recordedChannelName,
+    );
+  }
+
+  void _startOrRestartJikkyo() {
+    _stopJikkyo(clearOverlay: true);
+    if (!_jikkyoOn || !mounted) return;
+    final settings = ref.read(jikkyoSettingsProvider);
+    final match = _resolveCurrentJikkyoMatch(settings);
+    _jikkyoMatch = match;
+    if (!match.hasChannel) {
+      if (mounted) setState(() {});
+      return;
+    }
+
+    final controller = JikkyoPlaybackController(
+      client: ref.read(jikkyoClientProvider),
+      onStateChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+    _jikkyoController = controller;
+    if (widget.live) {
+      final ch = _activeLiveChannel;
+      final liveTitle = ch != null
+          ? resolveLiveOsdProgramInfo(
+              channel: ch,
+              guideEvents: _guideEventsForChannel(ch),
+              now: _effectiveLivePlaybackClock(_now()),
+            ).currentTitle
+          : widget.title;
+      controller.startLive(jkId: match.jkId!, initialNasneTitle: liveTitle);
+    } else {
+      final start = widget.recordedScheduledStart;
+      if (start != null) {
+        final dur = _effectiveDuration > Duration.zero
+            ? _effectiveDuration
+            : (widget.knownDuration ?? const Duration(minutes: 60));
+        controller.startRecorded(
+          jkId: match.jkId!,
+          scheduledStart: start,
+          duration: dur,
+        );
+      }
+    }
+
+    _jikkyoSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => _syncJikkyoTick(),
+    );
+    if (mounted) setState(() {});
+  }
+
+  void _stopJikkyo({bool clearOverlay = true}) {
+    _jikkyoSyncTimer?.cancel();
+    _jikkyoSyncTimer = null;
+    _jikkyoController?.dispose();
+    _jikkyoController = null;
+    if (clearOverlay) {
+      _jikkyoOverlayController.clear();
+    }
+  }
+
+  void _syncJikkyoTick() {
+    if (!mounted || !_jikkyoOn || _switchingChannel || _error != null) return;
+    final controller = _jikkyoController;
+    if (controller == null) return;
+    final settings = ref.read(jikkyoSettingsProvider);
+
+    if (widget.live) {
+      final now = _now();
+      final playbackClock = _effectiveLivePlaybackClock(now);
+      final ch = _activeLiveChannel;
+      if (ch != null) {
+        final currentTitle = resolveLiveOsdProgramInfo(
+          channel: ch,
+          guideEvents: _guideEventsForChannel(ch),
+          now: playbackClock,
+        ).currentTitle;
+        controller.updateLiveProgramTitle(currentTitle);
+      }
+      if (!_playingNow || _buffering || _interrupted) return;
+      final incoming = controller.pollLiveComments(
+        effectivePlaybackClock: playbackClock,
+        delaySeconds: settings.liveDelaySeconds,
+        manualOffsetSeconds: _jikkyoManualOffsetSeconds,
+      );
+      if (incoming.isNotEmpty) {
+        _jikkyoOverlayController.enqueue(incoming);
+      }
+      return;
+    }
+
+    if (!_playingNow || _buffering || _interrupted) return;
+    final incoming = controller.pollRecordedComments(
+      position: _lastPosition,
+      offsetSeconds: _jikkyoManualOffsetSeconds,
+    );
+    if (incoming.isNotEmpty) {
+      _jikkyoOverlayController.enqueue(incoming);
+    }
+  }
+
+  void _toggleJikkyo() {
+    final next = !_jikkyoOn;
+    setState(() => _jikkyoOn = next);
+    unawaited(ref.read(jikkyoEnabledProvider.notifier).set(next));
+    if (next) {
+      _startOrRestartJikkyo();
+      _showHudMessage(Icons.chat_bubble, 'ニコニコ実況 ON');
+    } else {
+      _stopJikkyo(clearOverlay: true);
+      _showHudMessage(Icons.chat_bubble_outline, 'ニコニコ実況 OFF');
+    }
+  }
+
+  Widget _buildJikkyoOsdStatusRow() {
+    final match = _jikkyoMatch;
+    final controller = _jikkyoController;
+    final offsetSuffix = _jikkyoManualOffsetSeconds == 0
+        ? ''
+        : ' / 補正 ${_jikkyoManualOffsetSeconds > 0 ? '+$_jikkyoManualOffsetSeconds' : '$_jikkyoManualOffsetSeconds'}秒';
+    final String statusText;
+    if (match == null) {
+      statusText = '実況: 準備中…';
+    } else if (match.isDisabled) {
+      statusText = '実況: このチャンネルは無効（「実況調整」から変更可）';
+    } else if (!match.hasChannel) {
+      statusText = '実況: 対応チャンネル未割当（「実況調整」から選択可）';
+    } else {
+      final chLabel = match.channelDef?.displayLabel ?? match.jkId!;
+      if (widget.live) {
+        final jkTitle = controller?.jikkyoProgramTitle;
+        if (jkTitle != null && jkTitle.isNotEmpty) {
+          statusText = '実況: $chLabel「$jkTitle」$offsetSuffix';
+        } else if (controller?.liveConnected == true) {
+          statusText = '実況: $chLabel（接続中）$offsetSuffix';
+        } else {
+          statusText = '実況: $chLabel（番組情報取得中…）$offsetSuffix';
+        }
+      } else {
+        if (widget.recordedScheduledStart == null) {
+          statusText = '実況: $chLabel（放送日時不明のため過去ログ非対応）';
+        } else if (controller?.recordedLoadedAny == true) {
+          final count = controller!.totalCommentCount;
+          statusText = '実況: $chLabel（過去ログ $count件）$offsetSuffix';
+        } else {
+          statusText = '実況: $chLabel（過去ログ取得中…）$offsetSuffix';
+        }
+      }
+    }
+    final showMismatch =
+        widget.live && (controller?.isProgramLikelyDifferent ?? false);
+    return Row(
+      children: [
+        const Icon(Icons.chat_bubble_outline, color: Colors.white70, size: 14),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            statusText,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white70, fontSize: 12.5),
+          ),
+        ),
+        if (showMismatch) ...[
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF57C00).withValues(alpha: 0.25),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: Colors.amberAccent, width: 1),
+            ),
+            child: const Text(
+              '別番組の可能性',
+              style: TextStyle(
+                color: Colors.amberAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _openJikkyoQuickDialog() async {
+    _osdTimer?.cancel();
+    if (!mounted) return;
+    final settingsNotifier = ref.read(jikkyoSettingsProvider.notifier);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogCtx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final currentSettings = ref.read(jikkyoSettingsProvider);
+            final currentMatch = _resolveCurrentJikkyoMatch(currentSettings);
+            final currentChText = currentMatch.isDisabled
+                ? 'このチャンネルは無効'
+                : (currentMatch.channelDef?.displayLabel ?? '自動判定なし（未割当）');
+            final sourceHint = switch (currentMatch.source) {
+              JikkyoMatchSource.manual => '手動設定',
+              JikkyoMatchSource.disabled => '手動無効',
+              JikkyoMatchSource.unmatched => '未一致',
+              _ => '自動判定',
+            };
+            return AlertDialog(
+              title: const Text('ニコニコ実況調整'),
+              content: SizedBox(
+                width: 440,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text('現在の参照チャンネル: $currentChText（$sourceHint）'),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.tv),
+                      label: const Text('チャンネルを変更 / 無効化'),
+                      onPressed: () async {
+                        final selected = await _pickJikkyoChannelDialog(
+                          dialogCtx,
+                          currentMatch: currentMatch,
+                        );
+                        if (selected == null) return;
+                        if (selected == '__auto__') {
+                          await settingsNotifier.removeChannelOverride(
+                            currentMatch.overrideKey,
+                          );
+                        } else {
+                          await settingsNotifier.setChannelOverride(
+                            currentMatch.overrideKey,
+                            selected,
+                            label: currentMatch.displayLabel,
+                          );
+                        }
+                        if (mounted) {
+                          _startOrRestartJikkyo();
+                          setDialogState(() {});
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      '表示タイミング補正: '
+                      '${_jikkyoManualOffsetSeconds == 0 ? '±0秒' : '${_jikkyoManualOffsetSeconds > 0 ? '+$_jikkyoManualOffsetSeconds' : '$_jikkyoManualOffsetSeconds'}秒'}',
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final delta in const [-10, -1, 0, 1, 10])
+                          OutlinedButton(
+                            onPressed: () {
+                              setState(() {
+                                if (delta == 0) {
+                                  _jikkyoManualOffsetSeconds = 0;
+                                } else {
+                                  _jikkyoManualOffsetSeconds =
+                                      (_jikkyoManualOffsetSeconds + delta)
+                                          .clamp(-300, 300);
+                                }
+                              });
+                              setDialogState(() {});
+                            },
+                            child: Text(
+                              delta == 0
+                                  ? '0秒'
+                                  : (delta > 0 ? '+$delta秒' : '$delta秒'),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                FilledButton(
+                  autofocus: true,
+                  onPressed: () => Navigator.of(dialogCtx).pop(),
+                  child: const Text('閉じる'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (mounted) {
+      _resetOsdTimer();
+    }
+  }
+
+  Future<String?> _pickJikkyoChannelDialog(
+    BuildContext parentCtx, {
+    required JikkyoChannelMatch currentMatch,
+  }) {
+    return showDialog<String>(
+      context: parentCtx,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text('${currentMatch.displayLabel} の実況先'),
+          content: SizedBox(
+            width: 420,
+            height: 360,
+            child: ListView(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.auto_fix_high),
+                  title: const Text('自動判定に戻す'),
+                  onTap: () => Navigator.of(ctx).pop('__auto__'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.block),
+                  title: const Text('このチャンネルは実況しない（無効）'),
+                  selected: currentMatch.isDisabled,
+                  onTap: () => Navigator.of(ctx).pop(kJikkyoDisabledId),
+                ),
+                const Divider(),
+                for (final ch in kJikkyoChannels)
+                  ListTile(
+                    title: Text(ch.displayLabel),
+                    selected: currentMatch.jkId == ch.id,
+                    trailing: currentMatch.jkId == ch.id
+                        ? const Icon(Icons.check)
+                        : null,
+                    onTap: () => Navigator.of(ctx).pop(ch.id),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('キャンセル'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _ensureAssExtradataLoaded(NativePlayer platform) async {
     if (_assExtradataLoaded) return;
     _assExtradataLoaded = true;
@@ -5795,6 +6180,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           name: 'superimpose sync timer',
           run: () => _superimposeSyncTimer?.cancel(),
         ),
+        (
+          name: 'jikkyo session',
+          run: () {
+            _stopJikkyo(clearOverlay: false);
+            _jikkyoOverlayController.dispose();
+          },
+        ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'osd clock timer', run: () => _osdClockTimer?.cancel()),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
@@ -6644,6 +7036,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(notify: false, stopTimer: true);
     _resetSubtitleTrackTracking();
+    _stopJikkyo(clearOverlay: true);
     _recordingStatusTimer?.cancel();
     _cornerNoticeTimer?.cancel();
     _customCornerNoticeTimer?.cancel();
@@ -7430,6 +7823,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         subtitleViewConfiguration:
                             const SubtitleViewConfiguration(visible: false),
                       ),
+                      if (_jikkyoOn && !_switchingChannel && _error == null)
+                        Positioned.fill(
+                          child: JikkyoDanmakuOverlay(
+                            controller: _jikkyoOverlayController,
+                            settings: ref.watch(jikkyoSettingsProvider),
+                            isPlaying:
+                                _playingNow && !_buffering && !_interrupted,
+                            playbackRate: widget.live
+                                ? _liveCatchUpRate
+                                : _playbackRate,
+                            avoidBottomSubtitles:
+                                (_subtitlesOn &&
+                                    _visibleSubtitleCues.isNotEmpty) ||
+                                (ref.watch(superimposeEnabledProvider) &&
+                                    _visibleSuperimposeCues.isNotEmpty),
+                          ),
+                        ),
                       if (_subtitlesOn &&
                           _visibleSubtitleCues.isNotEmpty &&
                           !_switchingChannel &&
@@ -7777,6 +8187,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (!widget.live &&
+                _jikkyoOn &&
+                (_jikkyoController?.momentumBuckets.isNotEmpty ?? false)) ...[
+              JikkyoMomentumGraph(
+                buckets: _jikkyoController!.momentumBuckets,
+                posFraction: posFraction,
+                loading: _jikkyoController!.momentumLoading,
+              ),
+              const SizedBox(height: 2),
+            ],
             _buildSeekProgressTrack(
               posFraction: posFraction,
               bufferFraction: bufferFraction,
@@ -8204,6 +8624,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               const SizedBox(height: 8),
               _buildSeekBarSection(isSeekingPreview: false),
             ],
+            if (_jikkyoOn) ...[
+              const SizedBox(height: 6),
+              _buildJikkyoOsdStatusRow(),
+            ],
             const SizedBox(height: 12),
             PlayerOsdButtonBar(
               focusScopeNode: _osdFocusScopeNode,
@@ -8313,6 +8737,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         _toggleSubtitles();
                         _resetOsdTimer();
                       },
+                    ),
+                  _osdButton(
+                    icon: _jikkyoOn
+                        ? Icons.chat_bubble
+                        : Icons.chat_bubble_outline,
+                    label: _jikkyoOn ? '実況 ON' : '実況 OFF',
+                    onPressed: () {
+                      _toggleJikkyo();
+                      _resetOsdTimer();
+                    },
+                  ),
+                  if (_jikkyoOn)
+                    _osdButton(
+                      icon: Icons.tune,
+                      label: '実況調整',
+                      onPressed: () => unawaited(_openJikkyoQuickDialog()),
                     ),
                   if (widget.canSwitchQuality && widget.onSwitchQuality != null)
                     _osdButton(

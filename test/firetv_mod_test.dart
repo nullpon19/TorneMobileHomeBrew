@@ -28,6 +28,9 @@ import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/format.dart';
 import 'package:tmhb/ui/home_screen.dart';
+import 'package:tmhb/ui/jikkyo_momentum_graph.dart';
+import 'package:tmhb/ui/jikkyo_overlay.dart';
+import 'package:tmhb/ui/jikkyo_settings_screen.dart';
 import 'package:tmhb/ui/live_channel_switch_policy.dart';
 import 'package:tmhb/ui/live_recording_policy.dart';
 import 'package:tmhb/ui/live_screen.dart';
@@ -12092,6 +12095,380 @@ void main() {
       },
     );
   });
+
+  group('Phase 40: Niconico Jikkyo overlay, mapper, controller & settings', () {
+    test('resolveJikkyoChannel maps BS/CS serviceIds, terrestrial stations, remote keys, and manual overrides', () {
+      const defaults = JikkyoSettings.defaults;
+
+      // BS primary & subchannel mapping
+      final bs1 = resolveJikkyoChannel(
+        settings: defaults,
+        bandId: '0/video/LiveTuner/BS',
+        serviceId: 101,
+        channelName: 'ＮＨＫ ＢＳ',
+      );
+      expect(bs1.jkId, 'jk101');
+      expect(bs1.source, JikkyoMatchSource.autoServiceId);
+
+      final bsSub = resolveJikkyoChannel(
+        settings: defaults,
+        bandId: '0/video/LiveTuner/BS',
+        serviceId: 102,
+        channelName: 'ＮＨＫ ＢＳサブ',
+      );
+      expect(bsSub.jkId, 'jk101');
+
+      final bs11 = resolveJikkyoChannel(
+        settings: defaults,
+        broadcastingType: 3,
+        serviceId: 211,
+        channelName: 'ＢＳ１１イレブン',
+      );
+      expect(bs11.jkId, 'jk211');
+
+      // Kansai terrestrial override nuance (ch 4 MBS -> TBS jk6, ch 6 ABC -> Asahi jk5)
+      final mbs = resolveJikkyoChannel(
+        settings: defaults,
+        broadcastingType: 2,
+        serviceId: 2048,
+        channelNumber: '041',
+        channelName: 'ＭＢＳ毎日放送',
+      );
+      expect(mbs.jkId, 'jk6');
+      expect(mbs.source, JikkyoMatchSource.autoStationName);
+
+      final abc = resolveJikkyoChannel(
+        settings: defaults,
+        broadcastingType: 2,
+        serviceId: 2056,
+        channelNumber: '061',
+        channelName: 'ＡＢＣテレビ',
+      );
+      expect(abc.jkId, 'jk5');
+
+      // Local station keywords (Akita ABS/AAB/AKT)
+      expect(
+        resolveJikkyoChannel(
+          settings: defaults,
+          channelNumber: '041',
+          channelName: 'ＡＢＳ秋田放送',
+        ).jkId,
+        'jk4',
+      );
+      expect(
+        resolveJikkyoChannel(
+          settings: defaults,
+          channelNumber: '051',
+          channelName: 'ＡＡＢ秋田朝日放送',
+        ).jkId,
+        'jk5',
+      );
+      expect(
+        resolveJikkyoChannel(
+          settings: defaults,
+          channelNumber: '081',
+          channelName: 'ＡＫＴ秋田テレビ',
+        ).jkId,
+        'jk8',
+      );
+
+      // Remote key fallback when station name is unknown
+      final fallback = resolveJikkyoChannel(
+        settings: defaults,
+        channelNumber: '091',
+        channelName: '謎の独立局',
+      );
+      expect(fallback.jkId, 'jk9');
+      expect(fallback.source, JikkyoMatchSource.autoRemoteKey);
+
+      // Manual override & disable
+      final overridden = defaults.withChannelOverride('sid:2048', 'jk9', label: 'MBS');
+      final manualMatch = resolveJikkyoChannel(
+        settings: overridden,
+        serviceId: 2048,
+        channelName: 'MBS',
+      );
+      expect(manualMatch.jkId, 'jk9');
+      expect(manualMatch.source, JikkyoMatchSource.manual);
+
+      final disabled = defaults.withChannelOverride('sid:2048', kJikkyoDisabledId);
+      final disabledMatch = resolveJikkyoChannel(
+        settings: disabled,
+        serviceId: 2048,
+        channelName: 'MBS',
+      );
+      expect(disabledMatch.isDisabled, isTrue);
+      expect(disabledMatch.hasChannel, isFalse);
+      expect(disabledMatch.jkId, isNull);
+    });
+
+    test('isJikkyoProgramLikelyDifferent normalizes ARIB marks and catches distinct local shows', () {
+      expect(
+        isJikkyoProgramLikelyDifferent(
+          nasneTitle: '［字］［新］名探偵コナン　スペシャル',
+          jikkyoTitle: '[字]名探偵コナン スペシャル',
+        ),
+        isFalse,
+      );
+      expect(
+        isJikkyoProgramLikelyDifferent(
+          nasneTitle: 'ローカル情報番組　あきた探検隊',
+          jikkyoTitle: 'ザ！鉄腕！ＤＡＳＨ！！【秋の収穫スペシャル】',
+        ),
+        isTrue,
+      );
+      expect(
+        isJikkyoProgramLikelyDifferent(
+          nasneTitle: '',
+          jikkyoTitle: 'ニュース',
+        ),
+        isFalse,
+      );
+    });
+
+    test('JikkyoComment & NX-Jikkyo protocol parser accept int/String fields, mail commands, and filter slash commands', () {
+      // Both String (Kakolog JSON) and int (Live WS JSON)
+      final kakologComment = JikkyoComment.fromChatJson({
+        'no': '120',
+        'date': '1795498696',
+        'date_usec': '500000',
+        'mail': '184 ue cyan big',
+        'content': 'きたー！',
+      });
+      expect(kakologComment, isNotNull);
+      expect(kakologComment!.no, 120);
+      expect(kakologComment.timestampMs, 1795498696500);
+      expect(kakologComment.position, JikkyoCommentPosition.ue);
+      expect(kakologComment.size, JikkyoCommentSize.big);
+      expect(kakologComment.colorValue, 0xFF00FFFF);
+
+      final wsComment = parseNxCommentMessage(
+        jsonEncode({
+          'chat': {
+            'no': 42,
+            'date': 1795587480,
+            'date_usec': 123456,
+            'mail': 'shita #112233 small',
+            'content': '下コメテスト',
+          },
+        }),
+      );
+      expect(wsComment, isNotNull);
+      expect(wsComment!.position, JikkyoCommentPosition.shita);
+      expect(wsComment.size, JikkyoCommentSize.small);
+      expect(wsComment.colorValue, 0xFF112233);
+
+      // Operator / system commands must be ignored.
+      expect(
+        JikkyoComment.fromChatJson({
+          'date': 1795587480,
+          'content': '/nicoad {"totalAdPoint":1000}',
+        }),
+        isNull,
+      );
+
+      final watchPing = parseNxWatchMessage('{"type":"ping"}');
+      expect(watchPing?.replyPong, isTrue);
+
+      final watchRoom = parseNxWatchMessage(
+        jsonEncode({
+          'type': 'room',
+          'data': {
+            'threadId': '28889',
+            'messageServer': {'uri': 'wss://example.invalid/ws/comment'},
+          },
+        }),
+      );
+      expect(watchRoom?.threadId, '28889');
+      expect(watchRoom?.messageServerUri, 'wss://example.invalid/ws/comment');
+    });
+
+    test('JikkyoPlaybackController handles Recorded chunked Kakolog + momentum graph & Live timeshift replay', () async {
+      final base = DateTime.utc(2026, 11, 25, 12, 0, 0);
+      final fakeClient = _FakeJikkyoClient(
+        channelsInfo: {
+          'jk4': const JikkyoChannelLiveInfo(
+            id: 'jk4',
+            name: '日本テレビ',
+            programPresent: JikkyoProgramInfo(title: '秘密のケンミンSHOW'),
+            jikkyoForce: 150,
+          ),
+        },
+        kakologComments: [
+          JikkyoComment(
+            no: 1,
+            timestampMs: base.millisecondsSinceEpoch + 10000,
+            text: '始まり',
+          ),
+          JikkyoComment(
+            no: 2,
+            timestampMs: base.millisecondsSinceEpoch + 45000,
+            text: '盛り上がり',
+          ),
+          JikkyoComment(
+            no: 3,
+            timestampMs: base.millisecondsSinceEpoch + 46000,
+            text: '8888',
+          ),
+        ],
+      );
+
+      final recordedCtrl = JikkyoPlaybackController(client: fakeClient);
+      recordedCtrl.startRecorded(
+        jkId: 'jk4',
+        scheduledStart: base,
+        duration: const Duration(minutes: 10),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(recordedCtrl.recordedLoadedAny, isTrue);
+      expect(recordedCtrl.totalCommentCount, 3);
+      expect(recordedCtrl.momentumBuckets, isNotEmpty);
+      expect(recordedCtrl.momentumBuckets[0], 1);
+      expect(recordedCtrl.momentumBuckets[1], 2);
+
+      // First poll sets cursor cleanly (no burst); normal ticks emit comments in range.
+      expect(
+        recordedCtrl.pollRecordedComments(position: const Duration(seconds: 40)),
+        isEmpty,
+      );
+      expect(
+        recordedCtrl.pollRecordedComments(position: const Duration(seconds: 43)),
+        isEmpty,
+      );
+      final emitted = recordedCtrl.pollRecordedComments(
+        position: const Duration(seconds: 46),
+      );
+      expect(emitted.map((e) => e.text).toList(), ['盛り上がり', '8888']);
+
+      // Large forward seek jump resets cursor without dumping stale comments.
+      expect(
+        recordedCtrl.pollRecordedComments(position: const Duration(seconds: 120)),
+        isEmpty,
+      );
+      recordedCtrl.dispose();
+
+      // Live + 5-min timeshift test
+      final liveCtrl = JikkyoPlaybackController(client: fakeClient);
+      liveCtrl.startLive(jkId: 'jk4', initialNasneTitle: 'ローカル独自特番');
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(liveCtrl.liveConnected, isTrue);
+      expect(liveCtrl.jikkyoProgramTitle, '秘密のケンミンSHOW');
+      expect(liveCtrl.isProgramLikelyDifferent, isTrue);
+
+      final liveT = base.add(const Duration(minutes: 2));
+      fakeClient.emitLiveComment(
+        JikkyoComment(
+          no: 10,
+          timestampMs: liveT.millisecondsSinceEpoch - 6000,
+          text: 'ライブコメント',
+        ),
+      );
+      // With delay=5s, target = liveT - 5s -> trailing starter catches comment at -6s.
+      final firstLive = liveCtrl.pollLiveComments(
+        effectivePlaybackClock: liveT,
+        delaySeconds: 5,
+      );
+      expect(firstLive.map((e) => e.text), contains('ライブコメント'));
+      liveCtrl.dispose();
+    });
+
+    test('JikkyoSettings serialization & Riverpod providers persist with default OFF', () async {
+      final kv = InMemoryKeyValueStore();
+      final container = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container.dispose);
+
+      expect(container.read(jikkyoEnabledProvider), isFalse);
+      expect(container.read(jikkyoSettingsProvider), JikkyoSettings.defaults);
+
+      await container.read(jikkyoEnabledProvider.notifier).set(true);
+      await container.read(jikkyoSettingsProvider.notifier).setOpacity(70);
+      await container
+          .read(jikkyoSettingsProvider.notifier)
+          .setTextSize(JikkyoTextSizePreset.large);
+      await container
+          .read(jikkyoSettingsProvider.notifier)
+          .setChannelOverride('sid:101', 'jk101', label: 'NHK BS');
+
+      expect(await kv.read('firetv_jikkyo_enabled'), 'true');
+      final rawSettings = await kv.read('firetv_jikkyo_settings');
+      expect(rawSettings, isNotNull);
+      final restored = JikkyoSettings.fromJsonString(rawSettings!);
+      expect(restored.opacityPercent, 70);
+      expect(restored.textSize, JikkyoTextSizePreset.large);
+      expect(restored.channelOverrides['sid:101'], 'jk101');
+      expect(restored.channelOverrideLabels['sid:101'], 'NHK BS');
+    });
+
+    testWidgets(
+      'JikkyoDanmakuOverlay, JikkyoMomentumGraph, and JikkyoSettingsScreen render and update cleanly',
+      (tester) async {
+        final ctrl = JikkyoDanmakuController();
+        addTearDown(ctrl.dispose);
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Column(
+                children: [
+                  SizedBox(
+                    width: 640,
+                    height: 360,
+                    child: JikkyoDanmakuOverlay(
+                      controller: ctrl,
+                      settings: JikkyoSettings.defaults,
+                      isPlaying: true,
+                      avoidBottomSubtitles: true,
+                    ),
+                  ),
+                  const JikkyoMomentumGraph(
+                    buckets: [2, 8, 24, 6, 0],
+                    posFraction: 0.45,
+                  ),
+                  const JikkyoMomentumGraph(
+                    buckets: [0, 0],
+                    posFraction: 0.0,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        ctrl.enqueue(const [
+          JikkyoComment(timestampMs: 1000, text: 'テスト弾幕'),
+          JikkyoComment(
+            timestampMs: 1200,
+            text: '上固定',
+            position: JikkyoCommentPosition.ue,
+          ),
+        ]);
+        await tester.pump(const Duration(milliseconds: 500));
+        expect(find.byType(JikkyoDanmakuOverlay), findsOneWidget);
+        expect(find.byType(JikkyoMomentumGraph), findsNWidgets(2));
+
+        // Settings screen persistence test
+        final kv = InMemoryKeyValueStore();
+        tester.view.physicalSize = const Size(1280, 960);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+            child: const MaterialApp(home: JikkyoSettingsScreen()),
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text('実況プレビュー (16:9)'), findsOneWidget);
+        final defaultToggle = find.text('ニコニコ実況表示（再生時の既定）');
+        expect(defaultToggle, findsOneWidget);
+        await tester.tap(defaultToggle);
+        await tester.pump();
+        expect(await kv.read('firetv_jikkyo_enabled'), 'true');
+      },
+    );
+  });
 }
 
 class _DeletableScheduleService implements ScheduleService {
@@ -12248,4 +12625,76 @@ class _FixedTitlesNotifier extends TitlesNotifier {
   @override
   Stream<TitleListProgress> build() =>
       Stream.value(TitleListProgress(_items, complete: true));
+}
+
+class _FakeJikkyoLiveConn implements JikkyoLiveConnection {
+  _FakeJikkyoLiveConn({
+    required this.onComment,
+    required this.onConnectionChanged,
+  }) {
+    onConnectionChanged?.call(true);
+  }
+
+  final void Function(JikkyoComment comment) onComment;
+  final void Function(bool connected)? onConnectionChanged;
+
+  @override
+  bool isConnected = true;
+
+  @override
+  Future<void> dispose() async {
+    isConnected = false;
+    onConnectionChanged?.call(false);
+  }
+}
+
+class _FakeJikkyoClient implements JikkyoClient {
+  _FakeJikkyoClient({
+    this.channelsInfo = const {},
+    this.kakologComments = const [],
+  });
+
+  final Map<String, JikkyoChannelLiveInfo> channelsInfo;
+  final List<JikkyoComment> kakologComments;
+  _FakeJikkyoLiveConn? _activeConn;
+
+  void emitLiveComment(JikkyoComment comment) {
+    _activeConn?.onComment(comment);
+  }
+
+  @override
+  Future<Map<String, JikkyoChannelLiveInfo>> fetchChannelsInfo({
+    bool forceRefresh = false,
+  }) async =>
+      channelsInfo;
+
+  @override
+  Future<List<JikkyoComment>> fetchKakolog({
+    required String jkId,
+    required DateTime startTime,
+    required DateTime endTime,
+  }) async {
+    final startMs = startTime.millisecondsSinceEpoch;
+    final endMs = endTime.millisecondsSinceEpoch;
+    return [
+      for (final c in kakologComments)
+        if (c.timestampMs >= startMs && c.timestampMs <= endMs) c,
+    ];
+  }
+
+  @override
+  JikkyoLiveConnection connectLive({
+    required String jkId,
+    required void Function(JikkyoComment comment) onComment,
+    void Function(bool connected)? onConnectionChanged,
+  }) {
+    _activeConn = _FakeJikkyoLiveConn(
+      onComment: onComment,
+      onConnectionChanged: onConnectionChanged,
+    );
+    return _activeConn!;
+  }
+
+  @override
+  void dispose() {}
 }
