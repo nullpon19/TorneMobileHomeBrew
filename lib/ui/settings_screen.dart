@@ -238,51 +238,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           const Divider(),
-          _sectionTitle(context, '操作'),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '操作モード（自動判定: ${ref.watch(defaultTargetUiControlModeProvider).label}）',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                const SizedBox(height: 8),
-                SegmentedButton<UiControlModePreference>(
-                  segments: const [
-                    ButtonSegment(
-                      value: UiControlModePreference.auto,
-                      label: Text('自動'),
-                    ),
-                    ButtonSegment(
-                      value: UiControlModePreference.tv,
-                      label: Text('TV'),
-                    ),
-                    ButtonSegment(
-                      value: UiControlModePreference.touch,
-                      label: Text('タッチ'),
-                    ),
-                    ButtonSegment(
-                      value: UiControlModePreference.desktop,
-                      label: Text('PC'),
-                    ),
-                  ],
-                  selected: {ref.watch(uiControlModePreferenceProvider)},
-                  onSelectionChanged: (selection) => ref
-                      .read(uiControlModePreferenceProvider.notifier)
-                      .set(selection.first),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  '現在の有効モード: ${ref.watch(uiControlModeProvider).label}'
-                  '（再生画面のホバー/タップ操作や入力欄の挙動を切り替えます）。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
-            ),
-          ),
-          const Divider(),
           _sectionTitle(context, '録画・予約'),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -480,6 +435,51 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               MaterialPageRoute<void>(
                 builder: (_) => const DtcpCredentialScreen(),
               ),
+            ),
+          ),
+          const Divider(),
+          _sectionTitle(context, '操作'),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '操作モード（自動判定: ${ref.watch(defaultTargetUiControlModeProvider).label}）',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<UiControlModePreference>(
+                  segments: const [
+                    ButtonSegment(
+                      value: UiControlModePreference.auto,
+                      label: Text('自動'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.tv,
+                      label: Text('TV'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.touch,
+                      label: Text('タッチ'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.desktop,
+                      label: Text('PC'),
+                    ),
+                  ],
+                  selected: {ref.watch(uiControlModePreferenceProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(uiControlModePreferenceProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '現在の有効モード: ${ref.watch(uiControlModeProvider).label}'
+                  '（再生画面のホバー/タップ操作や入力欄の挙動を切り替えます）。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
             ),
           ),
           const Divider(),

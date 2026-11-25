@@ -134,6 +134,10 @@ void main() {
         serviceName: 'テスト局',
       );
       final now = DateTime.now().toUtc();
+      final jstHour = now.add(const Duration(hours: 9)).hour;
+      final secondStart = jstHour >= 23
+          ? now.subtract(const Duration(hours: 1))
+          : now.add(const Duration(hours: 1));
       final guide = EpgGuide(
         broadcastingType: 2,
         services: [
@@ -149,7 +153,7 @@ void main() {
               ),
               EpgEvent(
                 eventId: 2,
-                start: now.add(const Duration(hours: 1)),
+                start: secondStart,
                 duration: const Duration(minutes: 30),
                 title: '通常番組',
               ),
