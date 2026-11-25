@@ -64,6 +64,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'multi_nasne_policy.dart';
@@ -283,6 +284,59 @@ Future<void> reportResumePosition({
       .applyResumePoint(titleId, position.inSeconds);
 }
 
+String? _formatRecordedDetailMeta(RecordedTitle title) {
+  final parts = <String>[
+    if (title.scheduledStart != null)
+      formatDateTimeWithWeekdayJst(title.scheduledStart!),
+    if (title.scheduledDurationSeconds != null)
+      formatDurationSeconds(title.scheduledDurationSeconds!),
+    if (title.channelName != null && title.channelName!.isNotEmpty)
+      title.channelName!,
+    if (title.genre != null && title.genre!.isNotEmpty) title.genre!,
+  ];
+  return parts.isEmpty ? null : parts.join(' ・ ');
+}
+
+({RegisteredNasne reg, RecordedTitle title})? _resolveNextRecordedEpisode({
+  required ProviderContainer container,
+  required RegisteredNasne currentReg,
+  required RecordedTitle currentTitle,
+}) {
+  try {
+    final regs = container.read(registrationsProvider).value;
+    final candidates = (regs != null && regs.isNotEmpty) ? regs : [currentReg];
+    final allTitles = <RecordedTitle>[];
+    final ownerByIdentity = Map<RecordedTitle, RegisteredNasne>.identity();
+    for (final reg in candidates) {
+      if (reg.host.isEmpty) continue;
+      final stage = container.read(titlesProvider(reg)).value;
+      if (stage == null || stage.titles.isEmpty) continue;
+      for (final item in stage.titles) {
+        if (item.res.isEmpty) continue;
+        allTitles.add(item);
+        ownerByIdentity[item] = reg;
+      }
+    }
+    if (allTitles.length < 2) return null;
+    final groups = groupRecordedTitles(
+      allTitles,
+      sort: TitleSortOrder.recordedOldest,
+    );
+    for (final group in groups) {
+      if (!group.isFolder) continue;
+      if (!group.titles.any((t) => t.id == currentTitle.id)) continue;
+      final next = resolveNextEpisodeInSeries(
+        current: currentTitle,
+        groupTitles: group.titles,
+      );
+      if (next == null) return null;
+      final owner = ownerByIdentity[next] ?? currentReg;
+      return (reg: owner, title: next);
+    }
+  } catch (_) {}
+  return null;
+}
+
 Widget _buildRecordedPlayerScreen({
   required ProviderContainer container,
   required RegisteredNasne reg,
@@ -310,6 +364,11 @@ Widget _buildRecordedPlayerScreen({
           title.scheduledDurationSeconds,
         )
       : null;
+  final nextTarget = _resolveNextRecordedEpisode(
+    container: container,
+    currentReg: reg,
+    currentTitle: title,
+  );
   return PlayerScreen(
     title: title.title,
     session: session,
@@ -326,6 +385,52 @@ Widget _buildRecordedPlayerScreen({
     canSwitchQuality: canSwitchQuality,
     currentUseMobile: useMobile,
     initialCornerNotice: initialCornerNotice,
+    nextEpisodeTitle: nextTarget?.title.title,
+    onPlayNextEpisode: nextTarget != null
+        ? (playerContext, stopCurrentSession) async {
+            await _reportResumePositionWithContainer(
+              container: container,
+              reg: reg,
+              titleId: title.id,
+              position: Duration.zero,
+            );
+            await stopCurrentSession();
+            final nextTitle = nextTarget.title;
+            final nextReg = nextTarget.reg;
+            final nextRes = useMobile
+                ? (nextTitle.mobileRes ??
+                      nextTitle.originalRes ??
+                      nextTitle.res.first)
+                : (nextTitle.originalRes ??
+                      nextTitle.mobileRes ??
+                      nextTitle.res.first);
+            final PlaybackSession nextSession;
+            try {
+              nextSession = await engine.startPlayback(nextTitle, nextRes);
+            } on NasneError {
+              return null;
+            }
+            if (!playerContext.mounted) {
+              await nextSession.stop();
+              return null;
+            }
+            return _buildRecordedPlayerScreen(
+              container: container,
+              reg: nextReg,
+              engine: engine,
+              title: nextTitle,
+              session: nextSession,
+              useMobile: useMobile,
+              initialStart: null,
+              detailMeta: _formatRecordedDetailMeta(nextTitle),
+              detailBody: formatProgramDetailBody(
+                description: nextTitle.description,
+                longDescription: nextTitle.longDescription,
+              ),
+              initialCornerNotice: '次のエピソードを再生します',
+            );
+          }
+        : null,
     onSwitchQuality: canSwitchQuality
         ? (
             playerContext,
@@ -919,7 +1024,11 @@ class _TitleListState extends ConsumerState<_TitleList> {
                   key: indented ? null : ValueKey('title:$itemKey'),
                   selected: itemKey == widget.selectedKey,
                   leading: _TitleLeading(reg: owner, title: t),
-                  title: Text(t.title),
+                  title: BroadcastTitleLine(
+                    rawTitle: t.title,
+                    maxLines: 2,
+                    darkSurface: Theme.of(context).brightness == Brightness.dark,
+                  ),
                   subtitle: Text(
                     '${t.scheduledStart != null ? formatDateTimeJst(t.scheduledStart!) : ''}'
                     '${t.scheduledDurationSeconds != null ? ' (${formatDurationSeconds(t.scheduledDurationSeconds!)})' : ''}'
@@ -1323,11 +1432,11 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    t.title,
+                  BroadcastTitleHeading(
+                    rawTitle: t.title,
                     style: Theme.of(context).textTheme.titleLarge,
                     maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
+                    darkSurface: Theme.of(context).brightness == Brightness.dark,
                   ),
                   const SizedBox(height: 6),
                   Text(
@@ -1449,18 +1558,7 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
       // the context rewind of resumeRewind (plan 98 / 102).
       initialStart = resume ? resumePlaybackStartOf(title) : null;
     }
-    final detailMetaParts = <String>[
-      if (title.scheduledStart != null)
-        formatDateTimeWithWeekdayJst(title.scheduledStart!),
-      if (title.scheduledDurationSeconds != null)
-        formatDurationSeconds(title.scheduledDurationSeconds!),
-      if (title.channelName != null && title.channelName!.isNotEmpty)
-        title.channelName!,
-      if (title.genre != null && title.genre!.isNotEmpty) title.genre!,
-    ];
-    final detailMeta = detailMetaParts.isEmpty
-        ? null
-        : detailMetaParts.join(' ・ ');
+    final detailMeta = _formatRecordedDetailMeta(title);
     final detailBody = formatProgramDetailBody(
       description: title.description,
       longDescription: title.longDescription,

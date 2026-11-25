@@ -26,6 +26,7 @@ import 'app_shell.dart';
 import 'channel_badge.dart';
 import 'epg_genre.dart';
 import 'epg_search_screen.dart';
+import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'live_channel_switch_policy.dart';
@@ -1976,6 +1977,7 @@ class _EventTileState extends State<_EventTile> {
     final top = startMin * _pxPerMinute;
     final height = math.max(10, (endMin - startMin) * _pxPerMinute - 1);
     final title = event.title;
+    final parsedTitle = title != null ? parseBroadcastTitleBadges(title) : null;
     final timeText = formatTimeJst(event.start);
     final focusBorderColor = isDark ? Colors.amberAccent : Colors.black;
     final reservedBorderColor = isDark
@@ -2018,23 +2020,46 @@ class _EventTileState extends State<_EventTile> {
                       ),
                       const SizedBox(width: 2),
                     ],
-                    Expanded(
-                      child: Text(
-                        timeText,
-                        style: timeStyle,
-                        maxLines: 1,
-                        overflow: TextOverflow.clip,
-                      ),
+                    Text(
+                      timeText,
+                      style: timeStyle,
+                      maxLines: 1,
+                      overflow: TextOverflow.clip,
                     ),
+                    if (parsedTitle != null &&
+                        parsedTitle.attributeBadges.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: SizedBox(
+                          height: 14,
+                          child: ClipRect(
+                            child: Wrap(
+                              spacing: 2,
+                              runSpacing: 4,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                for (final tag in parsedTitle.attributeBadges)
+                                  EpgAttributeMiniBadge(
+                                    label: tag,
+                                    inverted: useReservedFill,
+                                    isDark: isDark,
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ] else
+                      const Spacer(),
                   ],
                 ),
-                if (title != null)
+                if (parsedTitle != null)
                   Expanded(
-                    child: Text(
-                      title,
+                    child: EpgFormattedTitleText(
+                      parsed: parsedTitle,
                       style: titleStyle,
-                      overflow: TextOverflow.ellipsis,
                       maxLines: maxTitleLines.clamp(1, 4),
+                      inverted: useReservedFill,
                     ),
                   ),
               ],
@@ -2059,17 +2084,18 @@ class _EventTileState extends State<_EventTile> {
                   timeText,
                   style: timeStyle?.copyWith(fontSize: 10, height: 1.1),
                 ),
-                if (title != null) ...[
+                if (parsedTitle != null) ...[
                   const SizedBox(width: 4),
                   Expanded(
-                    child: Text(
-                      title,
+                    child: EpgFormattedTitleText(
+                      parsed: parsedTitle,
                       style: titleStyle?.copyWith(
                         fontSize: 10,
                         height: 1.1,
                       ),
                       maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                      inverted: useReservedFill,
+                      compact: true,
                     ),
                   ),
                 ],
@@ -2497,7 +2523,11 @@ class _EpgEventDetailDialogState extends State<EpgEventDetailDialog> {
         ? '録画予約済み（${widget.reservedNasneName}）'
         : '録画予約済み';
     return AlertDialog(
-      title: Text(event.title ?? '番組情報なし'),
+      title: BroadcastTitleHeading(
+        rawTitle: event.title ?? '番組情報なし',
+        style: theme.textTheme.headlineSmall,
+        darkSurface: isDark,
+      ),
       content: Focus(
         onFocusChange: (focused) {
           if (_bodyFocused != focused) setState(() => _bodyFocused = focused);

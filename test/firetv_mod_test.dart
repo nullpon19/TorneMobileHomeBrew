@@ -26,6 +26,7 @@ import 'package:tmhb/ui/app_shell.dart';
 import 'package:tmhb/ui/channel_badge.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
+import 'package:tmhb/ui/epg_title_badges.dart';
 import 'package:tmhb/ui/format.dart';
 import 'package:tmhb/ui/home_screen.dart';
 import 'package:tmhb/ui/jikkyo_momentum_graph.dart';
@@ -1002,7 +1003,7 @@ void main() {
       expect(find.text('2024/10/06 〜 2024/10/13'), findsOneWidget);
       expect(find.text('081モヤモヤさまぁ〜ず2'), findsOneWidget);
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsNothing,
       );
 
@@ -1010,20 +1011,22 @@ void main() {
       await tester.tap(find.text('わんだふるぷりきゅあ!'));
       await tester.pumpAndSettle();
       expect(
-        find.text('わんだふるぷりきゅあ! #37 みんなで初デート!?[デ][字]'),
+        find.text('わんだふるぷりきゅあ! #37 みんなで初デート!?'),
         findsOneWidget,
       );
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsOneWidget,
       );
+      expect(find.text('デ'), findsNWidgets(2));
+      expect(find.text('字'), findsNWidgets(2));
 
       // Toggle grouping OFF via FilterChip and verify persistence.
       await tester.tap(find.text('番組まとめ'));
       await tester.pumpAndSettle();
       expect(find.text('全 2 本'), findsNothing);
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsOneWidget,
       );
       expect(await kv.read('firetv_group_titles'), 'false');
@@ -12486,6 +12489,321 @@ void main() {
         resolveJikkyoBaseFontSize(JikkyoTextSizePreset.large, 2000.0),
         84.0,
       );
+    });
+  });
+
+  group('Phase 41: EPG badges, Jikkyo filters & series auto-play next episode', () {
+    test('parseBroadcastTitleBadges separates attribute marks while promoting 新/終/初 to inline badges', () {
+      final parsed = parseBroadcastTitleBadges(
+        '[新][字][デ]ドラマ名　第１話[解][終][再]',
+      );
+      expect(parsed.inlineBadges, [
+        EpgInlineBadgeKind.shin,
+        EpgInlineBadgeKind.shu,
+      ]);
+      expect(parsed.attributeBadges, ['字', 'デ', '解', '再']);
+      expect(parsed.cleanTitle, 'ドラマ名 第１話');
+
+      // Fullwidth / lenticular brackets & duplicate elimination
+      final fullwidth = parseBroadcastTitleBadges(
+        '【新】［字］［二］番組タイトル（再）［字］',
+      );
+      expect(fullwidth.inlineBadges, [EpgInlineBadgeKind.shin]);
+      expect(fullwidth.attributeBadges, ['字', '二', '再']);
+      expect(fullwidth.cleanTitle, '番組タイトル');
+
+      // Tag-only edge case keeps safe fallback text
+      final tagOnly = parseBroadcastTitleBadges('[字]');
+      expect(tagOnly.cleanTitle, '[字]');
+
+      // `[ほか]` must NOT be treated as an attribute badge
+      final hoka = parseBroadcastTitleBadges('ｎｅｗｓ　ｅｖｅｒｙ．[字][ほか]');
+      expect(hoka.attributeBadges, ['字']);
+      expect(hoka.cleanTitle, contains('[ほか]'));
+    });
+
+    testWidgets('EpgFormattedTitleText, EpgAttributeMiniBadge, BroadcastTitleLine & BroadcastTitleHeading render in normal and inverted modes', (tester) async {
+      final parsed = parseBroadcastTitleBadges('[新][字][生]ニュース特集');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Column(
+              children: [
+                Row(
+                  children: [
+                    for (final b in parsed.attributeBadges)
+                      EpgAttributeMiniBadge(label: b, inverted: false),
+                    for (final b in parsed.attributeBadges)
+                      EpgAttributeMiniBadge(label: b, inverted: true),
+                  ],
+                ),
+                EpgFormattedTitleText(parsed: parsed, maxLines: 2),
+                EpgFormattedTitleText(
+                  parsed: parsed,
+                  maxLines: 1,
+                  inverted: true,
+                  compact: true,
+                ),
+                const BroadcastTitleLine(
+                  rawTitle: '[終][二][デ]録画・ライブ見出し',
+                  darkSurface: true,
+                ),
+                const BroadcastTitleHeading(
+                  rawTitle: '[初][字][再]詳細タイトル',
+                  darkSurface: false,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      expect(find.text('字'), findsNWidgets(3));
+      expect(find.text('生'), findsNWidgets(2));
+      expect(find.text('デ'), findsOneWidget);
+      expect(find.text('新', findRichText: true), findsWidgets);
+      expect(find.text('終', findRichText: true), findsWidgets);
+      expect(find.text('初', findRichText: true), findsWidgets);
+    });
+
+    test('JikkyoSettings defaults avoidSubtitleArea=false and persists white/fixed/NG filters', () async {
+      expect(JikkyoSettings.defaults.avoidSubtitleArea, isFalse);
+
+      final filtered = JikkyoSettings.defaults
+          .copyWith(forceWhiteText: true, hideFixedComments: true)
+          .withAddedNgWord('NGword')
+          .withAddedNgWord('ngword'); // case-insensitive dedup
+      expect(filtered.ngWords, ['NGword']);
+      expect(
+        filtered.matchesFilter(
+          const JikkyoComment(timestampMs: 1000, text: '普通のコメント'),
+        ),
+        isTrue,
+      );
+      expect(
+        filtered.matchesFilter(
+          const JikkyoComment(
+            timestampMs: 1000,
+            text: '上固定コメント',
+            position: JikkyoCommentPosition.ue,
+          ),
+        ),
+        isFalse,
+      );
+      expect(
+        filtered.matchesFilter(
+          const JikkyoComment(timestampMs: 1000, text: 'このｎｇｗｏｒｄは除外'),
+        ),
+        isFalse,
+      );
+
+      final restored = JikkyoSettings.fromJsonString(filtered.toJsonString());
+      expect(restored.forceWhiteText, isTrue);
+      expect(restored.hideFixedComments, isTrue);
+      expect(restored.ngWords, ['NGword']);
+
+      final kv = InMemoryKeyValueStore();
+      final container = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container.dispose);
+      await container.read(jikkyoSettingsProvider.notifier).setForceWhiteText(true);
+      await container.read(jikkyoSettingsProvider.notifier).addNgWord('迷惑ワード');
+      final saved = JikkyoSettings.fromJsonString(
+        (await kv.read('firetv_jikkyo_settings'))!,
+      );
+      expect(saved.forceWhiteText, isTrue);
+      expect(saved.ngWords, ['迷惑ワード']);
+    });
+
+    testWidgets('JikkyoSettingsScreen persists filter switches (white text & hide fixed)', (tester) async {
+      final kv = InMemoryKeyValueStore();
+      tester.view.physicalSize = const Size(1280, 960);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+          child: const MaterialApp(home: JikkyoSettingsScreen()),
+        ),
+      );
+      await tester.pump();
+
+      final listScrollable = find.byType(Scrollable).first;
+      final whiteSwitch = find.text('文字色を白に統一');
+      await tester.scrollUntilVisible(
+        whiteSwitch,
+        250.0,
+        scrollable: listScrollable,
+      );
+      await tester.pump();
+      await tester.tap(whiteSwitch);
+      await tester.pump();
+
+      final hideFixedSwitch = find.text('上下固定コメントを非表示');
+      await tester.scrollUntilVisible(
+        hideFixedSwitch,
+        200.0,
+        scrollable: listScrollable,
+      );
+      await tester.pump();
+      await tester.tap(hideFixedSwitch);
+      await tester.pump();
+
+      final restored = JikkyoSettings.fromJsonString(
+        (await kv.read('firetv_jikkyo_settings'))!,
+      );
+      expect(restored.forceWhiteText, isTrue);
+      expect(restored.hideFixedComments, isTrue);
+    });
+
+    test('extractEpisodeNumber & resolveNextEpisodeInSeries separate rebroadcast lanes and skip duplicate episodes', () {
+      expect(extractEpisodeNumber('[字]アニメ名 #03 タイトル'), 3.0);
+      expect(extractEpisodeNumber('ドラマ 第１２話[終]'), 12.0);
+      expect(extractEpisodeNumber('大河 第三話'), 3.0);
+      expect(extractEpisodeNumber('2026年11月25日 特番'), isNull);
+
+      const dummyRes = [
+        TitleRes(url: 'http://192.0.2.1/1', protocolInfo: 'http-get:*:video/mpeg:*'),
+      ];
+      final ep1 = RecordedTitle(
+        id: 't1',
+        title: '[字]アニメＸ #01',
+        scheduledStart: DateTime.utc(2026, 11, 1, 10, 0),
+        res: dummyRes,
+      );
+      final ep2a = RecordedTitle(
+        id: 't2a',
+        title: '[字]アニメＸ #02',
+        scheduledStart: DateTime.utc(2026, 11, 8, 10, 0),
+        res: dummyRes,
+      );
+      final ep2b = RecordedTitle(
+        id: 't2b',
+        title: '[字]アニメＸ #02（別局）',
+        scheduledStart: DateTime.utc(2026, 11, 9, 10, 0),
+        res: dummyRes,
+      );
+      final ep3 = RecordedTitle(
+        id: 't3',
+        title: '[字]アニメＸ #03',
+        scheduledStart: DateTime.utc(2026, 11, 15, 10, 0),
+        res: dummyRes,
+      );
+      final re2 = RecordedTitle(
+        id: 'r2',
+        title: '[再][字]アニメＸ #02',
+        scheduledStart: DateTime.utc(2026, 11, 10, 14, 0),
+        res: dummyRes,
+      );
+      final re3 = RecordedTitle(
+        id: 'r3',
+        title: '[再][字]アニメＸ #03',
+        scheduledStart: DateTime.utc(2026, 11, 17, 14, 0),
+        res: dummyRes,
+      );
+
+      final list = [ep1, ep2a, ep2b, ep3, re2, re3];
+      // Regular lane: #1 -> #2a
+      expect(
+        resolveNextEpisodeInSeries(current: ep1, groupTitles: list)?.id,
+        't2a',
+      );
+      // Duplicate #2a skips duplicate #2b and goes directly to #3!
+      expect(
+        resolveNextEpisodeInSeries(current: ep2a, groupTitles: list)?.id,
+        't3',
+      );
+      // Rebroadcast lane: [再] #2 -> [再] #3 (does not cross into regular lane)
+      expect(
+        resolveNextEpisodeInSeries(current: re2, groupTitles: list)?.id,
+        'r3',
+      );
+      // Regular #3 ends cleanly without jumping to [再]
+      expect(
+        resolveNextEpisodeInSeries(current: ep3, groupTitles: list),
+        isNull,
+      );
+
+      // Unnumbered variety fallback follows scheduledStart ascending
+      final var1 = RecordedTitle(
+        id: 'v1',
+        title: 'バラエティ▼11月1日回',
+        scheduledStart: DateTime.utc(2026, 11, 1, 12, 0),
+        res: dummyRes,
+      );
+      final var2 = RecordedTitle(
+        id: 'v2',
+        title: 'バラエティ▼11月8日回',
+        scheduledStart: DateTime.utc(2026, 11, 8, 12, 0),
+        res: dummyRes,
+      );
+      expect(
+        resolveNextEpisodeInSeries(current: var2, groupTitles: [var2, var1]),
+        isNull,
+      );
+      expect(
+        resolveNextEpisodeInSeries(current: var1, groupTitles: [var2, var1])?.id,
+        'v2',
+      );
+    });
+
+    test('computeNextEpisodeCountdownState triggers 15s before end and autoPlayNextEpisodeProvider defaults ON', () async {
+      // > 15s remaining -> hidden
+      expect(
+        computeNextEpisodeCountdownState(
+          live: false,
+          enabled: true,
+          hasNextEpisode: true,
+          dismissed: false,
+          switchingChannel: false,
+          interrupted: false,
+          hasError: false,
+          duration: const Duration(minutes: 24),
+          position: const Duration(minutes: 23, seconds: 44),
+        ).visible,
+        isFalse,
+      );
+
+      // 14.2s remaining -> visible with 15s rounded up
+      final shown = computeNextEpisodeCountdownState(
+        live: false,
+        enabled: true,
+        hasNextEpisode: true,
+        dismissed: false,
+        switchingChannel: false,
+        interrupted: false,
+        hasError: false,
+        duration: const Duration(minutes: 24),
+        position: const Duration(minutes: 23, seconds: 45, milliseconds: 800),
+      );
+      expect(shown.visible, isTrue);
+      expect(shown.remainingSeconds, 15);
+
+      // Short <45s clip or live stream -> hidden
+      expect(
+        computeNextEpisodeCountdownState(
+          live: false,
+          enabled: true,
+          hasNextEpisode: true,
+          dismissed: false,
+          switchingChannel: false,
+          interrupted: false,
+          hasError: false,
+          duration: const Duration(seconds: 30),
+          position: const Duration(seconds: 20),
+        ).visible,
+        isFalse,
+      );
+
+      final kv = InMemoryKeyValueStore();
+      final container = ProviderContainer(
+        overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+      );
+      addTearDown(container.dispose);
+      expect(container.read(autoPlayNextEpisodeProvider), isTrue);
+      await container.read(autoPlayNextEpisodeProvider.notifier).set(false);
+      expect(await kv.read('firetv_auto_play_next_episode'), 'false');
     });
   });
 }

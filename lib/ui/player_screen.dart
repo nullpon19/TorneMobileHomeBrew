@@ -188,6 +188,7 @@ import '../app/providers.dart';
 import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
 import 'epg_genre.dart';
+import 'epg_title_badges.dart';
 import 'format.dart';
 import 'jikkyo_momentum_graph.dart';
 import 'jikkyo_overlay.dart';
@@ -219,6 +220,43 @@ String? playerLoadingLabel({
   if (!hasVideoFrame || !playingStarted) return '読み込み中…';
   if (buffering && playingNow) return 'バッファリング中…';
   return null;
+}
+
+/// Computes whether the "Next Episode" countdown overlay card should be shown
+/// during the final [leadSeconds] (default 15 s) of recorded series playback.
+({bool visible, int remainingSeconds}) computeNextEpisodeCountdownState({
+  required bool live,
+  required bool enabled,
+  required bool hasNextEpisode,
+  required bool dismissed,
+  required bool switchingChannel,
+  required bool interrupted,
+  required bool hasError,
+  required Duration duration,
+  required Duration position,
+  int leadSeconds = 15,
+  int minDurationSeconds = 45,
+}) {
+  if (live ||
+      !enabled ||
+      !hasNextEpisode ||
+      dismissed ||
+      switchingChannel ||
+      interrupted ||
+      hasError ||
+      duration.inSeconds < minDurationSeconds) {
+    return (visible: false, remainingSeconds: 0);
+  }
+  final remaining = duration - position;
+  if (remaining <= Duration.zero ||
+      remaining > Duration(seconds: leadSeconds)) {
+    return (visible: false, remainingSeconds: 0);
+  }
+  final seconds = ((remaining.inMilliseconds + 999) ~/ 1000).clamp(
+    1,
+    leadSeconds,
+  );
+  return (visible: true, remainingSeconds: seconds);
 }
 
 /// Returns `true` only once actual playback frames are flowing, so a
@@ -727,10 +765,12 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ],
                               ),
                               const SizedBox(height: 4),
-                              Text(
-                                programTitle ?? data.programTitle,
+                              BroadcastTitleLine(
+                                rawTitle: programTitle ?? data.programTitle,
                                 maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
+                                darkSurface: isDark,
+                                badgeScale: 1.0,
+                                maxAttributeBadges: 4,
                                 style: TextStyle(
                                   color: titleColor,
                                   fontSize: 14,
@@ -1914,10 +1954,11 @@ class LiveOsdProgramSection extends StatelessWidget {
         Row(
           children: [
             Expanded(
-              child: Text(
-                info.currentTitle,
+              child: BroadcastTitleLine(
+                rawTitle: info.currentTitle,
                 maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+                darkSurface: true,
+                badgeScale: 1.1,
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 15,
@@ -1986,10 +2027,12 @@ class LiveOsdProgramSection extends StatelessWidget {
                 const SizedBox(width: 8),
               ],
               Expanded(
-                child: Text(
-                  info.nextTitle!,
+                child: BroadcastTitleLine(
+                  rawTitle: info.nextTitle!,
                   maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  darkSurface: true,
+                  badgeScale: 0.95,
+                  maxAttributeBadges: 3,
                   style: const TextStyle(
                     color: Colors.white70,
                     fontSize: 13,
@@ -2021,10 +2064,11 @@ class RecordedOsdProgramSection extends StatelessWidget {
     return Row(
       children: [
         Expanded(
-          child: Text(
-            programTitle,
+          child: BroadcastTitleLine(
+            rawTitle: programTitle,
             maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+            darkSurface: true,
+            badgeScale: 1.1,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 15,
@@ -2461,10 +2505,11 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(
-                            title,
+                          BroadcastTitleHeading(
+                            rawTitle: title,
                             maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
+                            darkSurface: true,
+                            badgeScale: 1.15,
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 17,
@@ -2573,6 +2618,8 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.canSwitchQuality = false,
     this.currentUseMobile = false,
     this.onSwitchQuality,
+    this.nextEpisodeTitle,
+    this.onPlayNextEpisode,
     this.onLivePlaybackFinished,
     this.initialCornerNotice,
     this.nowProvider,
@@ -2760,6 +2807,15 @@ class PlayerScreen extends ConsumerStatefulWidget {
     Future<void> Function() stopCurrentSession,
   )?
   onSwitchQuality;
+
+  /// Title and launcher callback for auto-playing the next episode in a
+  /// recorded series folder during the last 15 seconds of playback (Phase 41).
+  final String? nextEpisodeTitle;
+  final Future<Widget?> Function(
+    BuildContext playerContext,
+    Future<void> Function() stopCurrentSession,
+  )?
+  onPlayNextEpisode;
 
   /// Injectable clock for testing same-channel recording notices.
   final DateTime Function()? nowProvider;
@@ -3000,6 +3056,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   final FocusNode _errorBackFocusNode = FocusNode(
     debugLabel: 'playerErrorBack',
   );
+  final FocusNode _nextPlayNowFocusNode = FocusNode(
+    debugLabel: 'nextEpPlayNow',
+  );
+  final FocusNode _nextCancelFocusNode = FocusNode(
+    debugLabel: 'nextEpCancel',
+  );
+
+  bool _nextEpisodeDismissed = false;
+  bool _startingNextEpisode = false;
+  int _lastRenderedNextCountdownSec = -1;
 
   bool _osdOpen = false;
   Timer? _osdTimer;
@@ -3596,6 +3662,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _committedSeekHoldTimer?.cancel();
           if (_seekHudVisible) shouldRebuild = true;
         }
+        final countdown = _currentNextEpisodeCountdown();
+        final nextSec = countdown.visible ? countdown.remainingSeconds : -1;
+        if (nextSec != _lastRenderedNextCountdownSec) {
+          _lastRenderedNextCountdownSec = nextSec;
+          shouldRebuild = true;
+        }
         if (shouldRebuild && mounted) setState(() {});
       }),
     );
@@ -3828,6 +3900,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (_autoPoppedOnComplete) return;
     _autoPoppedOnComplete = true;
+    final canAutoNext =
+        ref.read(autoPlayNextEpisodeProvider) &&
+        widget.onPlayNextEpisode != null &&
+        !_nextEpisodeDismissed &&
+        !_exitConfirmOpen &&
+        !_startingNextEpisode;
+    if (canAutoNext) {
+      unawaited(_executePlayNextEpisode());
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final nav = Navigator.of(context);
@@ -3839,6 +3921,56 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         nav.pop();
       }
     });
+  }
+
+  ({bool visible, int remainingSeconds}) _currentNextEpisodeCountdown() =>
+      computeNextEpisodeCountdownState(
+        live: widget.live,
+        enabled: ref.read(autoPlayNextEpisodeProvider),
+        hasNextEpisode: widget.onPlayNextEpisode != null,
+        dismissed: _nextEpisodeDismissed,
+        switchingChannel: _switchingChannel || _startingNextEpisode,
+        interrupted: _interrupted,
+        hasError: _error != null,
+        duration: _effectiveDuration,
+        position: _lastPosition,
+      );
+
+  Future<void> _executePlayNextEpisode() async {
+    final launcher = widget.onPlayNextEpisode;
+    if (launcher == null ||
+        _startingNextEpisode ||
+        _switchingChannel ||
+        !mounted) {
+      return;
+    }
+    _startingNextEpisode = true;
+    _suppressResumeReportOnDispose = true;
+    _switchingChannelLabel = widget.nextEpisodeTitle ?? '次のエピソード';
+
+    var sessionStopped = false;
+    Future<void> stopCurrentSession() async {
+      if (sessionStopped) return;
+      sessionStopped = true;
+      await _stopPlaybackForReplacement();
+    }
+
+    try {
+      final nextPlayer = await launcher(context, stopCurrentSession);
+      if (!mounted) return;
+      if (nextPlayer != null) {
+        await _pushReplacementPlayer(nextPlayer);
+        return;
+      }
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: next episode launch failed: $e');
+    }
+    if (mounted) {
+      final nav = Navigator.of(context);
+      if (nav.canPop()) {
+        nav.pop();
+      }
+    }
   }
 
   Future<void> _confirmExitPlayback() async {
@@ -6216,6 +6348,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _resumeButtonFocusNode.dispose();
             _closeBannerFocusNode.dispose();
             _errorBackFocusNode.dispose();
+            _nextPlayNowFocusNode.dispose();
+            _nextCancelFocusNode.dispose();
             _osdFadeController.dispose();
           },
         ),
@@ -7592,6 +7726,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _dismissChannelPreview(fromBackKey: true);
       return KeyEventResult.handled;
     }
+    final nextCountdown = _currentNextEpisodeCountdown();
+    final nextCardActive =
+        nextCountdown.visible && !_osdOpen && !_detailOpen && !_seekHudVisible;
+    final nextCardFocused =
+        _nextPlayNowFocusNode.hasFocus || _nextCancelFocusNode.hasFocus;
+    if (nextCardFocused) {
+      if (key == LogicalKeyboardKey.escape ||
+          key == LogicalKeyboardKey.goBack) {
+        setState(() => _nextEpisodeDismissed = true);
+        _rootFocusNode.requestFocus();
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowUp) {
+        _rootFocusNode.requestFocus();
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowLeft ||
+          key == LogicalKeyboardKey.arrowRight) {
+        return KeyEventResult.ignored;
+      }
+    }
+    if (nextCardActive &&
+        !isRepeat &&
+        (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack)) {
+      setState(() => _nextEpisodeDismissed = true);
+      _rootFocusNode.requestFocus();
+      return KeyEventResult.handled;
+    }
+    if (nextCardActive &&
+        !isRepeat &&
+        key == LogicalKeyboardKey.arrowDown &&
+        !nextCardFocused) {
+      _nextPlayNowFocusNode.requestFocus();
+      return KeyEventResult.handled;
+    }
     if (key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.mediaRewind) {
       if (widget.live) {
@@ -7943,10 +8112,110 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         ),
                       if (_interrupted && !_conflictHandled && !_switchingChannel)
                         _buildInterruptionBanner(),
+                      if (_currentNextEpisodeCountdown().visible &&
+                          !_osdOpen &&
+                          !_detailOpen &&
+                          !_seekHudVisible &&
+                          !_switchingChannel)
+                        _buildNextEpisodeCountdownCard(
+                          _currentNextEpisodeCountdown().remainingSeconds,
+                        ),
                     ],
                   ),
                 ),
               ),
+      ),
+    );
+  }
+
+  Widget _buildNextEpisodeCountdownCard(int remainingSeconds) {
+    return Positioned(
+      right: 28,
+      bottom: 28,
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.88),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.lightBlueAccent, width: 1.5),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black54,
+              blurRadius: 12,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: FocusTraversalGroup(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(
+                    Icons.skip_next,
+                    color: Colors.lightBlueAccent,
+                    size: 18,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '次のエピソード（あと $remainingSeconds秒）',
+                    style: const TextStyle(
+                      color: Colors.lightBlueAccent,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              BroadcastTitleLine(
+                rawTitle: widget.nextEpisodeTitle ?? '次の話',
+                maxLines: 2,
+                darkSurface: true,
+                badgeScale: 1.0,
+                maxAttributeBadges: 3,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                '下キーでボタン操作 / 戻るでキャンセル',
+                style: TextStyle(color: Colors.white60, fontSize: 11),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  OutlinedButton(
+                    focusNode: _nextCancelFocusNode,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                    onPressed: () {
+                      setState(() => _nextEpisodeDismissed = true);
+                      _rootFocusNode.requestFocus();
+                    },
+                    child: const Text('キャンセル'),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    focusNode: _nextPlayNowFocusNode,
+                    onPressed: () => unawaited(_executePlayNextEpisode()),
+                    icon: const Icon(Icons.play_arrow, size: 18),
+                    label: const Text('今すぐ再生'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -8372,10 +8641,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                   const SizedBox(width: 12),
                   Expanded(
-                    child: Text(
-                      headline,
+                    child: BroadcastTitleLine(
+                      rawTitle: headline,
                       maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                      darkSurface: true,
+                      badgeScale: 1.1,
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 16,

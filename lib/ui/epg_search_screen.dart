@@ -30,6 +30,7 @@ import '../app/state.dart';
 import '../core/core.dart';
 import 'epg_screen.dart';
 import 'epg_search.dart';
+import 'epg_title_badges.dart';
 import 'format.dart';
 import 'live_screen.dart';
 import 'multi_nasne_policy.dart';
@@ -197,7 +198,8 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
                 const <RecordSchedule>[]))
           OwnedRecordSchedule(reg: r, schedule: s),
     ];
-    final reservedColor = Theme.of(context).brightness == Brightness.dark
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final reservedColor = isDark
         ? Colors.redAccent
         : const Color(0xFFD32F2F);
     return ListView.builder(
@@ -211,7 +213,11 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
           event,
         );
         return ListTile(
-          title: Text(event.title ?? '番組情報なし'),
+          title: BroadcastTitleLine(
+            rawTitle: event.title ?? '番組情報なし',
+            maxLines: 2,
+            darkSurface: isDark,
+          ),
           subtitle: Text(
             '${hit.channelName}\n'
             '${formatDateTimeWithWeekdayJst(event.start)} 〜 '

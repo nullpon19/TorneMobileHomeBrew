@@ -8,6 +8,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app/providers.dart';
 import '../core/jikkyo/jikkyo_models.dart';
 import 'jikkyo_overlay.dart';
+import 'widgets.dart';
 
 const List<JikkyoComment> _jikkyoPreviewComments = [
   JikkyoComment(timestampMs: 1000, text: 'きたあああああ！'),
@@ -36,11 +37,32 @@ const List<JikkyoComment> _jikkyoPreviewComments = [
   ),
 ];
 
-class JikkyoSettingsScreen extends ConsumerWidget {
+class JikkyoSettingsScreen extends ConsumerStatefulWidget {
   const JikkyoSettingsScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<JikkyoSettingsScreen> createState() =>
+      _JikkyoSettingsScreenState();
+}
+
+class _JikkyoSettingsScreenState extends ConsumerState<JikkyoSettingsScreen> {
+  final TextEditingController _ngWordController = TextEditingController();
+
+  @override
+  void dispose() {
+    _ngWordController.dispose();
+    super.dispose();
+  }
+
+  void _submitNgWord(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return;
+    ref.read(jikkyoSettingsProvider.notifier).addNgWord(trimmed);
+    _ngWordController.clear();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final settings = ref.watch(jikkyoSettingsProvider);
     final notifier = ref.read(jikkyoSettingsProvider.notifier);
     final enabled = ref.watch(jikkyoEnabledProvider);
@@ -247,6 +269,73 @@ class JikkyoSettingsScreen extends ConsumerWidget {
                       ),
                   ],
                 ),
+                const Divider(height: 24),
+                _SectionHeader(title: 'コメントフィルタ', theme: theme),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('文字色を白に統一'),
+                  subtitle: const Text('色付きコメントの色指定を無視してすべて白文字で表示します'),
+                  value: settings.forceWhiteText,
+                  onChanged: notifier.setForceWhiteText,
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('上下固定コメントを非表示'),
+                  subtitle: const Text('画面上部・下部に固定表示されるコメントを除外します'),
+                  value: settings.hideFixedComments,
+                  onChanged: notifier.setHideFixedComments,
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FireTvTextInputField(
+                        controller: _ngWordController,
+                        labelText: 'NG ワードを追加',
+                        hintText: '例: 特定の単語や絵文字',
+                        dialogTitle: 'NG ワードを追加',
+                        onSubmitted: _submitNgWord,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed: () => _submitNgWord(_ngWordController.text),
+                      icon: const Icon(Icons.add),
+                      label: const Text('追加'),
+                    ),
+                  ],
+                ),
+                if (settings.ngWords.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Text(
+                        '登録済み NG ワード (${settings.ngWords.length}件)',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                      const Spacer(),
+                      TextButton.icon(
+                        onPressed: notifier.clearNgWords,
+                        icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                        label: const Text('すべて削除'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      for (final word in settings.ngWords)
+                        InputChip(
+                          label: Text(word),
+                          deleteIcon: const Icon(Icons.close, size: 16),
+                          onDeleted: () => notifier.removeNgWord(word),
+                        ),
+                    ],
+                  ),
+                ],
                 const Divider(height: 24),
                 Row(
                   children: [
