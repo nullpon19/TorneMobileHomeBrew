@@ -2523,7 +2523,11 @@ class _EpgEventDetailDialogState extends State<EpgEventDetailDialog> {
         ? '録画予約済み（${widget.reservedNasneName}）'
         : '録画予約済み';
     return AlertDialog(
-      title: Text(event.title ?? '番組情報なし'),
+      title: BroadcastTitleHeading(
+        rawTitle: event.title ?? '番組情報なし',
+        style: theme.textTheme.headlineSmall,
+        darkSurface: isDark,
+      ),
       content: Focus(
         onFocusChange: (focused) {
           if (_bodyFocused != focused) setState(() => _bodyFocused = focused);

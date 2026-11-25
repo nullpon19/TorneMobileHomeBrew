@@ -29,6 +29,7 @@ import '../core/core.dart';
 import 'channel_badge.dart';
 import 'epg_genre.dart';
 import 'epg_subchannel_visibility.dart';
+import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'live_channel_switch_policy.dart';
@@ -297,12 +298,36 @@ class _LiveChannelListTile extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            _channelSubtitleFromDisplay(channel, display),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: subtitleStyle,
-          ),
+          if (channel.channelName != null)
+            Row(
+              children: [
+                if (display.programStart != null &&
+                    display.programEnd != null) ...[
+                  Text(
+                    '${formatTimeJst(display.programStart!)}–${formatTimeJst(display.programEnd!)}',
+                    style: subtitleStyle,
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: BroadcastTitleLine(
+                    rawTitle: display.programTitle,
+                    maxLines: 1,
+                    darkSurface: theme.brightness == Brightness.dark,
+                    badgeScale: 1.0,
+                    maxAttributeBadges: 4,
+                    style: subtitleStyle,
+                  ),
+                ),
+              ],
+            )
+          else
+            Text(
+              _channelSubtitleFromDisplay(channel, display),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: subtitleStyle,
+            ),
           if (display.progress != null) ...[
             const SizedBox(height: 5),
             ClipRRect(
@@ -342,10 +367,12 @@ class _LiveChannelListTile extends StatelessWidget {
                   const SizedBox(width: 6),
                 ],
                 Expanded(
-                  child: Text(
-                    nextTitle,
+                  child: BroadcastTitleLine(
+                    rawTitle: nextTitle,
                     maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                    darkSurface: theme.brightness == Brightness.dark,
+                    badgeScale: 0.92,
+                    maxAttributeBadges: 3,
                     style: metaStyle,
                   ),
                 ),
@@ -1581,11 +1608,11 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
           ),
           const SizedBox(height: 8),
         ],
-        Text(
-          display.programTitle,
+        BroadcastTitleHeading(
+          rawTitle: display.programTitle,
           style: Theme.of(context).textTheme.titleLarge,
           maxLines: 3,
-          overflow: TextOverflow.ellipsis,
+          darkSurface: Theme.of(context).brightness == Brightness.dark,
         ),
         const SizedBox(height: 8),
         if (ch.channelName != null || channelNumber != null || logoBytes != null)

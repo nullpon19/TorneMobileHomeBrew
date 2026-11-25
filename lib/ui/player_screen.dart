@@ -188,6 +188,7 @@ import '../app/providers.dart';
 import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
 import 'epg_genre.dart';
+import 'epg_title_badges.dart';
 import 'format.dart';
 import 'jikkyo_momentum_graph.dart';
 import 'jikkyo_overlay.dart';
@@ -764,10 +765,12 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ],
                               ),
                               const SizedBox(height: 4),
-                              Text(
-                                programTitle ?? data.programTitle,
+                              BroadcastTitleLine(
+                                rawTitle: programTitle ?? data.programTitle,
                                 maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
+                                darkSurface: isDark,
+                                badgeScale: 1.0,
+                                maxAttributeBadges: 4,
                                 style: TextStyle(
                                   color: titleColor,
                                   fontSize: 14,
@@ -1951,10 +1954,11 @@ class LiveOsdProgramSection extends StatelessWidget {
         Row(
           children: [
             Expanded(
-              child: Text(
-                info.currentTitle,
+              child: BroadcastTitleLine(
+                rawTitle: info.currentTitle,
                 maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+                darkSurface: true,
+                badgeScale: 1.1,
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 15,
@@ -2023,10 +2027,12 @@ class LiveOsdProgramSection extends StatelessWidget {
                 const SizedBox(width: 8),
               ],
               Expanded(
-                child: Text(
-                  info.nextTitle!,
+                child: BroadcastTitleLine(
+                  rawTitle: info.nextTitle!,
                   maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  darkSurface: true,
+                  badgeScale: 0.95,
+                  maxAttributeBadges: 3,
                   style: const TextStyle(
                     color: Colors.white70,
                     fontSize: 13,
@@ -2058,10 +2064,11 @@ class RecordedOsdProgramSection extends StatelessWidget {
     return Row(
       children: [
         Expanded(
-          child: Text(
-            programTitle,
+          child: BroadcastTitleLine(
+            rawTitle: programTitle,
             maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+            darkSurface: true,
+            badgeScale: 1.1,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 15,
@@ -2498,10 +2505,11 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(
-                            title,
+                          BroadcastTitleHeading(
+                            rawTitle: title,
                             maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
+                            darkSurface: true,
+                            badgeScale: 1.15,
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 17,
@@ -8163,10 +8171,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ],
               ),
               const SizedBox(height: 6),
-              Text(
-                widget.nextEpisodeTitle ?? '次の話',
+              BroadcastTitleLine(
+                rawTitle: widget.nextEpisodeTitle ?? '次の話',
                 maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+                darkSurface: true,
+                badgeScale: 1.0,
+                maxAttributeBadges: 3,
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 14,
@@ -8631,10 +8641,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                   const SizedBox(width: 12),
                   Expanded(
-                    child: Text(
-                      headline,
+                    child: BroadcastTitleLine(
+                      rawTitle: headline,
                       maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                      darkSurface: true,
+                      badgeScale: 1.1,
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 16,

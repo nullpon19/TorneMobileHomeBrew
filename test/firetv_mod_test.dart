@@ -1003,7 +1003,7 @@ void main() {
       expect(find.text('2024/10/06 〜 2024/10/13'), findsOneWidget);
       expect(find.text('081モヤモヤさまぁ〜ず2'), findsOneWidget);
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsNothing,
       );
 
@@ -1011,20 +1011,22 @@ void main() {
       await tester.tap(find.text('わんだふるぷりきゅあ!'));
       await tester.pumpAndSettle();
       expect(
-        find.text('わんだふるぷりきゅあ! #37 みんなで初デート!?[デ][字]'),
+        find.text('わんだふるぷりきゅあ! #37 みんなで初デート!?'),
         findsOneWidget,
       );
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsOneWidget,
       );
+      expect(find.text('デ'), findsNWidgets(2));
+      expect(find.text('字'), findsNWidgets(2));
 
       // Toggle grouping OFF via FilterChip and verify persistence.
       await tester.tap(find.text('番組まとめ'));
       await tester.pumpAndSettle();
       expect(find.text('全 2 本'), findsNothing);
       expect(
-        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル![デ][字]'),
+        find.text('わんだふるぷりきゅあ! #36 特別なワンダフル!'),
         findsOneWidget,
       );
       expect(await kv.read('firetv_group_titles'), 'false');
@@ -12513,9 +12515,14 @@ void main() {
       // Tag-only edge case keeps safe fallback text
       final tagOnly = parseBroadcastTitleBadges('[字]');
       expect(tagOnly.cleanTitle, '[字]');
+
+      // `[ほか]` must NOT be treated as an attribute badge
+      final hoka = parseBroadcastTitleBadges('ｎｅｗｓ　ｅｖｅｒｙ．[字][ほか]');
+      expect(hoka.attributeBadges, ['字']);
+      expect(hoka.cleanTitle, contains('[ほか]'));
     });
 
-    testWidgets('EpgFormattedTitleText & EpgAttributeMiniBadge render in normal and inverted modes', (tester) async {
+    testWidgets('EpgFormattedTitleText, EpgAttributeMiniBadge, BroadcastTitleLine & BroadcastTitleHeading render in normal and inverted modes', (tester) async {
       final parsed = parseBroadcastTitleBadges('[新][字][生]ニュース特集');
       await tester.pumpWidget(
         MaterialApp(
@@ -12537,14 +12544,25 @@ void main() {
                   inverted: true,
                   compact: true,
                 ),
+                const BroadcastTitleLine(
+                  rawTitle: '[終][二][デ]録画・ライブ見出し',
+                  darkSurface: true,
+                ),
+                const BroadcastTitleHeading(
+                  rawTitle: '[初][字][再]詳細タイトル',
+                  darkSurface: false,
+                ),
               ],
             ),
           ),
         ),
       );
-      expect(find.text('字'), findsNWidgets(2));
+      expect(find.text('字'), findsNWidgets(3));
       expect(find.text('生'), findsNWidgets(2));
+      expect(find.text('デ'), findsOneWidget);
       expect(find.text('新', findRichText: true), findsWidgets);
+      expect(find.text('終', findRichText: true), findsWidgets);
+      expect(find.text('初', findRichText: true), findsWidgets);
     });
 
     test('JikkyoSettings defaults avoidSubtitleArea=false and persists white/fixed/NG filters', () async {

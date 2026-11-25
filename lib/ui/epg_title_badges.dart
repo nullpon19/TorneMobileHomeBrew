@@ -1,9 +1,9 @@
-/// ARIB programme mark parsing & miniature EPG tile badges (Phase 41).
+/// ARIB programme mark parsing & miniature EPG/title badges (Phase 41).
 ///
 /// Separates broadcast attribute tags (`[字]`, `[二]`, `[多]`, `[解]`, `[デ]`,
-/// `[再]`, `[生]`, etc.) into compact bordered badges placed beside the start
-/// time, while turning premier/final markers (`[新]`, `[終]`, `[初]`) into
-/// colored inline badges at the start of the cleaned title.
+/// `[再]`, `[生]`, etc.) into compact bordered badges, while turning
+/// premier/final markers (`[新]`, `[終]`, `[初]`) into colored inline badges at
+/// the start of the cleaned title.
 library;
 
 import 'package:material_ui/material_ui.dart';
@@ -65,7 +65,6 @@ const Set<String> _knownAttributeMarks = {
   'B',
   'N',
   'PPV',
-  'ほか',
 };
 
 final RegExp _markTokenPattern = RegExp(
@@ -112,11 +111,13 @@ class EpgAttributeMiniBadge extends StatelessWidget {
     required this.label,
     this.inverted = false,
     this.isDark = false,
+    this.badgeScale = 1.0,
   });
 
   final String label;
   final bool inverted;
   final bool isDark;
+  final double badgeScale;
 
   @override
   Widget build(BuildContext context) {
@@ -144,10 +145,13 @@ class EpgAttributeMiniBadge extends StatelessWidget {
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 0.5),
+      padding: EdgeInsets.symmetric(
+        horizontal: 3.0 * badgeScale,
+        vertical: 0.5 * badgeScale,
+      ),
       decoration: BoxDecoration(
         color: bgColor,
-        borderRadius: BorderRadius.circular(2.5),
+        borderRadius: BorderRadius.circular(2.5 * badgeScale),
         border: Border.all(color: borderColor, width: 0.8),
       ),
       child: Text(
@@ -155,7 +159,7 @@ class EpgAttributeMiniBadge extends StatelessWidget {
         maxLines: 1,
         style: TextStyle(
           color: fgColor,
-          fontSize: 8.5,
+          fontSize: 8.5 * badgeScale,
           fontWeight: FontWeight.w700,
           height: 1.05,
         ),
@@ -170,11 +174,13 @@ class EpgInlineTitleBadge extends StatelessWidget {
     required this.kind,
     this.inverted = false,
     this.compact = false,
+    this.badgeScale = 1.0,
   });
 
   final EpgInlineBadgeKind kind;
   final bool inverted;
   final bool compact;
+  final double badgeScale;
 
   @override
   Widget build(BuildContext context) {
@@ -187,19 +193,19 @@ class EpgInlineTitleBadge extends StatelessWidget {
     final fgColor = inverted ? accent : Colors.white;
     return Container(
       padding: EdgeInsets.symmetric(
-        horizontal: compact ? 3 : 4,
-        vertical: compact ? 0.5 : 1,
+        horizontal: (compact ? 3.0 : 4.0) * badgeScale,
+        vertical: (compact ? 0.5 : 1.0) * badgeScale,
       ),
       decoration: BoxDecoration(
         color: bgColor,
-        borderRadius: BorderRadius.circular(3),
+        borderRadius: BorderRadius.circular(3.0 * badgeScale),
       ),
       child: Text(
         kind.label,
         maxLines: 1,
         style: TextStyle(
           color: fgColor,
-          fontSize: compact ? 8.0 : 9.5,
+          fontSize: (compact ? 8.0 : 9.5) * badgeScale,
           fontWeight: FontWeight.w800,
           height: 1.05,
         ),
@@ -216,6 +222,7 @@ class EpgFormattedTitleText extends StatelessWidget {
     this.maxLines = 1,
     this.inverted = false,
     this.compact = false,
+    this.badgeScale = 1.0,
   });
 
   final ParsedBroadcastTitle parsed;
@@ -223,6 +230,7 @@ class EpgFormattedTitleText extends StatelessWidget {
   final int maxLines;
   final bool inverted;
   final bool compact;
+  final double badgeScale;
 
   @override
   Widget build(BuildContext context) {
@@ -242,11 +250,12 @@ class EpgFormattedTitleText extends StatelessWidget {
             WidgetSpan(
               alignment: PlaceholderAlignment.middle,
               child: Padding(
-                padding: const EdgeInsets.only(right: 3),
+                padding: EdgeInsets.only(right: 3 * badgeScale),
                 child: EpgInlineTitleBadge(
                   kind: kind,
                   inverted: inverted,
                   compact: compact,
+                  badgeScale: badgeScale,
                 ),
               ),
             ),
@@ -255,6 +264,133 @@ class EpgFormattedTitleText extends StatelessWidget {
       ),
       maxLines: maxLines,
       overflow: TextOverflow.ellipsis,
+    );
+  }
+}
+
+/// Compact title row with inline `[新]`/`[終]`/`[初]` pill(s) and trailing
+/// attribute mini-badges (`[字]`, `[二]`, `[再]`, etc.) so long titles elide
+/// cleanly without hiding the broadcast attribute icons.
+class BroadcastTitleLine extends StatelessWidget {
+  const BroadcastTitleLine({
+    super.key,
+    required this.rawTitle,
+    this.style,
+    this.maxLines = 1,
+    this.darkSurface = false,
+    this.inverted = false,
+    this.badgeScale = 1.05,
+    this.maxAttributeBadges = 5,
+  });
+
+  final String rawTitle;
+  final TextStyle? style;
+  final int maxLines;
+  final bool darkSurface;
+  final bool inverted;
+  final double badgeScale;
+  final int maxAttributeBadges;
+
+  @override
+  Widget build(BuildContext context) {
+    final parsed = parseBroadcastTitleBadges(rawTitle);
+    final attrs = parsed.attributeBadges.length > maxAttributeBadges
+        ? parsed.attributeBadges.sublist(0, maxAttributeBadges)
+        : parsed.attributeBadges;
+    final inlineScale = (badgeScale * 1.05).clamp(1.0, 1.3);
+    if (attrs.isEmpty) {
+      return EpgFormattedTitleText(
+        parsed: parsed,
+        style: style,
+        maxLines: maxLines,
+        inverted: inverted,
+        badgeScale: inlineScale,
+      );
+    }
+    return Row(
+      crossAxisAlignment: maxLines == 1
+          ? CrossAxisAlignment.center
+          : CrossAxisAlignment.start,
+      children: [
+        Flexible(
+          child: EpgFormattedTitleText(
+            parsed: parsed,
+            style: style,
+            maxLines: maxLines,
+            inverted: inverted,
+            badgeScale: inlineScale,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Padding(
+          padding: EdgeInsets.only(top: maxLines == 1 ? 0 : 2),
+          child: Wrap(
+            spacing: 3,
+            runSpacing: 2,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              for (final tag in attrs)
+                EpgAttributeMiniBadge(
+                  label: tag,
+                  inverted: inverted,
+                  isDark: darkSurface,
+                  badgeScale: badgeScale,
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Multi-line detail/dialog heading with inline `[新]`/`[終]`/`[初]` pill(s)
+/// and separated attribute mini-badges neatly aligned underneath.
+class BroadcastTitleHeading extends StatelessWidget {
+  const BroadcastTitleHeading({
+    super.key,
+    required this.rawTitle,
+    this.style,
+    this.maxLines = 3,
+    this.darkSurface = false,
+    this.badgeScale = 1.15,
+  });
+
+  final String rawTitle;
+  final TextStyle? style;
+  final int maxLines;
+  final bool darkSurface;
+  final double badgeScale;
+
+  @override
+  Widget build(BuildContext context) {
+    final parsed = parseBroadcastTitleBadges(rawTitle);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        EpgFormattedTitleText(
+          parsed: parsed,
+          style: style,
+          maxLines: maxLines,
+          badgeScale: (badgeScale * 1.08).clamp(1.0, 1.4),
+        ),
+        if (parsed.attributeBadges.isNotEmpty) ...[
+          const SizedBox(height: 5),
+          Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: [
+              for (final tag in parsed.attributeBadges)
+                EpgAttributeMiniBadge(
+                  label: tag,
+                  isDark: darkSurface,
+                  badgeScale: badgeScale,
+                ),
+            ],
+          ),
+        ],
+      ],
     );
   }
 }

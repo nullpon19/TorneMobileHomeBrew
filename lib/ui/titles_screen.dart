@@ -64,6 +64,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
 import 'multi_nasne_policy.dart';
@@ -1023,7 +1024,11 @@ class _TitleListState extends ConsumerState<_TitleList> {
                   key: indented ? null : ValueKey('title:$itemKey'),
                   selected: itemKey == widget.selectedKey,
                   leading: _TitleLeading(reg: owner, title: t),
-                  title: Text(t.title),
+                  title: BroadcastTitleLine(
+                    rawTitle: t.title,
+                    maxLines: 2,
+                    darkSurface: Theme.of(context).brightness == Brightness.dark,
+                  ),
                   subtitle: Text(
                     '${t.scheduledStart != null ? formatDateTimeJst(t.scheduledStart!) : ''}'
                     '${t.scheduledDurationSeconds != null ? ' (${formatDurationSeconds(t.scheduledDurationSeconds!)})' : ''}'
@@ -1427,11 +1432,11 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    t.title,
+                  BroadcastTitleHeading(
+                    rawTitle: t.title,
                     style: Theme.of(context).textTheme.titleLarge,
                     maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
+                    darkSurface: Theme.of(context).brightness == Brightness.dark,
                   ),
                   const SizedBox(height: 6),
                   Text(
