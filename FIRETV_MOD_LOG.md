@@ -425,7 +425,7 @@
 3. **3桁チャンネル番号＆局ロゴ画像のディスクキャッシュ化＆全画面展開 (`lib/core/store/registration_store.dart`, `app/bootstrap.dart`, `app/providers.dart`, `app/state.dart`, `app/bs_epg_providers.dart`, `core/parsing/epg.dart`, `ui/channel_badge.dart`, `live_screen.dart`, `epg_screen.dart`, `player_screen.dart`)**:
    - ARIB 伝送仕様により `PLTE` / `tRNS` チャンクが省略された放送局ロゴ（Color Type 3）に対し、ARIB STD-B24 / TR-B14 規定の固定 129 色 CLUT から標準 `PLTE` + `tRNS`（PNG CRC-32 付き、ビット深度別エントリ上限対応）を補完する `normalizeAribLogoPng` を導入（既存 `ChannelLogoCache.load` 時も自動補完）。
    - `ChannelLogoCache` (`channel_logo_cache.json`) を新設し、取得済みロゴ PNG を永続保存（手動「更新」時のみキャッシュ削除＋再取得）。`csChannelsProvider` / `csChannelLogosProvider` もベストエフォート追加。
-   - 共通部品 `ChannelLogoPlate`（暗い背景・ナイトモードでも黒文字ロゴが潰れない白系角丸プレート付き）と `ChannelNumberBadge`（`031` / `101` 等の 3 桁番号、5 桁 UPnP `channelNr` 除外）を作成し、TV 視聴一覧ではロゴ直下へ背景・枠なしのシンプルテキスト表示、TV 視聴詳細／番組表 `_ChannelHeader`／プレイヤー OSD ヘッダー 1 行目／左右チャンネル切替カードへ統一展開。
+   - 共通部品 `ChannelLogoPlate`（背景枠・余白なしの `ClipRRect` 直接角丸描画）と `ChannelNumberBadge`（`031` / `101` 等の 3 桁番号、5 桁 UPnP `channelNr` 除外）を作成し、TV 視聴一覧ではロゴ直下へ背景・枠なしのシンプルテキスト（14.5dp 太字）表示、TV 視聴詳細／番組表 `_ChannelHeader`／プレイヤー OSD ヘッダー 1 行目／左右チャンネル切替カードへ統一展開。
 4. **検証 (`test/firetv_mod_test.dart`)**:
    - 第25弾「一時停止」バッジ色アサーションを緑へ更新し、`liveStatusPresentation` 6パターン、`ChannelLogoCache`（レガシー自動補完含む）、3桁番号解決、`crc32Mpeg` テーブル検証、`normalizeAribLogoPng`（8bit/4bit `dart:ui` 実 PNG デコード＆RGBA 画素一致確認）、`LiveProgramProgressBar`・`LiveChannelSwitchPreviewCard`・`LiveScreen` EPG スピナー＆ロゴ直下番号描画テストを追加（`dart analyze` 問題なし、対象9スイート全214テスト合格）。
 

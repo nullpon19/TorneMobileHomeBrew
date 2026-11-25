@@ -69,8 +69,8 @@ Uint8List? resolveLiveChannelLogoBytes(
   );
 }
 
-/// Renders a station logo PNG inside a light rounded backing plate so dark-ink
-/// broadcaster logos remain crisp on dark OSD overlays and in night mode.
+/// Renders a station logo PNG clipped directly with rounded corners inside a
+/// fixed-size slot, with no background plate or border.
 class ChannelLogoPlate extends StatelessWidget {
   const ChannelLogoPlate({
     super.key,
@@ -89,24 +89,24 @@ class ChannelLogoPlate extends StatelessWidget {
   Widget build(BuildContext context) {
     final isDark =
         darkSurface || Theme.of(context).brightness == Brightness.dark;
-    return Container(
+    return SizedBox(
       width: width,
       height: height,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-      decoration: BoxDecoration(
-        color: isDark ? Colors.white.withValues(alpha: 0.92) : Colors.white,
-        borderRadius: BorderRadius.circular(4),
-        border: isDark ? null : Border.all(color: Colors.black12, width: 0.5),
-      ),
-      child: Image.memory(
-        bytes,
-        fit: BoxFit.contain,
-        gaplessPlayback: true,
-        errorBuilder: (_, _, _) => const Center(
-          child: Icon(
-            Icons.live_tv_outlined,
-            size: 16,
-            color: Colors.black38,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: width, maxHeight: height),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: Image.memory(
+              bytes,
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => Icon(
+                Icons.live_tv_outlined,
+                size: 18,
+                color: isDark ? Colors.white54 : Colors.black38,
+              ),
+            ),
           ),
         ),
       ),

@@ -258,23 +258,24 @@ class _LiveChannelListTile extends StatelessWidget {
         vertical: 8,
       ),
       leading: SizedBox(
-        width: 48,
+        width: 52,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             if (logoBytes != null)
-              ChannelLogoPlate(bytes: logoBytes!, width: 44, height: 26)
+              ChannelLogoPlate(bytes: logoBytes!, width: 48, height: 27)
             else
-              const Icon(Icons.live_tv_outlined, size: 24),
+              const Icon(Icons.live_tv_outlined, size: 26),
             if (channelNumber != null) ...[
-              const SizedBox(height: 2),
+              const SizedBox(height: 3),
               Text(
                 channelNumber!,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w600,
-                  height: 1.1,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.88),
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w700,
+                  height: 1.15,
                   fontFeatures: const [FontFeature.tabularFigures()],
                 ),
               ),
