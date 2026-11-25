@@ -3229,7 +3229,7 @@ void main() {
 
   group('Phase 20: Title unification, EPG reserved settings & ruler bars', () {
     testWidgets(
-      'SettingsScreen displays torne HB FireTV footer and persists EPG reserved style',
+      'SettingsScreen displays torne mobile HB footer and persists EPG reserved style',
       (tester) async {
         tester.view.physicalSize = const Size(1280, 900);
         tester.view.devicePixelRatio = 1.0;
@@ -3265,11 +3265,11 @@ void main() {
         expect(await kv.read('firetv_epg_reserved_style'), 'fill');
 
         await tester.scrollUntilVisible(
-          find.textContaining('torne HB FireTV'),
+          find.textContaining('torne mobile HB'),
           300,
           scrollable: find.byType(Scrollable).first,
         );
-        expect(find.textContaining('torne HB FireTV'), findsOneWidget);
+        expect(find.textContaining('torne mobile HB'), findsOneWidget);
       },
     );
 
@@ -3533,7 +3533,7 @@ void main() {
         // Complete registrations load so HomeScreen builds its refresh button & cards.
         storeCompleter.complete(const [reg]);
         await tester.pumpAndSettle();
-        expect(find.text('torne HB FireTV'), findsOneWidget);
+        expect(find.text('torne mobile HB'), findsOneWidget);
         expect(find.text('本体情報'), findsOneWidget);
         expect(primaryIsInRail(), isTrue);
 

@@ -499,7 +499,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Text(
               '発見にはローカルネットワークへのアクセス許可が必要です (iOS では許可ダイアログが'
               '表示される場合があります)。発見できない環境では手動登録を使ってください。\n\n'
-              'torne HB FireTV $appVersionLabel',
+              'torne mobile HB $appVersionLabel',
             ),
           ),
         ],

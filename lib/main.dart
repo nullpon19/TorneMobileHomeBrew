@@ -192,7 +192,7 @@ class TmhbApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final nightMode = ref.watch(nightModeProvider);
     return MaterialApp(
-      title: 'torne HB FireTV',
+      title: 'torne mobile HB',
       // Force Japanese locale so Fire OS fonts.xml picks NotoSansCJK JP
       // (index 0) instead of zh-Hans (index 2).
       locale: const Locale('ja', 'JP'),
