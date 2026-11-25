@@ -6,10 +6,13 @@ library;
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 
 import '../models/channel.dart';
 import '../models/device.dart';
 import '../models/epg.dart';
+import '../parsing/epg.dart' show normalizeAribLogoPng;
 
 /// Serializes asynchronous operations on one store so that
 /// read-modify-write sequences never interleave (plan 96). An
@@ -332,39 +335,20 @@ class EpgGuideCache {
   ) async {
     final raw = await _kv.read(_key(host, broadcastingType));
     if (raw == null) return const {};
-    try {
-      final decoded = jsonDecode(raw);
-      if (decoded is! Map) return const {};
-      final services = decoded['services'];
-      if (services is! List) return const {};
-      return {
-        for (final s in services)
-          if (s is Map && s['serviceId'] is num && s['events'] is List)
-            (s['serviceId'] as num).toInt(): [
-              for (final e in s['events'] as List)
-                if (e is Map) _eventFromJson(e.cast<String, dynamic>()),
-            ],
-      };
-    } on FormatException {
-      return const {};
+    if (raw.length >= 32768) {
+      return Isolate.run(() => _decodeEpgGuideCacheJson(raw));
     }
+    return _decodeEpgGuideCacheJson(raw);
   }
 
   Future<void> save(String host, int broadcastingType, EpgGuide guide) async {
-    await _kv.write(
-      _key(host, broadcastingType),
-      jsonEncode({
-        'broadcastingType': broadcastingType,
-        'savedAt': DateTime.now().toIso8601String(),
-        'services': [
-          for (final s in guide.services)
-            {
-              'serviceId': s.channel.serviceId,
-              'events': [for (final e in s.events) _eventToJson(e)],
-            },
-        ],
-      }),
-    );
+    final savedAtIso = DateTime.now().toIso8601String();
+    final encoded = guide.eventCount >= 200
+        ? await Isolate.run(
+            () => _encodeEpgGuideCacheJson(broadcastingType, savedAtIso, guide),
+          )
+        : _encodeEpgGuideCacheJson(broadcastingType, savedAtIso, guide);
+    await _kv.write(_key(host, broadcastingType), encoded);
   }
 
   static Map<String, dynamic> _eventToJson(EpgEvent e) => {
@@ -403,4 +387,153 @@ class EpgGuideCache {
     genreLevel1: (j['genreLevel1'] as num?)?.toInt(),
     genreLevel2: (j['genreLevel2'] as num?)?.toInt(),
   );
+}
+
+Map<int, List<EpgEvent>> _decodeEpgGuideCacheJson(String raw) {
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return const {};
+    final services = decoded['services'];
+    if (services is! List) return const {};
+    return {
+      for (final s in services)
+        if (s is Map && s['serviceId'] is num && s['events'] is List)
+          (s['serviceId'] as num).toInt(): [
+            for (final e in s['events'] as List)
+              if (e is Map) EpgGuideCache._eventFromJson(e.cast<String, dynamic>()),
+          ],
+    };
+  } on FormatException {
+    return const {};
+  }
+}
+
+String _encodeEpgGuideCacheJson(
+  int broadcastingType,
+  String savedAtIso,
+  EpgGuide guide,
+) =>
+    jsonEncode({
+      'broadcastingType': broadcastingType,
+      'savedAt': savedAtIso,
+      'services': [
+        for (final s in guide.services)
+          {
+            'serviceId': s.channel.serviceId,
+            'events': [
+              for (final e in s.events) EpgGuideCache._eventToJson(e),
+            ],
+          },
+      ],
+    });
+
+/// Default retention window before station logos are refreshed from nasne.
+const Duration channelLogoCacheMaxAge = Duration(days: 7);
+
+/// Builds a deterministic signature of [channels] (`serviceId`, `channelNumber`,
+/// `serviceName`) so station lineup/name changes trigger a logo cache refresh.
+String buildChannelLogoSignature(List<Channel> channels) {
+  if (channels.isEmpty) return '';
+  final sorted = List<Channel>.of(channels)
+    ..sort((a, b) {
+      final bySid = a.serviceId.compareTo(b.serviceId);
+      if (bySid != 0) return bySid;
+      final byNum = a.channelNumber.compareTo(b.channelNumber);
+      if (byNum != 0) return byNum;
+      return a.serviceName.compareTo(b.serviceName);
+    });
+  return [
+    for (final c in sorted)
+      '${c.serviceId}:${c.channelNumber}:${c.serviceName.trim()}',
+  ].join('|');
+}
+
+/// Persistent disk cache for broadcast station logo PNGs, keyed per device and
+/// broadcasting type (`serviceId -> Uint8List`).
+class ChannelLogoCache {
+  ChannelLogoCache(this._kv);
+
+  final KeyValueStore _kv;
+
+  static const String keyPrefix = 'channel-logos:';
+
+  String _key(String host, int broadcastingType) =>
+      '$keyPrefix$host:$broadcastingType';
+
+  Future<Map<int, Uint8List>?> load(
+    String host,
+    int broadcastingType, {
+    Duration? maxAge,
+    String? expectedChannelsSignature,
+    DateTime? now,
+  }) async {
+    final raw = await _kv.read(_key(host, broadcastingType));
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      if (maxAge != null) {
+        final savedRaw = decoded['savedAt'];
+        final savedAt =
+            savedRaw is String ? DateTime.tryParse(savedRaw) : null;
+        if (savedAt != null) {
+          final currentTime = now ?? DateTime.now();
+          if (currentTime.difference(savedAt) >= maxAge) return null;
+        }
+      }
+      if (expectedChannelsSignature != null &&
+          expectedChannelsSignature.isNotEmpty) {
+        final cachedSig = decoded['channelsSignature'];
+        if (cachedSig is! String || cachedSig != expectedChannelsSignature) {
+          return null;
+        }
+      }
+      final logosRaw = decoded['logos'];
+      if (logosRaw is! Map) return null;
+      final out = <int, Uint8List>{};
+      for (final entry in logosRaw.entries) {
+        final sid = int.tryParse(entry.key.toString());
+        final b64 = entry.value;
+        if (sid == null || b64 is! String || b64.isEmpty) continue;
+        final bytes = base64Decode(b64);
+        if (bytes.isNotEmpty) {
+          out[sid] = normalizeAribLogoPng(bytes);
+        }
+      }
+      return out.isEmpty ? null : out;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  Future<void> save(
+    String host,
+    int broadcastingType,
+    Map<int, List<int>> logos, {
+    String? channelsSignature,
+    DateTime? savedAt,
+  }) async {
+    if (logos.isEmpty) return;
+    final payload = <String, dynamic>{
+      'broadcastingType': broadcastingType,
+      'savedAt': (savedAt ?? DateTime.now()).toIso8601String(),
+      if (channelsSignature != null && channelsSignature.isNotEmpty)
+        'channelsSignature': channelsSignature,
+      'logos': {
+        for (final entry in logos.entries)
+          if (entry.value.isNotEmpty)
+            '${entry.key}': base64Encode(
+              normalizeAribLogoPng(
+                entry.value is Uint8List
+                    ? entry.value as Uint8List
+                    : Uint8List.fromList(entry.value),
+              ),
+            ),
+      },
+    };
+    await _kv.write(_key(host, broadcastingType), jsonEncode(payload));
+  }
+
+  Future<void> delete(String host, int broadcastingType) =>
+      _kv.delete(_key(host, broadcastingType));
 }

@@ -30,6 +30,7 @@
 library;
 
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../arib_b24.dart';
@@ -70,6 +71,22 @@ DateTime _eitStart(int mjd, int h, int m, int s) {
       .subtract(const Duration(hours: 9));
 }
 
+Uint32List _buildCrc32MpegTable() {
+  final table = Uint32List(256);
+  for (var i = 0; i < 256; i++) {
+    var crc = i << 24;
+    for (var bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80000000) != 0
+          ? ((crc << 1) ^ 0x04c11db7) & 0xffffffff
+          : (crc << 1) & 0xffffffff;
+    }
+    table[i] = crc;
+  }
+  return table;
+}
+
+final Uint32List _crc32MpegTable = _buildCrc32MpegTable();
+
 /// CRC-32/MPEG-2: polynomial 0x04C11DB7, initial value 0xFFFFFFFF,
 /// no input/output reflection, no final XOR. Every EIT section is
 /// trailed by this checksum computed over the whole section, so a
@@ -78,12 +95,8 @@ int crc32Mpeg(List<int> data, [int start = 0, int? end]) {
   var crc = 0xffffffff;
   final limit = end ?? data.length;
   for (var i = start; i < limit; i++) {
-    crc ^= data[i] << 24;
-    for (var bit = 0; bit < 8; bit++) {
-      crc = (crc & 0x80000000) != 0
-          ? ((crc << 1) ^ 0x04c11db7) & 0xffffffff
-          : (crc << 1) & 0xffffffff;
-    }
+    crc = ((crc << 8) ^ _crc32MpegTable[((crc >> 24) ^ data[i]) & 0xff]) &
+        0xffffffff;
   }
   return crc;
 }
@@ -96,48 +109,62 @@ class _Section {
   final Channel channel;
 }
 
-/// Finds the EIT sections in [plain]. A section is anchored on the
-/// (transportStreamId, originalNetworkId) byte pair of a known
-/// channel in the section header, with the table_id in the EIT
+/// Finds the EIT sections in [plain] in a single linear pass. A section is
+/// anchored on the (transportStreamId, originalNetworkId) byte pair of a
+/// known channel in the section header, with the table_id in the EIT
 /// range, the serviceId verified at its fixed offset, the section
 /// length inside the buffer and the trailing CRC-32/MPEG-2 valid.
 /// The checksum makes false anchors inside event data a non-issue
 /// (the full live corpus validates section by section, plan 22).
 List<_Section> _findSections(Uint8List plain, List<Channel> channels) {
-  final sections = <_Section>[];
+  if (channels.isEmpty || plain.length < 18) return const [];
+  final byTsOnid = <int, List<Channel>>{};
+  final seenTriples = <(int, int, int, int)>{};
   for (final ch in channels) {
-    final tsid = ch.transportStreamId, onid = ch.networkId;
-    for (var i = 8; i + 4 <= plain.length; i++) {
-      if (plain[i] == (tsid >> 8) &&
-          plain[i + 1] == (tsid & 0xff) &&
-          plain[i + 2] == (onid >> 8) &&
-          plain[i + 3] == (onid & 0xff)) {
-        final s = i - 8;
-        final tableId = plain[s];
-        // ARIB STD-B10: 0x60..0x6f is EIT schedule *other TS*.
-        // Preserve the original terrestrial EIT selection; accept the
-        // other-TS forms for the BS guide (not terrestrial).
-        final isEit = tableId == 0x4e ||
-            tableId == 0x4f ||
-            (tableId >= 0x50 && tableId <= 0x5f) ||
-            (ch.broadcastingType == 3 &&
-                tableId >= 0x60 && tableId <= 0x6f);
-        if (!isEit) continue;
-        if (_u16be(plain, s + 3) != ch.serviceId) continue;
-        final total = (((plain[s + 1] & 0x0f) << 8) | plain[s + 2]) + 3;
-        if (total < 18 || s + total > plain.length) continue;
-        if (crc32Mpeg(plain, s, s + total) != 0) continue;
-        sections.add(_Section(s, total, ch));
-      }
+    if (!seenTriples.add((
+      ch.broadcastingType,
+      ch.networkId,
+      ch.transportStreamId,
+      ch.serviceId,
+    ))) {
+      continue;
+    }
+    final key =
+        ((ch.transportStreamId & 0xffff) << 16) | (ch.networkId & 0xffff);
+    byTsOnid.putIfAbsent(key, () => <Channel>[]).add(ch);
+  }
+  final sections = <_Section>[];
+  for (var i = 8; i + 4 <= plain.length; i++) {
+    final key =
+        (plain[i] << 24) |
+        (plain[i + 1] << 16) |
+        (plain[i + 2] << 8) |
+        plain[i + 3];
+    final candidates = byTsOnid[key];
+    if (candidates == null) continue;
+    final s = i - 8;
+    final tableId = plain[s];
+    final sid = _u16be(plain, s + 3);
+    for (final ch in candidates) {
+      if (ch.serviceId != sid) continue;
+      // ARIB STD-B10: 0x60..0x6f is EIT schedule *other TS*.
+      // Preserve the original terrestrial EIT selection; accept the
+      // other-TS forms for the BS guide (not terrestrial).
+      final isEit = tableId == 0x4e ||
+          tableId == 0x4f ||
+          (tableId >= 0x50 && tableId <= 0x5f) ||
+          (ch.broadcastingType == 3 &&
+              tableId >= 0x60 &&
+              tableId <= 0x6f);
+      if (!isEit) continue;
+      final total = (((plain[s + 1] & 0x0f) << 8) | plain[s + 2]) + 3;
+      if (total < 18 || s + total > plain.length) continue;
+      if (crc32Mpeg(plain, s, s + total) != 0) continue;
+      sections.add(_Section(s, total, ch));
+      break;
     }
   }
-  sections.sort((a, b) => a.offset.compareTo(b.offset));
-  // Dedupe identical offsets (a channel listed twice).
-  final out = <_Section>[];
-  for (final s in sections) {
-    if (out.isEmpty || out.last.offset != s.offset) out.add(s);
-  }
-  return out;
+  return sections;
 }
 
 /// ARIB BS schedule can provide a title in the extended-event "番組名"
@@ -429,6 +456,169 @@ bool _listEquals(List<int> a, List<int> b) {
   throw const FormatException('zlib stream trailer not found');
 }
 
+/// Standard PNG IEEE CRC-32 (reflected polynomial 0xEDB88320). Kept separate
+/// from MPEG-2 [crc32Mpeg].
+Uint32List _buildCrc32PngTable() {
+  final table = Uint32List(256);
+  for (var i = 0; i < 256; i++) {
+    var c = i;
+    for (var bit = 0; bit < 8; bit++) {
+      c = (c & 1) != 0 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c;
+  }
+  return table;
+}
+
+final Uint32List _crc32PngTable = _buildCrc32PngTable();
+
+int _crc32Png(List<int> data, [int start = 0, int? end]) {
+  var c = 0xffffffff;
+  final limit = end ?? data.length;
+  for (var i = start; i < limit; i++) {
+    c = _crc32PngTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) & 0xffffffff;
+}
+
+/// ARIB STD-B24 / TR-B14 default 129-color CDT station logo palette (R, G, B, A).
+List<({int r, int g, int b, int a})> _buildAribLogoClut() {
+  final clut = <({int r, int g, int b, int a})>[];
+  for (var i = 0; i < 8; i++) {
+    clut.add((
+      r: (i & 1) != 0 ? 0xff : 0x00,
+      g: (i & 2) != 0 ? 0xff : 0x00,
+      b: (i & 4) != 0 ? 0xff : 0x00,
+      a: 0xff,
+    ));
+  }
+  clut.add((r: 0x00, g: 0x00, b: 0x00, a: 0x00));
+  for (var i = 1; i < 8; i++) {
+    clut.add((
+      r: (i & 1) != 0 ? 0xaa : 0x00,
+      g: (i & 2) != 0 ? 0xaa : 0x00,
+      b: (i & 4) != 0 ? 0xaa : 0x00,
+      a: 0xff,
+    ));
+  }
+  const levels = [0x00, 0x55, 0xaa, 0xff];
+  for (final r in levels) {
+    for (final g in levels) {
+      for (final b in levels) {
+        final allFull =
+            (r == 0x00 || r == 0xff) &&
+            (g == 0x00 || g == 0xff) &&
+            (b == 0x00 || b == 0xff);
+        final allHalf =
+            (r == 0x00 || r == 0xaa) &&
+            (g == 0x00 || g == 0xaa) &&
+            (b == 0x00 || b == 0xaa);
+        if (allFull || allHalf) continue;
+        clut.add((r: r, g: g, b: b, a: 0xff));
+      }
+    }
+  }
+  final opaqueCount = clut.length;
+  for (var i = 0; i < opaqueCount; i++) {
+    if (i == 8) continue;
+    final c = clut[i];
+    clut.add((r: c.r, g: c.g, b: c.b, a: 0x80));
+  }
+  return clut;
+}
+
+final List<({int r, int g, int b, int a})> _aribLogoClut =
+    _buildAribLogoClut();
+
+final Map<int, Uint8List> _aribLogoPaletteChunksByCount = {};
+
+Uint8List _buildPngChunk(String type, Uint8List body) {
+  final out = Uint8List(12 + body.length);
+  final view = ByteData.sublistView(out);
+  view.setUint32(0, body.length);
+  for (var i = 0; i < 4; i++) {
+    out[4 + i] = type.codeUnitAt(i);
+  }
+  out.setRange(8, 8 + body.length, body);
+  view.setUint32(8 + body.length, _crc32Png(out, 4, 8 + body.length));
+  return out;
+}
+
+Uint8List _aribPaletteChunksForCount(int entryCount) {
+  return _aribLogoPaletteChunksByCount.putIfAbsent(entryCount, () {
+    final rgb = Uint8List(entryCount * 3);
+    final alpha = Uint8List(entryCount);
+    for (var i = 0; i < entryCount; i++) {
+      final entry = _aribLogoClut[i];
+      rgb[i * 3] = entry.r;
+      rgb[i * 3 + 1] = entry.g;
+      rgb[i * 3 + 2] = entry.b;
+      alpha[i] = entry.a;
+    }
+    final plte = _buildPngChunk('PLTE', rgb);
+    final trns = _buildPngChunk('tRNS', alpha);
+    final combined = Uint8List(plte.length + trns.length);
+    combined.setRange(0, plte.length, plte);
+    combined.setRange(plte.length, combined.length, trns);
+    return combined;
+  });
+}
+
+/// Injects standard `PLTE` and `tRNS` chunks derived from the fixed ARIB CDT
+/// CLUT immediately after `IHDR` when an indexed-color PNG lacks `PLTE`.
+/// Standard PNGs (or non-indexed / already-paletted PNGs) are returned as-is.
+Uint8List normalizeAribLogoPng(Uint8List png) {
+  const afterIhdr = 33;
+  if (png.length < afterIhdr + 12) return png;
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (var i = 0; i < 8; i++) {
+    if (png[i] != sig[i]) return png;
+  }
+  if (png[8] != 0 ||
+      png[9] != 0 ||
+      png[10] != 0 ||
+      png[11] != 13 ||
+      png[12] != 0x49 ||
+      png[13] != 0x48 ||
+      png[14] != 0x44 ||
+      png[15] != 0x52) {
+    return png;
+  }
+  final bitDepth = png[24];
+  final colorType = png[25];
+  if (colorType != 3 ||
+      (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8)) {
+    return png;
+  }
+  var offset = afterIhdr;
+  while (offset + 12 <= png.length) {
+    final chunkLen =
+        (png[offset] << 24) |
+        (png[offset + 1] << 16) |
+        (png[offset + 2] << 8) |
+        png[offset + 3];
+    if (chunkLen < 0 || chunkLen > png.length - offset - 12) break;
+    final t0 = png[offset + 4];
+    final t1 = png[offset + 5];
+    final t2 = png[offset + 6];
+    final t3 = png[offset + 7];
+    if (t0 == 0x50 && t1 == 0x4c && t2 == 0x54 && t3 == 0x45) {
+      return png;
+    }
+    if (t0 == 0x49 && t1 == 0x45 && t2 == 0x4e && t3 == 0x44) {
+      break;
+    }
+    offset += 12 + chunkLen;
+  }
+  final entryCount = math.min(_aribLogoClut.length, 1 << bitDepth);
+  final paletteChunks = _aribPaletteChunksForCount(entryCount);
+  final out = Uint8List(png.length + paletteChunks.length);
+  out.setRange(0, afterIhdr, png, 0);
+  out.setRange(afterIhdr, afterIhdr + paletteChunks.length, paletteChunks);
+  out.setRange(afterIhdr + paletteChunks.length, out.length, png, afterIhdr);
+  return out;
+}
+
 /// Parses a `channelLogoDataGet` response into serviceId -> PNG
 /// bytes. Records without a PNG (length field 0) are omitted, as
 /// is the 8-byte file-header record.
@@ -455,7 +645,7 @@ Map<int, Uint8List> parseChannelLogos(List<int> rawResponse) {
     if (pngLen == 0 || 20 + pngLen > out.length) continue;
     final png = Uint8List.fromList(out.sublist(20, 20 + pngLen));
     if (png.length >= 4 && png[0] == 0x89 && png[1] == 0x50) {
-      logos[serviceId] = png;
+      logos[serviceId] = normalizeAribLogoPng(png);
     }
   }
   return logos;
@@ -631,4 +821,23 @@ Uint8List buildEpgGetBody(
 void _putU16be(Uint8List out, int offset, int value) {
   out[offset] = (value >> 8) & 0xff;
   out[offset + 1] = value & 0xff;
+}
+
+/// Deobfuscates, inflates, and parses a binary `chEpg/EPGGet` response
+/// payload into a normalized [EpgGuide]. Designed to be pure and safe to run on
+/// a background isolate via `Isolate.run`.
+EpgGuide parseEpgResponsePayload({
+  required Uint8List rawResponse,
+  required List<Channel> channels,
+  required int broadcastingType,
+}) {
+  final plain = inflateEpgResponse(rawResponse);
+  final parsed = parseEpgGuide(
+    plain,
+    channels,
+    broadcastingType: broadcastingType,
+  );
+  return broadcastingType == 3
+      ? completeBsEpgGuide(parsed, channels)
+      : parsed;
 }

@@ -82,7 +82,13 @@ class MainActivity : FlutterActivity() {
                         val id = call.argument<Int>("id")!!
                         val host = call.argument<String>("host")!!
                         val port = call.argument<Int>("port")!!
-                        val connection = AkeSocketConnection(id) { event -> emitAkeEvent(event) }
+                        val connection = AkeSocketConnection(
+                            id = id,
+                            emit = { event -> emitAkeEvent(event) },
+                            onClosed = { connId ->
+                                synchronized(akeConnections) { akeConnections.remove(connId) }
+                            },
+                        )
                         synchronized(akeConnections) { akeConnections[id] = connection }
                         akeExecutor.execute {
                             try {
@@ -179,6 +185,19 @@ class MainActivity : FlutterActivity() {
                     akeEventSink = null
                 }
             })
+    }
+
+    override fun onDestroy() {
+        val snapshot = synchronized(akeConnections) {
+            val copy = akeConnections.values.toList()
+            akeConnections.clear()
+            copy
+        }
+        for (connection in snapshot) {
+            connection.close()
+        }
+        akeExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun emitAkeEvent(event: Map<String, Any?>) {
@@ -520,7 +539,9 @@ private object FcntlCompat {
 private class AkeSocketConnection(
     private val id: Int,
     private val emit: (Map<String, Any?>) -> Unit,
+    private val onClosed: (Int) -> Unit,
 ) {
+    private val closeLock = Any()
     private var fd: FileDescriptor? = null
     private var input: FileInputStream? = null
     private var output: FileOutputStream? = null
@@ -576,7 +597,7 @@ private class AkeSocketConnection(
         val buffer = ByteArray(16384)
         try {
             while (!closed) {
-                val count = input!!.read(buffer)
+                val count = input?.read(buffer) ?: -1
                 if (count > 0) {
                     emit(
                         mapOf(
@@ -600,6 +621,9 @@ private class AkeSocketConnection(
                     ),
                 )
             }
+        } finally {
+            onClosed(id)
+            close()
         }
     }
 
@@ -624,21 +648,28 @@ private class AkeSocketConnection(
     }
 
     fun close() {
-        closed = true
-        // Best effort: closing the descriptor and the streams wakes
-        // the read loop in practice; a lingering reader exits when
-        // the peer closes and its events are dropped by the Dart
-        // side, which has already forgotten this connection.
+        val inStream: FileInputStream?
+        val outStream: FileOutputStream?
+        val descriptor: FileDescriptor?
+        synchronized(closeLock) {
+            closed = true
+            inStream = input
+            outStream = output
+            descriptor = fd
+            input = null
+            output = null
+            fd = null
+        }
+        // Close streams & OS fd idempotently so peer FIN never leaves
+        // the DTCP-IP AKE socket sitting in CLOSE-WAIT.
         try {
-            input?.close()
+            inStream?.close()
         } catch (_: Exception) {
         }
         try {
-            output?.close()
+            outStream?.close()
         } catch (_: Exception) {
         }
-        val descriptor = fd
-        fd = null
         if (descriptor != null) {
             try {
                 Os.close(descriptor)

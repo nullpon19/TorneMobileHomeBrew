@@ -189,6 +189,9 @@ class DtcpMediaFetcher {
         'content-length ${response.contentLength}',
       );
       if (response.statusCode != HttpStatus.ok) {
+        try {
+          await response.listen((_) {}, onError: (_) {}).cancel();
+        } catch (_) {}
         throw NasneError.http(response.statusCode, 'dtcp:http');
       }
       return response;
@@ -327,6 +330,7 @@ class DtcpProxy {
     int? windowCapBytesOverride,
     bool isLive = false,
     bool autoReconnect = false,
+    int maxInitialReconnectAttempts = 3,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
       Duration(seconds: 3),
@@ -345,6 +349,8 @@ class DtcpProxy {
        _totalDuration = totalDuration, // ignore: prefer_initializing_formals
        _isLive = isLive, // ignore: prefer_initializing_formals
        _autoReconnect = autoReconnect, // ignore: prefer_initializing_formals
+       // ignore: prefer_initializing_formals
+       _maxInitialReconnectAttempts = maxInitialReconnectAttempts,
        _onReauthenticate = onReauthenticate, // ignore: prefer_initializing_formals
        _reconnectBackoff = reconnectBackoff; // ignore: prefer_initializing_formals
 
@@ -359,6 +365,7 @@ class DtcpProxy {
   final DiagLog _diag;
   final bool _isLive;
   final bool _autoReconnect;
+  final int _maxInitialReconnectAttempts;
   final Future<void> Function()? _onReauthenticate;
   final List<Duration> _reconnectBackoff;
 
@@ -382,14 +389,28 @@ class DtcpProxy {
   int _pumpGeneration = 0;
   bool _legacyPumpActive = false;
   int _cipherBytes = 0;
+  int _plaintextBytes = 0;
   int _servedBytes = 0;
   DateTime? _firstServedAt;
   DateTime? _lastServedAt;
   int _consecutiveReconnectErrors = 0;
+  Object? _lastUpstreamError;
   int _requestCount = 0;
+
+  /// Total ciphertext bytes received from upstream so far.
+  int get cipherBytes => _cipherBytes;
+
+  /// Total plaintext bytes decrypted so far.
+  int get plaintextBytes => _plaintextBytes;
 
   /// Total plaintext bytes written to the downstream player so far.
   int get servedBytes => _servedBytes;
+
+  /// Number of downstream HTTP GET requests handled so far.
+  int get downstreamRequestCount => _requestCount;
+
+  /// Most recent upstream error / unexpected EOF recorded by the proxy, if any.
+  Object? get lastUpstreamError => _lastUpstreamError;
 
   /// Wall-clock time when the first plaintext byte was sent on the active
   /// legacy stream, or `null` if nothing has been served yet.
@@ -483,6 +504,7 @@ class DtcpProxy {
     int? windowCapBytesOverride,
     bool isLive = false,
     bool autoReconnect = false,
+    int maxInitialReconnectAttempts = 3,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
       Duration(seconds: 3),
@@ -504,6 +526,7 @@ class DtcpProxy {
       windowCapBytesOverride: windowCapBytesOverride,
       isLive: isLive,
       autoReconnect: autoReconnect,
+      maxInitialReconnectAttempts: maxInitialReconnectAttempts,
       onReauthenticate: onReauthenticate,
       reconnectBackoff: reconnectBackoff,
     );
@@ -626,6 +649,8 @@ class DtcpProxy {
                 if (pumpGen != _pumpGeneration) break;
                 consecutiveErrors = 0;
                 _consecutiveReconnectErrors = 0;
+                _lastUpstreamError = null;
+                _plaintextBytes += piece.length;
                 if (!firstPlainLogged) {
                   firstPlainLogged = true;
                   _diag(
@@ -700,9 +725,28 @@ class DtcpProxy {
           queue.close();
           return;
         }
-        final delay = _backoffForAttempt(consecutiveErrors);
+        final recordedError =
+            attemptError ??
+            NasneError.unreachable(
+              'dtcp:proxy',
+              cause: 'the upstream ended the stream before delivering media',
+            );
+        _lastUpstreamError = recordedError;
         consecutiveErrors++;
         _consecutiveReconnectErrors = consecutiveErrors;
+        if (plainBytes == 0 && consecutiveErrors > _maxInitialReconnectAttempts) {
+          _diag(
+            DiagCategory.playback,
+            'proxy: initial stream failed after $_maxInitialReconnectAttempts '
+            'reconnect attempts with 0 plaintext decrypted: $recordedError',
+          );
+          queue.close(recordedError);
+          return;
+        }
+        final rawDelay = _backoffForAttempt(consecutiveErrors - 1);
+        final delay = (plainBytes == 0 && rawDelay > const Duration(seconds: 2))
+            ? const Duration(seconds: 2)
+            : rawDelay;
         _diag(
           DiagCategory.playback,
           'proxy: live reconnect attempt $consecutiveErrors after '
@@ -833,7 +877,15 @@ class DtcpProxy {
     _queue.notify();
     _claimed = true;
     _downstreamGone = false;
-    if (_autoReconnect && (_queue.isClosed || !_legacyPumpActive)) {
+    final initialStartFailed =
+        _plaintextBytes == 0 &&
+        _queue.isClosed &&
+        _queue.bufferedBytes == 0 &&
+        _queue.hasError;
+    if (_autoReconnect &&
+        !initialStartFailed &&
+        (_queue.isClosed || !_legacyPumpActive)) {
+      ++_pumpGeneration;
       await _iterator?.cancel();
       _iterator = null;
       _queue = _PlaintextQueue();

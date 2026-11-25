@@ -6,7 +6,9 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show zlib;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -21,6 +23,7 @@ import 'package:tmhb/core/core.dart';
 import 'package:tmhb/core/dtcp/arib_ts_caption_tap.dart';
 import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
+import 'package:tmhb/ui/channel_badge.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/format.dart';
@@ -6425,7 +6428,7 @@ void main() {
           isPaused: true,
         );
         expect(delayedPausedBadge.label, '一時停止');
-        expect(delayedPausedBadge.color, const Color(0xFFEF6C00));
+        expect(delayedPausedBadge.color, const Color(0xFF2E7D32));
 
         final delayedNormalBadge = osdLiveStatusBadgeSpec(
           liveDelayedByPause: true,
@@ -9834,6 +9837,1957 @@ void main() {
               ),
             ),
             isTrue,
+          );
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 36: Live detail/list EPG sync, strict recording badge, partial-start matching, and EPG return cursor target',
+    () {
+      const channelMeta = Channel(
+        broadcastingType: terrestrialBroadcastingType,
+        networkId: 0x7880,
+        transportStreamId: 0x7880,
+        serviceId: 0x0400,
+        serviceType: 1,
+        channelNumber: 1,
+        serviceName: '日テレ１',
+      );
+      const reg = RegisteredNasne(
+        host: '192.0.2.36',
+        udn: 'uuid:p36',
+        friendlyName: 'nasne-p36',
+        macAddr: '00:11:22:33:44:66',
+      );
+
+      test(
+        'isProgramMatchingActiveRecording excludes ended A-programme and future C-programme even while channel records B-programme',
+        () {
+          final now = DateTime.utc(2026, 11, 25, 11, 15); // 20:15 JST
+          final schedB = RecordSchedule(
+            id: 'sched-b',
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            durationSeconds: 3600,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          // Programme A (ended 10 min ago) must NOT show 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 10, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 11, 0),
+              now: now,
+            ),
+            isFalse,
+          );
+
+          // Programme B (active & overlapping) shows 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 11, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 12, 0),
+              now: now,
+            ),
+            isTrue,
+          );
+
+          // Programme C (future) must NOT show 録画中.
+          expect(
+            isProgramMatchingActiveRecording(
+              activeSchedule: schedB,
+              programStart: DateTime.utc(2026, 11, 25, 12, 0),
+              programEnd: DateTime.utc(2026, 11, 25, 13, 0),
+              now: now,
+            ),
+            isFalse,
+          );
+        },
+      );
+
+      test(
+        'resolveLiveChannelDisplay overrides stale A-programme snapshot with current EPG B-programme without leaking old descriptions',
+        () {
+          final staleChannel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            genre: 'ニュース',
+            programTitle: '古いA番組',
+            description: '古いA番組の概要',
+            longDescription: '古いA番組の詳細',
+            programStart: DateTime.utc(2026, 11, 25, 10, 0),
+            programEnd: DateTime.utc(2026, 11, 25, 11, 0),
+          );
+          final eventB = EpgEvent(
+            eventId: 502,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: '新しいB番組',
+            shortText: 'Bの要点',
+            description: 'Bの詳細説明本文',
+            genreLevel1: 3,
+          );
+          final resolved = resolveLiveChannelDisplay(
+            channel: staleChannel,
+            guideEvents: [eventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolved.programTitle, '新しいB番組');
+          expect(resolved.programStart, eventB.start);
+          expect(resolved.programEnd, eventB.end);
+          expect(resolved.genre, 'ドラマ');
+          expect(resolved.shortDescription, 'Bの要点');
+          expect(resolved.longDescription, 'Bの詳細説明本文');
+
+          // New EPG event without descriptions must NOT leak A's old text.
+          final bareEventB = EpgEvent(
+            eventId: 503,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: '説明なしB番組',
+          );
+          final resolvedBare = resolveLiveChannelDisplay(
+            channel: staleChannel,
+            guideEvents: [bareEventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolvedBare.programTitle, '説明なしB番組');
+          expect(resolvedBare.shortDescription, isNull);
+          expect(resolvedBare.longDescription, isNull);
+
+          // Minimal LiveChannel without start/end times keeps its own title
+          // while borrowing EPG times when an on-air EPG event exists.
+          const timelessChannel = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: 'ライブ固有タイトル',
+          );
+          final resolvedTimeless = resolveLiveChannelDisplay(
+            channel: timelessChannel,
+            guideEvents: [eventB],
+            now: DateTime.utc(2026, 11, 25, 11, 20),
+          );
+          expect(resolvedTimeless.programTitle, 'ライブ固有タイトル');
+          expect(resolvedTimeless.programStart, eventB.start);
+          expect(resolvedTimeless.programEnd, eventB.end);
+        },
+      );
+
+      test(
+        'findMatchingSchedule matches partial-start immediate recording (eventId == 0) to B-programme and never A-programme',
+        () {
+          final eventA = EpgEvent(
+            eventId: 601,
+            start: DateTime.utc(2026, 11, 25, 10, 0),
+            duration: const Duration(hours: 1),
+            title: 'A番組',
+          );
+          final eventB = EpgEvent(
+            eventId: 602,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: 'B番組',
+          );
+          // Immediate manual recording started 15 min after B began, running to B's end.
+          final partialB = RecordSchedule(
+            id: 'partial-b',
+            start: DateTime.utc(2026, 11, 25, 11, 15),
+            durationSeconds: 45 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+          expect(findMatchingSchedule([partialB], channelMeta, eventA), isNull);
+          expect(
+            findMatchingSchedule([partialB], channelMeta, eventB)?.id,
+            'partial-b',
+          );
+        },
+      );
+
+      testWidgets(
+        'showEpgEventDetail omits 録画中 badge for already-ended events even if reservation window overlaps',
+        (tester) async {
+          final now = DateTime.now();
+          final endedEventA = EpgEvent(
+            eventId: 701,
+            start: now.subtract(const Duration(minutes: 65)),
+            duration: const Duration(minutes: 60),
+            title: '終了済みA番組',
+          );
+          final activeSched = RecordSchedule(
+            id: 'rec-active',
+            start: now.subtract(const Duration(minutes: 10)),
+            durationSeconds: 3600,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x02bd',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: Builder(
+                  builder: (ctx) => ElevatedButton(
+                    onPressed: () => showEpgEventDetail(
+                      ctx,
+                      reg: reg,
+                      channel: channelMeta,
+                      channelName: '日テレ１',
+                      event: endedEventA,
+                      existingSchedule: activeSched,
+                    ),
+                    child: const Text('open'),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.tap(find.text('open'));
+          await tester.pumpAndSettle();
+
+          expect(find.text('終了済みA番組'), findsOneWidget);
+          expect(find.text('録画予約済み'), findsOneWidget);
+          expect(find.text('録画中'), findsNothing);
+        },
+      );
+
+      test(
+        'findEpgTileTargetForLiveChannel finds active switched-to B-programme and falls back cleanly for hidden subchannels',
+        () {
+          const chMain = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            serviceType: 1,
+            channelNumber: 1,
+            serviceName: 'ＮＨＫ総合１',
+          );
+          const chOther = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7881,
+            transportStreamId: 0x7881,
+            serviceId: 0x0410,
+            serviceType: 1,
+            channelNumber: 2,
+            serviceName: 'Ｅテレ１',
+          );
+          final evB = EpgEvent(
+            eventId: 802,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: 'チャンネル切替先B番組',
+          );
+          final guide = EpgGuide(
+            broadcastingType: terrestrialBroadcastingType,
+            services: [
+              EpgServiceGuide(channel: chMain, events: [evB]),
+              EpgServiceGuide(
+                channel: chOther,
+                events: [
+                  EpgEvent(
+                    eventId: 809,
+                    start: DateTime.utc(2026, 11, 25, 11, 0),
+                    duration: const Duration(hours: 1),
+                    title: '別局B番組',
+                  ),
+                ],
+              ),
+            ],
+          );
+
+          final switchedMatch = findEpgTileTargetForLiveChannel(
+            guide: guide,
+            targetChannel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7881&tsid=7881&svid=0410',
+              bandId: '0/video/LiveTuner/DTTB',
+              networkId: 0x7881,
+              transportStreamId: 0x7881,
+              serviceId: 0x0410,
+              programTitle: '別局B番組',
+            ),
+            now: DateTime.utc(2026, 11, 25, 11, 10),
+          );
+          expect(switchedMatch, isNotNull);
+          expect(switchedMatch!.serviceIndex, 1);
+          expect(switchedMatch.event.eventId, 809);
+          expect(
+            switchedMatch.tileKey,
+            '${chOther.serviceId}-809-${switchedMatch.event.start}',
+          );
+
+          // Hidden subchannel (0x0401 sharing nid/tsid with chMain 0x0400).
+          final subFallback = findEpgTileTargetForLiveChannel(
+            guide: guide,
+            targetChannel: const LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0401',
+              bandId: '0/video/LiveTuner/DTTB',
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0401,
+              programTitle: 'サブ番組',
+            ),
+            now: DateTime.utc(2026, 11, 25, 11, 10),
+          );
+          expect(subFallback, isNotNull);
+          expect(subFallback!.serviceIndex, 0);
+          expect(subFallback.event.eventId, 802);
+        },
+      );
+
+      testWidgets(
+        'LiveChannelDetailView resolves current B-programme with 録画中 from EPG even when LiveChannel snapshot is stale A-programme, and hides 録画中 on expired CS snapshots',
+        (tester) async {
+          final now = DateTime.now();
+          final staleTerrestrial = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: '終了したA番組',
+            description: '古いA説明',
+            programStart: now.subtract(const Duration(minutes: 70)),
+            programEnd: now.subtract(const Duration(minutes: 10)),
+            res: const [
+              TitleRes(
+                url: 'http://192.0.2.36:58890/web/video/ch?quality=dr',
+                protocolInfo: 'http-get:*:application/x-dtcp1:*',
+                cleartextSize: 100,
+                quality: 'dr',
+              ),
+            ],
+          );
+          final guide = EpgGuide(
+            broadcastingType: terrestrialBroadcastingType,
+            services: [
+              EpgServiceGuide(
+                channel: channelMeta,
+                events: [
+                  EpgEvent(
+                    eventId: 901,
+                    start: now.subtract(const Duration(minutes: 10)),
+                    duration: const Duration(minutes: 60),
+                    title: '放送中のB番組',
+                    description: 'Bの新しい説明',
+                    genreLevel1: 3,
+                  ),
+                ],
+              ),
+            ],
+          );
+          final recB = RecordSchedule(
+            id: 'rec-b-live',
+            start: now.subtract(const Duration(minutes: 5)),
+            durationSeconds: 55 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: terrestrialBroadcastingType,
+              channelType: terrestrialBroadcastingType,
+              serviceId: 0x0400,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x7880,0x0385',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+
+          final container1 = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              epgGuideProvider(reg).overrideWith((ref) async => guide),
+              schedulesProvider(reg).overrideWith((ref) async => [recB]),
+            ],
+          );
+          addTearDown(container1.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container1,
+              child: MaterialApp(
+                home: Scaffold(
+                  body: LiveChannelDetailView(
+                    reg: reg,
+                    channel: staleTerrestrial,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('放送中のB番組'), findsOneWidget);
+          expect(find.text('Bの新しい説明'), findsOneWidget);
+          expect(find.text('録画中'), findsOneWidget);
+          expect(find.text('終了したA番組'), findsNothing);
+
+          // On CS (no EPG), an already-expired A-programme snapshot must NOT
+          // show 録画中 while B-programme is recording.
+          final expiredCs = LiveChannel(
+            id: '0/video/LiveTuner/CS/ch?nid=0006&tsid=0001&svid=0100',
+            bandId: '0/video/LiveTuner/CS',
+            networkId: 0x0006,
+            transportStreamId: 0x0001,
+            serviceId: 0x0100,
+            channelName: 'CS チャンネル',
+            programTitle: '終了済みCSのA番組',
+            programStart: now.subtract(const Duration(minutes: 70)),
+            programEnd: now.subtract(const Duration(minutes: 10)),
+            res: staleTerrestrial.res,
+          );
+          final recCs = RecordSchedule(
+            id: 'rec-cs-b',
+            start: now.subtract(const Duration(minutes: 5)),
+            durationSeconds: 55 * 60,
+            conditionId: '1',
+            channel: const ScheduleChannel(
+              broadcastingType: csBroadcastingType,
+              channelType: csBroadcastingType,
+              serviceId: 0x0100,
+            ),
+            desiredQualityMode: 100,
+            desiredMatchingId: ',,0x0006,0x0000',
+            reservationCreatorId: '2000',
+            priorityFlag: 0,
+            recordDestinationId: 'HDD',
+          );
+          final container2 = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              schedulesProvider(reg).overrideWith((ref) async => [recCs]),
+            ],
+          );
+          addTearDown(container2.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container2,
+              child: MaterialApp(
+                home: Scaffold(
+                  body: LiveChannelDetailView(reg: reg, channel: expiredCs),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('終了済みCSのA番組'), findsOneWidget);
+          expect(find.text('録画中'), findsNothing);
+        },
+      );
+    },
+  );
+
+  group(
+    'Phase 37: Live 5-min rewind cache, playback seek/switch lock, and Live list progress/next auto-refresh',
+    () {
+      test(
+        'computeMpvBufferPlan allocates 5-min Live backward cache and splits proportionally under 1 GiB reserve',
+        () {
+          final liveMobile = computeMpvBufferPlan(
+            live: true,
+            bufferSeconds: 0,
+            isAndroid: true,
+            availableDiskBytes: 2 * 1024 * 1024 * 1024,
+            cacheDirPath: '/tmp/mpv_cache',
+            liveUseMobile: true,
+          );
+          expect(liveMobile.useDiskCache, isTrue);
+          expect(liveMobile.demuxerMaxBytes, 105 * 1024 * 1024);
+          expect(liveMobile.demuxerMaxBackBytes, 105 * 1024 * 1024);
+
+          final liveDrAmple = computeMpvBufferPlan(
+            live: true,
+            bufferSeconds: 0,
+            isAndroid: true,
+            availableDiskBytes: 4 * 1024 * 1024 * 1024,
+            cacheDirPath: '/tmp/mpv_cache',
+            liveUseMobile: false,
+          );
+          expect(liveDrAmple.useDiskCache, isTrue);
+          expect(liveDrAmple.demuxerMaxBytes, 550 * 1024 * 1024);
+          expect(liveDrAmple.demuxerMaxBackBytes, 550 * 1024 * 1024);
+
+          const tightAvail = 1400 * 1024 * 1024;
+          final liveDrTight = computeMpvBufferPlan(
+            live: true,
+            bufferSeconds: 0,
+            isAndroid: true,
+            availableDiskBytes: tightAvail,
+            cacheDirPath: '/tmp/mpv_cache',
+            liveUseMobile: false,
+          );
+          expect(liveDrTight.useDiskCache, isTrue);
+          expect(liveDrTight.demuxerMaxBackBytes, greaterThan(2 * 1024 * 1024));
+          expect(
+            liveDrTight.demuxerMaxBytes + liveDrTight.demuxerMaxBackBytes,
+            lessThanOrEqualTo(tightAvail - minFreeDiskReserveBytes),
+          );
+
+          final liveTiny = computeMpvBufferPlan(
+            live: true,
+            bufferSeconds: 0,
+            isAndroid: true,
+            availableDiskBytes: 900 * 1024 * 1024,
+            cacheDirPath: '/tmp/mpv_cache',
+            liveUseMobile: false,
+          );
+          expect(liveTiny.useDiskCache, isFalse);
+          expect(liveTiny.demuxerMaxBytes, lessThanOrEqualTo(24 * 1024 * 1024));
+          expect(liveTiny.demuxerMaxBackBytes, 8 * 1024 * 1024);
+        },
+      );
+
+      test(
+        'parseDemuxerCacheStateRange & resolveLiveTimeshiftSeekTarget clamp bounds and detect live edge',
+        () {
+          const jsonMulti =
+              '{"cache-duration":42.5,"seekable-ranges":[{"start":10.0,"end":40.0},{"start":120.0,"end":300.0}]}';
+          final matchFirst = parseDemuxerCacheStateRange(
+            jsonMulti,
+            currentPosSeconds: 25.0,
+          );
+          expect(matchFirst, isNotNull);
+          expect(matchFirst!.startSeconds, 10.0);
+          expect(matchFirst.endSeconds, 40.0);
+          expect(matchFirst.cacheDurationSeconds, 42.5);
+
+          final matchLast = parseDemuxerCacheStateRange(jsonMulti);
+          expect(matchLast, isNotNull);
+          expect(matchLast!.startSeconds, 120.0);
+          expect(matchLast.endSeconds, 300.0);
+          expect(parseDemuxerCacheStateRange('{"seekable-ranges":[]}'), isNull);
+
+          final midRewind = resolveLiveTimeshiftSeekTarget(
+            currentPosSeconds: 280.0,
+            deltaSeconds: -20.0,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+          );
+          expect(midRewind.targetSeconds, 260.0);
+          expect(midRewind.hitStart, isFalse);
+          expect(midRewind.reachedLiveEdge, isFalse);
+
+          final clampedStart = resolveLiveTimeshiftSeekTarget(
+            currentPosSeconds: 125.0,
+            deltaSeconds: -10.0,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+          );
+          expect(clampedStart.targetSeconds, 120.5);
+          expect(clampedStart.hitStart, isTrue);
+          expect(clampedStart.reachedLiveEdge, isFalse);
+
+          final snappedEnd = resolveLiveTimeshiftSeekTarget(
+            currentPosSeconds: 294.0,
+            deltaSeconds: 10.0,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+          );
+          expect(snappedEnd.targetSeconds, 299.5);
+          expect(snappedEnd.reachedLiveEdge, isTrue);
+        },
+      );
+
+      test(
+        'channel switch lock, playback badge, and Live recording delay note follow Phase 37 policy',
+        () {
+          expect(
+            canSwitchLiveChannelOnDirectionKey(
+              live: true,
+              liveDelayedByPause: false,
+              playingNow: true,
+            ),
+            isTrue,
+          );
+          expect(
+            canSwitchLiveChannelOnDirectionKey(
+              live: true,
+              liveDelayedByPause: false,
+              playingNow: false,
+            ),
+            isFalse,
+          );
+          expect(
+            canSwitchLiveChannelOnDirectionKey(
+              live: true,
+              liveDelayedByPause: true,
+              playingNow: true,
+            ),
+            isFalse,
+          );
+          expect(
+            canSwitchLiveChannelOnDirectionKey(
+              live: false,
+              liveDelayedByPause: false,
+              playingNow: true,
+            ),
+            isFalse,
+          );
+
+          final playbackBadge = osdLiveStatusBadgeSpec(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: false,
+            isRewoundPlayback: true,
+          );
+          expect(playbackBadge.label, 'プレイバック');
+
+          final chaseBadge = osdLiveStatusBadgeSpec(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.5,
+            isPaused: false,
+            isRewoundPlayback: true,
+          );
+          expect(chaseBadge.label, '追いかけ再生 1.5倍');
+
+          final normalDialog = buildLiveRecordingConfirmContent(
+            titleText: 'ニュース番組',
+            qualityLabel: 'DR（元画質・字幕保持）',
+            liveDelayedByPause: false,
+          );
+          expect(normalDialog, isNot(contains('巻き戻し位置からは録画できません')));
+
+          final delayedDialog = buildLiveRecordingConfirmContent(
+            titleText: 'ニュース番組',
+            qualityLabel: 'DR（元画質・字幕保持）',
+            liveDelayedByPause: true,
+          );
+          expect(delayedDialog, contains('現在の放送位置から開始されます'));
+          expect(delayedDialog, contains('巻き戻し位置からは録画できません'));
+        },
+      );
+
+      test(
+        'resolveLiveChannelDisplay populates progress/next programme and computeNextLiveListRefresh picks earliest boundary',
+        () {
+          final now = DateTime.utc(2026, 11, 25, 11, 15);
+          const ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: '現行テスト番組',
+          );
+          final evCur = EpgEvent(
+            eventId: 701,
+            start: DateTime.utc(2026, 11, 25, 11, 0),
+            duration: const Duration(hours: 1),
+            title: '現行テスト番組',
+          );
+          final evNext = EpgEvent(
+            eventId: 702,
+            start: DateTime.utc(2026, 11, 25, 12, 0),
+            duration: const Duration(minutes: 30),
+            title: '次のテスト番組',
+          );
+          final display = resolveLiveChannelDisplay(
+            channel: ch,
+            guideEvents: [evCur, evNext],
+            now: now,
+          );
+          expect(display.progress, closeTo(0.25, 0.001));
+          expect(display.nextProgramTitle, '次のテスト番組');
+          expect(display.nextProgramStart, evNext.start);
+          expect(display.nextProgramEnd, evNext.end);
+          expect(display.nextTimeRange, isNotNull);
+
+          final csChannel = LiveChannel(
+            id: '0/video/LiveTuner/CS/ch?nid=0006&tsid=0001&svid=012C',
+            bandId: '0/video/LiveTuner/CS',
+            networkId: 0x0006,
+            transportStreamId: 0x0001,
+            serviceId: 0x012C,
+            channelName: 'CS局',
+            programTitle: 'CS現行番組',
+            programStart: DateTime.utc(2026, 11, 25, 11, 0),
+            programEnd: DateTime.utc(2026, 11, 25, 11, 30),
+          );
+          final csDisplay = resolveLiveChannelDisplay(
+            channel: csChannel,
+            guideEvents: const [],
+            now: now,
+          );
+          expect(csDisplay.progress, closeTo(0.5, 0.001));
+          expect(csDisplay.nextProgramTitle, isNull);
+
+          final boundaryRefresh = computeNextLiveListRefresh(
+            programEnds: [
+              DateTime.utc(2026, 11, 25, 11, 14, 0), // already ended: ignored
+              DateTime.utc(2026, 11, 25, 12, 0, 0),
+              DateTime.utc(2026, 11, 25, 11, 15, 12), // +12s earliest
+            ],
+            now: now,
+          );
+          expect(boundaryRefresh.isBoundary, isTrue);
+          expect(boundaryRefresh.delay, const Duration(seconds: 13));
+
+          final periodicRefresh = computeNextLiveListRefresh(
+            programEnds: [DateTime.utc(2026, 11, 25, 11, 45, 0)],
+            now: now,
+          );
+          expect(periodicRefresh.isBoundary, isFalse);
+          expect(periodicRefresh.delay, const Duration(seconds: 30));
+        },
+      );
+
+      testWidgets(
+        'LiveScreen renders progress bar and next programme line cleanly on Fire TV 960x540 layout',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:live-list-phase37',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final now = DateTime.now().toUtc();
+          final evCur = EpgEvent(
+            eventId: 801,
+            start: now.subtract(const Duration(minutes: 15)),
+            duration: const Duration(minutes: 60),
+            title: '放送中メイン番組',
+          );
+          final evNext = EpgEvent(
+            eventId: 802,
+            start: evCur.end,
+            duration: const Duration(minutes: 30),
+            title: '次に見られる予定番組',
+          );
+          final ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: 'テストTV',
+            programTitle: '古いスナップショット番組',
+            programStart: evCur.start.subtract(const Duration(hours: 1)),
+            programEnd: evCur.start,
+          );
+          final guide = EpgGuide(
+            broadcastingType: terrestrialBroadcastingType,
+            services: [
+              EpgServiceGuide(
+                channel: Channel(
+                  broadcastingType: terrestrialBroadcastingType,
+                  networkId: 0x7880,
+                  transportStreamId: 0x7880,
+                  serviceId: 0x0400,
+                  serviceType: 1,
+                  channelNumber: 4,
+                  serviceName: 'テストTV',
+                ),
+                events: [evCur, evNext],
+              ),
+            ],
+          );
+
+          final container = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              liveChannelsProvider(reg).overrideWith(
+                (ref) async => [
+                  LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [ch],
+                  ),
+                ],
+              ),
+              epgGuideProvider(reg).overrideWith((ref) async => guide),
+              schedulesProvider(reg).overrideWith((ref) async => const []),
+            ],
+          );
+          addTearDown(container.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container,
+              child: const MaterialApp(home: LiveScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('テストTV'), findsOneWidget);
+          expect(find.textContaining('放送中メイン番組'), findsOneWidget);
+          expect(find.byType(LinearProgressIndicator), findsOneWidget);
+          expect(find.text('次'), findsOneWidget);
+          expect(find.text('次に見られる予定番組'), findsOneWidget);
+        },
+      );
+
+      test(
+        'clampLivePendingSeekDelta and resolveLiveCacheCoordinatePos enforce playable cache bounds',
+        () {
+          final noCache = clampLivePendingSeekDelta(
+            basePosSeconds: 50.0,
+            desiredDeltaSeconds: -10.0,
+            cacheStartSeconds: null,
+            cacheEndSeconds: null,
+          );
+          expect(noCache.hasCache, isFalse);
+          expect(noCache.clampedDelta, 0.0);
+
+          final inside = clampLivePendingSeekDelta(
+            basePosSeconds: 200.0,
+            desiredDeltaSeconds: -10.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(inside.hasCache, isTrue);
+          expect(inside.clampedDelta, -10.0);
+          expect(inside.hitStart, isFalse);
+          expect(inside.hitEnd, isFalse);
+
+          final hitStart = clampLivePendingSeekDelta(
+            basePosSeconds: 105.0,
+            desiredDeltaSeconds: -20.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(hitStart.hasCache, isTrue);
+          expect(hitStart.clampedDelta, -4.0);
+          expect(hitStart.hitStart, isTrue);
+          expect(hitStart.hitEnd, isFalse);
+
+          final hitEnd = clampLivePendingSeekDelta(
+            basePosSeconds: 215.0,
+            desiredDeltaSeconds: 10.0,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 220.0,
+          );
+          expect(hitEnd.hasCache, isTrue);
+          expect(hitEnd.clampedDelta, 4.5);
+          expect(hitEnd.hitEnd, isTrue);
+
+          expect(
+            resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: 180.0,
+              timePosSeconds: 0.0,
+              cacheStartSeconds: 120.0,
+              cacheEndSeconds: 200.0,
+              fallbackSeconds: 200.0,
+            ),
+            180.0,
+          );
+          expect(
+            resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: 50000.0,
+              timePosSeconds: 150.0,
+              cacheStartSeconds: 120.0,
+              cacheEndSeconds: 200.0,
+              fallbackSeconds: 200.0,
+            ),
+            150.0,
+          );
+        },
+      );
+
+      test(
+        'resolveLiveTimeshiftBarState maps rewindable cache window and live edge onto programme total timeline',
+        () {
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: '60分特番',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+          );
+
+          final state = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          expect(state.usesProgramTimeline, isTrue);
+          expect(state.liveEdgeFraction, closeTo(0.5, 0.001));
+          expect(state.playableStartFraction, closeTo(0.45, 0.001));
+          expect(state.playbackFraction, closeTo(0.475, 0.001));
+          expect(state.rewindableSeconds, 180);
+          expect(state.lagSeconds, 90);
+          expect(state.isTimeshifting, isTrue);
+
+          final fallback = resolveLiveTimeshiftBarState(
+            info: null,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          expect(fallback.usesProgramTimeline, isFalse);
+          expect(fallback.liveEdgeFraction, 1.0);
+          expect(fallback.playableStartFraction, 0.0);
+          expect(fallback.playbackFraction, closeTo(0.5, 0.001));
+        },
+      );
+
+      testWidgets(
+        'LiveOsdProgramSection renders single integrated LiveProgramProgressBar during playback timeshift',
+        (tester) async {
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: 'タイムシフト番組',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+            nextTitle: '次の番組',
+            nextStart: end,
+            nextEnd: end.add(const Duration(minutes: 30)),
+          );
+          final timeshift = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 120.0,
+            cacheEndSeconds: 300.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: true,
+          );
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                backgroundColor: Colors.black,
+                body: SizedBox(
+                  width: 900,
+                  child: LiveOsdProgramSection(
+                    info: info,
+                    timeshift: timeshift,
+                  ),
+                ),
+              ),
+            ),
+          );
+
+          expect(find.byType(LiveProgramProgressBar), findsOneWidget);
+          expect(find.text('戻れる範囲: 最大 -3分'), findsOneWidget);
+          expect(find.text('現在位置から -1分30秒'), findsOneWidget);
+          expect(find.text('次の番組'), findsOneWidget);
+        },
+      );
+
+      test(
+        'liveDirectionKeySeekDeltaSeconds returns negative delta for rewind and normal LIVE ignores natural buffer lag',
+        () {
+          expect(PlayerScreen.rewindStep.inSeconds, -10);
+          expect(PlayerScreen.forwardStep.inSeconds, 10);
+          expect(liveDirectionKeySeekDeltaSeconds(forward: false), -10.0);
+          expect(liveDirectionKeySeekDeltaSeconds(forward: true), 10.0);
+
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: '通常LIVE番組',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+          );
+          final normalLive = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 213.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: false,
+          );
+          expect(normalLive.isTimeshifting, isFalse);
+          expect(normalLive.lagSeconds, 0);
+          expect(normalLive.rewindableSeconds, 113);
+          expect(normalLive.playbackFraction, normalLive.liveEdgeFraction);
+        },
+      );
+
+      test(
+        'liveStatusPresentation returns matching badges and 4-state bar colors including paused+rewound pair',
+        () {
+          final live = liveStatusPresentation(
+            liveDelayedByPause: false,
+            liveCatchUpRate: 1.0,
+          );
+          expect(live.badges.single.label, 'LIVE');
+          expect(live.badges.single.color, Colors.redAccent);
+          expect(live.barColor, Colors.redAccent);
+
+          final paused = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: true,
+            isRewoundPlayback: false,
+          );
+          expect(paused.badges.single.label, '一時停止');
+          expect(paused.badges.single.color, const Color(0xFF2E7D32));
+          expect(paused.barColor, const Color(0xFF66BB6A));
+
+          final pausedRewinding = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: true,
+            isRewoundPlayback: true,
+          );
+          expect(pausedRewinding.badges.map((b) => b.label).toList(), [
+            'プレイバック',
+            '一時停止',
+          ]);
+          expect(pausedRewinding.badges[0].color, const Color(0xFF0277BD));
+          expect(pausedRewinding.badges[1].color, const Color(0xFF2E7D32));
+          expect(pausedRewinding.barColor, Colors.lightBlueAccent);
+
+          final playingBack = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: false,
+            isRewoundPlayback: true,
+          );
+          expect(playingBack.badges.single.label, 'プレイバック');
+          expect(playingBack.badges.single.color, const Color(0xFF0277BD));
+          expect(playingBack.barColor, Colors.lightBlueAccent);
+
+          final fastChase = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.5,
+            isPaused: false,
+            isRewoundPlayback: false,
+          );
+          expect(fastChase.badges.single.label, '追いかけ再生 1.5倍');
+          expect(fastChase.badges.single.color, const Color(0xFFEF6C00));
+          expect(fastChase.barColor, Colors.orangeAccent);
+
+          final normalChase = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: false,
+            isRewoundPlayback: false,
+          );
+          expect(normalChase.badges.single.label, '追いかけ再生');
+          expect(normalChase.badges.single.color, const Color(0xFFEF6C00));
+          expect(normalChase.barColor, Colors.orangeAccent);
+        },
+      );
+
+      test(
+        'formatChannelNumber3Digit, resolveLiveChannelNumberLabel, and ChannelLogoCache handle 3-digit numbers and cached PNGs',
+        () async {
+          expect(formatChannelNumber3Digit(31), '031');
+          expect(formatChannelNumber3Digit(101), '101');
+          expect(formatChannelNumber3Digit(296), '296');
+          expect(formatChannelNumber3Digit(0), isNull);
+          expect(formatChannelNumber3Digit(null), isNull);
+          expect(formatChannelNumber3Digit(30310), isNull);
+
+          const liveCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            channelName: 'テストNHK',
+            channelNr: 30310,
+            programTitle: '番組',
+          );
+          const matchingCh = Channel(
+            broadcastingType: 2,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            serviceType: 1,
+            channelNumber: 31,
+            serviceName: 'テストNHK',
+          );
+          expect(
+            resolveLiveChannelNumberLabel(liveCh, const [matchingCh]),
+            '031',
+          );
+          expect(resolveLiveChannelNumberLabel(liveCh, const []), isNull);
+
+          final kv = InMemoryKeyValueStore();
+          final cache = ChannelLogoCache(kv);
+          expect(await cache.load('192.0.2.1', 2), isNull);
+          final png = Uint8List.fromList([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+          await cache.save('192.0.2.1', 2, {0xde00: png});
+          final loaded = await cache.load('192.0.2.1', 2);
+          expect(loaded, isNotNull);
+          expect(loaded![0xde00], png);
+
+          await cache.save('192.0.2.1', 3, const {});
+          expect(await cache.load('192.0.2.1', 3), isNull);
+
+          await kv.write('${ChannelLogoCache.keyPrefix}192.0.2.1:2', '{bad');
+          expect(await cache.load('192.0.2.1', 2), isNull);
+
+          await cache.save('192.0.2.1', 2, {0xde00: png});
+          await cache.delete('192.0.2.1', 2);
+          expect(await cache.load('192.0.2.1', 2), isNull);
+        },
+      );
+
+      test(
+        'crc32Mpeg lookup table and parseEpgResponsePayload produce valid checksum and guide',
+        () {
+          final bytes = Uint8List.fromList([0x4e, 0xf0, 0x05, 0x12, 0x34, 0xab]);
+          final crc = crc32Mpeg(bytes);
+          final withCrc = Uint8List.fromList([
+            ...bytes,
+            (crc >> 24) & 0xff,
+            (crc >> 16) & 0xff,
+            (crc >> 8) & 0xff,
+            crc & 0xff,
+          ]);
+          expect(crc32Mpeg(withCrc), 0);
+
+          final guide = parseEpgResponsePayload(
+            rawResponse: Uint8List.fromList(
+              zlib.encode(const <int>[]).map((b) => b ^ epgXorKey).toList(),
+            ),
+            channels: const [],
+            broadcastingType: 2,
+          );
+          expect(guide.broadcastingType, 2);
+          expect(guide.services, isEmpty);
+        },
+      );
+
+      testWidgets(
+        'LiveProgramProgressBar accepts custom accentColor and LiveChannelSwitchPreviewCard shows 3-digit number and logo plate',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final fakePng = Uint8List.fromList([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          ]);
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:preview-badge-test',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          const ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            channelName: 'テストテレビ',
+            programTitle: 'テスト放送番組',
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData.dark(),
+              home: Scaffold(
+                body: Stack(
+                  children: [
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(24),
+                        child: LiveProgramProgressBar(
+                          state: LiveTimeshiftBarState(
+                            liveEdgeFraction: 0.7,
+                            playableStartFraction: 0.5,
+                            playbackFraction: 0.6,
+                            rewindableSeconds: 120,
+                            lagSeconds: 45,
+                            isTimeshifting: true,
+                            usesProgramTimeline: true,
+                          ),
+                          showDetailsRow: true,
+                          accentColor: Color(0xFF66BB6A),
+                        ),
+                      ),
+                    ),
+                    LiveChannelSwitchPreviewCard(
+                      direction: ChannelSwitchDirection.next,
+                      visible: true,
+                      entry: const LiveChannelSwitchEntry(
+                        channel: ch,
+                        primaryReg: reg,
+                      ),
+                      channelNumber: '031',
+                      channelLogoBytes: fakePng,
+                      onTap: () {},
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+
+          expect(find.text('031'), findsOneWidget);
+          expect(find.byType(ChannelLogoPlate), findsOneWidget);
+          expect(find.text('テストテレビ'), findsOneWidget);
+        },
+      );
+
+      testWidgets(
+        'LiveScreen renders EPG loading indicator until guide completes, then shows 3-digit number, logo plate, and next programme',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:live-loading-spinner',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final now = DateTime.now().toUtc();
+          final evCur = EpgEvent(
+            eventId: 901,
+            start: now.subtract(const Duration(minutes: 10)),
+            duration: const Duration(minutes: 60),
+            title: '現在オンエア番組',
+          );
+          final evNext = EpgEvent(
+            eventId: 902,
+            start: evCur.end,
+            duration: const Duration(minutes: 30),
+            title: '次オンエア番組',
+          );
+          const dttbCh = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            serviceType: 1,
+            channelNumber: 31,
+            serviceName: 'テスト地デジ局',
+          );
+          final liveCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: 'テスト地デジ局',
+            programTitle: 'スナップショット',
+            programStart: evCur.start,
+            programEnd: evCur.end,
+          );
+          final guideCompleter = Completer<EpgGuide>();
+          final fakePng = Uint8List.fromList([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          ]);
+
+          final container = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              channelsProvider(reg).overrideWith((ref) async => [dttbCh]),
+              channelLogosProvider(reg).overrideWith(
+                (ref) async => {0x0400: fakePng},
+              ),
+              liveChannelsProvider(reg).overrideWith(
+                (ref) async => [
+                  LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [liveCh],
+                  ),
+                ],
+              ),
+              epgGuideProvider(reg).overrideWith((ref) => guideCompleter.future),
+              schedulesProvider(reg).overrideWith((ref) async => const []),
+            ],
+          );
+          addTearDown(container.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container,
+              child: const MaterialApp(home: LiveScreen()),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.pump();
+
+          expect(find.text('次の番組を読み込み中…'), findsOneWidget);
+          expect(find.text('031'), findsOneWidget);
+          expect(find.byType(ChannelLogoPlate), findsOneWidget);
+          expect(find.byType(ChannelNumberBadge), findsNothing);
+
+          guideCompleter.complete(
+            EpgGuide(
+              broadcastingType: terrestrialBroadcastingType,
+              services: [
+                EpgServiceGuide(channel: dttbCh, events: [evCur, evNext]),
+              ],
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('次の番組を読み込み中…'), findsNothing);
+          expect(find.text('次オンエア番組'), findsOneWidget);
+        },
+      );
+
+      test(
+        'normalizeAribLogoPng injects ARIB CLUT PLTE/tRNS for 8-bit and 4-bit PLTE-less PNGs and decodes via dart:ui, upgrading ChannelLogoCache loads',
+        () async {
+          int crc32Png(List<int> data) {
+            var c = 0xffffffff;
+            for (final b in data) {
+              c ^= b;
+              for (var k = 0; k < 8; k++) {
+                c = (c & 1) != 0 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+              }
+            }
+            return (c ^ 0xffffffff) & 0xffffffff;
+          }
+
+          Uint8List chunk(String type, List<int> body) {
+            final out = Uint8List(12 + body.length);
+            final view = ByteData.sublistView(out);
+            view.setUint32(0, body.length);
+            for (var i = 0; i < 4; i++) {
+              out[4 + i] = type.codeUnitAt(i);
+            }
+            out.setRange(8, 8 + body.length, body);
+            view.setUint32(
+              8 + body.length,
+              crc32Png(out.sublist(4, 8 + body.length)),
+            );
+            return out;
+          }
+
+          Uint8List buildIndexedNoPltePng({
+            required int width,
+            required int height,
+            required int bitDepth,
+            required List<int> scanlines,
+          }) {
+            final ihdrBody = Uint8List(13);
+            final ihdrView = ByteData.sublistView(ihdrBody);
+            ihdrView.setUint32(0, width);
+            ihdrView.setUint32(4, height);
+            ihdrBody[8] = bitDepth;
+            ihdrBody[9] = 3; // indexed-color
+            final idat = chunk('IDAT', zlib.encode(scanlines));
+            final iend = chunk('IEND', const []);
+            final ihdr = chunk('IHDR', ihdrBody);
+            return Uint8List.fromList([
+              0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+              ...ihdr,
+              ...idat,
+              ...iend,
+            ]);
+          }
+
+          // 8-bit 2x2: (0,0)=idx8 transparent, (1,0)=idx1 red, (0,1)=idx2 green, (1,1)=idx4 blue
+          final raw8 = buildIndexedNoPltePng(
+            width: 2,
+            height: 2,
+            bitDepth: 8,
+            scanlines: [0, 8, 1, 0, 2, 4],
+          );
+          final normalized8 = normalizeAribLogoPng(raw8);
+          expect(normalized8.length, greaterThan(raw8.length));
+          expect(ascii.decode(normalized8.sublist(37, 41)), 'PLTE');
+          expect(normalizeAribLogoPng(normalized8), normalized8);
+
+          final codec8 = await ui.instantiateImageCodec(normalized8);
+          final frame8 = await codec8.getNextFrame();
+          final rgba8 = (await frame8.image.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          ))!
+              .buffer
+              .asUint8List();
+          frame8.image.dispose();
+          codec8.dispose();
+          expect(rgba8, [
+            0, 0, 0, 0, // (0,0) transparent
+            255, 0, 0, 255, // (1,0) red
+            0, 255, 0, 255, // (0,1) green
+            0, 0, 255, 255, // (1,1) blue
+          ]);
+
+          // 4-bit 2x1: indices [8, 1] -> 0x81, PLTE must be capped to 16 entries (48 bytes)
+          final raw4 = buildIndexedNoPltePng(
+            width: 2,
+            height: 1,
+            bitDepth: 4,
+            scanlines: [0, 0x81],
+          );
+          final normalized4 = normalizeAribLogoPng(raw4);
+          expect(ByteData.sublistView(normalized4, 33, 37).getUint32(0), 48);
+          final codec4 = await ui.instantiateImageCodec(normalized4);
+          final frame4 = await codec4.getNextFrame();
+          final rgba4 = (await frame4.image.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          ))!
+              .buffer
+              .asUint8List();
+          frame4.image.dispose();
+          codec4.dispose();
+          expect(rgba4, [
+            0, 0, 0, 0,
+            255, 0, 0, 255,
+          ]);
+
+          // Legacy cached PLTE-less PNG in ChannelLogoCache is upgraded on load().
+          final kv = InMemoryKeyValueStore();
+          await kv.write(
+            '${ChannelLogoCache.keyPrefix}192.0.2.1:2',
+            jsonEncode({
+              'broadcastingType': 2,
+              'logos': {'56832': base64Encode(raw8)},
+            }),
+          );
+          final upgraded = await ChannelLogoCache(kv).load('192.0.2.1', 2);
+          expect(upgraded, isNotNull);
+          expect(upgraded![56832], normalized8);
+        },
+      );
+
+      test(
+        'Phase 38.3: OSD cache tick polling, timeshift programme boundary sync, UPnP priority & logo TTL/signature',
+        () async {
+          // 1. OSD cache tick polling & display-change sensitivity
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: true,
+            ),
+            isFalse,
+          );
+          // Even if floor values remain equal (e.g. start=0.2, end=10.6 -> 10.9),
+          // rounded rewindable span crossing 10s -> 11s triggers rebuild.
+          expect(
+            hasLiveCacheRangeDisplayChanged(
+              prevStart: 0.2,
+              prevEnd: 10.6,
+              prevPos: 10.6,
+              nextStart: 0.2,
+              nextEnd: 10.9,
+              nextPos: 10.9,
+            ),
+            isTrue,
+          );
+          expect(
+            hasLiveCacheRangeDisplayChanged(
+              prevStart: 0.2,
+              prevEnd: 10.6,
+              prevPos: 10.6,
+              nextStart: 0.2,
+              nextEnd: 10.65,
+              nextPos: 10.65,
+            ),
+            isFalse,
+          );
+
+          // 2. Timeshift playback spanning programme boundary A -> B
+          final progStart = DateTime.utc(2026, 11, 25, 12, 0);
+          final progMid = DateTime.utc(2026, 11, 25, 12, 15);
+          final progEnd = DateTime.utc(2026, 11, 25, 12, 20);
+          final wallNow = DateTime.utc(2026, 11, 25, 12, 17);
+          final ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            programTitle: '番組B',
+            programStart: progMid,
+            programEnd: progEnd,
+          );
+          final eventA = EpgEvent(
+            eventId: 701,
+            start: progStart,
+            duration: const Duration(minutes: 15),
+            title: '番組A',
+            shortText: '番組Aの内容',
+          );
+          final eventB = EpgEvent(
+            eventId: 702,
+            start: progMid,
+            duration: const Duration(minutes: 5),
+            title: '番組B',
+            shortText: '番組Bの内容',
+          );
+          final lagSec = resolveLivePlaybackLagSeconds(
+            liveDelayedByPause: true,
+            cacheStartSeconds: 60.0,
+            cacheEndSeconds: 540.0,
+            effectivePosSeconds: 240.0, // 300s behind -> 12:12:00
+          );
+          expect(lagSec, 300.0);
+          final playbackClock = resolveLivePlaybackClock(
+            now: wallNow,
+            lagSeconds: lagSec,
+          );
+          expect(playbackClock, DateTime.utc(2026, 11, 25, 12, 12));
+          final infoA = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: playbackClock,
+          );
+          expect(infoA.currentTitle, '番組A');
+          expect(infoA.remainingMinutes, 3);
+          expect(infoA.nextTitle, '番組B');
+          final barA = resolveLiveTimeshiftBarState(
+            info: infoA,
+            now: wallNow,
+            cacheStartSeconds: 60.0,
+            cacheEndSeconds: 540.0,
+            effectivePosSeconds: 240.0,
+            liveDelayedByPause: true,
+          );
+          expect(barA.liveEdgeFraction, 1.0);
+          expect(barA.playbackFraction, closeTo(0.80, 0.001));
+          expect(barA.lagSeconds, 300);
+          expect(barA.rewindableSeconds, 480);
+          final detailA = resolveLiveProgramDetail(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: playbackClock,
+          );
+          expect(detailA.title, '番組A');
+          expect(detailA.body, contains('番組Aの内容'));
+
+          // Moving forward into B's window switches title/detail to B
+          final clockB = resolveLivePlaybackClock(
+            now: wallNow,
+            lagSeconds: 60.0, // 12:16:00
+          );
+          final infoB = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [eventA, eventB],
+            now: clockB,
+          );
+          expect(infoB.currentTitle, '番組B');
+
+          expect(
+            shouldRefreshPlayerLiveGuide(
+              lastUpdatedAt: wallNow.subtract(const Duration(minutes: 9)),
+              now: wallNow,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldRefreshPlayerLiveGuide(
+              lastUpdatedAt: wallNow.subtract(const Duration(minutes: 10)),
+              now: wallNow,
+            ),
+            isTrue,
+          );
+
+          // 3. Emergency UPnP active schedule overrides stale EPG slot without leaking EPG text
+          final emergencyCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: '日テレ１',
+            genre: 'ニュース',
+            programTitle: '緊急ニュース特番',
+            description: '緊急報道',
+            programStart: DateTime.utc(2026, 11, 25, 12, 0),
+            programEnd: DateTime.utc(2026, 11, 25, 12, 30),
+          );
+          final staleScheduledA = EpgEvent(
+            eventId: 801,
+            start: DateTime.utc(2026, 11, 25, 12, 0),
+            duration: const Duration(hours: 1),
+            title: '通常番組A',
+            shortText: '通常番組Aの概要',
+            description: '通常番組Aの詳細',
+          );
+          final laterEvent = EpgEvent(
+            eventId: 802,
+            start: DateTime.utc(2026, 11, 25, 13, 0),
+            duration: const Duration(hours: 1),
+            title: '後続番組C',
+          );
+          final emergencyDisplay = resolveLiveChannelDisplay(
+            channel: emergencyCh,
+            guideEvents: [staleScheduledA, laterEvent],
+            now: DateTime.utc(2026, 11, 25, 12, 10),
+          );
+          expect(emergencyDisplay.programTitle, '緊急ニュース特番');
+          expect(emergencyDisplay.programEnd, DateTime.utc(2026, 11, 25, 12, 30));
+          expect(emergencyDisplay.shortDescription, '緊急報道');
+          expect(emergencyDisplay.longDescription, isNull);
+          expect(emergencyDisplay.nextProgramTitle, '後続番組C');
+
+          // 4. ChannelLogoCache TTL & channel lineup signature validation
+          final logoKv = InMemoryKeyValueStore();
+          final logoCache = ChannelLogoCache(logoKv);
+          const chList1 = [
+            Channel(
+              broadcastingType: 2,
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0400,
+              serviceType: 1,
+              channelNumber: 41,
+              serviceName: '旧局名',
+            ),
+          ];
+          const chListRenamed = [
+            Channel(
+              broadcastingType: 2,
+              networkId: 0x7880,
+              transportStreamId: 0x7880,
+              serviceId: 0x0400,
+              serviceType: 1,
+              channelNumber: 41,
+              serviceName: '新局名',
+            ),
+          ];
+          final sig1 = buildChannelLogoSignature(chList1);
+          final sig2 = buildChannelLogoSignature(chListRenamed);
+          expect(sig1, isNot(sig2));
+          final savedAt = DateTime.utc(2026, 11, 18, 12, 0);
+          final sampleLogo = Uint8List.fromList([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3,
+          ]);
+          await logoCache.save(
+            '192.0.2.1',
+            2,
+            {0x0400: sampleLogo},
+            channelsSignature: sig1,
+            savedAt: savedAt,
+          );
+          // Within 7 days & matching signature -> hit
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig1,
+              now: savedAt.add(const Duration(days: 6)),
+            ),
+            isNotNull,
+          );
+          // 7+ days -> expired (null)
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig1,
+              now: savedAt.add(const Duration(days: 7)),
+            ),
+            isNull,
+          );
+          // Channel lineup/name changed -> mismatch (null)
+          expect(
+            await logoCache.load(
+              '192.0.2.1',
+              2,
+              maxAge: channelLogoCacheMaxAge,
+              expectedChannelsSignature: sig2,
+              now: savedAt.add(const Duration(days: 1)),
+            ),
+            isNull,
+          );
+          // Offline stale fallback (no constraints) still returns cached PNG
+          expect(await logoCache.load('192.0.2.1', 2), isNotNull);
+        },
+      );
+
+      test(
+        'Phase 38.4: paused stream epoch locks past programme on frozen cache, supports multi-range & merges history',
+        () {
+          // 1. Paused on みんなのうた (12:45-12:50) at 12:48:30 (streamEpoch=12:47:30, pos=60s),
+          // left paused 6 minutes until 12:54:30 with cacheEnd frozen at 184s (EOS/cap)
+          final minnaStart = DateTime.utc(2026, 11, 25, 12, 45);
+          final minnaEnd = DateTime.utc(2026, 11, 25, 12, 50);
+          final shitenEnd = DateTime.utc(2026, 11, 25, 13, 0);
+          final streamEpoch = DateTime.utc(2026, 11, 25, 12, 47, 30);
+          final pausedWallNow = DateTime.utc(2026, 11, 25, 12, 54, 30);
+          const ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0408',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0408,
+            channelName: 'ＮＨＫＥテレ１秋田',
+            programTitle: '視点・論点',
+          );
+          final minnaEv = EpgEvent(
+            eventId: 901,
+            start: minnaStart,
+            duration: const Duration(minutes: 5),
+            title: 'みんなのうた',
+            shortText: 'みんなのうたの楽曲',
+          );
+          final shitenEv = EpgEvent(
+            eventId: 902,
+            start: minnaEnd,
+            duration: const Duration(minutes: 10),
+            title: '視点・論点',
+            shortText: '解説番組',
+          );
+
+          final frozenLag = resolveLivePlaybackLagSeconds(
+            liveDelayedByPause: true,
+            cacheStartSeconds: 0.0,
+            cacheEndSeconds: 184.0,
+            liveEdgeSeconds: 184.0,
+            effectivePosSeconds: 60.0, // 12:48:30
+            streamEpoch: streamEpoch,
+            now: pausedWallNow,
+          );
+          expect(frozenLag, 360.0);
+          final pausedClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: frozenLag,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 60.0,
+            liveDelayedByPause: true,
+          );
+          expect(pausedClock, DateTime.utc(2026, 11, 25, 12, 48, 30));
+          final pausedInfo = resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: [minnaEv, shitenEv],
+            now: pausedClock,
+          );
+          expect(pausedInfo.currentTitle, 'みんなのうた');
+          expect(pausedInfo.remainingMinutes, 2);
+          expect(pausedInfo.nextTitle, '視点・論点');
+
+          final pausedBar = resolveLiveTimeshiftBarState(
+            info: pausedInfo,
+            now: pausedWallNow,
+            cacheStartSeconds: 0.0,
+            cacheEndSeconds: 184.0,
+            liveEdgeSeconds: 184.0,
+            effectivePosSeconds: 60.0,
+            liveDelayedByPause: true,
+            streamEpoch: streamEpoch,
+          );
+          expect(pausedBar.liveEdgeFraction, 1.0);
+          expect(pausedBar.playbackFraction, closeTo(0.70, 0.001));
+          expect(pausedBar.lagSeconds, 360);
+
+          // 2. Seeking forward past 12:50 switches to 視点・論点; rewinding back switches back
+          final forwardClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: 0.0,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 160.0, // 12:50:10
+            liveDelayedByPause: true,
+          );
+          expect(
+            resolveLiveOsdProgramInfo(
+              channel: ch,
+              guideEvents: [minnaEv, shitenEv],
+              now: forwardClock,
+            ).currentTitle,
+            '視点・論点',
+          );
+          final backClock = resolveLivePlaybackClock(
+            now: pausedWallNow,
+            lagSeconds: 0.0,
+            streamEpoch: streamEpoch,
+            effectivePosSeconds: 140.0, // 12:49:50
+            liveDelayedByPause: true,
+          );
+          expect(
+            resolveLiveOsdProgramInfo(
+              channel: ch,
+              guideEvents: [minnaEv, shitenEv],
+              now: backClock,
+            ).currentTitle,
+            'みんなのうた',
+          );
+
+          // 3. Multi-range seekable-ranges preserves overall liveEdgeSeconds & earliestStartSeconds
+          const jsonMulti =
+              '{"cache-duration":42.5,"seekable-ranges":[{"start":10.0,"end":40.0},{"start":120.0,"end":300.0}]}';
+          final multiRange = parseDemuxerCacheStateRange(
+            jsonMulti,
+            currentPosSeconds: 25.0,
+          );
+          expect(multiRange, isNotNull);
+          expect(multiRange!.startSeconds, 10.0);
+          expect(multiRange.endSeconds, 40.0);
+          expect(multiRange.earliestStartSeconds, 10.0);
+          expect(multiRange.liveEdgeSeconds, 300.0);
+
+          // 4. OSD cache tick polling suppressed during initial startup / buffering
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+              initialPlaybackStarted: false,
+              buffering: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldPollLiveCacheOnOsdTick(
+              live: true,
+              osdOpen: true,
+              switchingChannel: false,
+              conflictHandled: false,
+              catchUpMonitorActive: false,
+              initialPlaybackStarted: true,
+              buffering: true,
+            ),
+            isFalse,
+          );
+
+          // 5. History merge keeps みんなのうた when newer EPG list drops finished programme
+          final mergedHistory = mergeLiveProgramEventLists(
+            [
+              EpgEvent(
+                eventId: 902,
+                start: minnaEnd,
+                duration: shitenEnd.difference(minnaEnd),
+                title: '視点・論点',
+              ),
+            ],
+            [minnaEv],
+          );
+          expect(mergedHistory.map((e) => e.title), ['みんなのうた', '視点・論点']);
+        },
+      );
+
+      test(
+        'Phase 38.5: start watchdog and pre-frame interruption helpers gate on real frames & sanitize errors',
+        () {
+          // Premature playing=true without a video frame must NOT disarm watchdog.
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: true,
+              buffering: true,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: true,
+              buffering: false,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              initialPlaybackStarted: false,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: false,
+              buffering: true,
+              initialPlaybackStarted: true,
+            ),
+            isTrue,
+          );
+
+          // Pre-frame stops must not show mid-stream interruption banner.
+          expect(
+            shouldSurfacePreFrameStopAsInterruption(
+              hasVideoFrame: false,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldSurfacePreFrameStopAsInterruption(
+              hasVideoFrame: true,
+              initialPlaybackStarted: false,
+            ),
+            isTrue,
+          );
+
+          expect(describeStreamErrorSafely(null), 'none');
+          expect(
+            describeStreamErrorSafely(NasneError.http(503, 'dtcp:http')),
+            'http(503)',
           );
         },
       );

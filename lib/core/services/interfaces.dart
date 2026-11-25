@@ -207,6 +207,15 @@ abstract interface class StreamTransferMetrics {
   int get consecutiveReconnectErrors;
 }
 
+/// Optional diagnostic counters exposed by a loopback [PlaybackSession] for
+/// release-safe startup tracing and timeout diagnostics (no secrets/URLs).
+abstract interface class StreamDiagnosticMetrics {
+  int get cipherBytes;
+  int get plaintextBytes;
+  int get downstreamRequestCount;
+  Object? get lastUpstreamError;
+}
+
 /// Optional live-edge flush hook exposed by a loopback [PlaybackSession] so the
 /// player can discard paused backlog and reconnect upstream at the latest
 /// broadcast edge without redoing DTCP-IP AKE.

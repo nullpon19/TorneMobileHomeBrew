@@ -92,6 +92,115 @@ void main() {
       expect(identical(mergeEpgGuideWithCache(fresh, const {}), fresh),
           isTrue);
     });
+
+    test('drops cached event replaced by emergency news overlap', () {
+      final t1200 = _day.add(const Duration(hours: 12));
+      final t1230 = _day.add(const Duration(minutes: 12 * 60 + 30));
+      final cachedOldA = EpgEvent(
+        eventId: 100,
+        start: t1200,
+        duration: const Duration(hours: 1),
+        title: '通常番組A',
+      );
+      final freshNews = EpgEvent(
+        eventId: 999,
+        start: t1200,
+        duration: const Duration(minutes: 30),
+        title: '緊急ニュース',
+      );
+      final freshDelayedA = EpgEvent(
+        eventId: 100,
+        start: t1230,
+        duration: const Duration(hours: 1),
+        title: '通常番組A',
+      );
+      final merged = mergeEpgGuideWithCache(
+        _guide([freshNews, freshDelayedA]),
+        {
+          0x3333: [cachedOldA],
+        },
+      );
+      final events = merged.services.single.events;
+      expect(events.map((e) => e.eventId), [999, 100]);
+      expect(events.map((e) => e.start), [t1200, t1230]);
+    });
+
+    test('drops shifted same-eventId cached event within 24h even without overlap', () {
+      final t1200 = _day.add(const Duration(hours: 12));
+      final t1300 = _day.add(const Duration(hours: 13));
+      final cachedOldA = EpgEvent(
+        eventId: 100,
+        start: t1200,
+        duration: const Duration(hours: 1),
+        title: '通常番組A',
+      );
+      final freshMovedA = EpgEvent(
+        eventId: 100,
+        start: t1300,
+        duration: const Duration(hours: 1),
+        title: '通常番組A',
+      );
+      final merged = mergeEpgGuideWithCache(
+        _guide([freshMovedA]),
+        {
+          0x3333: [cachedOldA],
+        },
+      );
+      final events = merged.services.single.events;
+      expect(events.length, 1);
+      expect(events.single.start, t1300);
+    });
+
+    test('retains non-overlapping past event for playback rewind', () {
+      final pastEvent = _event(50, 10, title: '直前の番組');
+      final freshCurrent = _event(51, 12, title: '今の番組');
+      final merged = mergeEpgGuideWithCache(
+        _guide([freshCurrent]),
+        {
+          0x3333: [pastEvent],
+        },
+      );
+      final events = merged.services.single.events;
+      expect(events.map((e) => e.eventId), [50, 51]);
+    });
+  });
+
+  group('shouldRefreshStaleEpgGuide', () {
+    test('returns true when missing, expired, or older than maxAge', () {
+      final now = _day.add(const Duration(hours: 12, minutes: 20));
+      expect(shouldRefreshStaleEpgGuide(null, now), isTrue);
+
+      final freshGuide = EpgGuide(
+        broadcastingType: 2,
+        fetchedAt: now.subtract(const Duration(minutes: 10)),
+        services: [
+          EpgServiceGuide(
+            channel: _channel,
+            events: [_event(1, 12, minutes: 60)],
+          ),
+        ],
+      );
+      expect(shouldRefreshStaleEpgGuide(freshGuide, now), isFalse);
+
+      final agedGuide = EpgGuide(
+        broadcastingType: 2,
+        fetchedAt: now.subtract(const Duration(minutes: 15)),
+        services: freshGuide.services,
+      );
+      expect(shouldRefreshStaleEpgGuide(agedGuide, now), isTrue);
+
+      final expiredGuide = EpgGuide(
+        broadcastingType: 2,
+        fetchedAt: now.subtract(const Duration(minutes: 1)),
+        services: [
+          EpgServiceGuide(
+            channel: _channel,
+            events: [_event(1, 11, minutes: 60)],
+          ),
+        ],
+      );
+      expect(shouldRefreshStaleEpgGuide(expiredGuide, now), isTrue);
+    });
   });
 
   group('EpgGuideCache', () {

@@ -23,10 +23,12 @@ import '../app/state.dart';
 import '../app/bs_epg_providers.dart';
 import '../core/core.dart';
 import 'app_shell.dart';
+import 'channel_badge.dart';
 import 'epg_genre.dart';
 import 'epg_search_screen.dart';
 import 'error_messages.dart';
 import 'format.dart';
+import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
 import 'live_screen.dart';
 import 'multi_nasne_policy.dart';
@@ -577,6 +579,9 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
   final GlobalKey _gridViewportKey = GlobalKey();
   late final Map<int, bool Function()> _tabBackHandlers;
   bool _syncing = false;
+  String? _pendingFocusTileKey;
+  LiveWatchedChannelTarget? _pendingReturnTarget;
+  double _lastChannelWidth = 180.0;
 
   @override
   void initState() {
@@ -671,6 +676,114 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
   }
 
   void _refreshOnReveal() => _refreshBandOnSwitch(_selectedBand);
+
+  Future<void> _handleWatchFromGuide(
+    RegisteredNasne guideReg,
+    Channel channel,
+  ) async {
+    final returned = await openLiveChannelForEpg(
+      context,
+      ref,
+      reg: guideReg,
+      channel: channel,
+    );
+    if (!mounted) return;
+    final regs =
+        ref.read(registrationsProvider).value ?? const <RegisteredNasne>[];
+    final selected = ref.read(selectedRegistrationProvider);
+    final activeRegs = regs.isNotEmpty
+        ? regs
+        : (selected != null ? [selected] : const <RegisteredNasne>[]);
+    for (final r in activeRegs) {
+      final sched = ref.read(schedulesProvider(r));
+      if (sched.hasValue && !sched.isLoading) {
+        ref.invalidate(schedulesProvider(r));
+      }
+    }
+    if (returned != null) {
+      _applyLiveReturnTarget(returned);
+    }
+  }
+
+  void _applyLiveReturnTarget(LiveWatchedChannelTarget target) {
+    final bandType = target.bandType;
+    if (bandType == terrestrialBroadcastingType ||
+        bandType == bsBroadcastingType) {
+      _selectedBand = bandType!;
+    }
+    _selectedDay = _jstDateOf(target.exitedAt);
+    _scrolledToNow = true;
+    _pendingReturnTarget = target;
+    setState(() {});
+  }
+
+  void _scheduleLiveReturnCursorSync(
+    EpgGuide visibleGuide,
+    LiveWatchedChannelTarget target,
+  ) {
+    _pendingReturnTarget = null;
+    final match = findEpgTileTargetForLiveChannel(
+      guide: visibleGuide,
+      targetChannel: target.channel,
+      now: target.exitedAt,
+    );
+    if (match == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final from = visibleGuide.from;
+      final to = visibleGuide.to;
+      if (from != null && to != null && visibleGuide.services.isNotEmpty) {
+        final firstDay = _jstDateOf(from);
+        final lastDay = _jstDateOf(to.subtract(const Duration(seconds: 1)));
+        final targetDay = _selectedDay ?? _jstDateOf(target.exitedAt);
+        final day =
+            !targetDay.isBefore(firstDay) && !targetDay.isAfter(lastDay)
+            ? targetDay
+            : firstDay;
+        final dayStart = _jstDayStart(day);
+        if (_gridController.hasClients) {
+          final cw = _lastChannelWidth;
+          final colOffset = match.serviceIndex * cw;
+          final curOffset = _gridController.offset;
+          final viewportW = _gridController.position.viewportDimension;
+          if (colOffset < curOffset || colOffset + cw > curOffset + viewportW) {
+            final centered = colOffset - math.max(0.0, (viewportW - cw) / 2);
+            final snapped = resolveEpgSnapTarget(
+              pixels: centered.clamp(
+                _gridController.position.minScrollExtent,
+                _gridController.position.maxScrollExtent,
+              ),
+              channelWidth: cw,
+              minScrollExtent: _gridController.position.minScrollExtent,
+              maxScrollExtent: _gridController.position.maxScrollExtent,
+            );
+            _gridController.jumpTo(
+              snapped.clamp(
+                _gridController.position.minScrollExtent,
+                _gridController.position.maxScrollExtent,
+              ),
+            );
+          }
+        }
+        if (_bodyController.hasClients) {
+          final startMin = math.max(
+            0,
+            match.event.start.difference(dayStart).inMinutes,
+          );
+          final targetY = math.max(0.0, (startMin - 60) * _pxPerMinute);
+          _bodyController.jumpTo(
+            targetY.clamp(
+              _bodyController.position.minScrollExtent,
+              _bodyController.position.maxScrollExtent,
+            ),
+          );
+        }
+      }
+      setState(() {
+        _pendingFocusTileKey = match.tileKey;
+      });
+    });
+  }
 
   List<FocusNode> _sortedFocusableDescendants(FocusNode root) {
     final targets = root.traversalDescendants
@@ -935,12 +1048,25 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
                         for (final r in activeRegs) {
                           ref.invalidate(schedulesProvider(r));
                           if (_selectedBand == terrestrialBroadcastingType) {
+                            ref.invalidate(channelsProvider(r));
                             ref.invalidate(epgGuideProvider(r));
-                            ref.invalidate(channelLogosProvider(r));
+                            unawaited(
+                              invalidateChannelLogosWithCacheReset(
+                                ref,
+                                r,
+                                broadcastingType: terrestrialBroadcastingType,
+                              ),
+                            );
                           } else {
                             ref.invalidate(bsChannelsProvider(r));
                             ref.invalidate(bsEpgGuideProvider(r));
-                            ref.invalidate(bsChannelLogosProvider(r));
+                            unawaited(
+                              invalidateChannelLogosWithCacheReset(
+                                ref,
+                                r,
+                                broadcastingType: bsBroadcastingType,
+                              ),
+                            );
                           }
                         }
                       },
@@ -1032,9 +1158,9 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
     final reservedStyle = ref.watch(epgReservedStyleProvider);
     final logos = isBs
         ? (ref.watch(bsChannelLogosProvider(guideReg)).value ??
-              const <int, List<int>>{})
+              const <int, Uint8List>{})
         : (ref.watch(channelLogosProvider(guideReg)).value ??
-              const <int, List<int>>{});
+              const <int, Uint8List>{});
 
     return Column(
       children: [
@@ -1067,45 +1193,62 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
                 }
               },
             ),
-            data: (guide) => _GuideView(
-              reg: guideReg,
-              guide: guideWithSubchannelSetting(
+            data: (guide) {
+              final visibleGuide = guideWithSubchannelSetting(
                 guide,
                 ref.watch(showSubchannelsProvider),
-              ),
-              ownedSchedules: ownedSchedules,
-              isMultiNasne: isMultiNasne,
-              recordingTitles: recordingTitles,
-              reservedStyle: reservedStyle,
-              hiddenGenres: ref.watch(hiddenEpgGenresProvider),
-              onWatchEvent: (channel) => openLiveChannelForEpg(
-                context,
-                ref,
+              );
+              final pendingTarget = _pendingReturnTarget;
+              if (pendingTarget != null) {
+                if (pendingTarget.bandType == null ||
+                    pendingTarget.bandType == _selectedBand) {
+                  _scheduleLiveReturnCursorSync(visibleGuide, pendingTarget);
+                } else if (pendingTarget.bandType !=
+                        terrestrialBroadcastingType &&
+                    pendingTarget.bandType != bsBroadcastingType) {
+                  _pendingReturnTarget = null;
+                }
+              }
+              return _GuideView(
                 reg: guideReg,
-                channel: channel,
-              ),
-              logos: logos,
-              selectedDay: _selectedDay,
-              onSelectDay: (day) => setState(() {
-                _selectedDay = day;
-                _scrolledToNow = false;
-              }),
-              rulerController: _rulerController,
-              bodyController: _bodyController,
-              gridController: _gridController,
-              daySelectorFocusNode: _daySelectorFocusNode,
-              gridFocusNode: _gridFocusNode,
-              gridViewportKey: _gridViewportKey,
-              onJumpToTopBar: ({double? preferredDx}) =>
-                  _focusTopBar(preferredDx: preferredDx),
-              onJumpToDaySelector: ({double? preferredDx}) =>
-                  _focusDaySelector(preferredDx: preferredDx),
-              onJumpToVisibleGrid: ({double? preferredDx}) =>
-                  _focusVisibleGridTile(preferredDx: preferredDx),
-              onEscapeLeftToRail: _focusLeftNavigationRail,
-              scrolledToNow: _scrolledToNow,
-              onScrolledToNow: () => _scrolledToNow = true,
-            ),
+                guide: visibleGuide,
+                ownedSchedules: ownedSchedules,
+                isMultiNasne: isMultiNasne,
+                recordingTitles: recordingTitles,
+                reservedStyle: reservedStyle,
+                hiddenGenres: ref.watch(hiddenEpgGenresProvider),
+                onWatchEvent: (channel) =>
+                    unawaited(_handleWatchFromGuide(guideReg, channel)),
+                logos: logos,
+                selectedDay: _selectedDay,
+                onSelectDay: (day) => setState(() {
+                  _selectedDay = day;
+                  _scrolledToNow = false;
+                }),
+                rulerController: _rulerController,
+                bodyController: _bodyController,
+                gridController: _gridController,
+                daySelectorFocusNode: _daySelectorFocusNode,
+                gridFocusNode: _gridFocusNode,
+                gridViewportKey: _gridViewportKey,
+                onJumpToTopBar: ({double? preferredDx}) =>
+                    _focusTopBar(preferredDx: preferredDx),
+                onJumpToDaySelector: ({double? preferredDx}) =>
+                    _focusDaySelector(preferredDx: preferredDx),
+                onJumpToVisibleGrid: ({double? preferredDx}) =>
+                    _focusVisibleGridTile(preferredDx: preferredDx),
+                onEscapeLeftToRail: _focusLeftNavigationRail,
+                scrolledToNow: _scrolledToNow,
+                onScrolledToNow: () => _scrolledToNow = true,
+                onChannelWidthChanged: (w) => _lastChannelWidth = w,
+                pendingFocusTileKey: _pendingFocusTileKey,
+                onPendingFocusClaimed: () {
+                  if (mounted && _pendingFocusTileKey != null) {
+                    setState(() => _pendingFocusTileKey = null);
+                  }
+                },
+              );
+            },
           ),
         ),
       ],
@@ -1138,6 +1281,9 @@ class _GuideView extends StatelessWidget {
     required this.onEscapeLeftToRail,
     required this.scrolledToNow,
     required this.onScrolledToNow,
+    this.onChannelWidthChanged,
+    this.pendingFocusTileKey,
+    this.onPendingFocusClaimed,
   });
 
   final RegisteredNasne reg;
@@ -1169,6 +1315,9 @@ class _GuideView extends StatelessWidget {
   final bool Function(double referenceY) onEscapeLeftToRail;
   final bool scrolledToNow;
   final VoidCallback onScrolledToNow;
+  final ValueChanged<double>? onChannelWidthChanged;
+  final String? pendingFocusTileKey;
+  final VoidCallback? onPendingFocusClaimed;
 
   KeyEventResult _handleGridKeyEvent(FocusNode node, KeyEvent event) {
     if (event is KeyDownEvent &&
@@ -1323,6 +1472,7 @@ class _GuideView extends StatelessWidget {
                       final channelWidth = resolveEpgChannelWidth(
                         constraints.maxWidth,
                       );
+                      onChannelWidthChanged?.call(channelWidth);
                       return _GuideGridScroll(
                         gridController: gridController,
                         bodyController: bodyController,
@@ -1350,6 +1500,8 @@ class _GuideView extends StatelessWidget {
                                   dayEnd: dayEnd,
                                   controller: bodyController,
                                   channelWidth: channelWidth,
+                                  pendingFocusTileKey: pendingFocusTileKey,
+                                  onPendingFocusClaimed: onPendingFocusClaimed,
                                 ),
                               ),
                             ],
@@ -1500,32 +1652,60 @@ class _ChannelHeader extends StatelessWidget {
       child: Row(
         children: [
           for (final service in services)
-            SizedBox(
-              width: channelWidth,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    if (logos[service.channel.serviceId] != null)
-                      SizedBox(
-                        height: 24,
-                        child: Image.memory(
-                          Uint8List.fromList(logos[service.channel.serviceId]!),
-                          fit: BoxFit.contain,
+            () {
+              final rawLogo = logos[service.channel.serviceId];
+              final logoBytes = rawLogo == null || rawLogo.isEmpty
+                  ? null
+                  : (rawLogo is Uint8List
+                        ? rawLogo
+                        : Uint8List.fromList(rawLogo));
+              final numberLabel = formatChannelNumber3Digit(
+                service.channel.channelNumber,
+              );
+              return SizedBox(
+                width: channelWidth,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 3,
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (logoBytes != null || numberLabel != null) ...[
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            if (logoBytes != null)
+                              ChannelLogoPlate(
+                                bytes: logoBytes,
+                                width: 38,
+                                height: 22,
+                              ),
+                            if (logoBytes != null && numberLabel != null)
+                              const SizedBox(width: 6),
+                            if (numberLabel != null)
+                              ChannelNumberBadge(
+                                label: numberLabel,
+                                compact: true,
+                              ),
+                          ],
                         ),
+                        const SizedBox(height: 2),
+                      ],
+                      Text(
+                        service.channel.serviceName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall,
+                        textAlign: TextAlign.center,
                       ),
-                    Text(
-                      service.channel.serviceName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall,
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ),
+              );
+            }(),
         ],
       ),
     );
@@ -1600,6 +1780,8 @@ class _DayGrid extends StatelessWidget {
     required this.dayEnd,
     required this.controller,
     required this.channelWidth,
+    this.pendingFocusTileKey,
+    this.onPendingFocusClaimed,
   });
 
   final RegisteredNasne reg;
@@ -1613,6 +1795,8 @@ class _DayGrid extends StatelessWidget {
   final DateTime dayEnd;
   final ScrollController controller;
   final double channelWidth;
+  final String? pendingFocusTileKey;
+  final VoidCallback? onPendingFocusClaimed;
 
   @override
   Widget build(BuildContext context) {
@@ -1645,29 +1829,33 @@ class _DayGrid extends StatelessWidget {
                               e.end.isAfter(dayStart) &&
                               e.start.isBefore(dayEnd),
                         ))
-                          _EventTile(
-                            key: ValueKey(
-                              '${services[i].channel.serviceId}-${event.eventId}-${event.start}',
-                            ),
-                            event: event,
-                            channel: services[i].channel,
-                            channelName: services[i].channel.serviceName,
-                            reg: reg,
-                            dayStart: dayStart,
-                            suppressed: epgGenreSuppressed(
-                              event.genreLevel1,
-                              hiddenGenres,
-                            ),
-                            reservedStyle: reservedStyle,
-                            matchedOwnedSchedule: findMatchingOwnedSchedule(
-                              ownedSchedules,
-                              services[i].channel,
-                              event,
-                            ),
-                            showNasneOwnerName: isMultiNasne,
-                            onWatch: () =>
-                                onWatchEvent(services[i].channel),
-                          ),
+                          () {
+                            final tileKey =
+                                '${services[i].channel.serviceId}-${event.eventId}-${event.start}';
+                            return _EventTile(
+                              key: ValueKey(tileKey),
+                              event: event,
+                              channel: services[i].channel,
+                              channelName: services[i].channel.serviceName,
+                              reg: reg,
+                              dayStart: dayStart,
+                              suppressed: epgGenreSuppressed(
+                                event.genreLevel1,
+                                hiddenGenres,
+                              ),
+                              reservedStyle: reservedStyle,
+                              matchedOwnedSchedule: findMatchingOwnedSchedule(
+                                ownedSchedules,
+                                services[i].channel,
+                                event,
+                              ),
+                              showNasneOwnerName: isMultiNasne,
+                              onWatch: () => onWatchEvent(services[i].channel),
+                              isPendingFocusTarget:
+                                  pendingFocusTileKey == tileKey,
+                              onPendingFocusClaimed: onPendingFocusClaimed,
+                            );
+                          }(),
                       ],
                     ),
                   ),
@@ -1702,6 +1890,8 @@ class _EventTile extends StatefulWidget {
     this.matchedOwnedSchedule,
     this.showNasneOwnerName = false,
     required this.onWatch,
+    this.isPendingFocusTarget = false,
+    this.onPendingFocusClaimed,
   });
 
   final EpgEvent event;
@@ -1725,13 +1915,48 @@ class _EventTile extends StatefulWidget {
   /// the detail dialog offers it only while the event is on
   /// air.
   final VoidCallback onWatch;
+  final bool isPendingFocusTarget;
+  final VoidCallback? onPendingFocusClaimed;
 
   @override
   State<_EventTile> createState() => _EventTileState();
 }
 
 class _EventTileState extends State<_EventTile> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'epgTile');
   bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isPendingFocusTarget) {
+      _claimPendingFocus();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _EventTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isPendingFocusTarget && !oldWidget.isPendingFocusTarget) {
+      _claimPendingFocus();
+    }
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _claimPendingFocus() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_focusNode.canRequestFocus) {
+        _focusNode.requestFocus();
+      }
+      widget.onPendingFocusClaimed?.call();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1891,6 +2116,7 @@ class _EventTileState extends State<_EventTile> {
           // below and get half-covered there (plan 22).
           clipBehavior: Clip.antiAlias,
           child: InkWell(
+            focusNode: _focusNode,
             borderRadius: BorderRadius.circular(3),
             focusColor: Colors.transparent,
             onFocusChange: (focused) {
@@ -1999,12 +2225,53 @@ RecordSchedule? findMatchingSchedule(
       continue;
     }
     if (parseScheduleEventId(s.desiredMatchingId) != null) continue;
-    if (s.start.difference(event.start).abs() <= const Duration(minutes: 2) &&
-        s.end.difference(event.end).abs() <= const Duration(minutes: 2)) {
+    final exactMatch =
+        s.start.difference(event.start).abs() <= const Duration(minutes: 2) &&
+        s.end.difference(event.end).abs() <= const Duration(minutes: 2);
+    final partialStartMatch =
+        s.end.difference(event.end).abs() <= const Duration(minutes: 2) &&
+        !s.start.isBefore(event.start.subtract(const Duration(minutes: 2))) &&
+        s.start.isBefore(event.end);
+    if (exactMatch || partialStartMatch) {
       return s;
     }
   }
   return null;
+}
+
+/// Resolves the EPG column index, active broadcast [EpgEvent], and corresponding
+/// tile key matching [targetChannel] at [now] inside [guide]. When a
+/// subchannel is hidden from [guide], falls back to the main channel sharing
+/// `(networkId, transportStreamId)`.
+({int serviceIndex, EpgEvent event, String tileKey})?
+findEpgTileTargetForLiveChannel({
+  required EpgGuide guide,
+  required LiveChannel targetChannel,
+  required DateTime now,
+}) {
+  final sid = targetChannel.serviceId;
+  if (sid == null) return null;
+  final nid = targetChannel.networkId;
+  final tsid = targetChannel.transportStreamId;
+  var serviceIdx = guide.services.indexWhere(
+    (s) =>
+        s.channel.serviceId == sid &&
+        (nid == null || s.channel.networkId == nid),
+  );
+  if (serviceIdx < 0 && nid != null && tsid != null) {
+    serviceIdx = guide.services.indexWhere(
+      (s) => s.channel.networkId == nid && s.channel.transportStreamId == tsid,
+    );
+  }
+  if (serviceIdx < 0) return null;
+  final svc = guide.services[serviceIdx];
+  final ev = findActiveEpgEvent(sortEpgEventsByStart(svc.events), now);
+  if (ev == null) return null;
+  return (
+    serviceIndex: serviceIdx,
+    event: ev,
+    tileKey: '${svc.channel.serviceId}-${ev.eventId}-${ev.start}',
+  );
 }
 
 /// Variant of [findMatchingSchedule] that retains the owning nasne record.
@@ -2038,6 +2305,7 @@ void showEpgEventDetail(
       onWatch != null && !event.start.isAfter(now) && event.end.isAfter(now);
   final recordingNow =
       existingSchedule != null &&
+      event.end.isAfter(now) &&
       isScheduleCurrentlyRecording(existingSchedule, now: now);
   final ownerReg = existingScheduleReg ?? reg;
   showDialog<void>(
