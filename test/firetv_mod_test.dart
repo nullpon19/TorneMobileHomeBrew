@@ -10581,7 +10581,7 @@ void main() {
           addTearDown(tester.view.reset);
 
           const reg = RegisteredNasne(
-            host: '192.168.10.171',
+            host: '192.0.2.1',
             udn: 'uuid:live-list-phase37',
             friendlyName: 'nasne-1',
             macAddr: '00:11:22:33:44:55',
@@ -11016,7 +11016,7 @@ void main() {
             0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
           ]);
           const reg = RegisteredNasne(
-            host: '192.168.10.171',
+            host: '192.0.2.1',
             udn: 'uuid:preview-badge-test',
             friendlyName: 'nasne-1',
             macAddr: '00:11:22:33:44:55',
@@ -11087,7 +11087,7 @@ void main() {
           addTearDown(tester.view.reset);
 
           const reg = RegisteredNasne(
-            host: '192.168.10.171',
+            host: '192.0.2.1',
             udn: 'uuid:live-loading-spinner',
             friendlyName: 'nasne-1',
             macAddr: '00:11:22:33:44:55',
