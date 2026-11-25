@@ -88,6 +88,15 @@ final channelCacheProvider = Provider<ChannelCache>(
   (ref) => ChannelCache(ref.watch(channelCacheStoreProvider)),
 );
 
+/// Key-value store backing [channelLogoCacheProvider] in its own JSON file.
+final channelLogoCacheStoreProvider = Provider<KeyValueStore>(
+  (ref) => InMemoryKeyValueStore(),
+);
+
+final channelLogoCacheProvider = Provider<ChannelLogoCache>(
+  (ref) => ChannelLogoCache(ref.watch(channelLogoCacheStoreProvider)),
+);
+
 /// The key-value store behind the programme-guide accumulation
 /// cache — its own file again (plan 96). The guide is by far the
 /// largest value in the app and is rewritten on every guide

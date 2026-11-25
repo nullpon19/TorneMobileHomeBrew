@@ -70,6 +70,22 @@ DateTime _eitStart(int mjd, int h, int m, int s) {
       .subtract(const Duration(hours: 9));
 }
 
+Uint32List _buildCrc32MpegTable() {
+  final table = Uint32List(256);
+  for (var i = 0; i < 256; i++) {
+    var crc = i << 24;
+    for (var bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80000000) != 0
+          ? ((crc << 1) ^ 0x04c11db7) & 0xffffffff
+          : (crc << 1) & 0xffffffff;
+    }
+    table[i] = crc;
+  }
+  return table;
+}
+
+final Uint32List _crc32MpegTable = _buildCrc32MpegTable();
+
 /// CRC-32/MPEG-2: polynomial 0x04C11DB7, initial value 0xFFFFFFFF,
 /// no input/output reflection, no final XOR. Every EIT section is
 /// trailed by this checksum computed over the whole section, so a
@@ -78,12 +94,8 @@ int crc32Mpeg(List<int> data, [int start = 0, int? end]) {
   var crc = 0xffffffff;
   final limit = end ?? data.length;
   for (var i = start; i < limit; i++) {
-    crc ^= data[i] << 24;
-    for (var bit = 0; bit < 8; bit++) {
-      crc = (crc & 0x80000000) != 0
-          ? ((crc << 1) ^ 0x04c11db7) & 0xffffffff
-          : (crc << 1) & 0xffffffff;
-    }
+    crc = ((crc << 8) ^ _crc32MpegTable[((crc >> 24) ^ data[i]) & 0xff]) &
+        0xffffffff;
   }
   return crc;
 }
@@ -96,48 +108,62 @@ class _Section {
   final Channel channel;
 }
 
-/// Finds the EIT sections in [plain]. A section is anchored on the
-/// (transportStreamId, originalNetworkId) byte pair of a known
-/// channel in the section header, with the table_id in the EIT
+/// Finds the EIT sections in [plain] in a single linear pass. A section is
+/// anchored on the (transportStreamId, originalNetworkId) byte pair of a
+/// known channel in the section header, with the table_id in the EIT
 /// range, the serviceId verified at its fixed offset, the section
 /// length inside the buffer and the trailing CRC-32/MPEG-2 valid.
 /// The checksum makes false anchors inside event data a non-issue
 /// (the full live corpus validates section by section, plan 22).
 List<_Section> _findSections(Uint8List plain, List<Channel> channels) {
-  final sections = <_Section>[];
+  if (channels.isEmpty || plain.length < 18) return const [];
+  final byTsOnid = <int, List<Channel>>{};
+  final seenTriples = <(int, int, int, int)>{};
   for (final ch in channels) {
-    final tsid = ch.transportStreamId, onid = ch.networkId;
-    for (var i = 8; i + 4 <= plain.length; i++) {
-      if (plain[i] == (tsid >> 8) &&
-          plain[i + 1] == (tsid & 0xff) &&
-          plain[i + 2] == (onid >> 8) &&
-          plain[i + 3] == (onid & 0xff)) {
-        final s = i - 8;
-        final tableId = plain[s];
-        // ARIB STD-B10: 0x60..0x6f is EIT schedule *other TS*.
-        // Preserve the original terrestrial EIT selection; accept the
-        // other-TS forms for the BS guide (not terrestrial).
-        final isEit = tableId == 0x4e ||
-            tableId == 0x4f ||
-            (tableId >= 0x50 && tableId <= 0x5f) ||
-            (ch.broadcastingType == 3 &&
-                tableId >= 0x60 && tableId <= 0x6f);
-        if (!isEit) continue;
-        if (_u16be(plain, s + 3) != ch.serviceId) continue;
-        final total = (((plain[s + 1] & 0x0f) << 8) | plain[s + 2]) + 3;
-        if (total < 18 || s + total > plain.length) continue;
-        if (crc32Mpeg(plain, s, s + total) != 0) continue;
-        sections.add(_Section(s, total, ch));
-      }
+    if (!seenTriples.add((
+      ch.broadcastingType,
+      ch.networkId,
+      ch.transportStreamId,
+      ch.serviceId,
+    ))) {
+      continue;
+    }
+    final key =
+        ((ch.transportStreamId & 0xffff) << 16) | (ch.networkId & 0xffff);
+    byTsOnid.putIfAbsent(key, () => <Channel>[]).add(ch);
+  }
+  final sections = <_Section>[];
+  for (var i = 8; i + 4 <= plain.length; i++) {
+    final key =
+        (plain[i] << 24) |
+        (plain[i + 1] << 16) |
+        (plain[i + 2] << 8) |
+        plain[i + 3];
+    final candidates = byTsOnid[key];
+    if (candidates == null) continue;
+    final s = i - 8;
+    final tableId = plain[s];
+    final sid = _u16be(plain, s + 3);
+    for (final ch in candidates) {
+      if (ch.serviceId != sid) continue;
+      // ARIB STD-B10: 0x60..0x6f is EIT schedule *other TS*.
+      // Preserve the original terrestrial EIT selection; accept the
+      // other-TS forms for the BS guide (not terrestrial).
+      final isEit = tableId == 0x4e ||
+          tableId == 0x4f ||
+          (tableId >= 0x50 && tableId <= 0x5f) ||
+          (ch.broadcastingType == 3 &&
+              tableId >= 0x60 &&
+              tableId <= 0x6f);
+      if (!isEit) continue;
+      final total = (((plain[s + 1] & 0x0f) << 8) | plain[s + 2]) + 3;
+      if (total < 18 || s + total > plain.length) continue;
+      if (crc32Mpeg(plain, s, s + total) != 0) continue;
+      sections.add(_Section(s, total, ch));
+      break;
     }
   }
-  sections.sort((a, b) => a.offset.compareTo(b.offset));
-  // Dedupe identical offsets (a channel listed twice).
-  final out = <_Section>[];
-  for (final s in sections) {
-    if (out.isEmpty || out.last.offset != s.offset) out.add(s);
-  }
-  return out;
+  return sections;
 }
 
 /// ARIB BS schedule can provide a title in the extended-event "番組名"
@@ -631,4 +657,23 @@ Uint8List buildEpgGetBody(
 void _putU16be(Uint8List out, int offset, int value) {
   out[offset] = (value >> 8) & 0xff;
   out[offset + 1] = value & 0xff;
+}
+
+/// Deobfuscates, inflates, and parses a binary `chEpg/EPGGet` response
+/// payload into a normalized [EpgGuide]. Designed to be pure and safe to run on
+/// a background isolate via `Isolate.run`.
+EpgGuide parseEpgResponsePayload({
+  required Uint8List rawResponse,
+  required List<Channel> channels,
+  required int broadcastingType,
+}) {
+  final plain = inflateEpgResponse(rawResponse);
+  final parsed = parseEpgGuide(
+    plain,
+    channels,
+    broadcastingType: broadcastingType,
+  );
+  return broadcastingType == 3
+      ? completeBsEpgGuide(parsed, channels)
+      : parsed;
 }

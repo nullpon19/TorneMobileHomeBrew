@@ -6,6 +6,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show zlib;
 import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
@@ -21,6 +22,7 @@ import 'package:tmhb/core/core.dart';
 import 'package:tmhb/core/dtcp/arib_ts_caption_tap.dart';
 import 'package:tmhb/main.dart';
 import 'package:tmhb/ui/app_shell.dart';
+import 'package:tmhb/ui/channel_badge.dart';
 import 'package:tmhb/ui/dtcp_credential_screen.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/format.dart';
@@ -6425,7 +6427,7 @@ void main() {
           isPaused: true,
         );
         expect(delayedPausedBadge.label, '一時停止');
-        expect(delayedPausedBadge.color, const Color(0xFFEF6C00));
+        expect(delayedPausedBadge.color, const Color(0xFF2E7D32));
 
         final delayedNormalBadge = osdLiveStatusBadgeSpec(
           liveDelayedByPause: true,
@@ -10850,6 +10852,334 @@ void main() {
           expect(normalLive.lagSeconds, 0);
           expect(normalLive.rewindableSeconds, 113);
           expect(normalLive.playbackFraction, normalLive.liveEdgeFraction);
+        },
+      );
+
+      test(
+        'liveStatusPresentation returns matching badges and 4-state bar colors including paused+rewound pair',
+        () {
+          final live = liveStatusPresentation(
+            liveDelayedByPause: false,
+            liveCatchUpRate: 1.0,
+          );
+          expect(live.badges.single.label, 'LIVE');
+          expect(live.badges.single.color, Colors.redAccent);
+          expect(live.barColor, Colors.redAccent);
+
+          final paused = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: true,
+            isRewoundPlayback: false,
+          );
+          expect(paused.badges.single.label, '一時停止');
+          expect(paused.badges.single.color, const Color(0xFF2E7D32));
+          expect(paused.barColor, const Color(0xFF66BB6A));
+
+          final pausedRewinding = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: true,
+            isRewoundPlayback: true,
+          );
+          expect(pausedRewinding.badges.map((b) => b.label).toList(), [
+            'プレイバック',
+            '一時停止',
+          ]);
+          expect(pausedRewinding.badges[0].color, const Color(0xFF0277BD));
+          expect(pausedRewinding.badges[1].color, const Color(0xFF2E7D32));
+          expect(pausedRewinding.barColor, Colors.lightBlueAccent);
+
+          final playingBack = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: false,
+            isRewoundPlayback: true,
+          );
+          expect(playingBack.badges.single.label, 'プレイバック');
+          expect(playingBack.badges.single.color, const Color(0xFF0277BD));
+          expect(playingBack.barColor, Colors.lightBlueAccent);
+
+          final fastChase = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.5,
+            isPaused: false,
+            isRewoundPlayback: false,
+          );
+          expect(fastChase.badges.single.label, '追いかけ再生 1.5倍');
+          expect(fastChase.badges.single.color, const Color(0xFFEF6C00));
+          expect(fastChase.barColor, Colors.orangeAccent);
+
+          final normalChase = liveStatusPresentation(
+            liveDelayedByPause: true,
+            liveCatchUpRate: 1.0,
+            isPaused: false,
+            isRewoundPlayback: false,
+          );
+          expect(normalChase.badges.single.label, '追いかけ再生');
+          expect(normalChase.badges.single.color, const Color(0xFFEF6C00));
+          expect(normalChase.barColor, Colors.orangeAccent);
+        },
+      );
+
+      test(
+        'formatChannelNumber3Digit, resolveLiveChannelNumberLabel, and ChannelLogoCache handle 3-digit numbers and cached PNGs',
+        () async {
+          expect(formatChannelNumber3Digit(31), '031');
+          expect(formatChannelNumber3Digit(101), '101');
+          expect(formatChannelNumber3Digit(296), '296');
+          expect(formatChannelNumber3Digit(0), isNull);
+          expect(formatChannelNumber3Digit(null), isNull);
+          expect(formatChannelNumber3Digit(30310), isNull);
+
+          const liveCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            channelName: 'テストNHK',
+            channelNr: 30310,
+            programTitle: '番組',
+          );
+          const matchingCh = Channel(
+            broadcastingType: 2,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            serviceType: 1,
+            channelNumber: 31,
+            serviceName: 'テストNHK',
+          );
+          expect(
+            resolveLiveChannelNumberLabel(liveCh, const [matchingCh]),
+            '031',
+          );
+          expect(resolveLiveChannelNumberLabel(liveCh, const []), isNull);
+
+          final kv = InMemoryKeyValueStore();
+          final cache = ChannelLogoCache(kv);
+          expect(await cache.load('192.0.2.1', 2), isNull);
+          final png = Uint8List.fromList([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+          await cache.save('192.0.2.1', 2, {0xde00: png});
+          final loaded = await cache.load('192.0.2.1', 2);
+          expect(loaded, isNotNull);
+          expect(loaded![0xde00], png);
+
+          await cache.save('192.0.2.1', 3, const {});
+          expect(await cache.load('192.0.2.1', 3), isNull);
+
+          await kv.write('${ChannelLogoCache.keyPrefix}192.0.2.1:2', '{bad');
+          expect(await cache.load('192.0.2.1', 2), isNull);
+
+          await cache.save('192.0.2.1', 2, {0xde00: png});
+          await cache.delete('192.0.2.1', 2);
+          expect(await cache.load('192.0.2.1', 2), isNull);
+        },
+      );
+
+      test(
+        'crc32Mpeg lookup table and parseEpgResponsePayload produce valid checksum and guide',
+        () {
+          final bytes = Uint8List.fromList([0x4e, 0xf0, 0x05, 0x12, 0x34, 0xab]);
+          final crc = crc32Mpeg(bytes);
+          final withCrc = Uint8List.fromList([
+            ...bytes,
+            (crc >> 24) & 0xff,
+            (crc >> 16) & 0xff,
+            (crc >> 8) & 0xff,
+            crc & 0xff,
+          ]);
+          expect(crc32Mpeg(withCrc), 0);
+
+          final guide = parseEpgResponsePayload(
+            rawResponse: Uint8List.fromList(
+              zlib.encode(const <int>[]).map((b) => b ^ epgXorKey).toList(),
+            ),
+            channels: const [],
+            broadcastingType: 2,
+          );
+          expect(guide.broadcastingType, 2);
+          expect(guide.services, isEmpty);
+        },
+      );
+
+      testWidgets(
+        'LiveProgramProgressBar accepts custom accentColor and LiveChannelSwitchPreviewCard shows 3-digit number and logo plate',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final fakePng = Uint8List.fromList([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          ]);
+          const reg = RegisteredNasne(
+            host: '192.168.10.171',
+            udn: 'uuid:preview-badge-test',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          const ch = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0xde00,
+            channelName: 'テストテレビ',
+            programTitle: 'テスト放送番組',
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData.dark(),
+              home: Scaffold(
+                body: Stack(
+                  children: [
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(24),
+                        child: LiveProgramProgressBar(
+                          state: LiveTimeshiftBarState(
+                            liveEdgeFraction: 0.7,
+                            playableStartFraction: 0.5,
+                            playbackFraction: 0.6,
+                            rewindableSeconds: 120,
+                            lagSeconds: 45,
+                            isTimeshifting: true,
+                            usesProgramTimeline: true,
+                          ),
+                          showDetailsRow: true,
+                          accentColor: Color(0xFF66BB6A),
+                        ),
+                      ),
+                    ),
+                    LiveChannelSwitchPreviewCard(
+                      direction: ChannelSwitchDirection.next,
+                      visible: true,
+                      entry: const LiveChannelSwitchEntry(
+                        channel: ch,
+                        primaryReg: reg,
+                      ),
+                      channelNumber: '031',
+                      channelLogoBytes: fakePng,
+                      onTap: () {},
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+
+          expect(find.text('031'), findsOneWidget);
+          expect(find.byType(ChannelLogoPlate), findsOneWidget);
+          expect(find.text('テストテレビ'), findsOneWidget);
+        },
+      );
+
+      testWidgets(
+        'LiveScreen renders EPG loading indicator until guide completes, then shows 3-digit number, logo plate, and next programme',
+        (tester) async {
+          tester.view.physicalSize = const Size(960, 540);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          const reg = RegisteredNasne(
+            host: '192.168.10.171',
+            udn: 'uuid:live-loading-spinner',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final now = DateTime.now().toUtc();
+          final evCur = EpgEvent(
+            eventId: 901,
+            start: now.subtract(const Duration(minutes: 10)),
+            duration: const Duration(minutes: 60),
+            title: '現在オンエア番組',
+          );
+          final evNext = EpgEvent(
+            eventId: 902,
+            start: evCur.end,
+            duration: const Duration(minutes: 30),
+            title: '次オンエア番組',
+          );
+          const dttbCh = Channel(
+            broadcastingType: terrestrialBroadcastingType,
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            serviceType: 1,
+            channelNumber: 31,
+            serviceName: 'テスト地デジ局',
+          );
+          final liveCh = LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=0400',
+            bandId: '0/video/LiveTuner/DTTB',
+            networkId: 0x7880,
+            transportStreamId: 0x7880,
+            serviceId: 0x0400,
+            channelName: 'テスト地デジ局',
+            programTitle: 'スナップショット',
+            programStart: evCur.start,
+            programEnd: evCur.end,
+          );
+          final guideCompleter = Completer<EpgGuide>();
+          final fakePng = Uint8List.fromList([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+          ]);
+
+          final container = ProviderContainer(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              channelsProvider(reg).overrideWith((ref) async => [dttbCh]),
+              channelLogosProvider(reg).overrideWith(
+                (ref) async => {0x0400: fakePng},
+              ),
+              liveChannelsProvider(reg).overrideWith(
+                (ref) async => [
+                  LiveBand(
+                    containerId: '0/video/LiveTuner/DTTB',
+                    title: '地上デジタル',
+                    channels: [liveCh],
+                  ),
+                ],
+              ),
+              epgGuideProvider(reg).overrideWith((ref) => guideCompleter.future),
+              schedulesProvider(reg).overrideWith((ref) async => const []),
+            ],
+          );
+          addTearDown(container.dispose);
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container,
+              child: const MaterialApp(home: LiveScreen()),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.pump();
+
+          expect(find.text('次の番組を読み込み中…'), findsOneWidget);
+          expect(find.text('031'), findsOneWidget);
+          expect(find.byType(ChannelLogoPlate), findsOneWidget);
+
+          guideCompleter.complete(
+            EpgGuide(
+              broadcastingType: terrestrialBroadcastingType,
+              services: [
+                EpgServiceGuide(channel: dttbCh, events: [evCur, evNext]),
+              ],
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('次の番組を読み込み中…'), findsNothing);
+          expect(find.text('次オンエア番組'), findsOneWidget);
         },
       );
     },

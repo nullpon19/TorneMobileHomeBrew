@@ -7,8 +7,7 @@ import '../app/bs_epg_providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 
-/// CS broadcastingType value in WebAPI / XSRS schedules (DTTB=2, BS=3, CS=4).
-const int csBroadcastingType = 4;
+export '../app/bs_epg_providers.dart' show csBroadcastingType;
 
 /// Lead time before reservation start when nasne claims the tuner.
 const Duration liveRecordingLeadMargin = Duration(seconds: 90);

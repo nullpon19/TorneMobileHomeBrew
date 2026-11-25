@@ -17,6 +17,7 @@ import 'providers.dart';
 const registrationFileName = 'registrations.json';
 const keyValueFileName = 'key_values.json';
 const channelCacheFileName = 'channel_cache.json';
+const channelLogoCacheFileName = 'channel_logo_cache.json';
 const epgCacheFileName = 'epg_cache.json';
 const srmFileName = 'dtcp_srm.json';
 const debugLogsDirectoryName = 'debug_logs';
@@ -48,6 +49,9 @@ ProviderContainer fileStoreContainer(
       ),
       channelCacheStoreProvider.overrideWithValue(
         JsonFileKeyValueStore(file(channelCacheFileName)),
+      ),
+      channelLogoCacheStoreProvider.overrideWithValue(
+        JsonFileKeyValueStore(file(channelLogoCacheFileName)),
       ),
       epgGuideCacheStoreProvider.overrideWithValue(
         JsonFileKeyValueStore(file(epgCacheFileName)),

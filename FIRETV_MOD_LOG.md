@@ -414,6 +414,20 @@
 4. **検証 (`test/firetv_mod_test.dart`)**:
    - Phase 37 単体・ウィジェットテスト 8 件（Live 5 分過去キャッシュ＆ 1 GiB 保護分割、`seekable-ranges` / `clampLivePendingSeekDelta` / `resolveLiveCacheCoordinatePos`・シーク境界・ライブ端復帰、CH 切替ロック・プレイバックバッジ・録画注意文、`resolveLiveTimeshiftBarState` ＆ `LiveOsdProgramSection` 統合バー描画、`ResolvedLiveChannelDisplay` 進捗/次番組・最短境界タイマー計算、`LiveScreen` 960×540 描画）を追加。
 
+### 第36弾（Phase 37.3 + 38：Live 4色バー＆下部シークHUDバッジ、EPG解析Isolate高速化＋スピナー、3桁チャンネル番号＆局ロゴ永続キャッシュ展開）
+
+1. **Live 状態バッジの下部シーク HUD 展開＆4状態シークバー配色 (`lib/ui/player_screen.dart`)**:
+   - `liveStatusPresentation` を新設し、OSD メニューおよび下部シークバー単体（`_buildSeekHud`）双方の右上へ共通バッジと連動バー色を適用（`LIVE`=赤／`一時停止`=緑 `#2E7D32`・バー `#66BB6A`／`追いかけ再生`=オレンジ／`プレイバック`=青・バー水色）。一時停止中に左キーで巻き戻している間は「`プレイバック`＋`一時停止`」の2バッジ＋水色バーを表示し、右キーで現在位置へ戻した際は一時停止単体へ復帰。下部シーク HUD 左端アクション枠色も同期。
+2. **EPG 解析・キャッシュ処理の高速化＆別スレッド化＋読み込みスピナー (`lib/core/parsing/epg.dart`, `services/epg.dart`, `registration_store.dart`, `ui/live_screen.dart`)**:
+   - `crc32Mpeg` を 256 エントリ参照テーブル化し、`_findSections` を全チャンネル総当たりから `(transportStreamId, networkId)` インデックス付き 1 パス走査へ最適化。
+   - EPG バイナリ解凍／解析 (`parseEpgResponsePayload`)・キャッシュマージ・`EpgGuideCache` 大規模 JSON 読み書きを `Isolate.run` へ逃がし、BS 切替や番組表初回取得時のメインスレッド硬直を解消。
+   - TV 視聴一覧（`_LiveList`）で地デジ／BS の EPG 初回取得中は「次の番組を読み込み中…」コンパクトスピナーを表示（取得完了で即非表示、CS は対象外）。一覧進捗バー色をライト `#0288D1`／ナイト `lightBlueAccent` へ調整。
+3. **3桁チャンネル番号＆局ロゴ画像のディスクキャッシュ化＆全画面展開 (`lib/core/store/registration_store.dart`, `app/bootstrap.dart`, `app/providers.dart`, `app/state.dart`, `app/bs_epg_providers.dart`, `ui/channel_badge.dart`, `live_screen.dart`, `epg_screen.dart`, `player_screen.dart`)**:
+   - `ChannelLogoCache` (`channel_logo_cache.json`) を新設し、取得済み放送局ロゴ PNG を端末へ永続保存（手動「更新」時のみキャッシュ削除＋再取得）。`csChannelsProvider` / `csChannelLogosProvider` もベストエフォート追加。
+   - 共通部品 `ChannelLogoPlate`（暗い背景・ナイトモードでも黒文字ロゴが潰れない白系角丸プレート付き）と `ChannelNumberBadge`（`031` / `101` 等の 3 桁番号、5 桁 UPnP `channelNr` 除外）を作成し、TV 視聴一覧／詳細、番組表 `_ChannelHeader`、プレイヤー OSD ヘッダー 1 行目、左右チャンネル切替カード（`LiveChannelSwitchPreviewCard`）へ統一展開。
+4. **検証 (`test/firetv_mod_test.dart`)**:
+   - 第25弾「一時停止」バッジ色アサーションを緑へ更新し、`liveStatusPresentation` 6パターン、`ChannelLogoCache`、3桁番号解決、`crc32Mpeg` テーブル検証、`LiveProgramProgressBar`・`LiveChannelSwitchPreviewCard`・`LiveScreen` EPG スピナー＆番号/ロゴ描画テストを追加（`dart analyze` 問題なし、対象9スイート全213テスト合格）。
+
 ---
 
 ## 3. 全変更・追加ファイル一覧 (vs アップストリーム `78d74a8`)
@@ -433,10 +447,16 @@
 | `android/app/src/main/cpp/tmhb_aes.c` | ネイティブ C T-table AES-128-CBC 復号実装 (`tmhb_aes128_cbc_decrypt` 等) |
 | `android/app/src/main/cpp/tmhb_fcntl.c` | JNI `nativeFcntlInt` に加え `nativeSetsockoptInt` を追加し API 24〜25 の `setsockopt` 互換を確保 |
 | `android/app/src/main/kotlin/com/markun/tmhb/MainActivity.kt` | `com.markun.tmhb/firetv_helper` MethodChannel（音量最大化・VPN/Tailscale・`MANAGE_EXTERNAL_STORAGE` 判定/設定誘導＋`Download`/`Downloads` 走査・`StatFs` 残容量 `getCacheAvailableBytes`・`getAndroidSdkInt`）、`FcntlCompat.setsockoptInt` |
-| `lib/app/bootstrap.dart` | `fileStoreContainer` に `mpvCacheDirectory` / `androidSdkInt` オプション引数を追加 |
+| `lib/app/bootstrap.dart` | `fileStoreContainer` に `mpvCacheDirectory` / `androidSdkInt` オプション引数および `channel_logo_cache.json` (`channelLogoCacheStoreProvider`) を追加 |
+| `lib/app/bs_epg_providers.dart` | BS に加え CS (`csChannelsProvider` / `csChannelLogosProvider`) およびロゴディスクキャッシュ参照・強制再取得ヘルパーを追加 |
 | `lib/app/firetv_helper.dart` | Fire TV 向け Platform Channel ラッパー（`getCacheAvailableBytes()`・`getAndroidSdkInt()` ほか） |
 | `lib/app/mpv_compat.dart` | API 28 以下向け同期 `mpv` 初期化判定 (`shouldUseLegacySyncMpvInit`) および FFI `mpv_wakeup` キック (`kickMpvEventLoop`) |
-| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`DefaultRecordingQualityNotifier`（既定 `DR`）、`DismissedRecNgKeysNotifier`、`NightModeNotifier`、`GroupTitlesNotifier`（既定 ON）、`EpgReservedStyleNotifier`（既定 `fill`）、`SubtitleSettingsNotifier`（`firetv_subtitle_settings`、`!ref.mounted` ガード付き）、`SubtitlesEnabledNotifier`（`firetv_subtitles_enabled`、既定 OFF）、`VideoHwdecModeNotifier`（`firetv_video_hwdec_mode`）、`mpvCacheDirectoryProvider`、`androidSdkIntProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
+| `lib/app/providers.dart` | `PlaybackQualityNotifier` 任意設定化（既定 `元画質`）、`DefaultRecordingQualityNotifier`（既定 `DR`）、`DismissedRecNgKeysNotifier`、`NightModeNotifier`、`GroupTitlesNotifier`（既定 ON）、`EpgReservedStyleNotifier`（既定 `fill`）、`SubtitleSettingsNotifier`（`firetv_subtitle_settings`、`!ref.mounted` ガード付き）、`SubtitlesEnabledNotifier`（`firetv_subtitles_enabled`、既定 OFF）、`VideoHwdecModeNotifier`（`firetv_video_hwdec_mode`）、`mpvCacheDirectoryProvider`、`androidSdkIntProvider`、`channelLogoCacheStoreProvider` / `channelLogoCacheProvider`、録画/Live バッファ設定、`autoReconnect` 有効化 |
+| `lib/app/state.dart` | `channelLogosProvider` へのディスクキャッシュ併用（`loadCachedOrFetchChannelLogos` / `clearChannelLogoCache`）および `invalidateDeviceData` 連携 |
+| `lib/core/parsing/epg.dart` | `crc32Mpeg` 256 テーブル高速化、`_findSections` 1 パス線形走査化、`parseEpgResponsePayload` 追加 |
+| `lib/core/services/epg.dart` | 大規模 EPG ペイロード解析・マージの `Isolate.run` バックグラウンドオフロード |
+| `lib/core/store/registration_store.dart` | `ChannelLogoCache`（PNG 永続キャッシュ）追加および `EpgGuideCache` 大規模 JSON の `Isolate.run` 化 |
+| `lib/ui/channel_badge.dart` | 3 桁チャンネル番号整形・照合 (`formatChannelNumber3Digit`, `resolveLiveChannelNumberLabel`) と `ChannelLogoPlate` / `ChannelNumberBadge` 共通部品 |
 | `lib/core/models/live_status.dart` | `RecNgItem` へ `desiredQualityMode` / `ngID` 解析を追加 |
 | `lib/core/arib_b24.dart` | ARIB STD-B24 単一セル復号ヘルパー `decodeAribB24OneByteCell` / `decodeAribB24TwoByteCell` を公開 |
 | `lib/core/dtcp/arib_ts_caption_tap.dart` | 生 MPEG-TS (188B) / TTS (192B) から PAT/PMT/ARIB PES・CSI 座標 (`SDP`/`SSM`/`SVS`/`ACPS`/`APS`) と `TIME`/`CS` 消去イベント、および本文テキスト・C1/`COL` 話者色・16 種マクロ・字幕管理/文内 1B/2B DRCS ビットマップ (`AribDrcsGlyph`, 最大 512 件 LRU、未定義時 `〓`) を直接デコード抽出 (`AribTsCaptionTap`, 最大 2400 件・重複置換・横話者分離) |

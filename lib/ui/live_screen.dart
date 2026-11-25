@@ -17,6 +17,7 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
@@ -25,6 +26,7 @@ import '../app/bs_epg_providers.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'channel_badge.dart';
 import 'epg_genre.dart';
 import 'epg_subchannel_visibility.dart';
 import 'error_messages.dart';
@@ -147,6 +149,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                 for (final r in activeRegs) {
                   ref.invalidate(liveChannelsProvider(r));
                   ref.invalidate(schedulesProvider(r));
+                  invalidateChannelLogosWithCacheReset(ref, r);
                 }
               },
             ),
@@ -220,6 +223,8 @@ class _LiveChannelListTile extends StatelessWidget {
     required this.display,
     required this.selected,
     required this.isRecording,
+    this.channelNumber,
+    this.logoBytes,
     required this.onTap,
   });
 
@@ -227,6 +232,8 @@ class _LiveChannelListTile extends StatelessWidget {
   final ResolvedLiveChannelDisplay display;
   final bool selected;
   final bool isRecording;
+  final String? channelNumber;
+  final Uint8List? logoBytes;
   final VoidCallback onTap;
 
   @override
@@ -241,17 +248,32 @@ class _LiveChannelListTile extends StatelessWidget {
     );
     final nextTitle = display.nextProgramTitle?.trim() ?? '';
     final nextRange = display.nextTimeRange;
+    final progressBarColor = theme.brightness == Brightness.dark
+        ? Colors.lightBlueAccent
+        : const Color(0xFF0288D1);
     return ListTile(
       selected: selected,
       contentPadding: const EdgeInsets.symmetric(
         horizontal: 16,
         vertical: 8,
       ),
-      leading: const Icon(Icons.live_tv_outlined),
-      title: Text(
-        channel.channelName ?? display.programTitle,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
+      leading: logoBytes != null
+          ? ChannelLogoPlate(bytes: logoBytes!, width: 44, height: 28)
+          : const Icon(Icons.live_tv_outlined),
+      title: Row(
+        children: [
+          if (channelNumber != null) ...[
+            ChannelNumberBadge(label: channelNumber!),
+            const SizedBox(width: 8),
+          ],
+          Expanded(
+            child: Text(
+              channel.channelName ?? display.programTitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
       subtitle: Column(
         mainAxisSize: MainAxisSize.min,
@@ -270,7 +292,7 @@ class _LiveChannelListTile extends StatelessWidget {
               child: LinearProgressIndicator(
                 value: display.progress,
                 minHeight: 4,
-                color: Colors.lightBlueAccent,
+                color: progressBarColor,
                 backgroundColor: theme.colorScheme.surfaceContainerHighest,
               ),
             ),
@@ -471,13 +493,19 @@ class _LiveListState extends ConsumerState<_LiveList>
     });
   }
 
-  ({ResolvedLiveChannelDisplay display, bool isRecording}) _resolveRowState({
+  ({
+    ResolvedLiveChannelDisplay display,
+    bool isRecording,
+    String? channelNumber,
+    Uint8List? logoBytes,
+  }) _resolveRowState({
     required RegisteredNasne ownerReg,
     required LiveChannel channel,
     required List<OwnedLiveChannel> candidates,
     required Map<String, List<RecordSchedule>> schedulesByHost,
     required DateTime now,
   }) {
+    final bandType = broadcastingTypeForLiveBandId(channel.bandId);
     final display = resolveLiveChannelDisplay(
       channel: channel,
       guideEvents: _watchedGuideEventsForChannel(ref, ownerReg, channel),
@@ -494,7 +522,41 @@ class _LiveListState extends ConsumerState<_LiveList>
       programEnd: display.programEnd,
       now: now,
     );
-    return (display: display, isRecording: isRecording);
+    final bandChannels = _watchedBandChannels(ref, ownerReg, bandType);
+    final bandLogos = _watchedBandLogos(ref, ownerReg, bandType);
+    return (
+      display: display,
+      isRecording: isRecording,
+      channelNumber: resolveLiveChannelNumberLabel(channel, bandChannels),
+      logoBytes: resolveLiveChannelLogoBytes(channel, bandLogos),
+    );
+  }
+
+  Widget _buildEpgLoadingBanner(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              '次の番組を読み込み中…',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -547,9 +609,19 @@ class _LiveListState extends ConsumerState<_LiveList>
                   channel: channel,
                   display: state.display,
                   isRecording: state.isRecording,
+                  channelNumber: state.channelNumber,
+                  logoBytes: state.logoBytes,
                 );
               }(),
           ];
+          final selectedBandType = selectedBand.channels.isNotEmpty
+              ? broadcastingTypeForLiveBandId(selectedBand.channels.first.bandId)
+              : null;
+          final epgLoading = _isBandEpgLoading(
+            ref,
+            [widget.reg],
+            selectedBandType,
+          );
           _scheduleAutoRefresh(
             items: [
               for (final r in rows) (channel: r.channel, display: r.display),
@@ -568,6 +640,8 @@ class _LiveListState extends ConsumerState<_LiveList>
                       display: row.display,
                       selected: row.channel.id == widget.selectedId,
                       isRecording: row.isRecording,
+                      channelNumber: row.channelNumber,
+                      logoBytes: row.logoBytes,
                       onTap: () => widget.onSelect(
                         row.channel.id,
                         row.channel,
@@ -598,6 +672,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                             widget.onSelectBand(selection.first),
                       ),
                     ),
+                  if (epgLoading) _buildEpgLoadingBanner(context),
                   Expanded(child: listView),
                 ],
               );
@@ -704,9 +779,21 @@ class _LiveListState extends ConsumerState<_LiveList>
             merged: merged,
             display: state.display,
             isRecording: state.isRecording,
+            channelNumber: state.channelNumber,
+            logoBytes: state.logoBytes,
           );
         }(),
     ];
+    final selectedBandType = selectedBand.channels.isNotEmpty
+        ? broadcastingTypeForLiveBandId(
+            selectedBand.channels.first.primary.bandId,
+          )
+        : null;
+    final epgLoading = _isBandEpgLoading(
+      ref,
+      [for (final s in loadedSources) s.reg],
+      selectedBandType,
+    );
     _scheduleAutoRefresh(
       items: [
         for (final r in mergedRows)
@@ -727,6 +814,8 @@ class _LiveListState extends ConsumerState<_LiveList>
                 display: row.display,
                 selected: row.merged.serviceKey == widget.selectedId,
                 isRecording: row.isRecording,
+                channelNumber: row.channelNumber,
+                logoBytes: row.logoBytes,
                 onTap: () => widget.onSelect(
                   row.merged.serviceKey,
                   row.merged.primary,
@@ -770,6 +859,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                       widget.onSelectBand(selection.first),
                 ),
               ),
+            if (epgLoading) _buildEpgLoadingBanner(context),
             Expanded(child: listView),
           ],
         );
@@ -1014,6 +1104,68 @@ List<EpgEvent> _watchedGuideEventsForChannel(
     guide = ref.watch(bsEpgGuideProvider(reg)).value;
   }
   return _serviceEventsFromGuide(guide, channel);
+}
+
+List<Channel> _watchedBandChannels(
+  WidgetRef ref,
+  RegisteredNasne reg,
+  int? bandType,
+) {
+  if (bandType == terrestrialBroadcastingType) {
+    final direct = ref.watch(channelsProvider(reg)).value;
+    if (direct != null && direct.isNotEmpty) return direct;
+    final guide = ref.watch(epgGuideProvider(reg)).value;
+    return [for (final s in guide?.services ?? const <EpgServiceGuide>[]) s.channel];
+  }
+  if (bandType == bsBroadcastingType) {
+    final direct = ref.watch(bsChannelsProvider(reg)).value;
+    if (direct != null && direct.isNotEmpty) return direct;
+    final guide = ref.watch(bsEpgGuideProvider(reg)).value;
+    return [for (final s in guide?.services ?? const <EpgServiceGuide>[]) s.channel];
+  }
+  if (bandType == csBroadcastingType) {
+    return ref.watch(csChannelsProvider(reg)).value ?? const <Channel>[];
+  }
+  return const <Channel>[];
+}
+
+Map<int, List<int>> _watchedBandLogos(
+  WidgetRef ref,
+  RegisteredNasne reg,
+  int? bandType,
+) {
+  if (bandType == terrestrialBroadcastingType) {
+    return ref.watch(channelLogosProvider(reg)).value ??
+        const <int, List<int>>{};
+  }
+  if (bandType == bsBroadcastingType) {
+    return ref.watch(bsChannelLogosProvider(reg)).value ??
+        const <int, List<int>>{};
+  }
+  if (bandType == csBroadcastingType) {
+    return ref.watch(csChannelLogosProvider(reg)).value ??
+        const <int, List<int>>{};
+  }
+  return const <int, List<int>>{};
+}
+
+bool _isBandEpgLoading(
+  WidgetRef ref,
+  Iterable<RegisteredNasne> regs,
+  int? bandType,
+) {
+  if (bandType == terrestrialBroadcastingType) {
+    for (final r in regs) {
+      final a = ref.watch(epgGuideProvider(r));
+      if (a.isLoading && !a.hasValue) return true;
+    }
+  } else if (bandType == bsBroadcastingType) {
+    for (final r in regs) {
+      final a = ref.watch(bsEpgGuideProvider(r));
+      if (a.isLoading && !a.hasValue) return true;
+    }
+  }
+  return false;
 }
 
 RecordSchedule? _firstActiveScheduleForCandidates(
@@ -1358,6 +1510,11 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
       programEnd: display.programEnd,
       now: now,
     );
+    final bandType = broadcastingTypeForLiveBandId(ch.bandId);
+    final bandChannels = _watchedBandChannels(ref, reg, bandType);
+    final bandLogos = _watchedBandLogos(ref, reg, bandType);
+    final channelNumber = resolveLiveChannelNumberLabel(ch, bandChannels);
+    final logoBytes = resolveLiveChannelLogoBytes(ch, bandLogos);
     final start = display.programStart;
     final end = display.programEnd;
     return ListView(
@@ -1377,8 +1534,33 @@ class _LiveChannelDetailViewState extends ConsumerState<LiveChannelDetailView> {
           overflow: TextOverflow.ellipsis,
         ),
         const SizedBox(height: 8),
-        if (ch.channelName != null)
-          FieldRow(label: 'チャンネル', value: ch.channelName!),
+        if (ch.channelName != null || channelNumber != null || logoBytes != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: 104,
+                  child: Text(
+                    'チャンネル',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                if (logoBytes != null) ...[
+                  ChannelLogoPlate(bytes: logoBytes, width: 42, height: 24),
+                  const SizedBox(width: 8),
+                ],
+                if (channelNumber != null) ...[
+                  ChannelNumberBadge(label: channelNumber),
+                  const SizedBox(width: 8),
+                ],
+                Expanded(child: Text(ch.channelName ?? '')),
+              ],
+            ),
+          ),
         if (start != null && end != null)
           FieldRow(
             label: '放送時間',
@@ -1900,6 +2082,44 @@ Widget _buildLivePlayerScreen({
     cachedGuide,
     bandChannels,
   );
+  ({Map<String, String> numbers, Map<String, Uint8List> logos})
+  buildCachedChannelMeta() {
+    final cachedChannels = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelsProvider(reg)).value ??
+            [for (final s in cachedGuide?.services ?? const <EpgServiceGuide>[]) s.channel],
+      bsBroadcastingType =>
+        container.read(bsChannelsProvider(reg)).value ??
+            [for (final s in cachedGuide?.services ?? const <EpgServiceGuide>[]) s.channel],
+      csBroadcastingType =>
+        container.read(csChannelsProvider(reg)).value ?? const <Channel>[],
+      _ => const <Channel>[],
+    };
+    final cachedLogos = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      bsBroadcastingType =>
+        container.read(bsChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      csBroadcastingType =>
+        container.read(csChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      _ => const <int, List<int>>{},
+    };
+    final numbers = <String, String>{};
+    final logos = <String, Uint8List>{};
+    for (final ch in bandChannels) {
+      final key = liveServiceKey(ch);
+      final numLabel = resolveLiveChannelNumberLabel(ch, cachedChannels);
+      if (numLabel != null) numbers[key] = numLabel;
+      final logo = resolveLiveChannelLogoBytes(ch, cachedLogos);
+      if (logo != null) logos[key] = logo;
+    }
+    return (numbers: numbers, logos: logos);
+  }
+
+  final initialMeta = buildCachedChannelMeta();
   return PlayerScreen(
     title: channel.channelName ?? channel.programTitle,
     session: session,
@@ -1914,6 +2134,52 @@ Widget _buildLivePlayerScreen({
     loadLiveBandGuideEvents: () async {
       final guide = await _loadEpgGuideForBand(container, reg, bandType);
       return _bandGuideEventsMap(guide, bandChannels);
+    },
+    initialLiveChannelNumbers: initialMeta.numbers,
+    initialLiveChannelLogos: initialMeta.logos,
+    loadLiveChannelMetadata: () async {
+      List<Channel> channels = const [];
+      Map<int, List<int>> rawLogos = const {};
+      final channelProvider = switch (bandType) {
+        terrestrialBroadcastingType => channelsProvider(reg),
+        bsBroadcastingType => bsChannelsProvider(reg),
+        csBroadcastingType => csChannelsProvider(reg),
+        _ => null,
+      };
+      final logoProvider = switch (bandType) {
+        terrestrialBroadcastingType => channelLogosProvider(reg),
+        bsBroadcastingType => bsChannelLogosProvider(reg),
+        csBroadcastingType => csChannelLogosProvider(reg),
+        _ => null,
+      };
+      await Future.wait([
+        if (channelProvider != null)
+          () async {
+            try {
+              channels = await container
+                  .read(channelProvider.future)
+                  .timeout(const Duration(seconds: 6));
+            } catch (_) {}
+          }(),
+        if (logoProvider != null)
+          () async {
+            try {
+              rawLogos = await container
+                  .read(logoProvider.future)
+                  .timeout(const Duration(seconds: 6));
+            } catch (_) {}
+          }(),
+      ]);
+      final numbers = <String, String>{};
+      final logos = <String, Uint8List>{};
+      for (final ch in bandChannels) {
+        final key = liveServiceKey(ch);
+        final numLabel = resolveLiveChannelNumberLabel(ch, channels);
+        if (numLabel != null) numbers[key] = numLabel;
+        final logo = resolveLiveChannelLogoBytes(ch, rawLogos);
+        if (logo != null) logos[key] = logo;
+      }
+      return (numbers: numbers, logos: logos);
     },
     onRefreshLiveChannels: () async {
       final refreshed = await _resolveLiveSwitchContext(

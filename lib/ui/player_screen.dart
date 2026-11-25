@@ -183,6 +183,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import '../app/firetv_helper.dart';
 import '../app/mpv_compat.dart';
+import 'channel_badge.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
 import '../core/dtcp/arib_ts_caption_tap.dart';
@@ -271,8 +272,8 @@ Widget buildPlayerOsdStatusBadge({
   );
 }
 
-/// Returns the OSD header live status badge label and color for real-time vs
-/// paused / delayed chase playback after pausing.
+/// Returns the primary OSD header live status badge label and color for
+/// real-time vs paused / delayed chase / playback after pausing.
 ({String label, Color color}) osdLiveStatusBadgeSpec({
   required bool liveDelayedByPause,
   required double liveCatchUpRate,
@@ -283,7 +284,7 @@ Widget buildPlayerOsdStatusBadge({
     return (label: 'LIVE', color: Colors.redAccent);
   }
   if (isPaused) {
-    return (label: '一時停止', color: const Color(0xFFEF6C00));
+    return (label: '一時停止', color: const Color(0xFF2E7D32));
   }
   if (liveCatchUpRate > 1.0) {
     return (
@@ -295,6 +296,57 @@ Widget buildPlayerOsdStatusBadge({
     return (label: 'プレイバック', color: const Color(0xFF0277BD));
   }
   return (label: '追いかけ再生', color: const Color(0xFFEF6C00));
+}
+
+/// Returns the ordered status badges and matching progress-bar accent color
+/// for both the live OSD menu and the bottom seek HUD.
+({
+  List<({String label, Color color})> badges,
+  Color barColor,
+}) liveStatusPresentation({
+  required bool liveDelayedByPause,
+  required double liveCatchUpRate,
+  bool isPaused = false,
+  bool isRewoundPlayback = false,
+}) {
+  if (!liveDelayedByPause) {
+    return (
+      badges: const [(label: 'LIVE', color: Colors.redAccent)],
+      barColor: Colors.redAccent,
+    );
+  }
+  if (isPaused && isRewoundPlayback) {
+    return (
+      badges: const [
+        (label: 'プレイバック', color: Color(0xFF0277BD)),
+        (label: '一時停止', color: Color(0xFF2E7D32)),
+      ],
+      barColor: Colors.lightBlueAccent,
+    );
+  }
+  if (isPaused) {
+    return (
+      badges: const [(label: '一時停止', color: Color(0xFF2E7D32))],
+      barColor: const Color(0xFF66BB6A),
+    );
+  }
+  if (isRewoundPlayback) {
+    return (
+      badges: const [(label: 'プレイバック', color: Color(0xFF0277BD))],
+      barColor: Colors.lightBlueAccent,
+    );
+  }
+  return (
+    badges: [
+      (
+        label: liveCatchUpRate > 1.0
+            ? '追いかけ再生 ${playbackSpeedLabel(liveCatchUpRate)}'
+            : '追いかけ再生',
+        color: const Color(0xFFEF6C00),
+      ),
+    ],
+    barColor: Colors.orangeAccent,
+  );
 }
 
 /// Returns whether D-pad left/right keys during live playback should switch
@@ -494,6 +546,8 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     required this.visible,
     required this.entry,
     this.resolvedProgram,
+    this.channelNumber,
+    this.channelLogoBytes,
     required this.onTap,
   });
 
@@ -501,6 +555,8 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
   final bool visible;
   final LiveChannelSwitchEntry? entry;
   final ResolvedLiveSwitchProgram? resolvedProgram;
+  final String? channelNumber;
+  final Uint8List? channelLogoBytes;
   final VoidCallback? onTap;
 
   @override
@@ -604,15 +660,38 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ],
                               ),
                               const SizedBox(height: 6),
-                              Text(
-                                data.displayChannelName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: titleColor,
-                                  fontSize: 17,
-                                  fontWeight: FontWeight.bold,
-                                ),
+                              Row(
+                                children: [
+                                  if (channelLogoBytes != null) ...[
+                                    ChannelLogoPlate(
+                                      bytes: channelLogoBytes!,
+                                      width: 38,
+                                      height: 22,
+                                      darkSurface: isDark,
+                                    ),
+                                    const SizedBox(width: 6),
+                                  ],
+                                  if (channelNumber != null) ...[
+                                    ChannelNumberBadge(
+                                      label: channelNumber!,
+                                      darkSurface: isDark,
+                                      compact: true,
+                                    ),
+                                    const SizedBox(width: 6),
+                                  ],
+                                  Expanded(
+                                    child: Text(
+                                      data.displayChannelName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        color: titleColor,
+                                        fontSize: 17,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                               const SizedBox(height: 4),
                               Text(
@@ -1399,11 +1478,13 @@ class LiveProgramProgressBar extends StatelessWidget {
     required this.state,
     this.showDetailsRow = false,
     this.barHeight = 6.0,
+    this.accentColor = Colors.lightBlueAccent,
   });
 
   final LiveTimeshiftBarState state;
   final bool showDetailsRow;
   final double barHeight;
+  final Color accentColor;
 
   @override
   Widget build(BuildContext context) {
@@ -1463,7 +1544,7 @@ class LiveProgramProgressBar extends StatelessWidget {
                         child: Container(
                           height: barHeight,
                           width: playableStartX,
-                          color: Colors.lightBlueAccent.withValues(alpha: 0.32),
+                          color: accentColor.withValues(alpha: 0.32),
                         ),
                       ),
                     if (liveX > playableStartX)
@@ -1483,7 +1564,7 @@ class LiveProgramProgressBar extends StatelessWidget {
                         height: barHeight,
                         child: ClipRRect(
                           borderRadius: BorderRadius.circular(barHeight / 2),
-                          child: Container(color: Colors.lightBlueAccent),
+                          child: Container(color: accentColor),
                         ),
                       ),
                     Positioned(
@@ -1506,7 +1587,7 @@ class LiveProgramProgressBar extends StatelessWidget {
                       child: Container(
                         height: barHeight,
                         width: liveX,
-                        color: Colors.lightBlueAccent,
+                        color: accentColor,
                       ),
                     ),
                   Positioned(
@@ -1519,7 +1600,7 @@ class LiveProgramProgressBar extends StatelessWidget {
                         shape: BoxShape.circle,
                         color: Colors.white,
                         border: Border.all(
-                          color: Colors.lightBlueAccent,
+                          color: accentColor,
                           width: 2,
                         ),
                       ),
@@ -1580,10 +1661,12 @@ class LiveOsdProgramSection extends StatelessWidget {
     super.key,
     required this.info,
     this.timeshift,
+    this.accentColor = Colors.lightBlueAccent,
   });
 
   final LiveOsdProgramInfo info;
   final LiveTimeshiftBarState? timeshift;
+  final Color accentColor;
 
   @override
   Widget build(BuildContext context) {
@@ -1641,6 +1724,7 @@ class LiveOsdProgramSection extends StatelessWidget {
                 effectiveTimeshift.isTimeshifting ||
                 effectiveTimeshift.rewindableSeconds >= 2,
             barHeight: 6.0,
+            accentColor: accentColor,
           ),
         ],
         if (info.nextTitle != null) ...[
@@ -2250,6 +2334,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.onRefreshLiveChannels,
     this.liveSwitchChannels = const [],
     this.currentLiveSwitchIndex = -1,
+    this.initialLiveChannelNumbers = const {},
+    this.initialLiveChannelLogos = const {},
+    this.loadLiveChannelMetadata,
     this.onSwitchLiveChannel,
     this.onCheckRecordingConflict,
     this.onBuildRecordingChannelPlayer,
@@ -2367,6 +2454,17 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Index of [currentLiveChannel] inside [liveSwitchChannels].
   final int currentLiveSwitchIndex;
+
+  /// Pre-loaded 3-digit channel numbers keyed by [liveServiceKey].
+  final Map<String, String> initialLiveChannelNumbers;
+
+  /// Pre-loaded channel logo PNG bytes keyed by [liveServiceKey].
+  final Map<String, Uint8List> initialLiveChannelLogos;
+
+  /// Optional background loader for channel numbers and logos when not cached.
+  final Future<({Map<String, String> numbers, Map<String, Uint8List> logos})>
+  Function()?
+  loadLiveChannelMetadata;
 
   /// Called when live playback actually exits (skipping `pushReplacement` hops
   /// such as channel/quality switches or failover), passing the last active channel.
@@ -2579,6 +2677,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   LiveChannel? _currentLiveChannel;
   List<LiveChannelSwitchEntry> _liveSwitchChannels = const [];
   int _currentLiveSwitchIndex = -1;
+  Map<String, String> _liveChannelNumbers = const {};
+  Map<String, Uint8List> _liveChannelLogos = const {};
+  bool _liveChannelMetaLoading = false;
   bool _liveGuideLoading = false;
   DateTime? _lastLiveGuideAttemptAt;
   bool _liveChannelsRefreshing = false;
@@ -2964,6 +3065,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       widget.liveSwitchChannels,
     );
     _currentLiveSwitchIndex = widget.currentLiveSwitchIndex;
+    _liveChannelNumbers = Map<String, String>.of(
+      widget.initialLiveChannelNumbers,
+    );
+    _liveChannelLogos = Map<String, Uint8List>.of(
+      widget.initialLiveChannelLogos,
+    );
+    if (widget.live &&
+        widget.loadLiveChannelMetadata != null &&
+        (_liveChannelNumbers.isEmpty || _liveChannelLogos.isEmpty)) {
+      unawaited(_loadLiveChannelMetadata());
+    }
     _liveBandGuideEvents = {
       for (final entry in widget.initialLiveBandGuideEvents.entries)
         entry.key: List<EpgEvent>.of(entry.value),
@@ -4652,6 +4764,35 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
+  Future<void> _loadLiveChannelMetadata() async {
+    final loader = widget.loadLiveChannelMetadata;
+    if (!widget.live || loader == null || _liveChannelMetaLoading) return;
+    _liveChannelMetaLoading = true;
+    try {
+      final loaded = await loader();
+      if (!mounted) return;
+      if (loaded.numbers.isNotEmpty || loaded.logos.isNotEmpty) {
+        setState(() {
+          if (loaded.numbers.isNotEmpty) {
+            _liveChannelNumbers = {
+              ..._liveChannelNumbers,
+              ...loaded.numbers,
+            };
+          }
+          if (loaded.logos.isNotEmpty) {
+            _liveChannelLogos = {
+              ..._liveChannelLogos,
+              ...loaded.logos,
+            };
+          }
+        });
+      }
+    } catch (_) {
+    } finally {
+      _liveChannelMetaLoading = false;
+    }
+  }
+
   Future<void> _refreshLiveChannelSnapshots({bool force = false}) async {
     final refresher = widget.onRefreshLiveChannels;
     if (!widget.live || refresher == null || _liveChannelsRefreshing) return;
@@ -5674,6 +5815,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         'これ以上戻れません (-${_formatOverlaySeconds(maxBack)})',
       );
     } else if (deltaSec > 0 && clamped.hitEnd) {
+      _liveRewoundByUser = false;
       _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
     } else {
       _showSeekHud(
@@ -5829,6 +5971,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         'これ以上戻れません (-${_formatOverlaySeconds((cacheEnd - res.targetSeconds).round())})',
       );
     } else if (res.reachedLiveEdge && !_playingNow) {
+      _liveRewoundByUser = false;
       _showSeekHud(Icons.live_tv, '現在位置（再開で通常視聴）');
     } else {
       setState(() {});
@@ -6909,12 +7052,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             guideEvents: _guideEventsForChannel(nextEntry.channel),
             now: now,
           );
+    final prevKey = prevEntry != null ? liveServiceKey(prevEntry.channel) : null;
+    final nextKey = nextEntry != null ? liveServiceKey(nextEntry.channel) : null;
     return [
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.previous,
         visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
         entry: prevEntry,
         resolvedProgram: prevResolved,
+        channelNumber: prevKey != null ? _liveChannelNumbers[prevKey] : null,
+        channelLogoBytes: prevKey != null ? _liveChannelLogos[prevKey] : null,
         onTap: prevEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
@@ -6924,6 +7071,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         visible: _channelPreviewDirection == ChannelSwitchDirection.next,
         entry: nextEntry,
         resolvedProgram: nextResolved,
+        channelNumber: nextKey != null ? _liveChannelNumbers[nextKey] : null,
+        channelLogoBytes: nextKey != null ? _liveChannelLogos[nextKey] : null,
         onTap: nextEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
@@ -7108,6 +7257,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final liveTimeshift = widget.live
         ? _currentLiveTimeshiftBarState(liveInfo, now)
         : null;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final seekAccentColor = liveStatus?.barColor ?? Colors.lightBlueAccent;
     final headline = (liveInfo != null && liveInfo.currentTitle.isNotEmpty)
         ? liveInfo.currentTitle
         : widget.title;
@@ -7139,7 +7297,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     decoration: BoxDecoration(
                       color: Colors.black87,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.lightBlueAccent),
+                      border: Border.all(color: seekAccentColor),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -7147,7 +7305,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         if (_seekHudIcon != null) ...[
                           Icon(
                             _seekHudIcon,
-                            color: Colors.lightBlueAccent,
+                            color: seekAccentColor,
                             size: 20,
                           ),
                           const SizedBox(width: 6),
@@ -7191,6 +7349,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ],
                   const SizedBox(width: 12),
                   _buildBufferBadge(),
+                  if (liveStatus != null)
+                    for (final badge in liveStatus.badges) ...[
+                      const SizedBox(width: 8),
+                      buildPlayerOsdStatusBadge(
+                        label: badge.label,
+                        color: badge.color,
+                      ),
+                    ],
                 ],
               ),
               const SizedBox(height: 10),
@@ -7199,6 +7365,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   state: liveTimeshift,
                   showDetailsRow: true,
                   barHeight: 8.0,
+                  accentColor: seekAccentColor,
                 )
               else
                 _buildSeekBarSection(isSeekingPreview: true),
@@ -7266,7 +7433,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   Widget _buildOsdClockOverlay() =>
       PlayerOsdClockOverlay(now: _now(), opacity: _osdFadeAnimation);
 
-  Widget _buildLiveOsdProgramSection() {
+  Widget _buildLiveOsdProgramSection({
+    Color accentColor = Colors.lightBlueAccent,
+  }) {
     final now = _now();
     final channel = _activeLiveChannel;
     if (channel == null) {
@@ -7275,6 +7444,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         state: _currentLiveTimeshiftBarState(null, now),
         showDetailsRow: true,
         barHeight: 6.0,
+        accentColor: accentColor,
       );
     }
     final info = resolveLiveOsdProgramInfo(
@@ -7285,10 +7455,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return LiveOsdProgramSection(
       info: info,
       timeshift: _currentLiveTimeshiftBarState(info, now),
+      accentColor: accentColor,
     );
   }
 
   Widget _buildRemoteOsd() {
+    final activeChannel = widget.live ? _activeLiveChannel : null;
+    final activeServiceKey = activeChannel != null
+        ? liveServiceKey(activeChannel)
+        : null;
+    final activeLogoBytes = activeServiceKey != null
+        ? _liveChannelLogos[activeServiceKey]
+        : null;
+    final activeChannelNumber = activeServiceKey != null
+        ? _liveChannelNumbers[activeServiceKey]
+        : null;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
     return Positioned(
       left: 0,
       right: 0,
@@ -7314,6 +7503,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           children: [
             Row(
               children: [
+                if (widget.live && activeLogoBytes != null) ...[
+                  ChannelLogoPlate(
+                    bytes: activeLogoBytes,
+                    width: 42,
+                    height: 24,
+                    darkSurface: true,
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                if (widget.live && activeChannelNumber != null) ...[
+                  ChannelNumberBadge(
+                    label: activeChannelNumber,
+                    darkSurface: true,
+                  ),
+                  const SizedBox(width: 8),
+                ],
                 Expanded(
                   child: Text(
                     (!widget.live &&
@@ -7340,28 +7545,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     icon: Icons.fiber_manual_record,
                   ),
                 ],
-                if (widget.live) ...[
-                  const SizedBox(width: 8),
-                  Builder(
-                    builder: (_) {
-                      final spec = osdLiveStatusBadgeSpec(
-                        liveDelayedByPause: _liveDelayedByPause,
-                        liveCatchUpRate: _liveCatchUpRate,
-                        isPaused: !_playingNow || _livePausedAt != null,
-                        isRewoundPlayback: _liveRewoundByUser,
-                      );
-                      return buildPlayerOsdStatusBadge(
-                        label: spec.label,
-                        color: spec.color,
-                      );
-                    },
-                  ),
-                ],
+                if (liveStatus != null)
+                  for (final badge in liveStatus.badges) ...[
+                    const SizedBox(width: 8),
+                    buildPlayerOsdStatusBadge(
+                      label: badge.label,
+                      color: badge.color,
+                    ),
+                  ],
               ],
             ),
             if (widget.live && (_activeLiveChannel != null || _liveDelayedByPause)) ...[
               const SizedBox(height: 6),
-              _buildLiveOsdProgramSection(),
+              _buildLiveOsdProgramSection(
+                accentColor: liveStatus?.barColor ?? Colors.lightBlueAccent,
+              ),
             ] else if (!widget.live) ...[
               if ((widget.recordedChannelName != null &&
                       widget.recordedChannelName!.trim().isNotEmpty) ||

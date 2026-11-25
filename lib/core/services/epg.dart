@@ -24,6 +24,9 @@
 /// the recipe with the real format; see `buildEpgGetBody`.
 library;
 
+import 'dart:isolate';
+import 'dart:typed_data';
+
 import '../diagnostics.dart';
 import '../endpoints.dart';
 import '../errors.dart';
@@ -95,12 +98,20 @@ class WebApiEpgService {
       WebApiEndpoints.epgGet,
       body: body,
     );
-    final plain = inflateEpgResponse(raw);
-    final parsed = parseEpgGuide(plain, channels,
-        broadcastingType: broadcastingType);
-    final fresh = broadcastingType == 3
-        ? completeBsEpgGuide(parsed, channels)
-        : parsed;
+    final rawBytes = raw is Uint8List ? raw : Uint8List.fromList(raw);
+    final fresh = rawBytes.length >= 16384
+        ? await Isolate.run(
+            () => parseEpgResponsePayload(
+              rawResponse: rawBytes,
+              channels: channels,
+              broadcastingType: broadcastingType,
+            ),
+          )
+        : parseEpgResponsePayload(
+            rawResponse: rawBytes,
+            channels: channels,
+            broadcastingType: broadcastingType,
+          );
     _diag(
       DiagCategory.epg,
       'epg fetch type=$broadcastingType: ${fresh.services.length} '
@@ -115,7 +126,9 @@ class WebApiEpgService {
     // the guide itself.
     try {
       final cached = await cache.load(host, broadcastingType);
-      final merged = mergeEpgGuideWithCache(fresh, cached);
+      final merged = (cached.isNotEmpty && fresh.eventCount >= 200)
+          ? await Isolate.run(() => mergeEpgGuideWithCache(fresh, cached))
+          : mergeEpgGuideWithCache(fresh, cached);
       await cache.save(host, broadcastingType, merged);
       return merged;
     } catch (_) {

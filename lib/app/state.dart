@@ -7,6 +7,7 @@
 /// substitute fakes by overriding the composition-root providers.
 library;
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -210,23 +211,63 @@ final epgGuideProvider = FutureProvider.family<EpgGuide, RegisteredNasne>((
       .getProgrammeGuide(terrestrialBroadcastingType, channels);
 });
 
-/// Channel logos (terrestrial): serviceId -> PNG bytes (plan 21).
-/// A logo failure must not sink the guide, so errors degrade to an
-/// empty map.
-final channelLogosProvider =
-    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>((
-      ref,
-      reg,
-    ) async {
+/// Loads persisted station logos from disk cache or fetches them once from
+/// nasne and saves them to [channelLogoCacheProvider]. Returns an empty map
+/// when the device has no logos or returns an error.
+Future<Map<int, List<int>>> loadCachedOrFetchChannelLogos(
+  Ref ref,
+  RegisteredNasne reg,
+  int broadcastingType,
+) async {
+  final cache = ref.watch(channelLogoCacheProvider);
+  final cached = await cache.load(reg.host, broadcastingType);
+  if (cached != null && cached.isNotEmpty) {
+    return cached;
+  }
+  try {
+    final raw = await ref
+        .watch(deviceServicesProvider(reg))
+        .metadata
+        .getChannelLogos(broadcastingType);
+    final normalized = <int, Uint8List>{
+      for (final entry in raw.entries)
+        if (entry.value.isNotEmpty)
+          entry.key: entry.value is Uint8List
+              ? entry.value as Uint8List
+              : Uint8List.fromList(entry.value),
+    };
+    if (normalized.isNotEmpty) {
       try {
-        return await ref
-            .watch(deviceServicesProvider(reg))
-            .metadata
-            .getChannelLogos(terrestrialBroadcastingType);
-      } on NasneError {
-        return const {};
+        await cache.save(reg.host, broadcastingType, normalized);
+      } catch (_) {
+        // Cache persistence is best-effort; never fail logo rendering.
       }
-    });
+    }
+    return normalized;
+  } on NasneError {
+    return const <int, List<int>>{};
+  }
+}
+
+/// Clears disk-cached station logos for [reg] so the next provider read
+/// re-fetches fresh images from the nasne unit.
+Future<void> clearChannelLogoCache(
+  WidgetRef ref,
+  RegisteredNasne reg, {
+  int? broadcastingType,
+}) async {
+  final cache = ref.read(channelLogoCacheProvider);
+  final types = broadcastingType != null ? [broadcastingType] : const [2, 3, 4];
+  await Future.wait([for (final t in types) cache.delete(reg.host, t)]);
+}
+
+/// Channel logos (terrestrial): serviceId -> PNG bytes (plan 21), backed by
+/// [channelLogoCacheProvider].
+final channelLogosProvider =
+    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
+      (ref, reg) =>
+          loadCachedOrFetchChannelLogos(ref, reg, terrestrialBroadcastingType),
+    );
 
 /// Reservations in chronological order (the device returns them in
 /// its own order; the UI contract is time order, plan 5.6).
@@ -375,6 +416,7 @@ void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
   ref.invalidate(bcasInfoProvider(reg));
   ref.invalidate(channelsProvider(reg));
   ref.invalidate(epgGuideProvider(reg));
+  unawaited(clearChannelLogoCache(ref, reg));
   ref.invalidate(channelLogosProvider(reg));
   ref.invalidate(schedulesProvider(reg));
   ref.invalidate(titlesProvider(reg));

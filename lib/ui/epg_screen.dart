@@ -23,6 +23,7 @@ import '../app/state.dart';
 import '../app/bs_epg_providers.dart';
 import '../core/core.dart';
 import 'app_shell.dart';
+import 'channel_badge.dart';
 import 'epg_genre.dart';
 import 'epg_search_screen.dart';
 import 'error_messages.dart';
@@ -1048,11 +1049,19 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
                           ref.invalidate(schedulesProvider(r));
                           if (_selectedBand == terrestrialBroadcastingType) {
                             ref.invalidate(epgGuideProvider(r));
-                            ref.invalidate(channelLogosProvider(r));
+                            invalidateChannelLogosWithCacheReset(
+                              ref,
+                              r,
+                              broadcastingType: terrestrialBroadcastingType,
+                            );
                           } else {
                             ref.invalidate(bsChannelsProvider(r));
                             ref.invalidate(bsEpgGuideProvider(r));
-                            ref.invalidate(bsChannelLogosProvider(r));
+                            invalidateChannelLogosWithCacheReset(
+                              ref,
+                              r,
+                              broadcastingType: bsBroadcastingType,
+                            );
                           }
                         }
                       },
@@ -1144,9 +1153,9 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
     final reservedStyle = ref.watch(epgReservedStyleProvider);
     final logos = isBs
         ? (ref.watch(bsChannelLogosProvider(guideReg)).value ??
-              const <int, List<int>>{})
+              const <int, Uint8List>{})
         : (ref.watch(channelLogosProvider(guideReg)).value ??
-              const <int, List<int>>{});
+              const <int, Uint8List>{});
 
     return Column(
       children: [
@@ -1638,32 +1647,60 @@ class _ChannelHeader extends StatelessWidget {
       child: Row(
         children: [
           for (final service in services)
-            SizedBox(
-              width: channelWidth,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    if (logos[service.channel.serviceId] != null)
-                      SizedBox(
-                        height: 24,
-                        child: Image.memory(
-                          Uint8List.fromList(logos[service.channel.serviceId]!),
-                          fit: BoxFit.contain,
+            () {
+              final rawLogo = logos[service.channel.serviceId];
+              final logoBytes = rawLogo == null || rawLogo.isEmpty
+                  ? null
+                  : (rawLogo is Uint8List
+                        ? rawLogo
+                        : Uint8List.fromList(rawLogo));
+              final numberLabel = formatChannelNumber3Digit(
+                service.channel.channelNumber,
+              );
+              return SizedBox(
+                width: channelWidth,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 3,
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (logoBytes != null || numberLabel != null) ...[
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            if (logoBytes != null)
+                              ChannelLogoPlate(
+                                bytes: logoBytes,
+                                width: 38,
+                                height: 22,
+                              ),
+                            if (logoBytes != null && numberLabel != null)
+                              const SizedBox(width: 6),
+                            if (numberLabel != null)
+                              ChannelNumberBadge(
+                                label: numberLabel,
+                                compact: true,
+                              ),
+                          ],
                         ),
+                        const SizedBox(height: 2),
+                      ],
+                      Text(
+                        service.channel.serviceName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall,
+                        textAlign: TextAlign.center,
                       ),
-                    Text(
-                      service.channel.serviceName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall,
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ),
+              );
+            }(),
         ],
       ),
     );
