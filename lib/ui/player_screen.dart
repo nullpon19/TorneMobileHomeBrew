@@ -306,6 +306,12 @@ bool canSwitchLiveChannelOnDirectionKey({
 }) =>
     live && !liveDelayedByPause && playingNow;
 
+/// Signed relative seek delta (seconds) for D-pad left/right during live
+/// pause/playback/chase mode.
+double liveDirectionKeySeekDeltaSeconds({required bool forward}) => forward
+    ? PlayerScreen.forwardStep.inSeconds.toDouble()
+    : PlayerScreen.rewindStep.inSeconds.toDouble();
+
 /// Builds the live recording confirmation dialog body text, appending a notice
 /// when the viewer is currently paused or playing behind the live edge.
 String buildLiveRecordingConfirmContent({
@@ -948,15 +954,16 @@ LiveTimeshiftBarState resolveLiveTimeshiftBarState({
           cacheEndSeconds > cacheStartSeconds)
       ? (cacheEndSeconds - cacheStartSeconds)
       : 0.0;
-  final rawLag =
-      (cacheEndSeconds != null &&
-          effectivePosSeconds != null &&
-          cacheEndSeconds.isFinite &&
-          effectivePosSeconds.isFinite)
-      ? (cacheEndSeconds - effectivePosSeconds)
-            .clamp(0.0, rewindableRaw > 0 ? rewindableRaw : double.infinity)
-            .toDouble()
-      : math.max(0.0, fallbackLagSeconds);
+  final rawLag = !liveDelayedByPause
+      ? 0.0
+      : ((cacheEndSeconds != null &&
+              effectivePosSeconds != null &&
+              cacheEndSeconds.isFinite &&
+              effectivePosSeconds.isFinite)
+          ? (cacheEndSeconds - effectivePosSeconds)
+                .clamp(0.0, rewindableRaw > 0 ? rewindableRaw : double.infinity)
+                .toDouble()
+          : math.max(0.0, fallbackLagSeconds));
 
   final start = info?.currentStart;
   final end = info?.currentEnd;
@@ -993,7 +1000,7 @@ LiveTimeshiftBarState resolveLiveTimeshiftBarState({
     playbackFraction: playbackFrac,
     rewindableSeconds: math.max(0, rewindableRaw.round()),
     lagSeconds: math.max(0, rawLag.round()),
-    isTimeshifting: liveDelayedByPause || rawLag > 1.5,
+    isTimeshifting: liveDelayedByPause,
     usesProgramTimeline: usesProgramTimeline,
   );
 }
@@ -1630,7 +1637,9 @@ class LiveOsdProgramSection extends StatelessWidget {
           const SizedBox(height: 6),
           LiveProgramProgressBar(
             state: effectiveTimeshift,
-            showDetailsRow: effectiveTimeshift.isTimeshifting,
+            showDetailsRow:
+                effectiveTimeshift.isTimeshifting ||
+                effectiveTimeshift.rewindableSeconds >= 2,
             barHeight: 6.0,
           ),
         ],
@@ -6483,7 +6492,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         } else {
           _dismissChannelPreview();
-          _queueLiveRelativeSeek(-_rewindStep.inSeconds.toDouble());
+          _queueLiveRelativeSeek(liveDirectionKeySeekDeltaSeconds(forward: false));
         }
       } else {
         _queueRelativeSeek(_rewindStep);
@@ -6508,7 +6517,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         } else {
           _dismissChannelPreview();
-          _queueLiveRelativeSeek(_forwardStep.inSeconds.toDouble());
+          _queueLiveRelativeSeek(liveDirectionKeySeekDeltaSeconds(forward: true));
         }
       } else {
         _queueRelativeSeek(_forwardStep);
@@ -6704,9 +6713,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           settings: ref.watch(subtitleSettingsProvider),
                           cues: _visibleSubtitleCues,
                           bottomSafePadding: _osdOpen
-                              ? (widget.live
-                                    ? (_liveDelayedByPause ? 250.0 : 216.0)
-                                    : 176.0)
+                              ? (widget.live ? 250.0 : 176.0)
                               : (_seekHudVisible ? 116.0 : 24.0),
                         ),
                       if (!_conflictHandled &&
@@ -7390,7 +7397,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       icon: Icons.replay_10,
                       label: '-10秒',
                       onPressed: () {
-                        _queueLiveRelativeSeek(-10.0);
+                        _queueLiveRelativeSeek(
+                          liveDirectionKeySeekDeltaSeconds(forward: false),
+                        );
                         _resetOsdTimer();
                       },
                     ),
@@ -7398,7 +7407,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       icon: Icons.forward_10,
                       label: '+10秒',
                       onPressed: () {
-                        _queueLiveRelativeSeek(10.0);
+                        _queueLiveRelativeSeek(
+                          liveDirectionKeySeekDeltaSeconds(forward: true),
+                        );
                         _resetOsdTimer();
                       },
                     ),

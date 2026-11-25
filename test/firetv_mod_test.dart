@@ -10819,6 +10819,39 @@ void main() {
           expect(find.text('次の番組'), findsOneWidget);
         },
       );
+
+      test(
+        'liveDirectionKeySeekDeltaSeconds returns negative delta for rewind and normal LIVE ignores natural buffer lag',
+        () {
+          expect(PlayerScreen.rewindStep.inSeconds, -10);
+          expect(PlayerScreen.forwardStep.inSeconds, 10);
+          expect(liveDirectionKeySeekDeltaSeconds(forward: false), -10.0);
+          expect(liveDirectionKeySeekDeltaSeconds(forward: true), 10.0);
+
+          final start = DateTime.utc(2026, 11, 25, 10, 0);
+          final end = DateTime.utc(2026, 11, 25, 11, 0);
+          final now = DateTime.utc(2026, 11, 25, 10, 30);
+          final info = LiveOsdProgramInfo(
+            currentTitle: '通常LIVE番組',
+            currentStart: start,
+            currentEnd: end,
+            progress: 0.5,
+            remainingMinutes: 30,
+          );
+          final normalLive = resolveLiveTimeshiftBarState(
+            info: info,
+            now: now,
+            cacheStartSeconds: 100.0,
+            cacheEndSeconds: 213.0,
+            effectivePosSeconds: 210.0,
+            liveDelayedByPause: false,
+          );
+          expect(normalLive.isTimeshifting, isFalse);
+          expect(normalLive.lagSeconds, 0);
+          expect(normalLive.rewindableSeconds, 113);
+          expect(normalLive.playbackFraction, normalLive.liveEdgeFraction);
+        },
+      );
     },
   );
 }

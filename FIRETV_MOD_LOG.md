@@ -408,7 +408,7 @@
    - `computeMpvBufferPlan` における Live の過去キャッシュ上限 (`demuxerMaxBackBytes`) を従来の固定 `2 MiB` から最大 5 分（`livePauseTimeshiftSeconds = 300`：モバイル ~105 MiB / DR ~550 MiB）へ拡張し、既存の空き容量 1 GiB 厳格保護の下で先読み・過去バッファをバランス配分するよう修正（極小空き容量端末向けの低容量 RAM フォールバックも維持）。
 3. **Live 一時停止／追いかけ／プレイバック中の左右 ±10 秒シーク・等速プレイバック・1本シークバー統合＆録画注意文 (`lib/ui/player_screen.dart`)**:
    - `mpv` の Live キャッシュシークを確実に有効化するため `_open` で `force-seekable=yes` / `demuxer-seekable-cache=yes` を設定し、`seekable-ranges` と `playback-time`/`time-pos` の座標系を揃えた (`resolveLiveCacheCoordinatePos`) 上で `seek <delta> relative+keyframes` によるキャッシュ内シークを実行。等速プレイバック中の自動終了誤発火も遮断し、右キー／「現在位置へ」／倍速追いつき時のみ CH 切替へ復帰。
-   - キー押下時点の即時上限クランプ (`clampLivePendingSeekDelta`) を導入し、長押し／連打時もプレイバック可能範囲外へ進まず先頭で「これ以上戻れません」停止。一時停止解除時は未確定シークを先出し反映してから再生再開。
+   - キー押下時点の即時上限クランプ (`clampLivePendingSeekDelta`) と符号安全ヘルパー (`liveDirectionKeySeekDeltaSeconds`・二重反転バグ防止) を導入し、長押し／連打時もプレイバック可能範囲外へ進まず先頭で「これ以上戻れません」停止。一時停止解除時は未確定シークを先出し反映してから再生再開。通常 LIVE 中の自然先読み分は `現在位置 (LIVE)` 表記に統一。
    - シークバーを「番組トータル時間 1 本バー (`LiveProgramProgressBar` / `resolveLiveTimeshiftBarState`)」へ統一（戻れる限界の白目盛り＋ハイライト、LIVE 現在位置の赤ライン、再生位置の白丸サム、`戻れる範囲`／`現在位置からの遅れ` 表示）。OSD 非表示時は下部シーク HUD 単体で表示し、OSD 表示時は既存 `LiveOsdProgramSection` に統合（二重バー廃止）。
    - Live 通常視聴中（ライブ端・再生中）の左右キーは従来の 2 段階チャンネル切替、一時停止後または追いかけ／プレイバック中の左右キーは `-10秒` / `+10秒` 早戻し・早送り（ARIB 字幕オフセット `_aribPtsOffset` 維持）へ切替。左キーで戻してから決定キーで再開すると **等速 (1.0x) プレイバック**（`プレイバック` バッジ）、戻さず一時停止→再開時は従来の倍速追いかけ（OSD で相互切替可）。遅延再生中の「この番組を録画」確認ダイアログには `buildLiveRecordingConfirmContent` で注意書きを追加。
 4. **検証 (`test/firetv_mod_test.dart`)**:
