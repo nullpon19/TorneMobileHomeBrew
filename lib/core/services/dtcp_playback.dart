@@ -284,6 +284,7 @@ class _DtcpPlaybackSession
     implements
         PlaybackSession,
         StreamTransferMetrics,
+        StreamDiagnosticMetrics,
         LiveEdgeResettable,
         AribCaptionLayoutSource {
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
@@ -307,6 +308,18 @@ class _DtcpPlaybackSession
 
   @override
   int get consecutiveReconnectErrors => _proxy.consecutiveReconnectErrors;
+
+  @override
+  int get cipherBytes => _proxy.cipherBytes;
+
+  @override
+  int get plaintextBytes => _proxy.plaintextBytes;
+
+  @override
+  int get downstreamRequestCount => _proxy.downstreamRequestCount;
+
+  @override
+  Object? get lastUpstreamError => _proxy.lastUpstreamError;
 
   @override
   List<AribCaptionLayoutEvent> get aribCaptionEvents =>

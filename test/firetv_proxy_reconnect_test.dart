@@ -495,5 +495,67 @@ void main() {
         expect(upstreamAttempt, greaterThanOrEqualTo(2));
       },
     );
+
+    test(
+      'live proxy fails fast after maxInitialReconnectAttempts on 0-byte upstream failures and exposes diagnostics',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        var upstreamAttempt = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          request.response.statusCode = HttpStatus.serviceUnavailable;
+          request.response.headers.contentType = ContentType.text;
+          request.response.write('busy-$upstreamAttempt');
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/live_fail'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          isLive: true,
+          autoReconnect: true,
+          maxInitialReconnectAttempts: 3,
+          reconnectBackoff: const [Duration(milliseconds: 10)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+
+        // Wait briefly for the bounded initial attempts (1 initial + 3 retries = 4).
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        expect(upstreamAttempt, 4);
+        expect(proxy.cipherBytes, 0);
+        expect(proxy.plaintextBytes, 0);
+        expect(proxy.servedBytes, 0);
+        expect(proxy.lastUpstreamError, isA<NasneError>());
+
+        // Downstream GET observes 502 once queue is closed with the initial error.
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        await resp.drain<void>();
+        expect(resp.statusCode, HttpStatus.badGateway);
+        expect(proxy.downstreamRequestCount, 1);
+
+        // Also verify DtcpMediaFetcher.openContent cleanly drains non-200 error bodies.
+        await expectLater(
+          fetcher.openContent(
+            Uri.parse('http://127.0.0.1:${server.port}/direct_503'),
+          ),
+          throwsA(isA<NasneError>()),
+        );
+      },
+    );
   });
 }

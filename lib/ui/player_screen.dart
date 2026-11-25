@@ -219,6 +219,37 @@ String? playerLoadingLabel({
   return null;
 }
 
+/// Returns `true` only once actual playback frames are flowing, so a
+/// premature `playing=true` emission before the first decoded video frame never
+/// disarms the startup timeout watchdog.
+bool shouldCancelStartWatchdog({
+  required bool hasVideoFrame,
+  required bool playingNow,
+  required bool buffering,
+  required bool initialPlaybackStarted,
+}) => initialPlaybackStarted || (hasVideoFrame && playingNow && !buffering);
+
+/// Returns `true` only when at least one frame has been rendered (or initial
+/// playback latched); pre-frame stops belong to the startup failure/watchdog
+/// path rather than the frozen-frame mid-stream interruption banner.
+bool shouldSurfacePreFrameStopAsInterruption({
+  required bool hasVideoFrame,
+  required bool initialPlaybackStarted,
+}) => hasVideoFrame || initialPlaybackStarted;
+
+/// Formats an upstream error into a secret-free classification string for
+/// release diagnostics (never includes URLs, keys, credentials, or IPs).
+String describeStreamErrorSafely(Object? error) {
+  if (error == null) return 'none';
+  if (error is NasneError) {
+    final code = error.code;
+    return code != null && code.isNotEmpty
+        ? '${error.category.name}($code)'
+        : error.category.name;
+  }
+  return error.runtimeType.toString();
+}
+
 /// Combines [description] and [longDescription] for the in-player OSD detail
 /// viewer, deduplicating identical or prefix-contained text.
 String? formatProgramDetailBody({
@@ -2739,6 +2770,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _decodeStatusLogged = false;
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _watchdog;
+  Timer? _startupTraceTimer;
+  bool _startTraceCompleted = false;
   bool _playing = false;
   bool _buffering = true;
   bool _hasVideoFrame = false;
@@ -3011,6 +3044,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     if (!ready) return false;
     _initialPlaybackStarted = true;
+    _maybeCancelStartWatchdog();
+    _stopStartupTraceTimer();
+    _startTraceCompleted = true;
     if (!_buffering) {
       _stopPreBufferPoller();
     }
@@ -3022,8 +3058,70 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         'player: initial playback started in ${startedAt.elapsedMilliseconds} ms '
         '(live=${widget.live}, mobile=${widget.liveUseMobile})',
       );
+      _logPlaybackTrace(
+        'started in ${startedAt.elapsedMilliseconds}ms (${_buildCompactDiagnosticsSummary()})',
+      );
     }
     return true;
+  }
+
+  void _maybeCancelStartWatchdog() {
+    if (shouldCancelStartWatchdog(
+      hasVideoFrame: _hasVideoFrame,
+      playingNow: _playingNow,
+      buffering: _buffering,
+      initialPlaybackStarted: _initialPlaybackStarted,
+    )) {
+      _watchdog?.cancel();
+    }
+  }
+
+  void _logPlaybackTrace(String message) {
+    debugPrint('[tmhb:play] $message');
+  }
+
+  void _startStartupTraceTimer() {
+    _startupTraceTimer?.cancel();
+    _startTraceCompleted = false;
+    _startupTraceTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted || _startTraceCompleted || _initialPlaybackStarted || _error != null) {
+        _stopStartupTraceTimer();
+        return;
+      }
+      final elapsedMs = _openStartedAt?.elapsedMilliseconds ?? 0;
+      _logPlaybackTrace(
+        'wait +${(elapsedMs / 1000).toStringAsFixed(1)}s ${_buildCompactDiagnosticsSummary()}',
+      );
+    });
+  }
+
+  void _stopStartupTraceTimer() {
+    _startupTraceTimer?.cancel();
+    _startupTraceTimer = null;
+  }
+
+  String _buildCompactDiagnosticsSummary() {
+    var cipher = -1;
+    var plain = -1;
+    var served = -1;
+    var reqs = -1;
+    var reconnectErrs = 0;
+    Object? rawUpstream;
+    if (widget.session case final StreamTransferMetrics transfer) {
+      served = transfer.servedBytes;
+      reconnectErrs = transfer.consecutiveReconnectErrors;
+    }
+    if (widget.session case final StreamDiagnosticMetrics diagMetrics) {
+      cipher = diagMetrics.cipherBytes;
+      plain = diagMetrics.plaintextBytes;
+      reqs = diagMetrics.downstreamRequestCount;
+      rawUpstream = diagMetrics.lastUpstreamError;
+    }
+    final upstream = describeStreamErrorSafely(rawUpstream);
+    return 'cipher=${cipher}B plain=${plain}B served=${served}B '
+        'reqs=$reqs reconErr=$reconnectErrs up=$upstream '
+        'playingNow=$_playingNow playing=$_playing buf=$_buffering frame=$_hasVideoFrame '
+        'v=${_tracks.video.length} a=${_tracks.audio.length} s=${_tracks.subtitle.length}';
   }
 
   double get _bufferDeltaSeconds {
@@ -3228,11 +3326,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         r.width > 0 &&
         r.height > 0 &&
         mounted) {
+      _logPlaybackTrace(
+        'first frame rect=${r.width.toInt()}x${r.height.toInt()} at ${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+      );
       setState(() {
         _hasVideoFrame = true;
         _positionAtFirstFrame ??= _lastPosition;
         _maybeLatchInitialPlaybackStarted();
       });
+      _maybeCancelStartWatchdog();
     }
   }
 
@@ -3318,6 +3420,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _player.stream.playing.listen((playing) {
         if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: playing=$playing');
+        if (!_initialPlaybackStarted) {
+          _logPlaybackTrace(
+            'mpv playing=$playing buf=$_buffering frame=$_hasVideoFrame +${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+          );
+        }
         _wakelockSession.setPlaying(playing);
         final wasPlaying = _playingNow;
         if (widget.live && _playing) {
@@ -3354,7 +3461,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _maybeLatchInitialPlaybackStarted();
         }
         if (playing) {
-          _watchdog?.cancel();
+          _maybeCancelStartWatchdog();
           _resumeWatchdogTimer?.cancel();
           _autoResumeTimer?.cancel();
           _autoResumeCountdown = 0;
@@ -3379,6 +3486,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _player.stream.buffering.listen((buffering) {
         if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: buffering=$buffering');
+        if (!_initialPlaybackStarted) {
+          _logPlaybackTrace(
+            'mpv buffering=$buffering playingNow=$_playingNow frame=$_hasVideoFrame +${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+          );
+        }
         if (_playingNow) {
           // Buffering while mpv is trying to play is the
           // signature the plan-78 stalls left just before
@@ -3408,6 +3520,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _startPreBufferPoller();
         }
         final latched = _maybeLatchInitialPlaybackStarted();
+        _maybeCancelStartWatchdog();
         if (mounted && (changed || latched)) {
           setState(() {});
         }
@@ -3416,11 +3529,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _subscriptions.add(
       _player.stream.width.listen((width) {
         if (!_hasVideoFrame && width != null && width > 0 && mounted) {
+          _logPlaybackTrace(
+            'first frame width=$width at ${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+          );
           setState(() {
             _hasVideoFrame = true;
             _positionAtFirstFrame ??= _lastPosition;
             _maybeLatchInitialPlaybackStarted();
           });
+          _maybeCancelStartWatchdog();
         }
       }),
     );
@@ -3502,6 +3619,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _subscriptions.add(
       _player.stream.tracks.listen((tracks) {
+        if (!_initialPlaybackStarted) {
+          _logPlaybackTrace(
+            'mpv tracks v=${tracks.video.length} a=${tracks.audio.length} '
+            's=${tracks.subtitle.length} +${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+          );
+        }
         _diag(
           DiagCategory.playback,
           'player: tracks: video=${tracks.video.length} '
@@ -3573,11 +3696,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _player.stream.error.listen((error) {
         if (_conflictHandled || _switchingChannel) return;
         _diag(DiagCategory.playback, 'player: error: $error');
-        if (!playerErrorIsFatal(
+        final fatal = playerErrorIsFatal(
           error,
           live: widget.live,
           alreadyPlaying: _playing,
-        )) {
+        );
+        _logPlaybackTrace(
+          'mpv error fatal=$fatal hasFrame=$_hasVideoFrame playing=$_playing: $error',
+        );
+        if (!fatal) {
           // A seek complaint the policy classes as benign
           // (plan 43, extended after 1.4.0): live viewing,
           // where the stream is unseekable by design, or any
@@ -3594,8 +3721,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         _wakelockSession.setPlaying(false);
         _watchdog?.cancel();
+        _stopStartupTraceTimer();
         if (!mounted) return;
-        if (_playing) {
+        final hasStartedFrames = shouldSurfacePreFrameStopAsInterruption(
+          hasVideoFrame: _hasVideoFrame,
+          initialPlaybackStarted: _initialPlaybackStarted,
+        );
+        if (hasStartedFrames && _playing) {
           if (!widget.live && _isEffectivelyCompleted) {
             _handleRecordedCompletion('trailing error near end: $error');
             return;
@@ -3607,7 +3739,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // start-failure message.
           _enterInterruptedState(error);
         } else if (_error == null) {
-          _setStartError(error);
+          _setStartError('$error\n\n${_buildCompactDiagnosticsSummary()}');
         }
       }),
     );
@@ -3708,6 +3840,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _setStartError(String error, {bool allowAfterConflict = false}) {
     _stopPreBufferPoller();
+    _stopStartupTraceTimer();
+    _logPlaybackTrace('start error: $error');
     if (!mounted) return;
     if (!allowAfterConflict && (_conflictHandled || _switchingChannel)) return;
     setState(() => _error = error);
@@ -3723,6 +3857,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _enterInterruptedState(String? detail) {
     _stopPreBufferPoller();
+    _stopStartupTraceTimer();
+    _logPlaybackTrace(
+      'interrupted detail=${detail ?? 'stall'} ${_buildCompactDiagnosticsSummary()}',
+    );
     if (!mounted ||
         shouldSuppressPlayerInterruption(
           completed: _completed,
@@ -3800,13 +3938,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       unawaited(_handlePossibleLiveRecordingConflict());
     }
     final timeoutSec = _bufferPlan?.startTimeoutSeconds ?? startTimeout.inSeconds;
+    final diagSummary = _buildCompactDiagnosticsSummary();
     _diag(
       DiagCategory.playback,
       'player: no playback within $timeoutSec seconds; '
-      'showing a timeout error',
+      'showing a timeout error ($diagSummary)',
     );
+    _logPlaybackTrace('start timeout (${timeoutSec}s): $diagSummary');
     _setStartError(
-      '再生が開始できませんでした ($timeoutSec 秒以内に映像が届きませんでした)。',
+      '再生が開始できませんでした ($timeoutSec 秒以内に映像が届きませんでした)。\n\n$diagSummary',
     );
   }
 
@@ -4119,6 +4259,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _autoResumeDisabled = true;
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
+    _stopStartupTraceTimer();
     _stopSubtitleSyncTimer();
     _watchdog?.cancel();
     _stallTimer?.cancel();
@@ -4244,6 +4385,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// anything.
   void _onPlaybackStopped() {
     if (_conflictHandled || _switchingChannel) return;
+    if (!shouldSurfacePreFrameStopAsInterruption(
+      hasVideoFrame: _hasVideoFrame,
+      initialPlaybackStarted: _initialPlaybackStarted,
+    )) {
+      var served = -1;
+      Object? upstreamErr;
+      if (widget.session case final StreamTransferMetrics transfer) {
+        served = transfer.servedBytes;
+      }
+      if (widget.session case final StreamDiagnosticMetrics diagMetrics) {
+        upstreamErr = diagMetrics.lastUpstreamError;
+      }
+      _logPlaybackTrace(
+        'pre-frame stop: ${_buildCompactDiagnosticsSummary()}',
+      );
+      if (served == 0 && upstreamErr != null) {
+        _watchdog?.cancel();
+        _setStartError(
+          'ストリームを受信できませんでした (${describeStreamErrorSafely(upstreamErr)})。\n\n'
+          '${_buildCompactDiagnosticsSummary()}',
+        );
+      }
+      return;
+    }
     if (!playbackStoppedEarly(
       alreadyPlaying: _playing,
       completed: _completed,
@@ -5229,6 +5394,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         liveUseMobile: widget.liveUseMobile,
       );
       if (!mounted) return;
+      _logPlaybackTrace(
+        'open live=${widget.live} mobile=${widget.liveUseMobile} '
+        'bufSec=$bufferSeconds disk=${plan.useDiskCache} '
+        'hwdec=${_hwdecMode.name} sdk=$_androidSdkInt legacySync=$_useLegacySyncMpvInit',
+      );
+      _startStartupTraceTimer();
       _bufferPlan = plan;
       _initialPlaybackStarted = false;
       _positionAtFirstFrame = null;
@@ -5273,6 +5444,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _diag(
           DiagCategory.playback,
           'player: mpv init ready in ${initWatch.elapsedMilliseconds} ms',
+        );
+        _logPlaybackTrace(
+          'mpv init ready in ${initWatch.elapsedMilliseconds}ms',
         );
         if (_useLegacySyncMpvInit) {
           try {
@@ -5387,12 +5561,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
       await _player.setVolume(100.0);
       _diag(DiagCategory.playback, 'player: open completed');
+      _logPlaybackTrace(
+        'player.open completed at ${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
+      );
       await _applySubtitleSelection();
       if (_subtitlesOn && mounted) {
         _startSubtitleSyncTimer();
       }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: open failed: $e');
+      _logPlaybackTrace('player.open caught: $e');
       if (!playerErrorIsFatal('$e', live: widget.live)) {
         // Same seek complaint as the error-stream path, thrown
         // through open() instead (plan 43): not a failed start.
@@ -5501,6 +5679,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   @override
   void dispose() {
+    _logPlaybackTrace('dispose ${_buildCompactDiagnosticsSummary()}');
     // What leaving reports to the unit is decided first,
     // from plain fields, before anything is torn down
     // (plan 104).
@@ -5512,6 +5691,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     runTeardownSteps(
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
+        (name: 'startup trace timer', run: () => _stopStartupTraceTimer()),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
         (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
         (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
@@ -6383,6 +6563,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _stopLiveCatchUpMonitor();
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
+    _stopStartupTraceTimer();
     _watchdog?.cancel();
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
@@ -6597,6 +6778,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           Duration(milliseconds: (anchorPos * 1000).round()),
         );
         _liveMaxAdvancingCacheEndSec ??= anchorPos;
+      } else {
+        unawaited(_pollMpvBufferProperties());
       }
     }
     _livePausedAt ??= _now();

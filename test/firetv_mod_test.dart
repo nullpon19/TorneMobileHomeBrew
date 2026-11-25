@@ -11726,6 +11726,71 @@ void main() {
           expect(mergedHistory.map((e) => e.title), ['みんなのうた', '視点・論点']);
         },
       );
+
+      test(
+        'Phase 38.5: start watchdog and pre-frame interruption helpers gate on real frames & sanitize errors',
+        () {
+          // Premature playing=true without a video frame must NOT disarm watchdog.
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: true,
+              buffering: true,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: true,
+              buffering: false,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: true,
+              playingNow: true,
+              buffering: false,
+              initialPlaybackStarted: false,
+            ),
+            isTrue,
+          );
+          expect(
+            shouldCancelStartWatchdog(
+              hasVideoFrame: false,
+              playingNow: false,
+              buffering: true,
+              initialPlaybackStarted: true,
+            ),
+            isTrue,
+          );
+
+          // Pre-frame stops must not show mid-stream interruption banner.
+          expect(
+            shouldSurfacePreFrameStopAsInterruption(
+              hasVideoFrame: false,
+              initialPlaybackStarted: false,
+            ),
+            isFalse,
+          );
+          expect(
+            shouldSurfacePreFrameStopAsInterruption(
+              hasVideoFrame: true,
+              initialPlaybackStarted: false,
+            ),
+            isTrue,
+          );
+
+          expect(describeStreamErrorSafely(null), 'none');
+          expect(
+            describeStreamErrorSafely(NasneError.http(503, 'dtcp:http')),
+            'http(503)',
+          );
+        },
+      );
     },
   );
 }
