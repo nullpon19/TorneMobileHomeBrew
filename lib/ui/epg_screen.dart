@@ -1005,6 +1005,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
       }
     });
     final reg = ref.watch(selectedRegistrationProvider);
+    final uiMode = ref.watch(uiControlModeProvider);
     final regs =
         ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
     final activeRegs = regs.length > 1
@@ -1078,7 +1079,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
 
         return Scaffold(
           appBar: AppBar(
-            title: inlineBand && showHint && reg != null
+            title: inlineBand && showHint && reg != null && uiMode.isTv
                 ? Row(
                     children: [
                       const Text('番組表'),

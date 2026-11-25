@@ -287,8 +287,8 @@ class DesktopChannelEdgeZones extends StatelessWidget {
   Widget build(BuildContext context) {
     if (!enabled) return const SizedBox.shrink();
     return Positioned.fill(
-      top: 56,
-      bottom: 180,
+      top: 72,
+      bottom: 220,
       child: Row(
         children: [
           if (hasPrevious)
@@ -299,7 +299,7 @@ class DesktopChannelEdgeZones extends StatelessWidget {
               onTap: () => onClickDirection(ChannelSwitchDirection.previous),
             )
           else
-            const SizedBox(width: 72),
+            const SizedBox(width: 96),
           const Spacer(),
           if (hasNext)
             _EdgeHitStrip(
@@ -309,7 +309,7 @@ class DesktopChannelEdgeZones extends StatelessWidget {
               onTap: () => onClickDirection(ChannelSwitchDirection.next),
             )
           else
-            const SizedBox(width: 72),
+            const SizedBox(width: 96),
         ],
       ),
     );
@@ -337,7 +337,7 @@ class _EdgeHitStrip extends StatelessWidget {
       child: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: onTap,
-        child: const SizedBox(width: 72, height: double.infinity),
+        child: const SizedBox(width: 96, height: double.infinity),
       ),
     );
   }

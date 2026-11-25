@@ -625,6 +625,9 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     required this.onTap,
     this.peeking = false,
     this.onPeekTap,
+    this.uiMode = UiControlMode.tv,
+    this.onHoverEnter,
+    this.onHoverExit,
   });
 
   final ChannelSwitchDirection direction;
@@ -636,6 +639,9 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
   final VoidCallback? onTap;
   final bool peeking;
   final VoidCallback? onPeekTap;
+  final UiControlMode uiMode;
+  final VoidCallback? onHoverEnter;
+  final VoidCallback? onHoverExit;
 
   @override
   Widget build(BuildContext context) {
@@ -697,9 +703,13 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                           minWidth: 260,
                           maxWidth: 340,
                         ),
-                        child: GestureDetector(
-                          onTap: visible ? onTap : onPeekTap,
-                          child: Container(
+                        child: MouseRegion(
+                          cursor: SystemMouseCursors.click,
+                          onEnter: (_) => onHoverEnter?.call(),
+                          onExit: (_) => onHoverExit?.call(),
+                          child: GestureDetector(
+                            onTap: visible ? onTap : onPeekTap,
+                            child: Container(
                           key: cardKey,
                           padding: innerPadding,
                           decoration: BoxDecoration(
@@ -804,44 +814,54 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ),
                               ],
                               const SizedBox(height: 8),
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    'もう一度 ',
-                                    style: TextStyle(
-                                      color: hintColor,
-                                      fontSize: 11,
+                              if (uiMode.isTv)
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      'もう一度 ',
+                                      style: TextStyle(
+                                        color: hintColor,
+                                        fontSize: 11,
+                                      ),
                                     ),
-                                  ),
-                                  if (isNext)
-                                    Icon(
-                                      Icons.play_arrow,
-                                      size: 12,
-                                      color: hintColor,
-                                    )
-                                  else
-                                    Transform.flip(
-                                      flipX: true,
-                                      child: Icon(
+                                    if (isNext)
+                                      Icon(
                                         Icons.play_arrow,
                                         size: 12,
                                         color: hintColor,
+                                      )
+                                    else
+                                      Transform.flip(
+                                        flipX: true,
+                                        child: Icon(
+                                          Icons.play_arrow,
+                                          size: 12,
+                                          color: hintColor,
+                                        ),
+                                      ),
+                                    Text(
+                                      ' / 決定 で切替',
+                                      style: TextStyle(
+                                        color: hintColor,
+                                        fontSize: 11,
                                       ),
                                     ),
-                                  Text(
-                                    ' / 決定 で切替',
-                                    style: TextStyle(
-                                      color: hintColor,
-                                      fontSize: 11,
-                                    ),
+                                  ],
+                                )
+                              else
+                                Text(
+                                  uiMode.isDesktop ? 'クリックで切替' : 'タップで切替',
+                                  style: TextStyle(
+                                    color: hintColor,
+                                    fontSize: 11,
                                   ),
-                                ],
-                              ),
+                                ),
                             ],
                           ),
                         ),
                       ),
+                    ),
                     ),
                     ),
             ),
@@ -2491,6 +2511,7 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
     required this.focusNode,
     required this.onClose,
     required this.onScrollDelta,
+    this.uiMode = UiControlMode.tv,
   });
 
   final String title;
@@ -2500,6 +2521,7 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
   final FocusNode focusNode;
   final VoidCallback onClose;
   final void Function(double delta) onScrollDelta;
+  final UiControlMode uiMode;
 
   @override
   Widget build(BuildContext context) {
@@ -2608,9 +2630,13 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  '上下キーでスクロール ／ 決定・戻るキーで閉じる',
-                  style: TextStyle(color: Colors.amberAccent, fontSize: 11),
+                Text(
+                  uiMode.isTv
+                      ? '上下キーでスクロール ／ 決定・戻るキーで閉じる'
+                      : (uiMode.isDesktop
+                            ? 'ホイールでスクロール ／ Escで閉じる'
+                            : 'スワイプでスクロール'),
+                  style: const TextStyle(color: Colors.amberAccent, fontSize: 11),
                 ),
                 const Divider(color: Colors.white24, height: 14),
                 Flexible(
@@ -3108,6 +3134,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _desktopFullscreen = false;
   bool _pointerOverControls = false;
   ChannelSwitchDirection? _hoveredChannelEdge;
+  Timer? _desktopEdgeHideTimer;
   Duration? _scrubbingPosition;
   Timer? _orientationResetTimer;
   bool _touchPortraitOverlayOpen = false;
@@ -6426,6 +6453,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           name: 'orientation reset timer',
           run: () => _orientationResetTimer?.cancel(),
         ),
+        (
+          name: 'desktop edge hide timer',
+          run: () => _desktopEdgeHideTimer?.cancel(),
+        ),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
         (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
         (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
@@ -6759,6 +6790,37 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _resetOsdTimer();
   }
 
+  void _adjustPlayerVolume(double delta) {
+    final current = ref.read(playerVolumeProvider);
+    final next = (current + delta).clamp(0.0, 100.0).toDouble();
+    unawaited(ref.read(playerVolumeProvider.notifier).set(next));
+    if (next > 0 && ref.read(playerMutedProvider)) {
+      unawaited(ref.read(playerMutedProvider.notifier).set(false));
+    }
+    unawaited(_applyPlayerVolume());
+    _showHudMessage(
+      next <= 0 ? Icons.volume_off : Icons.volume_up,
+      '音量 ${next.round()}%',
+    );
+    _resetOsdTimer();
+  }
+
+  void _onDesktopEdgeHoverEnter(ChannelSwitchDirection dir) {
+    _desktopEdgeHideTimer?.cancel();
+    if (_hoveredChannelEdge != dir) {
+      setState(() => _hoveredChannelEdge = dir);
+    }
+  }
+
+  void _onDesktopEdgeHoverExit() {
+    _desktopEdgeHideTimer?.cancel();
+    _desktopEdgeHideTimer = Timer(const Duration(milliseconds: 250), () {
+      if (mounted && _hoveredChannelEdge != null) {
+        setState(() => _hoveredChannelEdge = null);
+      }
+    });
+  }
+
   Future<void> _toggleDesktopFullscreen() async {
     final next = await _desktopWindow.toggleFullscreen();
     if (!mounted) return;
@@ -6774,15 +6836,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _toggleTouchFullscreen(bool currentlyLandscape) {
     _orientationResetTimer?.cancel();
+    if (!currentlyLandscape) {
+      // Keep landscape orientation locked while in user-requested fullscreen so
+      // devices with portrait orientation lock enabled do not snap back.
+      unawaited(
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+      return;
+    }
     unawaited(
-      SystemChrome.setPreferredOrientations(
-        currentlyLandscape
-            ? const [DeviceOrientation.portraitUp]
-            : const [
-                DeviceOrientation.landscapeLeft,
-                DeviceOrientation.landscapeRight,
-              ],
-      ),
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]),
     );
     _orientationResetTimer = Timer(const Duration(seconds: 2), () {
       if (!mounted || !_uiMode.isTouch) return;
@@ -6938,7 +7006,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _syncDisplayedBufferBadge(force: true);
     setState(() {
       _channelPreviewDirection = null;
-      _hoveredChannelEdge = null;
       _osdOpen = true;
     });
     if (widget.live && _activeLiveChannel != null) {
@@ -8028,49 +8095,142 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (_detailOpen) {
       if (event is KeyDownEvent &&
           (key == LogicalKeyboardKey.escape ||
-              key == LogicalKeyboardKey.goBack)) {
+              key == LogicalKeyboardKey.goBack ||
+              (_uiMode.isDesktop && key == LogicalKeyboardKey.keyI))) {
         _closeDetail(fromBackKey: true);
       }
       return KeyEventResult.handled;
     }
-    if (_uiMode.isDesktop && event is KeyDownEvent) {
-      if (key == LogicalKeyboardKey.keyF) {
-        unawaited(_toggleDesktopFullscreen());
+    if (_uiMode.isDesktop) {
+      if (event is KeyDownEvent) {
+        if (key == LogicalKeyboardKey.keyF) {
+          unawaited(_toggleDesktopFullscreen());
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyM) {
+          _togglePlayerMute();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyK ||
+            key == LogicalKeyboardKey.space) {
+          _togglePlayPauseWithHud();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyJ) {
+          if (widget.live) {
+            _queueLiveRelativeSeek(
+              liveDirectionKeySeekDeltaSeconds(forward: false),
+            );
+          } else {
+            _queueRelativeSeek(_rewindStep);
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyL) {
+          if (widget.live) {
+            if (_liveDelayedByPause) {
+              _queueLiveRelativeSeek(
+                liveDirectionKeySeekDeltaSeconds(forward: true),
+              );
+            }
+          } else {
+            _queueRelativeSeek(_forwardStep);
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyC &&
+            canToggleSubtitles(_realSubtitleTracks.length)) {
+          _toggleSubtitles();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyN) {
+          _toggleJikkyo();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyI && _hasProgramDetail) {
+          _openDetail();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyS &&
+            canChangePlaybackSpeed(live: widget.live)) {
+          _cyclePlaybackRate();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyA &&
+            canSwitchAudio(_realAudioTracks.length)) {
+          _cycleAudioTrack();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.bracketLeft ||
+            key == LogicalKeyboardKey.pageUp) {
+          if (widget.live && _canSwitchLiveChannel) {
+            final target = _previewTargetFor(ChannelSwitchDirection.previous);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else if (!widget.live && _chapters.isNotEmpty) {
+            unawaited(_seekToChapter(forward: false));
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.bracketRight ||
+            key == LogicalKeyboardKey.pageDown) {
+          if (widget.live && _canSwitchLiveChannel) {
+            final target = _previewTargetFor(ChannelSwitchDirection.next);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else if (!widget.live && _chapters.isNotEmpty) {
+            unawaited(_seekToChapter(forward: true));
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.backspace) {
+          Navigator.of(context).pop();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.escape) {
+          if (_desktopFullscreen) {
+            unawaited(_setDesktopFullscreen(false));
+          } else if (_channelPreviewDirection != null) {
+            _dismissChannelPreview(fromBackKey: true);
+          } else {
+            Navigator.of(context).pop();
+          }
+          return KeyEventResult.handled;
+        }
+      }
+      if (key == LogicalKeyboardKey.arrowUp) {
+        _adjustPlayerVolume(5.0);
         return KeyEventResult.handled;
       }
-      if (key == LogicalKeyboardKey.keyM) {
-        _togglePlayerMute();
-        return KeyEventResult.handled;
-      }
-      if (key == LogicalKeyboardKey.escape &&
-          _desktopFullscreen &&
-          !_osdOpen &&
-          _channelPreviewDirection == null) {
-        unawaited(_setDesktopFullscreen(false));
+      if (key == LogicalKeyboardKey.arrowDown) {
+        _adjustPlayerVolume(-5.0);
         return KeyEventResult.handled;
       }
     }
-    if (_osdOpen) {
+    if (_osdOpen && _uiMode.isTv) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
         _closeOsd(fromBackKey: true);
         return KeyEventResult.handled;
       }
       _resetOsdTimer();
-      if (_uiMode.isTv &&
-          (key == LogicalKeyboardKey.arrowLeft ||
-              key == LogicalKeyboardKey.arrowRight ||
-              key == LogicalKeyboardKey.arrowUp ||
-              key == LogicalKeyboardKey.arrowDown)) {
+      if (key == LogicalKeyboardKey.arrowLeft ||
+          key == LogicalKeyboardKey.arrowRight ||
+          key == LogicalKeyboardKey.arrowUp ||
+          key == LogicalKeyboardKey.arrowDown) {
         if (_osdFirstFocusNode.canRequestFocus) {
           _osdFirstFocusNode.requestFocus();
         }
         return KeyEventResult.handled;
       }
-      if (!_uiMode.isTv && key == LogicalKeyboardKey.space) {
+      return KeyEventResult.ignored;
+    }
+    if (_osdOpen && _uiMode.isTouch) {
+      if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
+        _closeOsd(fromBackKey: true);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.space) {
         _togglePlayPauseWithHud();
         return KeyEventResult.handled;
       }
-      return KeyEventResult.ignored;
     }
     final isRepeat = event is KeyRepeatEvent;
     if (_channelPreviewDirection != null &&
@@ -8241,9 +8401,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       playingNow: _playingNow,
       buffering: _buffering,
     );
-    final canSwipeChannels =
+    final canLiveSwitch =
         widget.live &&
-        !_osdOpen &&
         !_detailOpen &&
         !_interrupted &&
         _error == null &&
@@ -8254,6 +8413,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           liveDelayedByPause: _liveDelayedByPause,
           playingNow: _playingNow,
         );
+    final canTouchSwipeChannels = canLiveSwitch && !_osdOpen;
 
     return PopScope(
       canPop: false,
@@ -8373,7 +8533,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             : isTouchPortrait
             ? _buildTouchPortraitLayout(
                 loadingLabel: loadingLabel,
-                canSwipeChannels: canSwipeChannels,
+                canSwipeChannels: canTouchSwipeChannels,
               )
             : Focus(
                 focusNode: _rootFocusNode,
@@ -8387,18 +8547,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     onDoubleTap: uiMode.isDesktop
                         ? () => unawaited(_toggleDesktopFullscreen())
                         : null,
-                    onHorizontalDragStart: uiMode.isTouch && canSwipeChannels
+                    onHorizontalDragStart:
+                        uiMode.isTouch && canTouchSwipeChannels
                         ? (details) {
                             _touchSwipeStartX = details.localPosition.dx;
                             _touchSwipeDeltaX = 0.0;
                           }
                         : null,
-                    onHorizontalDragUpdate: uiMode.isTouch && canSwipeChannels
+                    onHorizontalDragUpdate:
+                        uiMode.isTouch && canTouchSwipeChannels
                         ? (details) {
                             _touchSwipeDeltaX += details.delta.dx;
                           }
                         : null,
-                    onHorizontalDragEnd: uiMode.isTouch && canSwipeChannels
+                    onHorizontalDragEnd:
+                        uiMode.isTouch && canTouchSwipeChannels
                         ? (details) {
                             final dir = resolveTouchHorizontalSwipeDirection(
                               dragDeltaX: _touchSwipeDeltaX,
@@ -8475,7 +8638,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                             customText: _customCornerNoticeText,
                             recordingNotice: _cornerRecordingNotice,
                           ),
-                        if (uiMode.isDesktop && canSwipeChannels)
+                        if (uiMode.isDesktop && canLiveSwitch)
                           DesktopChannelEdgeZones(
                             enabled: true,
                             hasPrevious:
@@ -8489,13 +8652,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                 ) !=
                                 null,
                             onHoverDirection: (dir) {
-                              if (_hoveredChannelEdge != dir) {
-                                setState(() => _hoveredChannelEdge = dir);
+                              if (dir != null) {
+                                _onDesktopEdgeHoverEnter(dir);
+                              } else {
+                                _onDesktopEdgeHoverExit();
                               }
                             },
                             onClickDirection: _showChannelPreview,
                           ),
-                        if (canSwipeChannels)
+                        if ((uiMode.isDesktop && canLiveSwitch) ||
+                            canTouchSwipeChannels)
                           ..._buildChannelSwitchPreviewCards(),
                         if (_seekHudVisible && !_osdOpen) _buildSeekHud(),
                         if (!uiMode.isTv &&
@@ -8538,6 +8704,56 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                               _resetOsdTimer();
                             },
                           ),
+                        if (!uiMode.isTv &&
+                            !_detailOpen &&
+                            (_osdOpen ||
+                                _osdFadeController.status !=
+                                    AnimationStatus.dismissed))
+                          Positioned(
+                            top: MediaQuery.paddingOf(context).top + 14,
+                            left: MediaQuery.paddingOf(context).left + 18,
+                            child: IgnorePointer(
+                              ignoring: !_osdOpen,
+                              child: MouseRegion(
+                                onEnter: uiMode.isDesktop
+                                    ? (_) {
+                                        _pointerOverControls = true;
+                                        _osdTimer?.cancel();
+                                      }
+                                    : null,
+                                onExit: uiMode.isDesktop
+                                    ? (_) {
+                                        _pointerOverControls = false;
+                                        _resetOsdTimer();
+                                      }
+                                    : null,
+                                child: FadeTransition(
+                                  opacity: _osdFadeAnimation,
+                                  child: FilledButton.tonalIcon(
+                                    key: const ValueKey(
+                                      'player_top_back_button',
+                                    ),
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: Colors.black.withValues(
+                                        alpha: 0.62,
+                                      ),
+                                      foregroundColor: Colors.white,
+                                      side: const BorderSide(
+                                        color: Colors.white24,
+                                      ),
+                                    ),
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                    icon: const Icon(
+                                      Icons.arrow_back,
+                                      size: 18,
+                                    ),
+                                    label: const Text('戻る'),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         if (_osdOpen ||
                             _osdFadeController.status !=
                                 AnimationStatus.dismissed) ...[
@@ -8565,6 +8781,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                     body: widget.programDetailBody!,
                                     scrollController: _detailScrollController,
                                     focusNode: _detailFocusNode,
+                                    uiMode: uiMode,
                                     onClose: () =>
                                         _closeDetail(fromBackKey: true),
                                     onScrollDelta: _scrollDetailBy,
@@ -8589,6 +8806,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                   body: detailBody,
                                   scrollController: _detailScrollController,
                                   focusNode: _detailFocusNode,
+                                  uiMode: uiMode,
                                   onClose: () =>
                                       _closeDetail(fromBackKey: true),
                                   onScrollDelta: _scrollDetailBy,
@@ -9156,35 +9374,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
     final prevKey = prevEntry != null ? liveServiceKey(prevEntry.channel) : null;
     final nextKey = nextEntry != null ? liveServiceKey(nextEntry.channel) : null;
-    final canPeek = _uiMode.isDesktop && !_osdOpen;
+    final isDesktop = _uiMode.isDesktop;
     return [
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.previous,
-        visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
-        peeking:
-            canPeek && _hoveredChannelEdge == ChannelSwitchDirection.previous,
+        visible:
+            _channelPreviewDirection == ChannelSwitchDirection.previous ||
+            (isDesktop &&
+                _hoveredChannelEdge == ChannelSwitchDirection.previous),
+        uiMode: _uiMode,
         entry: prevEntry,
         resolvedProgram: prevResolved,
         channelNumber: prevKey != null ? _liveChannelNumbers[prevKey] : null,
         channelLogoBytes: prevKey != null ? _liveChannelLogos[prevKey] : null,
-        onPeekTap: prevEntry == null
-            ? null
-            : () => _showChannelPreview(ChannelSwitchDirection.previous),
+        onHoverEnter: isDesktop
+            ? () => _onDesktopEdgeHoverEnter(ChannelSwitchDirection.previous)
+            : null,
+        onHoverExit: isDesktop ? _onDesktopEdgeHoverExit : null,
         onTap: prevEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
       ),
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.next,
-        visible: _channelPreviewDirection == ChannelSwitchDirection.next,
-        peeking: canPeek && _hoveredChannelEdge == ChannelSwitchDirection.next,
+        visible:
+            _channelPreviewDirection == ChannelSwitchDirection.next ||
+            (isDesktop && _hoveredChannelEdge == ChannelSwitchDirection.next),
+        uiMode: _uiMode,
         entry: nextEntry,
         resolvedProgram: nextResolved,
         channelNumber: nextKey != null ? _liveChannelNumbers[nextKey] : null,
         channelLogoBytes: nextKey != null ? _liveChannelLogos[nextKey] : null,
-        onPeekTap: nextEntry == null
-            ? null
-            : () => _showChannelPreview(ChannelSwitchDirection.next),
+        onHoverEnter: isDesktop
+            ? () => _onDesktopEdgeHoverEnter(ChannelSwitchDirection.next)
+            : null,
+        onHoverExit: isDesktop ? _onDesktopEdgeHoverExit : null,
         onTap: nextEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
@@ -10040,7 +10264,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       runSpacing: 8,
                       children: _buildOsdButtonsList(
                         tvMode: false,
-                        includeCloseButton: true,
+                        includeCloseButton: false,
                         includeDetailButton: true,
                       ),
                     ),
@@ -10157,9 +10381,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// (see [_resume]); the close button dismisses the notice
   /// and leaves the stopped frame as it is.
   Widget _buildInterruptionBanner() {
+    final uiMode = _uiMode;
+    final resumeHint = uiMode.isTv
+        ? '電波復帰を待っています…（決定キーで今すぐ再開）'
+        : (uiMode.isDesktop
+              ? '電波復帰を待っています…（クリックで今すぐ再開）'
+              : '電波復帰を待っています…（タップで今すぐ再開）');
     final countdownText = !_autoResumeDisabled && _autoResumeCountdown > 0
         ? 'あと $_autoResumeCountdown 秒で自動再接続します…（$_autoResumeAttempts回目）'
-        : '電波復帰を待っています…（決定キーで今すぐ再開）';
+        : resumeHint;
     return Positioned(
       left: 0,
       right: 0,

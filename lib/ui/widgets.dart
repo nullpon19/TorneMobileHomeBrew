@@ -469,6 +469,20 @@ class KeyboardDismissOnTap extends StatelessWidget {
   }
 }
 
+/// Strips Fire TV remote-specific phrasing (e.g. `決定キーで入力（...）`)
+/// when rendering an inline [TextField] on touch or desktop devices.
+String? sanitizeNonTvInputHint(String? hintText) {
+  if (hintText == null) return null;
+  final match = RegExp(r'^決定キーで入力[（(](.+)[）)]$').firstMatch(hintText.trim());
+  if (match != null) {
+    return match.group(1)?.trim();
+  }
+  if (hintText.trim() == '決定キーで入力') {
+    return '入力';
+  }
+  return hintText;
+}
+
 /// Fire TV D-pad friendly text input box that avoids exposing a raw
 /// [TextField] directly on screen (which causes FireTVIME to pop up and trap
 /// D-pad focus on hover). Opens a dedicated input dialog only on explicit
@@ -603,7 +617,7 @@ class _FireTvTextInputFieldState extends ConsumerState<FireTvTextInputField> {
         onSubmitted: widget.onSubmitted,
         decoration: InputDecoration(
           labelText: widget.labelText,
-          hintText: widget.hintText,
+          hintText: sanitizeNonTvInputHint(widget.hintText),
           prefixIcon: widget.prefixIcon != null
               ? Icon(widget.prefixIcon, size: 20)
               : null,

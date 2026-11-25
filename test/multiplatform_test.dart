@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -8,9 +9,11 @@ import 'package:tmhb/app/arib_sound.dart';
 import 'package:tmhb/app/desktop_window.dart';
 import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/providers.dart';
+import 'package:tmhb/app/state.dart';
 import 'package:tmhb/app/ui_control_mode.dart';
 import 'package:tmhb/core/arib_chime_wav.dart';
 import 'package:tmhb/core/core.dart';
+import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/live_channel_switch_policy.dart';
 import 'package:tmhb/ui/player_multiplatform_controls.dart';
 import 'package:tmhb/ui/player_screen.dart';
@@ -561,6 +564,187 @@ void main() {
       await tester.pump();
       expect(scrubbedEnd, isNotNull);
       expect(scrubbedEnd!, closeTo(0.5, 0.05));
+    });
+  });
+
+  group('Device-specific wording & hover behavior', () {
+    test('sanitizeNonTvInputHint removes remote-only phrasing', () {
+      expect(
+        sanitizeNonTvInputHint('決定キーで入力（内容を貼り付け）'),
+        '内容を貼り付け',
+      );
+      expect(sanitizeNonTvInputHint('決定キーで入力'), '入力');
+      expect(sanitizeNonTvInputHint('例: 192.168.1.10'), '例: 192.168.1.10');
+      expect(sanitizeNonTvInputHint(null), isNull);
+    });
+
+    testWidgets(
+      'LiveChannelSwitchPreviewCard renders mode-specific hints and hover callbacks',
+      (tester) async {
+        const reg = RegisteredNasne(
+          host: '192.0.2.1',
+          udn: 'uuid:test',
+          friendlyName: 'nasne',
+          macAddr: '00:11:22:33:44:55',
+        );
+        const entry = LiveChannelSwitchEntry(
+          channel: LiveChannel(
+            id: '0/video/LiveTuner/DTTB/ch?nid=1&tsid=1&svid=101',
+            bandId: 'DTTB',
+            networkId: 1,
+            transportStreamId: 1,
+            serviceId: 101,
+            channelName: 'NHK総合',
+            programTitle: 'ニュース',
+          ),
+          primaryReg: reg,
+        );
+
+        var entered = 0;
+        var exited = 0;
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  LiveChannelSwitchPreviewCard(
+                    direction: ChannelSwitchDirection.next,
+                    visible: true,
+                    uiMode: UiControlMode.desktop,
+                    entry: entry,
+                    onHoverEnter: () => entered++,
+                    onHoverExit: () => exited++,
+                    onTap: () {},
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('クリックで切替'), findsOneWidget);
+
+        final gesture = await tester.createGesture(
+          kind: PointerDeviceKind.mouse,
+        );
+        await gesture.addPointer(location: Offset.zero);
+        addTearDown(gesture.removePointer);
+        await tester.pump();
+        final cardCenter = tester.getCenter(
+          find.byKey(const ValueKey('live_channel_preview_next')),
+        );
+        await gesture.moveTo(cardCenter);
+        await tester.pump();
+        expect(entered, 1);
+        await gesture.moveTo(const Offset(10, 10));
+        await tester.pump();
+        expect(exited, 1);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Stack(
+                children: [
+                  LiveChannelSwitchPreviewCard(
+                    direction: ChannelSwitchDirection.next,
+                    visible: true,
+                    uiMode: UiControlMode.touch,
+                    entry: entry,
+                    onTap: () {},
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('タップで切替'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'ProgramDetailOverlayPanel renders mode-specific scroll/close hint',
+      (tester) async {
+        final scrollCtrl = ScrollController();
+        final focusNode = FocusNode();
+        addTearDown(() {
+          scrollCtrl.dispose();
+          focusNode.dispose();
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: ProgramDetailOverlayPanel(
+                title: '番組タイトル',
+                body: '本文テスト',
+                scrollController: scrollCtrl,
+                focusNode: focusNode,
+                uiMode: UiControlMode.desktop,
+                onClose: () {},
+                onScrollDelta: (_) {},
+              ),
+            ),
+          ),
+        );
+        expect(find.text('ホイールでスクロール ／ Escで閉じる'), findsOneWidget);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: ProgramDetailOverlayPanel(
+                title: '番組タイトル',
+                body: '本文テスト',
+                scrollController: scrollCtrl,
+                focusNode: focusNode,
+                uiMode: UiControlMode.touch,
+                onClose: () {},
+                onScrollDelta: (_) {},
+              ),
+            ),
+          ),
+        );
+        expect(find.text('スワイプでスクロール'), findsOneWidget);
+      },
+    );
+
+    testWidgets('EpgScreen hides remote-only top-jump hint in non-TV mode', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      const reg = RegisteredNasne(
+        host: '192.0.2.1',
+        udn: 'uuid:test',
+        friendlyName: 'nasne',
+        macAddr: '00:11:22:33:44:55',
+      );
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            defaultTargetUiControlModeProvider.overrideWithValue(
+              UiControlMode.desktop,
+            ),
+            registrationStoreProvider.overrideWithValue(
+              InMemoryRegistrationStore(const [reg]),
+            ),
+            epgGuideProvider.overrideWith(
+              (ref, r) async =>
+                  const EpgGuide(broadcastingType: 2, services: []),
+            ),
+            channelLogosProvider.overrideWith(
+              (ref, r) async => const <int, List<int>>{},
+            ),
+          ],
+          child: const MaterialApp(home: EpgScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('番組表'), findsOneWidget);
+      expect(find.text('戻る / メニューで上部へ'), findsNothing);
     });
   });
 }
