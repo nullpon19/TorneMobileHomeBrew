@@ -1,3 +1,4 @@
+import AVFoundation
 import Flutter
 import UIKit
 
@@ -29,6 +30,12 @@ import UIKit
       forPlugin: "ShareChannels")
     {
       ShareHub.shared.register(messenger: shareRegistrar.messenger())
+    }
+    // Native ARIB built-in chime sound channel.
+    if let aribSoundRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "AribSoundChannels")
+    {
+      AribSoundHub.shared.register(messenger: aribSoundRegistrar.messenger())
     }
   }
 }
@@ -132,5 +139,40 @@ final class ShareHub {
       controller = presented
     }
     return controller
+  }
+}
+
+final class AribSoundHub {
+  static let shared = AribSoundHub()
+  private var player: AVAudioPlayer?
+
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: "com.markun.tmhb/arib_sound", binaryMessenger: messenger)
+    channel.setMethodCallHandler { [weak self] call, result in
+      switch call.method {
+      case "playWav":
+        let args = call.arguments as? [String: Any] ?? [:]
+        guard let typed = args["wav"] as? FlutterStandardTypedData else {
+          result(false)
+          return
+        }
+        do {
+          let session = AVAudioSession.sharedInstance()
+          try session.setCategory(.playback, options: [.mixWithOthers])
+          try session.setActive(true)
+          self?.player?.stop()
+          let next = try AVAudioPlayer(data: typed.data)
+          next.prepareToPlay()
+          let ok = next.play()
+          self?.player = next
+          result(ok)
+        } catch {
+          result(false)
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
   }
 }

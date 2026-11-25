@@ -15,7 +15,9 @@ import '../core/core.dart';
 import '../ui/player_cache_policy.dart';
 import '../ui/subtitle_style_policy.dart';
 import 'ake_socket.dart';
+import 'arib_sound.dart';
 import 'debug_log.dart';
+import 'desktop_window.dart';
 import 'file_pick.dart';
 import 'firetv_helper.dart';
 import 'log_folder.dart';
@@ -1097,6 +1099,16 @@ final androidSdkIntProvider = Provider<int?>((ref) => null);
 
 /// Platform helper for Fire TV (volume max, Tailscale, local file scan).
 final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
+
+/// Cross-platform ARIB built-in chime sound player.
+final aribSoundPlayerProvider = Provider<AribSoundPlayer>(
+  (ref) => AribSoundPlayer(fireTvHelper: ref.watch(fireTvHelperProvider)),
+);
+
+/// Desktop fullscreen window controller (macOS / Windows).
+final desktopWindowControllerProvider = Provider<DesktopWindowController>(
+  (ref) => DesktopWindowController(),
+);
 
 final playbackEngineProvider = Provider<PlaybackEngine>(
   (ref) => DtcpPlaybackEngine(

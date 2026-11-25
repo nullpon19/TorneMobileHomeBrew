@@ -77,7 +77,7 @@ class _SubtitleSettingsScreenState
     if (ref.read(superimposeSoundEnabledProvider)) {
       unawaited(
         ref
-            .read(fireTvHelperProvider)
+            .read(aribSoundPlayerProvider)
             .playAribBuiltinSound(emergency ? 4 : 0, urgent: emergency),
       );
     }

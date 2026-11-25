@@ -4915,10 +4915,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             !(_seekDebounceTimer?.isActive ?? false) &&
             !(_liveSeekDebounceTimer?.isActive ?? false)) {
           unawaited(
-            _fireTvHelper.playAribBuiltinSound(
-              soundId,
-              urgent: resolved.isUrgent,
-            ),
+            ref
+                .read(aribSoundPlayerProvider)
+                .playAribBuiltinSound(
+                  soundId,
+                  urgent: resolved.isUrgent,
+                ),
           );
         }
       }
