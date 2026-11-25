@@ -8,6 +8,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show zlib;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11167,6 +11168,7 @@ void main() {
           expect(find.text('次の番組を読み込み中…'), findsOneWidget);
           expect(find.text('031'), findsOneWidget);
           expect(find.byType(ChannelLogoPlate), findsOneWidget);
+          expect(find.byType(ChannelNumberBadge), findsNothing);
 
           guideCompleter.complete(
             EpgGuide(
@@ -11180,6 +11182,124 @@ void main() {
 
           expect(find.text('次の番組を読み込み中…'), findsNothing);
           expect(find.text('次オンエア番組'), findsOneWidget);
+        },
+      );
+
+      test(
+        'normalizeAribLogoPng injects ARIB CLUT PLTE/tRNS for 8-bit and 4-bit PLTE-less PNGs and decodes via dart:ui, upgrading ChannelLogoCache loads',
+        () async {
+          int crc32Png(List<int> data) {
+            var c = 0xffffffff;
+            for (final b in data) {
+              c ^= b;
+              for (var k = 0; k < 8; k++) {
+                c = (c & 1) != 0 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+              }
+            }
+            return (c ^ 0xffffffff) & 0xffffffff;
+          }
+
+          Uint8List chunk(String type, List<int> body) {
+            final out = Uint8List(12 + body.length);
+            final view = ByteData.sublistView(out);
+            view.setUint32(0, body.length);
+            for (var i = 0; i < 4; i++) {
+              out[4 + i] = type.codeUnitAt(i);
+            }
+            out.setRange(8, 8 + body.length, body);
+            view.setUint32(
+              8 + body.length,
+              crc32Png(out.sublist(4, 8 + body.length)),
+            );
+            return out;
+          }
+
+          Uint8List buildIndexedNoPltePng({
+            required int width,
+            required int height,
+            required int bitDepth,
+            required List<int> scanlines,
+          }) {
+            final ihdrBody = Uint8List(13);
+            final ihdrView = ByteData.sublistView(ihdrBody);
+            ihdrView.setUint32(0, width);
+            ihdrView.setUint32(4, height);
+            ihdrBody[8] = bitDepth;
+            ihdrBody[9] = 3; // indexed-color
+            final idat = chunk('IDAT', zlib.encode(scanlines));
+            final iend = chunk('IEND', const []);
+            final ihdr = chunk('IHDR', ihdrBody);
+            return Uint8List.fromList([
+              0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+              ...ihdr,
+              ...idat,
+              ...iend,
+            ]);
+          }
+
+          // 8-bit 2x2: (0,0)=idx8 transparent, (1,0)=idx1 red, (0,1)=idx2 green, (1,1)=idx4 blue
+          final raw8 = buildIndexedNoPltePng(
+            width: 2,
+            height: 2,
+            bitDepth: 8,
+            scanlines: [0, 8, 1, 0, 2, 4],
+          );
+          final normalized8 = normalizeAribLogoPng(raw8);
+          expect(normalized8.length, greaterThan(raw8.length));
+          expect(ascii.decode(normalized8.sublist(37, 41)), 'PLTE');
+          expect(normalizeAribLogoPng(normalized8), normalized8);
+
+          final codec8 = await ui.instantiateImageCodec(normalized8);
+          final frame8 = await codec8.getNextFrame();
+          final rgba8 = (await frame8.image.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          ))!
+              .buffer
+              .asUint8List();
+          frame8.image.dispose();
+          codec8.dispose();
+          expect(rgba8, [
+            0, 0, 0, 0, // (0,0) transparent
+            255, 0, 0, 255, // (1,0) red
+            0, 255, 0, 255, // (0,1) green
+            0, 0, 255, 255, // (1,1) blue
+          ]);
+
+          // 4-bit 2x1: indices [8, 1] -> 0x81, PLTE must be capped to 16 entries (48 bytes)
+          final raw4 = buildIndexedNoPltePng(
+            width: 2,
+            height: 1,
+            bitDepth: 4,
+            scanlines: [0, 0x81],
+          );
+          final normalized4 = normalizeAribLogoPng(raw4);
+          expect(ByteData.sublistView(normalized4, 33, 37).getUint32(0), 48);
+          final codec4 = await ui.instantiateImageCodec(normalized4);
+          final frame4 = await codec4.getNextFrame();
+          final rgba4 = (await frame4.image.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          ))!
+              .buffer
+              .asUint8List();
+          frame4.image.dispose();
+          codec4.dispose();
+          expect(rgba4, [
+            0, 0, 0, 0,
+            255, 0, 0, 255,
+          ]);
+
+          // Legacy cached PLTE-less PNG in ChannelLogoCache is upgraded on load().
+          final kv = InMemoryKeyValueStore();
+          await kv.write(
+            '${ChannelLogoCache.keyPrefix}192.0.2.1:2',
+            jsonEncode({
+              'broadcastingType': 2,
+              'logos': {'56832': base64Encode(raw8)},
+            }),
+          );
+          final upgraded = await ChannelLogoCache(kv).load('192.0.2.1', 2);
+          expect(upgraded, isNotNull);
+          expect(upgraded![56832], normalized8);
         },
       );
     },

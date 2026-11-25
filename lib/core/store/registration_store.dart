@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import '../models/channel.dart';
 import '../models/device.dart';
 import '../models/epg.dart';
+import '../parsing/epg.dart' show normalizeAribLogoPng;
 
 /// Serializes asynchronous operations on one store so that
 /// read-modify-write sequences never interleave (plan 96). An
@@ -456,7 +457,7 @@ class ChannelLogoCache {
         if (sid == null || b64 is! String || b64.isEmpty) continue;
         final bytes = base64Decode(b64);
         if (bytes.isNotEmpty) {
-          out[sid] = bytes;
+          out[sid] = normalizeAribLogoPng(bytes);
         }
       }
       return out.isEmpty ? null : out;
@@ -479,7 +480,13 @@ class ChannelLogoCache {
         'logos': {
           for (final entry in logos.entries)
             if (entry.value.isNotEmpty)
-              '${entry.key}': base64Encode(entry.value),
+              '${entry.key}': base64Encode(
+                normalizeAribLogoPng(
+                  entry.value is Uint8List
+                      ? entry.value as Uint8List
+                      : Uint8List.fromList(entry.value),
+                ),
+              ),
         },
       }),
     );

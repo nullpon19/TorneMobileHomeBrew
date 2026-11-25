@@ -64,7 +64,9 @@ Uint8List? resolveLiveChannelLogoBytes(
   if (sid == null) return null;
   final raw = logos[sid];
   if (raw == null || raw.isEmpty) return null;
-  return raw is Uint8List ? raw : Uint8List.fromList(raw);
+  return normalizeAribLogoPng(
+    raw is Uint8List ? raw : Uint8List.fromList(raw),
+  );
 }
 
 /// Renders a station logo PNG inside a light rounded backing plate so dark-ink
@@ -100,7 +102,13 @@ class ChannelLogoPlate extends StatelessWidget {
         bytes,
         fit: BoxFit.contain,
         gaplessPlayback: true,
-        errorBuilder: (_, _, _) => const SizedBox.shrink(),
+        errorBuilder: (_, _, _) => const Center(
+          child: Icon(
+            Icons.live_tv_outlined,
+            size: 16,
+            color: Colors.black38,
+          ),
+        ),
       ),
     );
   }

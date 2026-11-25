@@ -30,6 +30,7 @@
 library;
 
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../arib_b24.dart';
@@ -455,6 +456,169 @@ bool _listEquals(List<int> a, List<int> b) {
   throw const FormatException('zlib stream trailer not found');
 }
 
+/// Standard PNG IEEE CRC-32 (reflected polynomial 0xEDB88320). Kept separate
+/// from MPEG-2 [crc32Mpeg].
+Uint32List _buildCrc32PngTable() {
+  final table = Uint32List(256);
+  for (var i = 0; i < 256; i++) {
+    var c = i;
+    for (var bit = 0; bit < 8; bit++) {
+      c = (c & 1) != 0 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c;
+  }
+  return table;
+}
+
+final Uint32List _crc32PngTable = _buildCrc32PngTable();
+
+int _crc32Png(List<int> data, [int start = 0, int? end]) {
+  var c = 0xffffffff;
+  final limit = end ?? data.length;
+  for (var i = start; i < limit; i++) {
+    c = _crc32PngTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) & 0xffffffff;
+}
+
+/// ARIB STD-B24 / TR-B14 default 129-color CDT station logo palette (R, G, B, A).
+List<({int r, int g, int b, int a})> _buildAribLogoClut() {
+  final clut = <({int r, int g, int b, int a})>[];
+  for (var i = 0; i < 8; i++) {
+    clut.add((
+      r: (i & 1) != 0 ? 0xff : 0x00,
+      g: (i & 2) != 0 ? 0xff : 0x00,
+      b: (i & 4) != 0 ? 0xff : 0x00,
+      a: 0xff,
+    ));
+  }
+  clut.add((r: 0x00, g: 0x00, b: 0x00, a: 0x00));
+  for (var i = 1; i < 8; i++) {
+    clut.add((
+      r: (i & 1) != 0 ? 0xaa : 0x00,
+      g: (i & 2) != 0 ? 0xaa : 0x00,
+      b: (i & 4) != 0 ? 0xaa : 0x00,
+      a: 0xff,
+    ));
+  }
+  const levels = [0x00, 0x55, 0xaa, 0xff];
+  for (final r in levels) {
+    for (final g in levels) {
+      for (final b in levels) {
+        final allFull =
+            (r == 0x00 || r == 0xff) &&
+            (g == 0x00 || g == 0xff) &&
+            (b == 0x00 || b == 0xff);
+        final allHalf =
+            (r == 0x00 || r == 0xaa) &&
+            (g == 0x00 || g == 0xaa) &&
+            (b == 0x00 || b == 0xaa);
+        if (allFull || allHalf) continue;
+        clut.add((r: r, g: g, b: b, a: 0xff));
+      }
+    }
+  }
+  final opaqueCount = clut.length;
+  for (var i = 0; i < opaqueCount; i++) {
+    if (i == 8) continue;
+    final c = clut[i];
+    clut.add((r: c.r, g: c.g, b: c.b, a: 0x80));
+  }
+  return clut;
+}
+
+final List<({int r, int g, int b, int a})> _aribLogoClut =
+    _buildAribLogoClut();
+
+final Map<int, Uint8List> _aribLogoPaletteChunksByCount = {};
+
+Uint8List _buildPngChunk(String type, Uint8List body) {
+  final out = Uint8List(12 + body.length);
+  final view = ByteData.sublistView(out);
+  view.setUint32(0, body.length);
+  for (var i = 0; i < 4; i++) {
+    out[4 + i] = type.codeUnitAt(i);
+  }
+  out.setRange(8, 8 + body.length, body);
+  view.setUint32(8 + body.length, _crc32Png(out, 4, 8 + body.length));
+  return out;
+}
+
+Uint8List _aribPaletteChunksForCount(int entryCount) {
+  return _aribLogoPaletteChunksByCount.putIfAbsent(entryCount, () {
+    final rgb = Uint8List(entryCount * 3);
+    final alpha = Uint8List(entryCount);
+    for (var i = 0; i < entryCount; i++) {
+      final entry = _aribLogoClut[i];
+      rgb[i * 3] = entry.r;
+      rgb[i * 3 + 1] = entry.g;
+      rgb[i * 3 + 2] = entry.b;
+      alpha[i] = entry.a;
+    }
+    final plte = _buildPngChunk('PLTE', rgb);
+    final trns = _buildPngChunk('tRNS', alpha);
+    final combined = Uint8List(plte.length + trns.length);
+    combined.setRange(0, plte.length, plte);
+    combined.setRange(plte.length, combined.length, trns);
+    return combined;
+  });
+}
+
+/// Injects standard `PLTE` and `tRNS` chunks derived from the fixed ARIB CDT
+/// CLUT immediately after `IHDR` when an indexed-color PNG lacks `PLTE`.
+/// Standard PNGs (or non-indexed / already-paletted PNGs) are returned as-is.
+Uint8List normalizeAribLogoPng(Uint8List png) {
+  const afterIhdr = 33;
+  if (png.length < afterIhdr + 12) return png;
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (var i = 0; i < 8; i++) {
+    if (png[i] != sig[i]) return png;
+  }
+  if (png[8] != 0 ||
+      png[9] != 0 ||
+      png[10] != 0 ||
+      png[11] != 13 ||
+      png[12] != 0x49 ||
+      png[13] != 0x48 ||
+      png[14] != 0x44 ||
+      png[15] != 0x52) {
+    return png;
+  }
+  final bitDepth = png[24];
+  final colorType = png[25];
+  if (colorType != 3 ||
+      (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8)) {
+    return png;
+  }
+  var offset = afterIhdr;
+  while (offset + 12 <= png.length) {
+    final chunkLen =
+        (png[offset] << 24) |
+        (png[offset + 1] << 16) |
+        (png[offset + 2] << 8) |
+        png[offset + 3];
+    if (chunkLen < 0 || chunkLen > png.length - offset - 12) break;
+    final t0 = png[offset + 4];
+    final t1 = png[offset + 5];
+    final t2 = png[offset + 6];
+    final t3 = png[offset + 7];
+    if (t0 == 0x50 && t1 == 0x4c && t2 == 0x54 && t3 == 0x45) {
+      return png;
+    }
+    if (t0 == 0x49 && t1 == 0x45 && t2 == 0x4e && t3 == 0x44) {
+      break;
+    }
+    offset += 12 + chunkLen;
+  }
+  final entryCount = math.min(_aribLogoClut.length, 1 << bitDepth);
+  final paletteChunks = _aribPaletteChunksForCount(entryCount);
+  final out = Uint8List(png.length + paletteChunks.length);
+  out.setRange(0, afterIhdr, png, 0);
+  out.setRange(afterIhdr, afterIhdr + paletteChunks.length, paletteChunks);
+  out.setRange(afterIhdr + paletteChunks.length, out.length, png, afterIhdr);
+  return out;
+}
+
 /// Parses a `channelLogoDataGet` response into serviceId -> PNG
 /// bytes. Records without a PNG (length field 0) are omitted, as
 /// is the 8-byte file-header record.
@@ -481,7 +645,7 @@ Map<int, Uint8List> parseChannelLogos(List<int> rawResponse) {
     if (pngLen == 0 || 20 + pngLen > out.length) continue;
     final png = Uint8List.fromList(out.sublist(20, 20 + pngLen));
     if (png.length >= 4 && png[0] == 0x89 && png[1] == 0x50) {
-      logos[serviceId] = png;
+      logos[serviceId] = normalizeAribLogoPng(png);
     }
   }
   return logos;
