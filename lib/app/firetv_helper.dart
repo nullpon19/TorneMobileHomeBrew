@@ -29,16 +29,33 @@ class CredentialCandidateFile {
 
 /// Platform channel wrapper for Fire TV specific helpers.
 class FireTvHelper {
-  FireTvHelper({MethodChannel? channel, bool? isAndroidOverride})
-    : _channel = channel ?? const MethodChannel(_channelName),
-      _isAndroidOverride = isAndroidOverride; // ignore: prefer_initializing_formals
+  FireTvHelper({
+    MethodChannel? channel,
+    bool? isAndroidOverride,
+    bool? isTvOverride,
+  }) : _channel = channel ?? const MethodChannel(_channelName),
+       _isAndroidOverride = isAndroidOverride, // ignore: prefer_initializing_formals
+       _isTvOverride = isTvOverride; // ignore: prefer_initializing_formals
 
   static const String _channelName = 'com.markun.tmhb/firetv_helper';
 
   final MethodChannel _channel;
   final bool? _isAndroidOverride;
+  final bool? _isTvOverride;
 
   bool get isAndroid => _isAndroidOverride ?? (!kIsWeb && Platform.isAndroid);
+
+  Future<bool> isTvDevice() async {
+    if (_isTvOverride != null) return _isTvOverride;
+    if (!isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('isTvDevice') ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
 
   Future<bool> setMediaVolumeMax() async {
     if (!isAndroid) return false;

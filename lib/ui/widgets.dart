@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/providers.dart';
 import '../core/core.dart';
 import 'error_messages.dart';
 
@@ -472,7 +473,7 @@ class KeyboardDismissOnTap extends StatelessWidget {
 /// [TextField] directly on screen (which causes FireTVIME to pop up and trap
 /// D-pad focus on hover). Opens a dedicated input dialog only on explicit
 /// activation (Select / Enter / tap).
-class FireTvTextInputField extends StatefulWidget {
+class FireTvTextInputField extends ConsumerStatefulWidget {
   const FireTvTextInputField({
     super.key,
     required this.controller,
@@ -511,10 +512,11 @@ class FireTvTextInputField extends StatefulWidget {
   final ValueChanged<String>? onSubmitted;
 
   @override
-  State<FireTvTextInputField> createState() => _FireTvTextInputFieldState();
+  ConsumerState<FireTvTextInputField> createState() =>
+      _FireTvTextInputFieldState();
 }
 
-class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
+class _FireTvTextInputFieldState extends ConsumerState<FireTvTextInputField> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'fireTvTextInput');
   bool _focused = false;
 
@@ -582,10 +584,43 @@ class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
 
   @override
   Widget build(BuildContext context) {
+    final uiMode = ref.watch(uiControlModeProvider);
     final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
     final text = widget.controller.text;
     final hasText = text.isNotEmpty;
+    if (!uiMode.isTv) {
+      return TextField(
+        controller: widget.controller,
+        focusNode: _focusNode,
+        autofocus: widget.autofocus,
+        keyboardType: widget.keyboardType,
+        textInputAction: widget.textInputAction,
+        minLines: widget.minLines,
+        maxLines: widget.maxLines,
+        autocorrect: widget.autocorrect,
+        enableSuggestions: widget.enableSuggestions,
+        onChanged: widget.onChanged,
+        onSubmitted: widget.onSubmitted,
+        decoration: InputDecoration(
+          labelText: widget.labelText,
+          hintText: widget.hintText,
+          prefixIcon: widget.prefixIcon != null
+              ? Icon(widget.prefixIcon, size: 20)
+              : null,
+          suffixText: widget.suffixText,
+          suffixIcon: widget.showClearButton && hasText
+              ? IconButton(
+                  icon: const Icon(Icons.clear),
+                  tooltip: 'クリア',
+                  onPressed: _clear,
+                )
+              : null,
+          border: const OutlineInputBorder(),
+          isDense: true,
+        ),
+      );
+    }
+    final isDark = theme.brightness == Brightness.dark;
     final borderColor = _focused
         ? (isDark ? Colors.amberAccent : Colors.amber)
         : theme.colorScheme.outlineVariant;

@@ -12,6 +12,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/core.dart';
 import 'providers.dart';
+import 'ui_control_mode.dart';
 
 /// File and directory names used inside the store directory.
 const registrationFileName = 'registrations.json';
@@ -37,6 +38,7 @@ ProviderContainer fileStoreContainer(
   Directory storeDirectory, {
   Directory? mpvCacheDirectory,
   int? androidSdkInt,
+  UiControlMode? defaultUiControlMode,
 }) {
   File file(String name) => File('${storeDirectory.path}/$name');
   return ProviderContainer(
@@ -64,6 +66,10 @@ ProviderContainer fileStoreContainer(
         mpvCacheDirectoryProvider.overrideWithValue(mpvCacheDirectory),
       if (androidSdkInt != null)
         androidSdkIntProvider.overrideWithValue(androidSdkInt),
+      if (defaultUiControlMode != null)
+        defaultTargetUiControlModeProvider.overrideWithValue(
+          defaultUiControlMode,
+        ),
     ],
   );
 }

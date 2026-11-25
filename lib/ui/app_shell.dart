@@ -94,6 +94,7 @@ class _AppShellState extends ConsumerState<AppShell> {
     _railFocusNode.addListener(_handleRailFocusChange);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      if (!ref.read(uiControlModeProvider).isTv) return;
       if (_railFocusNode.context != null && !_railFocusNode.hasFocus) {
         _focusSelectedRailDestination(ref.read(tabIndexProvider));
       }
@@ -167,6 +168,7 @@ class _AppShellState extends ConsumerState<AppShell> {
   }
 
   void _restoreHomeRailFocusIfNeeded() {
+    if (!ref.read(uiControlModeProvider).isTv) return;
     if (ref.read(tabIndexProvider) != AppTabs.home || _userMovedIntoHomePane) {
       return;
     }
@@ -281,6 +283,7 @@ class _AppShellState extends ConsumerState<AppShell> {
   @override
   Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
+    final uiMode = ref.watch(uiControlModeProvider);
     ref.listen<AsyncValue<List<RegisteredNasne>>>(
       registrationsProvider,
       (prev, next) => _restoreHomeRailFocusIfNeeded(),
@@ -302,16 +305,18 @@ class _AppShellState extends ConsumerState<AppShell> {
         _userMovedIntoHomePane = true;
       }
       ref.read(tabIndexProvider.notifier).select(index);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _focusRightPaneFirst();
-      });
+      if (uiMode.isTv) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _focusRightPaneFirst();
+        });
+      }
     }
 
     return PopScope(
-      canPop: false,
+      canPop: !uiMode.isTv,
       onPopInvokedWithResult: (didPop, result) {
-        if (didPop || _exitDialogOpen) return;
+        if (didPop || _exitDialogOpen || !uiMode.isTv) return;
         final activeTab = ref.read(tabIndexProvider);
         final handler = ref.read(tabBackHandlersProvider)[activeTab];
         if (handler != null && handler()) return;
@@ -378,29 +383,31 @@ class _AppShellState extends ConsumerState<AppShell> {
                                     ),
                                   ),
                               ],
-                              trailing: Padding(
-                                padding: const EdgeInsets.only(top: 12),
-                                child: IconButton(
-                                  tooltip: 'Tailscale を開く',
-                                  icon: const Icon(Icons.vpn_lock),
-                                  onPressed: () async {
-                                    final ok = await ref
-                                        .read(fireTvHelperProvider)
-                                        .launchTailscale();
-                                    if (!ok && context.mounted) {
-                                      ScaffoldMessenger.maybeOf(
-                                        context,
-                                      )?.showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Tailscale アプリが見つかりませんでした',
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                  },
-                                ),
-                              ),
+                              trailing: ref.watch(fireTvHelperProvider).isAndroid
+                                  ? Padding(
+                                      padding: const EdgeInsets.only(top: 12),
+                                      child: IconButton(
+                                        tooltip: 'Tailscale を開く',
+                                        icon: const Icon(Icons.vpn_lock),
+                                        onPressed: () async {
+                                          final ok = await ref
+                                              .read(fireTvHelperProvider)
+                                              .launchTailscale();
+                                          if (!ok && context.mounted) {
+                                            ScaffoldMessenger.maybeOf(
+                                              context,
+                                            )?.showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Tailscale アプリが見つかりませんでした',
+                                                ),
+                                              ),
+                                            );
+                                          }
+                                        },
+                                      ),
+                                    )
+                                  : null,
                             ),
                           ),
                         ),

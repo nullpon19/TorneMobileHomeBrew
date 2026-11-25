@@ -21,6 +21,7 @@ import 'firetv_helper.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
+import 'ui_control_mode.dart';
 import 'wakelock.dart';
 
 final httpClientProvider = Provider<http.Client>((ref) => http.Client());
@@ -886,6 +887,124 @@ final autoPlayNextEpisodeProvider =
       AutoPlayNextEpisodeNotifier.new,
     );
 
+/// Platform-inferred default UI control mode, overridden in `main.dart` from the
+/// live platform & Android TV flag (defaults to `tv` in unit/widget tests so
+/// existing Fire TV test suites keep running without modification).
+final defaultTargetUiControlModeProvider = Provider<UiControlMode>(
+  (ref) => UiControlMode.tv,
+);
+
+/// Persisted user preference for UI control mode (`auto`, `tv`, `touch`, `desktop`).
+class UiControlModePreferenceNotifier extends Notifier<UiControlModePreference> {
+  static const _key = 'ui_control_mode_preference';
+  bool _dirty = false;
+
+  @override
+  UiControlModePreference build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = UiControlModePreference.fromStorage(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return UiControlModePreference.auto;
+  }
+
+  Future<void> set(UiControlModePreference preference) async {
+    _dirty = true;
+    state = preference;
+    await ref.read(keyValueStoreProvider).write(_key, preference.storageValue);
+  }
+}
+
+final uiControlModePreferenceProvider =
+    NotifierProvider<UiControlModePreferenceNotifier, UiControlModePreference>(
+      UiControlModePreferenceNotifier.new,
+    );
+
+final uiControlModeProvider = Provider<UiControlMode>((ref) {
+  final pref = ref.watch(uiControlModePreferenceProvider);
+  switch (pref) {
+    case UiControlModePreference.auto:
+      return ref.watch(defaultTargetUiControlModeProvider);
+    case UiControlModePreference.tv:
+      return UiControlMode.tv;
+    case UiControlModePreference.touch:
+      return UiControlMode.touch;
+    case UiControlModePreference.desktop:
+      return UiControlMode.desktop;
+  }
+});
+
+/// Persisted player volume (`0.0..100.0`, defaults to `100.0`).
+class PlayerVolumeNotifier extends Notifier<double> {
+  static const _key = 'player_volume';
+  bool _dirty = false;
+
+  @override
+  double build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final parsed = double.tryParse(raw);
+      if (parsed == null) return;
+      final clamped = parsed.clamp(0.0, 100.0).toDouble();
+      if (clamped != state) {
+        state = clamped;
+      }
+    });
+    return 100.0;
+  }
+
+  Future<void> set(double volume) async {
+    final clamped = volume.clamp(0.0, 100.0).toDouble();
+    _dirty = true;
+    state = clamped;
+    await ref.read(keyValueStoreProvider).write(_key, clamped.toStringAsFixed(1));
+  }
+}
+
+final playerVolumeProvider = NotifierProvider<PlayerVolumeNotifier, double>(
+  PlayerVolumeNotifier.new,
+);
+
+/// Persisted player mute state (defaults to `false`).
+class PlayerMutedNotifier extends Notifier<bool> {
+  static const _key = 'player_muted';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool muted) async {
+    _dirty = true;
+    state = muted;
+    await ref.read(keyValueStoreProvider).write(_key, '$muted');
+  }
+}
+
+final playerMutedProvider = NotifierProvider<PlayerMutedNotifier, bool>(
+  PlayerMutedNotifier.new,
+);
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {
@@ -984,7 +1103,7 @@ final playbackEngineProvider = Provider<PlaybackEngine>(
     credentialStore: ref.watch(credentialStoreProvider),
     srmStore: ref.watch(srmStoreProvider),
     diag: ref.watch(diagLogProvider),
-    autoReconnect: Platform.isAndroid,
+    autoReconnect: true,
     akeConnectionFactory: (host, port) =>
         nativeAkeConnectionFactory(host, port, diag: ref.read(diagLogProvider)),
   ),
@@ -1076,7 +1195,7 @@ DeviceServices assembleDeviceServices(
           srmStore ??
           KeyValueSrmStore(srmKeyValueStore ?? InMemoryKeyValueStore()),
       diag: diagLog ?? const DiagLog.none(),
-      autoReconnect: autoReconnect ?? Platform.isAndroid,
+      autoReconnect: autoReconnect ?? true,
       akeConnectionFactory: (host, port) => nativeAkeConnectionFactory(
         host,
         port,

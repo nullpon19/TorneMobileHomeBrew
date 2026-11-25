@@ -23,6 +23,7 @@ import 'ui/widgets.dart';
 import 'app/lifecycle_log.dart';
 import 'app/providers.dart';
 import 'app/store_directory.dart';
+import 'app/ui_control_mode.dart';
 import 'ui/app_shell.dart';
 
 Future<void> main() async {
@@ -42,13 +43,21 @@ Future<void> main() async {
   } catch (_) {
     // Non-fatal: mpv falls back to RAM cache if cache directory creation fails.
   }
+  final fireTvHelper = FireTvHelper();
   final androidSdkInt = Platform.isAndroid
-      ? await FireTvHelper().getAndroidSdkInt()
+      ? await fireTvHelper.getAndroidSdkInt()
       : null;
+  final isAndroidTv = Platform.isAndroid
+      ? await fireTvHelper.isTvDevice()
+      : false;
+  final defaultUiControlMode = detectPlatformDefaultUiControlMode(
+    isAndroidTv: isAndroidTv,
+  );
   final container = fileStoreContainer(
     storeDirectory,
     mpvCacheDirectory: mpvCacheDir,
     androidSdkInt: androidSdkInt,
+    defaultUiControlMode: defaultUiControlMode,
   );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed

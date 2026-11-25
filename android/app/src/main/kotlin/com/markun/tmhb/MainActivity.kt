@@ -1,10 +1,12 @@
 package com.markun.tmhb
 
 import android.Manifest
+import android.app.UiModeManager
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -148,6 +150,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "setMediaVolumeMax" -> result.success(setMediaVolumeMax())
+                    "isTvDevice" -> result.success(isTvDevice())
                     "isVpnActive" -> result.success(isVpnActive())
                     "isTailscaleInstalled" -> result.success(isTailscaleInstalled())
                     "tryConnectTailscale" -> result.success(tryConnectTailscale())
@@ -276,6 +279,15 @@ class MainActivity : FlutterActivity() {
         }
         startActivity(Intent.createChooser(intent, "デバッグログを共有"))
     }
+
+    private fun isTvDevice(): Boolean =
+        try {
+            val uiMode = applicationContext.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+            uiMode?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+                packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+        } catch (_: Exception) {
+            false
+        }
 
     private fun setMediaVolumeMax(): Boolean =
         try {

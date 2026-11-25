@@ -83,7 +83,7 @@ class _DtcpCredentialScreenState extends ConsumerState<DtcpCredentialScreen> {
   /// picker fallback), falls back to [FileBytesPicker].
   Future<Uint8List?> _pickFile() async {
     final helper = ref.read(fireTvHelperProvider);
-    if (helper.isAndroid) {
+    if (helper.isAndroid && ref.read(uiControlModeProvider).isTv) {
       final result = await showDialog<_FireTvPickResult>(
         context: context,
         builder: (_) => _FireTvFilePickerDialog(helper: helper),

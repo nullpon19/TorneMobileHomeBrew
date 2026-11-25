@@ -14,6 +14,7 @@ import '../app/log_share.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../app/store_directory.dart';
+import '../app/ui_control_mode.dart';
 import '../core/core.dart';
 import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
@@ -181,6 +182,49 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             value: ref.watch(nightModeProvider),
             onChanged: (value) =>
                 ref.read(nightModeProvider.notifier).set(value),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '操作モード（自動判定: ${ref.watch(defaultTargetUiControlModeProvider).label}）',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<UiControlModePreference>(
+                  segments: const [
+                    ButtonSegment(
+                      value: UiControlModePreference.auto,
+                      label: Text('自動'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.tv,
+                      label: Text('TV'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.touch,
+                      label: Text('タッチ'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.desktop,
+                      label: Text('PC'),
+                    ),
+                  ],
+                  selected: {ref.watch(uiControlModePreferenceProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(uiControlModePreferenceProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '現在の有効モード: ${ref.watch(uiControlModeProvider).label}'
+                  '（再生画面のホバー/タップ操作や入力欄の挙動を切り替えます）。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
           ),
           const Divider(),
           _sectionTitle(context, '番組表'),

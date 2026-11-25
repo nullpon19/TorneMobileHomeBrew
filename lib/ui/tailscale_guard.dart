@@ -48,7 +48,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
 
   Future<void> _onStartup() async {
     final helper = ref.read(fireTvHelperProvider);
-    if (!helper.isAndroid) return;
+    if (!helper.isAndroid || !ref.read(uiControlModeProvider).isTv) return;
     await helper.setMediaVolumeMax();
     if (!mounted) return;
     final reg = ref.read(selectedRegistrationProvider);
@@ -62,7 +62,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
     final helper = ref.read(fireTvHelperProvider);
-    if (!helper.isAndroid) return;
+    if (!helper.isAndroid || !ref.read(uiControlModeProvider).isTv) return;
     unawaited(helper.setMediaVolumeMax());
     final reg = ref.read(selectedRegistrationProvider);
     if (reg == null) return;
@@ -76,7 +76,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
     bool force = false,
   }) async {
     final helper = ref.read(fireTvHelperProvider);
-    if (!helper.isAndroid) return;
+    if (!helper.isAndroid || !ref.read(uiControlModeProvider).isTv) return;
     if (_checking || _dialogOpen) return;
     if (!force && _dismissedForSession) return;
     _checking = true;
