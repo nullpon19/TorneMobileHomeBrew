@@ -56,9 +56,9 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
 
-  ios:
-    name: iOS / iPadOS IPA (Unsigned)
-    runs-on: macos-latest
+  apple:
+    name: Apple (iOS / iPadOS & macOS)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -69,10 +69,11 @@ jobs:
           flutter-version: "3.50.0"
           cache: true
 
+      - name: Install dependencies
+        run: flutter pub get
+
       - name: Build unsigned iOS app
-        run: |
-          flutter pub get
-          flutter build ios --no-codesign --release
+        run: flutter build ios --no-codesign --release
 
       - name: Package IPA
         run: |
@@ -82,29 +83,8 @@ jobs:
           cp -r "${APP_PATH}" Payload/
           zip -qry "dist/TorneMobileHomeBrew-ios-ipados-unsigned.ipa" Payload
 
-      - name: Upload iOS IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-ipa
-          path: dist/*.ipa
-          if-no-files-found: error
-
-  macos:
-    name: macOS Desktop App
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Flutter 3.50.0
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: "3.50.0"
-          cache: true
-
       - name: Build macOS app via workspace
         run: |
-          flutter pub get
           flutter build macos --config-only --release
           xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner \
             -configuration Release -derivedDataPath build/macos \
@@ -129,6 +109,13 @@ jobs:
           fi
           mkdir -p dist
           ditto -c -k --keepParent "$APP" "dist/TorneMobileHomeBrew-macos.zip"
+
+      - name: Upload iOS IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: dist/*.ipa
+          if-no-files-found: error
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -171,7 +158,7 @@ jobs:
 
   release:
     name: Rolling Prerelease (multiplatform-dev)
-    needs: [android, ios, macos, windows]
+    needs: [android, apple, windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
