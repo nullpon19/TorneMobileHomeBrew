@@ -23,8 +23,7 @@ class AribSoundPlayer {
   }) : _fireTvHelper = fireTvHelper ?? FireTvHelper(),
        _channel = channel ?? const MethodChannel(_channelName),
        _isAndroidOverride = isAndroidOverride, // ignore: prefer_initializing_formals
-       _isNativeWavSupportedOverride =
-           isNativeWavSupportedOverride; // ignore: prefer_initializing_formals
+       _isNativeWavSupportedOverride = isNativeWavSupportedOverride; // ignore: prefer_initializing_formals
 
   static const String _channelName = 'com.markun.tmhb/arib_sound';
 
@@ -33,7 +32,7 @@ class AribSoundPlayer {
   final bool? _isAndroidOverride;
   final bool? _isNativeWavSupportedOverride;
 
-  bool get _isAndroid => _isAndroidOverride ?? (!kIsWeb && Platform.isAndroid);
+  bool get _isAndroid => _isAndroidOverride ?? _fireTvHelper.isAndroid;
   bool get _isNativeWavSupported =>
       _isNativeWavSupportedOverride ??
       (!kIsWeb && (Platform.isIOS || Platform.isMacOS || Platform.isWindows));

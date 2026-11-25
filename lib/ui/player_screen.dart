@@ -181,8 +181,10 @@ import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../app/desktop_window.dart';
 import '../app/firetv_helper.dart';
 import '../app/mpv_compat.dart';
+import '../app/ui_control_mode.dart';
 import 'channel_badge.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
@@ -195,6 +197,7 @@ import 'jikkyo_overlay.dart';
 import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
 import 'multi_nasne_policy.dart';
+import 'player_multiplatform_controls.dart';
 import 'widgets.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
@@ -620,6 +623,8 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     this.channelNumber,
     this.channelLogoBytes,
     required this.onTap,
+    this.peeking = false,
+    this.onPeekTap,
   });
 
   final ChannelSwitchDirection direction;
@@ -629,12 +634,21 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
   final String? channelNumber;
   final Uint8List? channelLogoBytes;
   final VoidCallback? onTap;
+  final bool peeking;
+  final VoidCallback? onPeekTap;
 
   @override
   Widget build(BuildContext context) {
     final isNext = direction == ChannelSwitchDirection.next;
     final alignment = isNext ? Alignment.centerRight : Alignment.centerLeft;
     final hiddenOffset = isNext ? const Offset(1.05, 0) : const Offset(-1.05, 0);
+    final peekOffset = isNext ? const Offset(0.84, 0) : const Offset(-0.84, 0);
+    final data = entry;
+    final isPeeking = !visible && peeking && data != null;
+    final showCard = visible || isPeeking;
+    final targetOffset = visible
+        ? Offset.zero
+        : (isPeeking ? peekOffset : hiddenOffset);
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final bgColor = isDark ? const Color(0xD90D1117) : const Color(0xF5FFFFFF);
     final accentColor = isDark ? Colors.amberAccent : const Color(0xFF3949AB);
@@ -657,33 +671,35 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     final cardKey = ValueKey(
       isNext ? 'live_channel_preview_next' : 'live_channel_preview_previous',
     );
-    final data = entry;
     final timeRange = resolvedProgram != null
         ? resolvedProgram!.broadcastTimeRange
         : data?.broadcastTimeRange;
     final programTitle = resolvedProgram?.programTitle ?? data?.programTitle;
     return Positioned.fill(
       child: IgnorePointer(
-        ignoring: !visible,
+        ignoring: !showCard,
         child: Align(
           alignment: alignment,
           child: AnimatedSlide(
-            offset: visible ? Offset.zero : hiddenOffset,
+            offset: targetOffset,
             duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
             child: AnimatedOpacity(
-              opacity: visible && data != null ? 1.0 : 0.0,
+              opacity: showCard && data != null ? (visible ? 1.0 : 0.94) : 0.0,
               duration: const Duration(milliseconds: 180),
               child: data == null
                   ? const SizedBox.shrink()
-                  : ConstrainedBox(
-                      constraints: const BoxConstraints(
-                        minWidth: 260,
-                        maxWidth: 340,
-                      ),
-                      child: GestureDetector(
-                        onTap: onTap,
-                        child: Container(
+                  : FittedBox(
+                      fit: BoxFit.scaleDown,
+                      alignment: alignment,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          minWidth: 260,
+                          maxWidth: 340,
+                        ),
+                        child: GestureDetector(
+                          onTap: visible ? onTap : onPeekTap,
+                          child: Container(
                           key: cardKey,
                           padding: innerPadding,
                           decoration: BoxDecoration(
@@ -826,6 +842,7 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                           ),
                         ),
                       ),
+                    ),
                     ),
             ),
           ),
@@ -1743,19 +1760,26 @@ class LiveProgramProgressBar extends StatelessWidget {
     this.showDetailsRow = false,
     this.barHeight = 6.0,
     this.accentColor = Colors.lightBlueAccent,
+    this.interactive = false,
+    this.onScrubFractionUpdate,
+    this.onScrubFractionEnd,
   });
 
   final LiveTimeshiftBarState state;
   final bool showDetailsRow;
   final double barHeight;
   final Color accentColor;
+  final bool interactive;
+  final ValueChanged<double>? onScrubFractionUpdate;
+  final ValueChanged<double>? onScrubFractionEnd;
 
   @override
   Widget build(BuildContext context) {
     final showTimeshiftOverlay =
         state.rewindableSeconds >= 2 || state.isTimeshifting;
+    final canScrub = interactive && showTimeshiftOverlay;
     final thumbDiameter = barHeight + 6.0;
-    final trackHeight = thumbDiameter + 4.0;
+    final trackHeight = math.max(thumbDiameter + 4.0, canScrub ? 26.0 : 0.0);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1790,7 +1814,14 @@ class LiveProgramProgressBar extends StatelessWidget {
                 width * (playbackFrac - playableStartFrac),
               );
 
-              return Stack(
+              double clampFrac(double dx) {
+                if (width <= 0) return playbackFrac;
+                return (dx / width)
+                    .clamp(playableStartFrac, liveFrac)
+                    .toDouble();
+              }
+
+              final trackStack = Stack(
                 alignment: Alignment.centerLeft,
                 children: [
                   ClipRRect(
@@ -1872,6 +1903,28 @@ class LiveProgramProgressBar extends StatelessWidget {
                   ),
                 ],
               );
+
+              if (!canScrub) return trackStack;
+              var lastFrac = playbackFrac;
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapDown: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionEnd?.call(lastFrac);
+                },
+                onHorizontalDragStart: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionUpdate?.call(lastFrac);
+                },
+                onHorizontalDragUpdate: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionUpdate?.call(lastFrac);
+                },
+                onHorizontalDragEnd: (_) {
+                  onScrubFractionEnd?.call(lastFrac);
+                },
+                child: trackStack,
+              );
             },
           ),
         ),
@@ -1926,11 +1979,17 @@ class LiveOsdProgramSection extends StatelessWidget {
     required this.info,
     this.timeshift,
     this.accentColor = Colors.lightBlueAccent,
+    this.interactive = false,
+    this.onScrubFractionUpdate,
+    this.onScrubFractionEnd,
   });
 
   final LiveOsdProgramInfo info;
   final LiveTimeshiftBarState? timeshift;
   final Color accentColor;
+  final bool interactive;
+  final ValueChanged<double>? onScrubFractionUpdate;
+  final ValueChanged<double>? onScrubFractionEnd;
 
   @override
   Widget build(BuildContext context) {
@@ -1990,6 +2049,9 @@ class LiveOsdProgramSection extends StatelessWidget {
                 effectiveTimeshift.rewindableSeconds >= 2,
             barHeight: 6.0,
             accentColor: accentColor,
+            interactive: interactive,
+            onScrubFractionUpdate: onScrubFractionUpdate,
+            onScrubFractionEnd: onScrubFractionEnd,
           ),
         ],
         if (info.nextTitle != null) ...[
@@ -3037,6 +3099,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// teardown (see player_teardown_policy).
   late final DiagLog _diag;
   late final FireTvHelper _fireTvHelper;
+  late final DesktopWindowController _desktopWindow;
+  late final UiControlMode _initialUiMode;
+
+  UiControlMode get _uiMode =>
+      mounted ? ref.read(uiControlModeProvider) : _initialUiMode;
+
+  bool _desktopFullscreen = false;
+  bool _pointerOverControls = false;
+  ChannelSwitchDirection? _hoveredChannelEdge;
+  Duration? _scrubbingPosition;
+  Timer? _orientationResetTimer;
+  bool _touchPortraitOverlayOpen = false;
+  Timer? _touchPortraitOverlayTimer;
+  double _touchSwipeStartX = 0.0;
+  double _touchSwipeDeltaX = 0.0;
+  bool _lastTouchLandscape = true;
 
   final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
   final FocusScopeNode _osdFocusScopeNode = FocusScopeNode(
@@ -3447,6 +3525,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
+    _desktopWindow = ref.read(desktopWindowControllerProvider);
+    _initialUiMode = ref.read(uiControlModeProvider);
     _androidSdkInt = ref.read(androidSdkIntProvider);
     _useLegacySyncMpvInit = shouldUseLegacySyncMpvInit(
       isAndroid: Platform.isAndroid,
@@ -3483,14 +3563,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
     }
     _recordLiveChannelProgramSnapshot(_activeLiveChannel);
-    unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
-    );
-    unawaited(_fireTvHelper.setMediaVolumeMax());
+    if (_initialUiMode.isTouch) {
+      unawaited(
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+    }
+    if (_initialUiMode.isTv) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
+      unawaited(_fireTvHelper.setMediaVolumeMax());
+    } else if (_initialUiMode.isDesktop) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
+    }
     _player = _useLegacySyncMpvInit
         ? Player(configuration: const PlayerConfiguration(async: false))
         : Player();
-    unawaited(_player.setVolume(100.0));
+    unawaited(_applyPlayerVolume());
     _videoController = _hwdecMode == VideoHwdecMode.software
         ? VideoController(
             _player,
@@ -4682,7 +4777,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _enterInterruptedState('再接続がタイムアウトしました。電波状況を確認して再試行します。');
     });
     try {
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       if (!mounted || _conflictHandled || _switchingChannel) return;
       await _player.open(
         Media(
@@ -4693,7 +4788,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         ),
       );
       if (!mounted || _conflictHandled || _switchingChannel) return;
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
       if (!mounted || _conflictHandled || _switchingChannel) return;
@@ -6144,11 +6239,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           '(plan 86)',
         );
       }
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       await _player.open(
         Media(widget.session.mediaUri.toString(), start: start),
       );
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       _diag(DiagCategory.playback, 'player: open completed');
       _logPlaybackTrace(
         'player.open completed at ${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
@@ -6323,6 +6418,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'osd clock timer', run: () => _osdClockTimer?.cancel()),
+        (
+          name: 'touch portrait overlay timer',
+          run: () => _touchPortraitOverlayTimer?.cancel(),
+        ),
+        (
+          name: 'orientation reset timer',
+          run: () => _orientationResetTimer?.cancel(),
+        ),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
         (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
         (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
@@ -6357,9 +6460,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         ),
         (
           name: 'system ui restore',
-          run: () => unawaited(
-            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
-          ),
+          run: () {
+            unawaited(
+              SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+            );
+            if (_initialUiMode.isTouch) {
+              unawaited(SystemChrome.setPreferredOrientations(const []));
+            }
+            if (_initialUiMode.isDesktop && _desktopFullscreen) {
+              unawaited(_desktopWindow.setFullscreen(false));
+            }
+          },
         ),
         (name: 'wakelock', run: () => _wakelockSession.release()),
         (
@@ -6617,11 +6728,217 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return true;
   }
 
-  void _openOsd() {
+  Future<void> _applyPlayerVolume() async {
+    final muted = mounted ? ref.read(playerMutedProvider) : false;
+    final volume = mounted ? ref.read(playerVolumeProvider) : 100.0;
+    try {
+      await _player.setVolume(muted ? 0.0 : volume.clamp(0.0, 100.0).toDouble());
+    } catch (_) {
+      // Ignore if player is already disposing.
+    }
+  }
+
+  void _setPlayerVolume(double value) {
+    final clamped = value.clamp(0.0, 100.0).toDouble();
+    unawaited(ref.read(playerVolumeProvider.notifier).set(clamped));
+    if (clamped > 0 && ref.read(playerMutedProvider)) {
+      unawaited(ref.read(playerMutedProvider.notifier).set(false));
+    }
+    unawaited(_applyPlayerVolume());
+    _resetOsdTimer();
+  }
+
+  void _togglePlayerMute() {
+    final nextMuted = !ref.read(playerMutedProvider);
+    unawaited(ref.read(playerMutedProvider.notifier).set(nextMuted));
+    unawaited(_applyPlayerVolume());
+    _showHudMessage(
+      nextMuted ? Icons.volume_off : Icons.volume_up,
+      nextMuted ? 'ミュート' : 'ミュート解除',
+    );
+    _resetOsdTimer();
+  }
+
+  Future<void> _toggleDesktopFullscreen() async {
+    final next = await _desktopWindow.toggleFullscreen();
+    if (!mounted) return;
+    setState(() => _desktopFullscreen = next);
+    _resetOsdTimer();
+  }
+
+  Future<void> _setDesktopFullscreen(bool target) async {
+    final next = await _desktopWindow.setFullscreen(target);
+    if (!mounted) return;
+    setState(() => _desktopFullscreen = next);
+  }
+
+  void _toggleTouchFullscreen(bool currentlyLandscape) {
+    _orientationResetTimer?.cancel();
+    unawaited(
+      SystemChrome.setPreferredOrientations(
+        currentlyLandscape
+            ? const [DeviceOrientation.portraitUp]
+            : const [
+                DeviceOrientation.landscapeLeft,
+                DeviceOrientation.landscapeRight,
+              ],
+      ),
+    );
+    _orientationResetTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted || !_uiMode.isTouch) return;
+      unawaited(
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+    });
+  }
+
+  void _onDesktopHover() {
+    if (!_uiMode.isDesktop || _detailOpen || _interrupted || _error != null) {
+      return;
+    }
+    if (!_osdOpen) {
+      _openOsd(requestFocus: false);
+    } else {
+      _resetOsdTimer();
+    }
+  }
+
+  void _resetTouchPortraitOverlayTimer() {
+    _touchPortraitOverlayTimer?.cancel();
+    _touchPortraitOverlayTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && _touchPortraitOverlayOpen) {
+        setState(() => _touchPortraitOverlayOpen = false);
+      }
+    });
+  }
+
+  void _toggleTouchPortraitOverlay() {
+    setState(() => _touchPortraitOverlayOpen = !_touchPortraitOverlayOpen);
+    if (_touchPortraitOverlayOpen) {
+      _resetTouchPortraitOverlayTimer();
+    } else {
+      _touchPortraitOverlayTimer?.cancel();
+    }
+  }
+
+  void _onRecordedScrubUpdate(double fraction) {
+    final dur = _effectiveDuration;
+    if (dur <= Duration.zero) return;
+    final target = scrubFractionToDuration(fraction, dur);
+    setState(() => _scrubbingPosition = target);
+    _resetOsdTimer();
+  }
+
+  void _onRecordedScrubEnd(double fraction) {
+    final dur = _effectiveDuration;
+    if (dur <= Duration.zero) {
+      if (_scrubbingPosition != null) setState(() => _scrubbingPosition = null);
+      return;
+    }
+    final target = scrubFractionToDuration(fraction, dur);
+    _seekBasePosition = null;
+    _pendingSeekOffset = Duration.zero;
+    _seekDebounceTimer?.cancel();
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (mounted) setState(() {});
+    });
+    setState(() => _scrubbingPosition = null);
+    _clearDisplayedSubtitles();
+    _resetSubtitleTrackTracking();
+    unawaited(_player.seek(target));
+    _resetOsdTimer();
+  }
+
+  void _onLiveScrubUpdate(double fraction, LiveTimeshiftBarState barState) {
+    _resetOsdTimer();
+    if (_liveCacheStartSec == null || _liveCacheEndSec == null) return;
+    final ch = _activeLiveChannel;
+    final now = _now();
+    final info = ch != null
+        ? resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: _guideEventsForChannel(ch),
+            now: _effectiveLivePlaybackClock(now),
+          )
+        : null;
+    final targetSec = resolveLiveTimeshiftTargetSeconds(
+      fraction: fraction,
+      liveEdgeFraction: barState.liveEdgeFraction,
+      playableStartFraction: barState.playableStartFraction,
+      usesProgramTimeline: barState.usesProgramTimeline,
+      programStart: info?.currentStart,
+      programEnd: info?.currentEnd,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
+    );
+    if (targetSec == null) return;
+    final current =
+        _liveCommittedSeekSec ??
+        _liveTimePosSec ??
+        _liveCacheLiveEdgeSec ??
+        _liveCacheEndSec;
+    if (current == null) return;
+    setState(() {
+      _livePendingSeekBaseSec = current;
+      _livePendingSeekDeltaSec = targetSec - current;
+    });
+  }
+
+  void _onLiveScrubEnd(double fraction, LiveTimeshiftBarState barState) {
+    _resetOsdTimer();
+    if (fraction >= barState.liveEdgeFraction - 0.005) {
+      _livePendingSeekBaseSec = null;
+      _livePendingSeekDeltaSec = 0.0;
+      _liveSeekDebounceTimer?.cancel();
+      if (_liveDelayedByPause) {
+        unawaited(_catchUpToLiveEdge());
+      }
+      return;
+    }
+    final ch = _activeLiveChannel;
+    final now = _now();
+    final info = ch != null
+        ? resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: _guideEventsForChannel(ch),
+            now: _effectiveLivePlaybackClock(now),
+          )
+        : null;
+    final targetSec = resolveLiveTimeshiftTargetSeconds(
+      fraction: fraction,
+      liveEdgeFraction: barState.liveEdgeFraction,
+      playableStartFraction: barState.playableStartFraction,
+      usesProgramTimeline: barState.usesProgramTimeline,
+      programStart: info?.currentStart,
+      programEnd: info?.currentEnd,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
+    );
+    if (targetSec == null) return;
+    final current =
+        _liveCommittedSeekSec ??
+        _liveTimePosSec ??
+        _liveCacheLiveEdgeSec ??
+        _liveCacheEndSec;
+    if (current == null) return;
+    _livePendingSeekBaseSec = current;
+    _livePendingSeekDeltaSec = 0.0;
+    _queueLiveRelativeSeek(targetSec - current);
+  }
+
+  void _openOsd({bool requestFocus = true}) {
     _channelPreviewTimer?.cancel();
     _syncDisplayedBufferBadge(force: true);
     setState(() {
       _channelPreviewDirection = null;
+      _hoveredChannelEdge = null;
       _osdOpen = true;
     });
     if (widget.live && _activeLiveChannel != null) {
@@ -6685,11 +7002,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     });
     unawaited(_pollMpvBufferProperties());
     _resetOsdTimer();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _osdFirstFocusNode.canRequestFocus) {
-        _osdFirstFocusNode.requestFocus();
-      }
-    });
+    if (requestFocus && _uiMode.isTv) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+      });
+    }
   }
 
   void _closeOsd({bool fromBackKey = false}) {
@@ -6727,8 +7046,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _resetOsdTimer() {
     _osdTimer?.cancel();
-    _osdTimer = Timer(const Duration(seconds: 5), () {
-      if (mounted && _osdOpen && !_detailOpen) _closeOsd();
+    if (_uiMode.isDesktop && _pointerOverControls) return;
+    final timeout = _uiMode.isTv
+        ? const Duration(seconds: 5)
+        : const Duration(milliseconds: 3500);
+    _osdTimer = Timer(timeout, () {
+      if (mounted &&
+          _osdOpen &&
+          !_detailOpen &&
+          !(_uiMode.isDesktop && _pointerOverControls)) {
+        _closeOsd();
+      }
     });
   }
 
@@ -6736,6 +7064,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _duration > Duration.zero ? _duration : (widget.knownDuration ?? Duration.zero);
 
   Duration? get _seekHudPositionOverride {
+    if (_scrubbingPosition != null) return _scrubbingPosition;
     if (_seekBasePosition != null) {
       return skipSeekTarget(
         position: _seekBasePosition!,
@@ -7646,7 +7975,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
       await _player.open(Media(uri.toString()));
       if (!mounted) return;
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       await _player.play();
       await _applySubtitleSelection();
       if (mounted) {
@@ -7704,19 +8033,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
       return KeyEventResult.handled;
     }
+    if (_uiMode.isDesktop && event is KeyDownEvent) {
+      if (key == LogicalKeyboardKey.keyF) {
+        unawaited(_toggleDesktopFullscreen());
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.keyM) {
+        _togglePlayerMute();
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.escape &&
+          _desktopFullscreen &&
+          !_osdOpen &&
+          _channelPreviewDirection == null) {
+        unawaited(_setDesktopFullscreen(false));
+        return KeyEventResult.handled;
+      }
+    }
     if (_osdOpen) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
         _closeOsd(fromBackKey: true);
         return KeyEventResult.handled;
       }
       _resetOsdTimer();
-      if (key == LogicalKeyboardKey.arrowLeft ||
-          key == LogicalKeyboardKey.arrowRight ||
-          key == LogicalKeyboardKey.arrowUp ||
-          key == LogicalKeyboardKey.arrowDown) {
+      if (_uiMode.isTv &&
+          (key == LogicalKeyboardKey.arrowLeft ||
+              key == LogicalKeyboardKey.arrowRight ||
+              key == LogicalKeyboardKey.arrowUp ||
+              key == LogicalKeyboardKey.arrowDown)) {
         if (_osdFirstFocusNode.canRequestFocus) {
           _osdFirstFocusNode.requestFocus();
         }
+        return KeyEventResult.handled;
+      }
+      if (!_uiMode.isTv && key == LogicalKeyboardKey.space) {
+        _togglePlayPauseWithHud();
         return KeyEventResult.handled;
       }
       return KeyEventResult.ignored;
@@ -7868,6 +8219,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   @override
   Widget build(BuildContext context) {
+    final uiMode = ref.watch(uiControlModeProvider);
+    final mediaSize = MediaQuery.sizeOf(context);
+    final isLandscape = mediaSize.width >= mediaSize.height;
+    final isTouchPortrait = uiMode.isTouch && !isLandscape;
+    if (uiMode.isTouch && isLandscape != _lastTouchLandscape) {
+      _lastTouchLandscape = isLandscape;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        unawaited(
+          SystemChrome.setEnabledSystemUIMode(
+            isLandscape ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+          ),
+        );
+      });
+    }
     final loadingLabel = playerLoadingLabel(
       interrupted: _interrupted,
       hasVideoFrame: _hasVideoFrame,
@@ -7875,10 +8241,32 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       playingNow: _playingNow,
       buffering: _buffering,
     );
+    final canSwipeChannels =
+        widget.live &&
+        !_osdOpen &&
+        !_detailOpen &&
+        !_interrupted &&
+        _error == null &&
+        !_switchingChannel &&
+        _canSwitchLiveChannel &&
+        canSwitchLiveChannelOnDirectionKey(
+          live: widget.live,
+          liveDelayedByPause: _liveDelayedByPause,
+          playingNow: _playingNow,
+        );
+
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
+        if (uiMode.isDesktop &&
+            _desktopFullscreen &&
+            !_detailOpen &&
+            !_osdOpen &&
+            _channelPreviewDirection == null) {
+          unawaited(_setDesktopFullscreen(false));
+          return;
+        }
         switch (resolvePlayerBackOutcome(
           detailOpen: _detailOpen,
           osdOpen: _osdOpen,
@@ -7899,7 +8287,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _dismissChannelPreview(fromBackKey: true);
             return;
           case PlayerBackOutcome.confirmExit:
-            unawaited(_confirmExitPlayback());
+            if (uiMode.isTv) {
+              unawaited(_confirmExitPlayback());
+            } else {
+              Navigator.of(context).pop();
+            }
             return;
           case PlayerBackOutcome.popPlayer:
             Navigator.of(context).pop();
@@ -7978,13 +8370,320 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                 ),
               )
+            : isTouchPortrait
+            ? _buildTouchPortraitLayout(
+                loadingLabel: loadingLabel,
+                canSwipeChannels: canSwipeChannels,
+              )
             : Focus(
                 focusNode: _rootFocusNode,
                 autofocus: true,
                 onKeyEvent: _handleKeyEvent,
-                child: GestureDetector(
+                child: MouseRegion(
+                  onHover: uiMode.isDesktop ? (_) => _onDesktopHover() : null,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _toggleOsd,
+                    onDoubleTap: uiMode.isDesktop
+                        ? () => unawaited(_toggleDesktopFullscreen())
+                        : null,
+                    onHorizontalDragStart: uiMode.isTouch && canSwipeChannels
+                        ? (details) {
+                            _touchSwipeStartX = details.localPosition.dx;
+                            _touchSwipeDeltaX = 0.0;
+                          }
+                        : null,
+                    onHorizontalDragUpdate: uiMode.isTouch && canSwipeChannels
+                        ? (details) {
+                            _touchSwipeDeltaX += details.delta.dx;
+                          }
+                        : null,
+                    onHorizontalDragEnd: uiMode.isTouch && canSwipeChannels
+                        ? (details) {
+                            final dir = resolveTouchHorizontalSwipeDirection(
+                              dragDeltaX: _touchSwipeDeltaX,
+                              primaryVelocity: details.primaryVelocity,
+                              startX: _touchSwipeStartX,
+                              viewportWidth: mediaSize.width,
+                            );
+                            if (dir != null) _showChannelPreview(dir);
+                          }
+                        : null,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Video(
+                          controller: _videoController,
+                          controls: NoVideoControls,
+                          subtitleViewConfiguration:
+                              const SubtitleViewConfiguration(visible: false),
+                        ),
+                        if (_jikkyoOn && !_switchingChannel && _error == null)
+                          Positioned.fill(
+                            child: JikkyoDanmakuOverlay(
+                              controller: _jikkyoOverlayController,
+                              settings: ref.watch(jikkyoSettingsProvider),
+                              isPlaying:
+                                  _playingNow && !_buffering && !_interrupted,
+                              playbackRate: widget.live
+                                  ? _liveCatchUpRate
+                                  : _playbackRate,
+                              avoidBottomSubtitles:
+                                  (_subtitlesOn &&
+                                      _visibleSubtitleCues.isNotEmpty) ||
+                                  (ref.watch(superimposeEnabledProvider) &&
+                                      _visibleSuperimposeCues.isNotEmpty),
+                            ),
+                          ),
+                        if (_subtitlesOn &&
+                            _visibleSubtitleCues.isNotEmpty &&
+                            !_switchingChannel &&
+                            _error == null)
+                          PlayerSubtitleOverlay(
+                            settings: ref.watch(subtitleSettingsProvider),
+                            cues: _visibleSubtitleCues,
+                            bottomSafePadding: _osdOpen
+                                ? (widget.live ? 250.0 : 176.0)
+                                : (_seekHudVisible ? 116.0 : 24.0),
+                          ),
+                        if (ref.watch(superimposeEnabledProvider) &&
+                            _visibleSuperimposeCues.isNotEmpty &&
+                            !_switchingChannel &&
+                            _error == null)
+                          PlayerSubtitleOverlay(
+                            settings: ref.watch(subtitleSettingsProvider),
+                            cues: _visibleSuperimposeCues,
+                            bottomSafePadding: _osdOpen
+                                ? (widget.live ? 250.0 : 176.0)
+                                : (_seekHudVisible ? 116.0 : 24.0),
+                          ),
+                        if (!_conflictHandled &&
+                            (loadingLabel != null ||
+                                (!_interrupted && _isPreBuffering)))
+                          _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
+                        if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                        if (shouldShowPlayerCornerNotice(
+                          cornerRecordingNotice: _cornerRecordingNotice,
+                          customCornerNoticeText: _customCornerNoticeText,
+                          osdOpen: _osdOpen,
+                          detailOpen: _detailOpen,
+                          interrupted: _interrupted,
+                          error: _error,
+                          switchingChannel: _switchingChannel,
+                        ))
+                          PlayerCornerNotice(
+                            customText: _customCornerNoticeText,
+                            recordingNotice: _cornerRecordingNotice,
+                          ),
+                        if (uiMode.isDesktop && canSwipeChannels)
+                          DesktopChannelEdgeZones(
+                            enabled: true,
+                            hasPrevious:
+                                _previewTargetFor(
+                                  ChannelSwitchDirection.previous,
+                                ) !=
+                                null,
+                            hasNext:
+                                _previewTargetFor(
+                                  ChannelSwitchDirection.next,
+                                ) !=
+                                null,
+                            onHoverDirection: (dir) {
+                              if (_hoveredChannelEdge != dir) {
+                                setState(() => _hoveredChannelEdge = dir);
+                              }
+                            },
+                            onClickDirection: _showChannelPreview,
+                          ),
+                        if (canSwipeChannels)
+                          ..._buildChannelSwitchPreviewCards(),
+                        if (_seekHudVisible && !_osdOpen) _buildSeekHud(),
+                        if (!uiMode.isTv &&
+                            _osdOpen &&
+                            !_detailOpen &&
+                            !_interrupted &&
+                            _error == null)
+                          PlayerCenterTransportOverlay(
+                            visible: true,
+                            isPlaying: _playingNow,
+                            canSeekBackward: true,
+                            canSeekForward:
+                                !widget.live || _liveDelayedByPause,
+                            onRewind: () {
+                              if (widget.live) {
+                                _queueLiveRelativeSeek(
+                                  liveDirectionKeySeekDeltaSeconds(
+                                    forward: false,
+                                  ),
+                                );
+                              } else {
+                                _queueRelativeSeek(_rewindStep);
+                              }
+                              _resetOsdTimer();
+                            },
+                            onTogglePlayPause: () {
+                              _togglePlayPauseWithHud();
+                              _resetOsdTimer();
+                            },
+                            onForward: () {
+                              if (widget.live) {
+                                _queueLiveRelativeSeek(
+                                  liveDirectionKeySeekDeltaSeconds(
+                                    forward: true,
+                                  ),
+                                );
+                              } else {
+                                _queueRelativeSeek(_forwardStep);
+                              }
+                              _resetOsdTimer();
+                            },
+                          ),
+                        if (_osdOpen ||
+                            _osdFadeController.status !=
+                                AnimationStatus.dismissed) ...[
+                          if (!_detailOpen) _buildOsdClockOverlay(),
+                          if (uiMode.isTv)
+                            _buildRemoteOsd()
+                          else
+                            _buildMultiplatformFullscreenOsd(
+                              isDesktop: uiMode.isDesktop,
+                            ),
+                        ],
+                        if (_detailOpen && _hasProgramDetail)
+                          Positioned(
+                            top: 20,
+                            left: 28,
+                            right: 28,
+                            child: Builder(
+                              builder: (_) {
+                                if (!widget.live) {
+                                  return ProgramDetailOverlayPanel(
+                                    title:
+                                        widget.programDetailTitle ??
+                                        widget.title,
+                                    meta: widget.programDetailMeta,
+                                    body: widget.programDetailBody!,
+                                    scrollController: _detailScrollController,
+                                    focusNode: _detailFocusNode,
+                                    onClose: () =>
+                                        _closeDetail(fromBackKey: true),
+                                    onScrollDelta: _scrollDetailBy,
+                                  );
+                                }
+                                final opened = _openedLiveDetail;
+                                final detailBody =
+                                    (_liveDetailLoading &&
+                                        !(opened?.hasBody ?? false))
+                                    ? '番組詳細を読み込み中…'
+                                    : ((opened?.hasBody ?? false)
+                                          ? opened!.body!
+                                          : '番組詳細情報はありません');
+                                return ProgramDetailOverlayPanel(
+                                  title:
+                                      opened?.title ??
+                                      widget.programDetailTitle ??
+                                      widget.title,
+                                  meta: opened != null
+                                      ? opened.meta
+                                      : widget.programDetailMeta,
+                                  body: detailBody,
+                                  scrollController: _detailScrollController,
+                                  focusNode: _detailFocusNode,
+                                  onClose: () =>
+                                      _closeDetail(fromBackKey: true),
+                                  onScrollDelta: _scrollDetailBy,
+                                );
+                              },
+                            ),
+                          ),
+                        if (_interrupted &&
+                            !_conflictHandled &&
+                            !_switchingChannel)
+                          _buildInterruptionBanner(),
+                        if (_currentNextEpisodeCountdown().visible &&
+                            !_osdOpen &&
+                            !_detailOpen &&
+                            !_seekHudVisible &&
+                            !_switchingChannel)
+                          _buildNextEpisodeCountdownCard(
+                            _currentNextEpisodeCountdown().remainingSeconds,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  Widget _buildTouchPortraitLayout({
+    required String? loadingLabel,
+    required bool canSwipeChannels,
+  }) {
+    final activeChannel = widget.live ? _activeLiveChannel : null;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final volume = ref.watch(playerVolumeProvider);
+    final muted = ref.watch(playerMutedProvider);
+    final now = _now();
+    final ResolvedProgramDetail? portraitDetail;
+    if (!widget.live) {
+      portraitDetail = _hasProgramDetail
+          ? ResolvedProgramDetail(
+              title: widget.programDetailTitle ?? widget.title,
+              meta: widget.programDetailMeta,
+              body: widget.programDetailBody,
+            )
+          : null;
+    } else if (activeChannel != null) {
+      portraitDetail = _resolveLiveDetailSnapshot(
+        activeChannel,
+        _effectiveLivePlaybackClock(now),
+      );
+    } else {
+      portraitDetail = null;
+    }
+
+    return SafeArea(
+      child: Column(
+        children: [
+          AspectRatio(
+            aspectRatio: 16 / 9,
+            child: Container(
+              color: Colors.black,
+              child: LayoutBuilder(
+                builder: (context, constraints) => GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: _toggleOsd,
+                  onTap: _toggleTouchPortraitOverlay,
+                  onHorizontalDragStart: canSwipeChannels
+                      ? (details) {
+                          _touchSwipeStartX = details.localPosition.dx;
+                          _touchSwipeDeltaX = 0.0;
+                        }
+                      : null,
+                  onHorizontalDragUpdate: canSwipeChannels
+                      ? (details) {
+                          _touchSwipeDeltaX += details.delta.dx;
+                        }
+                      : null,
+                  onHorizontalDragEnd: canSwipeChannels
+                      ? (details) {
+                          final dir = resolveTouchHorizontalSwipeDirection(
+                            dragDeltaX: _touchSwipeDeltaX,
+                            primaryVelocity: details.primaryVelocity,
+                            startX: _touchSwipeStartX,
+                            viewportWidth: constraints.maxWidth,
+                          );
+                          if (dir != null) _showChannelPreview(dir);
+                        }
+                      : null,
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
@@ -8018,9 +8717,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         PlayerSubtitleOverlay(
                           settings: ref.watch(subtitleSettingsProvider),
                           cues: _visibleSubtitleCues,
-                          bottomSafePadding: _osdOpen
-                              ? (widget.live ? 250.0 : 176.0)
-                              : (_seekHudVisible ? 116.0 : 24.0),
+                          bottomSafePadding: 12.0,
+                          minFontSize: 10.0,
                         ),
                       if (ref.watch(superimposeEnabledProvider) &&
                           _visibleSuperimposeCues.isNotEmpty &&
@@ -8029,20 +8727,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         PlayerSubtitleOverlay(
                           settings: ref.watch(subtitleSettingsProvider),
                           cues: _visibleSuperimposeCues,
-                          bottomSafePadding: _osdOpen
-                              ? (widget.live ? 250.0 : 176.0)
-                              : (_seekHudVisible ? 116.0 : 24.0),
+                          bottomSafePadding: 12.0,
+                          minFontSize: 10.0,
                         ),
                       if (!_conflictHandled &&
                           (loadingLabel != null ||
                               (!_interrupted && _isPreBuffering)))
                         _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
-                      if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                      if (_hudText != null) _buildStatusHud(),
                       if (shouldShowPlayerCornerNotice(
                         cornerRecordingNotice: _cornerRecordingNotice,
                         customCornerNoticeText: _customCornerNoticeText,
-                        osdOpen: _osdOpen,
-                        detailOpen: _detailOpen,
+                        osdOpen: false,
+                        detailOpen: false,
                         interrupted: _interrupted,
                         error: _error,
                         switchingChannel: _switchingChannel,
@@ -8051,73 +8748,84 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           customText: _customCornerNoticeText,
                           recordingNotice: _cornerRecordingNotice,
                         ),
-                      if (widget.live &&
-                          !_osdOpen &&
-                          !_detailOpen &&
-                          !_interrupted &&
-                          _error == null &&
-                          !_switchingChannel &&
-                          _canSwitchLiveChannel &&
-                          canSwitchLiveChannelOnDirectionKey(
-                            live: widget.live,
-                            liveDelayedByPause: _liveDelayedByPause,
-                            playingNow: _playingNow,
-                          ))
+                      if (canSwipeChannels)
                         ..._buildChannelSwitchPreviewCards(),
-                      if (_seekHudVisible && !_osdOpen) _buildSeekHud(),
-                      if (_osdOpen ||
-                          _osdFadeController.status != AnimationStatus.dismissed) ...[
-                        if (!_detailOpen) _buildOsdClockOverlay(),
-                        _buildRemoteOsd(),
-                      ],
-                      if (_detailOpen && _hasProgramDetail)
+                      if (_touchPortraitOverlayOpen &&
+                          !_interrupted &&
+                          _error == null) ...[
                         Positioned(
-                          top: 20,
-                          left: 28,
-                          right: 28,
-                          child: Builder(
-                            builder: (_) {
-                              if (!widget.live) {
-                                return ProgramDetailOverlayPanel(
-                                  title: widget.programDetailTitle ?? widget.title,
-                                  meta: widget.programDetailMeta,
-                                  body: widget.programDetailBody!,
-                                  scrollController: _detailScrollController,
-                                  focusNode: _detailFocusNode,
-                                  onClose: () => _closeDetail(fromBackKey: true),
-                                  onScrollDelta: _scrollDetailBy,
-                                );
-                              }
-                              final opened = _openedLiveDetail;
-                              final detailBody = (_liveDetailLoading &&
-                                      !(opened?.hasBody ?? false))
-                                  ? '番組詳細を読み込み中…'
-                                  : ((opened?.hasBody ?? false)
-                                      ? opened!.body!
-                                      : '番組詳細情報はありません');
-                              return ProgramDetailOverlayPanel(
-                                title:
-                                    opened?.title ??
-                                    widget.programDetailTitle ??
-                                    widget.title,
-                                meta: opened != null
-                                    ? opened.meta
-                                    : widget.programDetailMeta,
-                                body: detailBody,
-                                scrollController: _detailScrollController,
-                                focusNode: _detailFocusNode,
-                                onClose: () => _closeDetail(fromBackKey: true),
-                                onScrollDelta: _scrollDetailBy,
-                              );
-                            },
+                          top: 8,
+                          left: 8,
+                          child: CircleAvatar(
+                            backgroundColor: Colors.black54,
+                            child: IconButton(
+                              key: const ValueKey('touch_portrait_back_button'),
+                              icon: const Icon(
+                                Icons.arrow_back,
+                                color: Colors.white,
+                              ),
+                              tooltip: '戻る',
+                              onPressed: () => Navigator.of(context).pop(),
+                            ),
                           ),
                         ),
-                      if (_interrupted && !_conflictHandled && !_switchingChannel)
+                        PlayerCenterTransportOverlay(
+                          visible: true,
+                          compact: true,
+                          isPlaying: _playingNow,
+                          canSeekBackward: true,
+                          canSeekForward: !widget.live || _liveDelayedByPause,
+                          onRewind: () {
+                            if (widget.live) {
+                              _queueLiveRelativeSeek(
+                                liveDirectionKeySeekDeltaSeconds(
+                                  forward: false,
+                                ),
+                              );
+                            } else {
+                              _queueRelativeSeek(_rewindStep);
+                            }
+                            _resetTouchPortraitOverlayTimer();
+                          },
+                          onTogglePlayPause: () {
+                            _togglePlayPauseWithHud();
+                            _resetTouchPortraitOverlayTimer();
+                          },
+                          onForward: () {
+                            if (widget.live) {
+                              _queueLiveRelativeSeek(
+                                liveDirectionKeySeekDeltaSeconds(forward: true),
+                              );
+                            } else {
+                              _queueRelativeSeek(_forwardStep);
+                            }
+                            _resetTouchPortraitOverlayTimer();
+                          },
+                        ),
+                        Positioned(
+                          right: 8,
+                          bottom: 8,
+                          child: CircleAvatar(
+                            backgroundColor: Colors.black54,
+                            child: IconButton(
+                              key: const ValueKey(
+                                'touch_portrait_fullscreen_overlay_button',
+                              ),
+                              icon: const Icon(
+                                Icons.fullscreen,
+                                color: Colors.white,
+                              ),
+                              tooltip: '全画面（横画面）',
+                              onPressed: () => _toggleTouchFullscreen(false),
+                            ),
+                          ),
+                        ),
+                      ],
+                      if (_interrupted &&
+                          !_conflictHandled &&
+                          !_switchingChannel)
                         _buildInterruptionBanner(),
                       if (_currentNextEpisodeCountdown().visible &&
-                          !_osdOpen &&
-                          !_detailOpen &&
-                          !_seekHudVisible &&
                           !_switchingChannel)
                         _buildNextEpisodeCountdownCard(
                           _currentNextEpisodeCountdown().remainingSeconds,
@@ -8126,6 +8834,126 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                 ),
               ),
+            ),
+          ),
+          Expanded(
+            child: Container(
+              key: const ValueKey('touch_portrait_osd_panel'),
+              width: double.infinity,
+              color: const Color(0xFF101318),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildOsdHeaderRow(liveStatus: liveStatus),
+                    if (widget.live &&
+                        (_activeLiveChannel != null ||
+                            _liveDelayedByPause)) ...[
+                      const SizedBox(height: 8),
+                      _buildLiveOsdProgramSection(
+                        accentColor:
+                            liveStatus?.barColor ?? Colors.lightBlueAccent,
+                        interactive: true,
+                      ),
+                    ] else if (!widget.live) ...[
+                      if ((widget.recordedChannelName != null &&
+                              widget.recordedChannelName!.trim().isNotEmpty) ||
+                          (widget.recordedBroadcastTimeRange != null &&
+                              widget.recordedBroadcastTimeRange!
+                                  .trim()
+                                  .isNotEmpty)) ...[
+                        const SizedBox(height: 6),
+                        RecordedOsdProgramSection(
+                          programTitle: widget.title,
+                          broadcastTimeRange: widget.recordedBroadcastTimeRange,
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      _buildSeekBarSection(
+                        isSeekingPreview: false,
+                        interactive: true,
+                      ),
+                    ],
+                    if (_jikkyoOn) ...[
+                      const SizedBox(height: 8),
+                      _buildJikkyoOsdStatusRow(),
+                    ],
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        PlayerVolumeControl(
+                          volume: volume,
+                          muted: muted,
+                          sliderWidth: 110,
+                          onToggleMute: _togglePlayerMute,
+                          onVolumeChanged: _setPlayerVolume,
+                        ),
+                        const Spacer(),
+                        OutlinedButton.icon(
+                          key: const ValueKey('player_fullscreen_button'),
+                          style: osdButtonStyle(),
+                          onPressed: () => _toggleTouchFullscreen(false),
+                          icon: const Icon(Icons.fullscreen, size: 20),
+                          label: const Text('全画面'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _buildOsdButtonsList(
+                        tvMode: false,
+                        includeCloseButton: false,
+                        includeDetailButton: false,
+                      ),
+                    ),
+                    if (portraitDetail != null) ...[
+                      const SizedBox(height: 16),
+                      const Divider(color: Colors.white24),
+                      const SizedBox(height: 8),
+                      const Text(
+                        '番組詳細',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      if (portraitDetail.meta != null &&
+                          portraitDetail.meta!.trim().isNotEmpty) ...[
+                        Text(
+                          portraitDetail.meta!,
+                          style: const TextStyle(
+                            color: Colors.white60,
+                            fontSize: 12,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      if (portraitDetail.hasBody)
+                        Text(
+                          portraitDetail.body!,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            height: 1.5,
+                          ),
+                        )
+                      else
+                        const Text(
+                          '番組詳細情報はありません',
+                          style: TextStyle(color: Colors.white54, fontSize: 13),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -8328,14 +9156,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
     final prevKey = prevEntry != null ? liveServiceKey(prevEntry.channel) : null;
     final nextKey = nextEntry != null ? liveServiceKey(nextEntry.channel) : null;
+    final canPeek = _uiMode.isDesktop && !_osdOpen;
     return [
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.previous,
         visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
+        peeking:
+            canPeek && _hoveredChannelEdge == ChannelSwitchDirection.previous,
         entry: prevEntry,
         resolvedProgram: prevResolved,
         channelNumber: prevKey != null ? _liveChannelNumbers[prevKey] : null,
         channelLogoBytes: prevKey != null ? _liveChannelLogos[prevKey] : null,
+        onPeekTap: prevEntry == null
+            ? null
+            : () => _showChannelPreview(ChannelSwitchDirection.previous),
         onTap: prevEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
@@ -8343,10 +9177,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.next,
         visible: _channelPreviewDirection == ChannelSwitchDirection.next,
+        peeking: canPeek && _hoveredChannelEdge == ChannelSwitchDirection.next,
         entry: nextEntry,
         resolvedProgram: nextResolved,
         channelNumber: nextKey != null ? _liveChannelNumbers[nextKey] : null,
         channelLogoBytes: nextKey != null ? _liveChannelLogos[nextKey] : null,
+        onPeekTap: nextEntry == null
+            ? null
+            : () => _showChannelPreview(ChannelSwitchDirection.next),
         onTap: nextEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
@@ -8358,19 +9196,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     required double posFraction,
     double? bufferFraction,
     List<double> tickFractions = const [],
+    bool interactive = false,
+    ValueChanged<double>? onScrubUpdate,
+    ValueChanged<double>? onScrubEnd,
   }) {
     const barColor = Colors.lightBlueAccent;
     final clampedPos = posFraction.clamp(0.0, 1.0);
     final clampedBuf = bufferFraction?.clamp(clampedPos, 1.0);
+    final trackHeight = interactive ? 26.0 : 18.0;
+    final thumbTop = (trackHeight - 14.0) / 2.0;
+    final tickTop = (trackHeight - 12.0) / 2.0;
     return SizedBox(
-      height: 18,
+      height: trackHeight,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final width = constraints.maxWidth;
           final thumbLeft = (width * clampedPos - 7)
               .clamp(0.0, math.max(0.0, width - 14))
               .toDouble();
-          return Stack(
+          double fractionForDx(double dx) {
+            if (width <= 0) return clampedPos;
+            return (dx / width).clamp(0.0, 1.0).toDouble();
+          }
+
+          final stack = Stack(
             alignment: Alignment.centerLeft,
             children: [
               ClipRRect(
@@ -8403,14 +9252,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   left: (width * tick - 1)
                       .clamp(0.0, math.max(0.0, width - 2))
                       .toDouble(),
-                  top: 3,
+                  top: tickTop,
                   width: 2,
                   height: 12,
                   child: const ColoredBox(color: Colors.white70),
                 ),
               Positioned(
                 left: thumbLeft,
-                top: 2,
+                top: thumbTop,
                 child: Container(
                   width: 14,
                   height: 14,
@@ -8423,12 +9272,37 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               ),
             ],
           );
+
+          if (!interactive) return stack;
+          var lastFrac = clampedPos;
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubEnd?.call(lastFrac);
+            },
+            onHorizontalDragStart: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubUpdate?.call(lastFrac);
+            },
+            onHorizontalDragUpdate: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubUpdate?.call(lastFrac);
+            },
+            onHorizontalDragEnd: (_) {
+              onScrubEnd?.call(lastFrac);
+            },
+            child: stack,
+          );
         },
       ),
     );
   }
 
-  Widget _buildSeekBarSection({required bool isSeekingPreview}) {
+  Widget _buildSeekBarSection({
+    required bool isSeekingPreview,
+    bool interactive = false,
+  }) {
     return StreamBuilder<Duration>(
       stream: _player.stream.position,
       initialData: _lastPosition,
@@ -8472,6 +9346,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               posFraction: posFraction,
               bufferFraction: bufferFraction,
               tickFractions: ticks,
+              interactive: interactive && dur > Duration.zero,
+              onScrubUpdate: _onRecordedScrubUpdate,
+              onScrubEnd: _onRecordedScrubEnd,
             ),
             const SizedBox(height: 4),
             Row(
@@ -8756,17 +9633,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Widget _buildLiveOsdProgramSection({
     Color accentColor = Colors.lightBlueAccent,
+    bool interactive = false,
   }) {
     final now = _now();
     final playbackNow = _effectiveLivePlaybackClock(now);
     final channel = _activeLiveChannel;
     if (channel == null) {
       if (!_liveDelayedByPause) return const SizedBox.shrink();
+      final barState = _currentLiveTimeshiftBarState(null, now);
       return LiveProgramProgressBar(
-        state: _currentLiveTimeshiftBarState(null, now),
+        state: barState,
         showDetailsRow: true,
         barHeight: 6.0,
         accentColor: accentColor,
+        interactive: interactive,
+        onScrubFractionUpdate: interactive
+            ? (frac) => _onLiveScrubUpdate(frac, barState)
+            : null,
+        onScrubFractionEnd: interactive
+            ? (frac) => _onLiveScrubEnd(frac, barState)
+            : null,
       );
     }
     final info = resolveLiveOsdProgramInfo(
@@ -8774,14 +9660,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       guideEvents: _guideEventsForChannel(channel),
       now: playbackNow,
     );
+    final barState = _currentLiveTimeshiftBarState(info, now);
     return LiveOsdProgramSection(
       info: info,
-      timeshift: _currentLiveTimeshiftBarState(info, now),
+      timeshift: barState,
       accentColor: accentColor,
+      interactive: interactive,
+      onScrubFractionUpdate: interactive
+          ? (frac) => _onLiveScrubUpdate(frac, barState)
+          : null,
+      onScrubFractionEnd: interactive
+          ? (frac) => _onLiveScrubEnd(frac, barState)
+          : null,
     );
   }
 
-  Widget _buildRemoteOsd() {
+  Widget _buildOsdHeaderRow({
+    ({List<({String label, Color color})> badges, Color barColor})? liveStatus,
+  }) {
     final activeChannel = widget.live ? _activeLiveChannel : null;
     final activeServiceKey = activeChannel != null
         ? liveServiceKey(activeChannel)
@@ -8792,6 +9688,373 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final activeChannelNumber = activeServiceKey != null
         ? _liveChannelNumbers[activeServiceKey]
         : null;
+    return Row(
+      children: [
+        if (widget.live && activeLogoBytes != null) ...[
+          ChannelLogoPlate(
+            bytes: activeLogoBytes,
+            width: 42,
+            height: 24,
+            darkSurface: true,
+          ),
+          const SizedBox(width: 8),
+        ],
+        if (widget.live && activeChannelNumber != null) ...[
+          ChannelNumberBadge(
+            label: activeChannelNumber,
+            darkSurface: true,
+          ),
+          const SizedBox(width: 8),
+        ],
+        Expanded(
+          child: Text(
+            (!widget.live &&
+                    widget.recordedChannelName != null &&
+                    widget.recordedChannelName!.trim().isNotEmpty)
+                ? widget.recordedChannelName!.trim()
+                : widget.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        _buildBufferBadge(),
+        if (widget.live && _sameChannelRecording) ...[
+          const SizedBox(width: 8),
+          buildPlayerOsdStatusBadge(
+            label: '録画中',
+            color: const Color(0xFFC62828),
+            icon: Icons.fiber_manual_record,
+          ),
+        ],
+        if (liveStatus != null)
+          for (final badge in liveStatus.badges) ...[
+            const SizedBox(width: 8),
+            buildPlayerOsdStatusBadge(
+              label: badge.label,
+              color: badge.color,
+            ),
+          ],
+      ],
+    );
+  }
+
+  List<Widget> _buildOsdButtonsList({
+    required bool tvMode,
+    required bool includeCloseButton,
+    required bool includeDetailButton,
+  }) {
+    void onInteraction() {
+      if (tvMode) {
+        _resetOsdTimer();
+      } else {
+        _resetOsdTimer();
+        _resetTouchPortraitOverlayTimer();
+      }
+    }
+
+    return [
+      _osdButton(
+        focusNode: tvMode ? _osdFirstFocusNode : null,
+        autofocus: tvMode,
+        icon: _playingNow ? Icons.pause : Icons.play_arrow,
+        label: _playingNow ? '一時停止' : '再生',
+        onPressed: () {
+          _togglePlayPauseWithHud();
+          onInteraction();
+        },
+      ),
+      if (widget.live && _liveDelayedByPause) ...[
+        _osdButton(
+          icon: Icons.replay_10,
+          label: '-10秒',
+          onPressed: () {
+            _queueLiveRelativeSeek(
+              liveDirectionKeySeekDeltaSeconds(forward: false),
+            );
+            onInteraction();
+          },
+        ),
+        _osdButton(
+          icon: Icons.forward_10,
+          label: '+10秒',
+          onPressed: () {
+            _queueLiveRelativeSeek(
+              liveDirectionKeySeekDeltaSeconds(forward: true),
+            );
+            onInteraction();
+          },
+        ),
+        _osdButton(
+          icon: Icons.skip_next,
+          label: '現在位置へ',
+          onPressed: _catchingUpLive
+              ? null
+              : () => unawaited(_catchUpToLiveEdge()),
+        ),
+        _osdButton(
+          icon: Icons.speed,
+          label: _liveAutoCatchUpEnabled ? '等速に戻す' : '倍速追いかけ',
+          onPressed: _catchingUpLive ? null : _toggleLiveAutoCatchUp,
+        ),
+      ],
+      if (!widget.live) ...[
+        _osdButton(
+          icon: Icons.replay_10,
+          label: '-10秒',
+          onPressed: () {
+            _queueRelativeSeek(_rewindStep);
+            onInteraction();
+          },
+        ),
+        _osdButton(
+          icon: Icons.forward_10,
+          label: '+10秒',
+          onPressed: () {
+            _queueRelativeSeek(_forwardStep);
+            onInteraction();
+          },
+        ),
+        if (_chapters.isNotEmpty) ...[
+          _osdButton(
+            icon: Icons.fast_rewind,
+            label: '前チャプター',
+            onPressed: () {
+              unawaited(_seekToChapter(forward: false));
+              onInteraction();
+            },
+          ),
+          _osdButton(
+            icon: Icons.fast_forward,
+            label: '次チャプター',
+            onPressed: () {
+              unawaited(_seekToChapter(forward: true));
+              onInteraction();
+            },
+          ),
+        ],
+      ],
+      if (canChangePlaybackSpeed(live: widget.live))
+        _osdButton(
+          icon: Icons.speed,
+          label: '速度 ${playbackSpeedLabel(_playbackRate)}',
+          onPressed: _cyclePlaybackRate,
+        ),
+      if (canSwitchAudio(_realAudioTracks.length))
+        _osdButton(
+          icon: Icons.audiotrack,
+          label: audioTrackLabel(_selectedAudioIndex),
+          onPressed: _cycleAudioTrack,
+        ),
+      if (canToggleSubtitles(_realSubtitleTracks.length))
+        _osdButton(
+          icon: _subtitlesOn
+              ? Icons.closed_caption
+              : Icons.closed_caption_off,
+          label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
+          onPressed: () {
+            _toggleSubtitles();
+            onInteraction();
+          },
+        ),
+      _osdButton(
+        icon: _jikkyoOn ? Icons.chat_bubble : Icons.chat_bubble_outline,
+        label: _jikkyoOn ? '実況 ON' : '実況 OFF',
+        onPressed: () {
+          _toggleJikkyo();
+          onInteraction();
+        },
+      ),
+      if (_jikkyoOn)
+        _osdButton(
+          icon: Icons.tune,
+          label: '実況調整',
+          onPressed: () => unawaited(_openJikkyoQuickDialog()),
+        ),
+      if (widget.canSwitchQuality && widget.onSwitchQuality != null)
+        _osdButton(
+          icon: osdQualityButtonIcon(useMobile: widget.currentUseMobile),
+          label: osdQualityButtonLabel(useMobile: widget.currentUseMobile),
+          onPressed: _switchingChannel
+              ? null
+              : () => unawaited(_executeQualitySwitch()),
+        ),
+      if (widget.live &&
+          _sameChannelRecording &&
+          _activeSameChannelSchedule != null &&
+          widget.onStopCurrentProgramRecording != null)
+        _osdButton(
+          icon: Icons.stop_circle_outlined,
+          label: '録画を停止',
+          onPressed: _recordingActionBusy
+              ? null
+              : () => unawaited(_confirmAndStopLiveRecording()),
+        )
+      else if (widget.live &&
+          !_sameChannelRecording &&
+          widget.onStartCurrentProgramRecording != null)
+        _osdButton(
+          icon: Icons.fiber_manual_record,
+          label: 'この番組を録画',
+          onPressed: _recordingActionBusy
+              ? null
+              : () => unawaited(_confirmAndStartLiveRecording()),
+        ),
+      if (includeDetailButton && _hasProgramDetail)
+        _osdButton(
+          focusNode: tvMode ? _osdDetailButtonFocusNode : null,
+          icon: Icons.info_outline,
+          label: _detailOpen ? '詳細を閉じる' : '番組詳細',
+          onPressed: () => _detailOpen ? _closeDetail() : _openDetail(),
+        ),
+      if (includeCloseButton)
+        _osdButton(
+          icon: Icons.close,
+          label: playerOsdCloseMenuLabel,
+          onPressed: _closeOsd,
+        ),
+    ];
+  }
+
+  Widget _buildMultiplatformFullscreenOsd({required bool isDesktop}) {
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final volume = ref.watch(playerVolumeProvider);
+    final muted = ref.watch(playerMutedProvider);
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: IgnorePointer(
+        ignoring: !_osdOpen,
+        child: ExcludeFocus(
+          excluding: !_osdOpen,
+          child: MouseRegion(
+            onEnter: isDesktop
+                ? (_) {
+                    _pointerOverControls = true;
+                    _osdTimer?.cancel();
+                  }
+                : null,
+            onExit: isDesktop
+                ? (_) {
+                    _pointerOverControls = false;
+                    _resetOsdTimer();
+                  }
+                : null,
+            child: FadeTransition(
+              opacity: _osdFadeAnimation,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(24, 18, 24, 20),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Colors.transparent, Colors.black87, Colors.black],
+                  ),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildOsdHeaderRow(liveStatus: liveStatus),
+                    if (widget.live &&
+                        (_activeLiveChannel != null ||
+                            _liveDelayedByPause)) ...[
+                      const SizedBox(height: 6),
+                      _buildLiveOsdProgramSection(
+                        accentColor:
+                            liveStatus?.barColor ?? Colors.lightBlueAccent,
+                        interactive: true,
+                      ),
+                    ] else if (!widget.live) ...[
+                      if ((widget.recordedChannelName != null &&
+                              widget.recordedChannelName!.trim().isNotEmpty) ||
+                          (widget.recordedBroadcastTimeRange != null &&
+                              widget.recordedBroadcastTimeRange!
+                                  .trim()
+                                  .isNotEmpty)) ...[
+                        const SizedBox(height: 4),
+                        RecordedOsdProgramSection(
+                          programTitle: widget.title,
+                          broadcastTimeRange: widget.recordedBroadcastTimeRange,
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      _buildSeekBarSection(
+                        isSeekingPreview: false,
+                        interactive: true,
+                      ),
+                    ],
+                    if (_jikkyoOn) ...[
+                      const SizedBox(height: 6),
+                      _buildJikkyoOsdStatusRow(),
+                    ],
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        PlayerVolumeControl(
+                          volume: volume,
+                          muted: muted,
+                          onToggleMute: _togglePlayerMute,
+                          onVolumeChanged: _setPlayerVolume,
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          key: const ValueKey('player_fullscreen_button'),
+                          icon: Icon(
+                            isDesktop
+                                ? (_desktopFullscreen
+                                      ? Icons.fullscreen_exit
+                                      : Icons.fullscreen)
+                                : Icons.fullscreen_exit,
+                            color: Colors.white,
+                          ),
+                          tooltip: isDesktop
+                              ? (_desktopFullscreen ? '全画面解除' : '全画面')
+                              : '縦画面に戻す',
+                          onPressed: () {
+                            if (isDesktop) {
+                              unawaited(_toggleDesktopFullscreen());
+                            } else {
+                              _toggleTouchFullscreen(true);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _buildOsdButtonsList(
+                        tvMode: false,
+                        includeCloseButton: true,
+                        includeDetailButton: true,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteOsd() {
     final liveStatus = widget.live
         ? liveStatusPresentation(
             liveDelayedByPause: _liveDelayedByPause,
@@ -8820,262 +10083,50 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ),
               ),
               child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                if (widget.live && activeLogoBytes != null) ...[
-                  ChannelLogoPlate(
-                    bytes: activeLogoBytes,
-                    width: 42,
-                    height: 24,
-                    darkSurface: true,
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                if (widget.live && activeChannelNumber != null) ...[
-                  ChannelNumberBadge(
-                    label: activeChannelNumber,
-                    darkSurface: true,
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                Expanded(
-                  child: Text(
-                    (!widget.live &&
-                            widget.recordedChannelName != null &&
-                            widget.recordedChannelName!.trim().isNotEmpty)
-                        ? widget.recordedChannelName!.trim()
-                        : widget.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildOsdHeaderRow(liveStatus: liveStatus),
+                  if (widget.live &&
+                      (_activeLiveChannel != null || _liveDelayedByPause)) ...[
+                    const SizedBox(height: 6),
+                    _buildLiveOsdProgramSection(
+                      accentColor:
+                          liveStatus?.barColor ?? Colors.lightBlueAccent,
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                _buildBufferBadge(),
-                if (widget.live && _sameChannelRecording) ...[
-                  const SizedBox(width: 8),
-                  buildPlayerOsdStatusBadge(
-                    label: '録画中',
-                    color: const Color(0xFFC62828),
-                    icon: Icons.fiber_manual_record,
-                  ),
-                ],
-                if (liveStatus != null)
-                  for (final badge in liveStatus.badges) ...[
-                    const SizedBox(width: 8),
-                    buildPlayerOsdStatusBadge(
-                      label: badge.label,
-                      color: badge.color,
-                    ),
-                  ],
-              ],
-            ),
-            if (widget.live && (_activeLiveChannel != null || _liveDelayedByPause)) ...[
-              const SizedBox(height: 6),
-              _buildLiveOsdProgramSection(
-                accentColor: liveStatus?.barColor ?? Colors.lightBlueAccent,
-              ),
-            ] else if (!widget.live) ...[
-              if ((widget.recordedChannelName != null &&
-                      widget.recordedChannelName!.trim().isNotEmpty) ||
-                  (widget.recordedBroadcastTimeRange != null &&
-                      widget.recordedBroadcastTimeRange!.trim().isNotEmpty)) ...[
-                const SizedBox(height: 4),
-                RecordedOsdProgramSection(
-                  programTitle: widget.title,
-                  broadcastTimeRange: widget.recordedBroadcastTimeRange,
-                ),
-              ],
-              const SizedBox(height: 8),
-              _buildSeekBarSection(isSeekingPreview: false),
-            ],
-            if (_jikkyoOn) ...[
-              const SizedBox(height: 6),
-              _buildJikkyoOsdStatusRow(),
-            ],
-            const SizedBox(height: 12),
-            PlayerOsdButtonBar(
-              focusScopeNode: _osdFocusScopeNode,
-              onClose: () => _closeOsd(fromBackKey: true),
-              onInteraction: _resetOsdTimer,
-              children: [
-                  _osdButton(
-                    focusNode: _osdFirstFocusNode,
-                    autofocus: true,
-                    icon: _playingNow ? Icons.pause : Icons.play_arrow,
-                    label: _playingNow ? '一時停止' : '再生',
-                    onPressed: () {
-                      _togglePlayPauseWithHud();
-                      _resetOsdTimer();
-                    },
-                  ),
-                  if (widget.live && _liveDelayedByPause) ...[
-                    _osdButton(
-                      icon: Icons.replay_10,
-                      label: '-10秒',
-                      onPressed: () {
-                        _queueLiveRelativeSeek(
-                          liveDirectionKeySeekDeltaSeconds(forward: false),
-                        );
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.forward_10,
-                      label: '+10秒',
-                      onPressed: () {
-                        _queueLiveRelativeSeek(
-                          liveDirectionKeySeekDeltaSeconds(forward: true),
-                        );
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.skip_next,
-                      label: '現在位置へ',
-                      onPressed: _catchingUpLive
-                          ? null
-                          : () => unawaited(_catchUpToLiveEdge()),
-                    ),
-                    _osdButton(
-                      icon: Icons.speed,
-                      label: _liveAutoCatchUpEnabled ? '等速に戻す' : '倍速追いかけ',
-                      onPressed:
-                          _catchingUpLive ? null : _toggleLiveAutoCatchUp,
-                    ),
-                  ],
-                  if (!widget.live) ...[
-                    _osdButton(
-                      icon: Icons.replay_10,
-                      label: '-10秒',
-                      onPressed: () {
-                        _queueRelativeSeek(_rewindStep);
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.forward_10,
-                      label: '+10秒',
-                      onPressed: () {
-                        _queueRelativeSeek(_forwardStep);
-                        _resetOsdTimer();
-                      },
-                    ),
-                    if (_chapters.isNotEmpty) ...[
-                      _osdButton(
-                        icon: Icons.fast_rewind,
-                        label: '前チャプター',
-                        onPressed: () {
-                          unawaited(_seekToChapter(forward: false));
-                          _resetOsdTimer();
-                        },
-                      ),
-                      _osdButton(
-                        icon: Icons.fast_forward,
-                        label: '次チャプター',
-                        onPressed: () {
-                          unawaited(_seekToChapter(forward: true));
-                          _resetOsdTimer();
-                        },
+                  ] else if (!widget.live) ...[
+                    if ((widget.recordedChannelName != null &&
+                            widget.recordedChannelName!.trim().isNotEmpty) ||
+                        (widget.recordedBroadcastTimeRange != null &&
+                            widget.recordedBroadcastTimeRange!
+                                .trim()
+                                .isNotEmpty)) ...[
+                      const SizedBox(height: 4),
+                      RecordedOsdProgramSection(
+                        programTitle: widget.title,
+                        broadcastTimeRange: widget.recordedBroadcastTimeRange,
                       ),
                     ],
+                    const SizedBox(height: 8),
+                    _buildSeekBarSection(isSeekingPreview: false),
                   ],
-                  if (canChangePlaybackSpeed(live: widget.live))
-                    _osdButton(
-                      icon: Icons.speed,
-                      label: '速度 ${playbackSpeedLabel(_playbackRate)}',
-                      onPressed: _cyclePlaybackRate,
+                  if (_jikkyoOn) ...[
+                    const SizedBox(height: 6),
+                    _buildJikkyoOsdStatusRow(),
+                  ],
+                  const SizedBox(height: 12),
+                  PlayerOsdButtonBar(
+                    focusScopeNode: _osdFocusScopeNode,
+                    onClose: () => _closeOsd(fromBackKey: true),
+                    onInteraction: _resetOsdTimer,
+                    children: _buildOsdButtonsList(
+                      tvMode: true,
+                      includeCloseButton: true,
+                      includeDetailButton: true,
                     ),
-                  if (canSwitchAudio(_realAudioTracks.length))
-                    _osdButton(
-                      icon: Icons.audiotrack,
-                      label: audioTrackLabel(_selectedAudioIndex),
-                      onPressed: _cycleAudioTrack,
-                    ),
-                  if (canToggleSubtitles(_realSubtitleTracks.length))
-                    _osdButton(
-                      icon: _subtitlesOn
-                          ? Icons.closed_caption
-                          : Icons.closed_caption_off,
-                      label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
-                      onPressed: () {
-                        _toggleSubtitles();
-                        _resetOsdTimer();
-                      },
-                    ),
-                  _osdButton(
-                    icon: _jikkyoOn
-                        ? Icons.chat_bubble
-                        : Icons.chat_bubble_outline,
-                    label: _jikkyoOn ? '実況 ON' : '実況 OFF',
-                    onPressed: () {
-                      _toggleJikkyo();
-                      _resetOsdTimer();
-                    },
-                  ),
-                  if (_jikkyoOn)
-                    _osdButton(
-                      icon: Icons.tune,
-                      label: '実況調整',
-                      onPressed: () => unawaited(_openJikkyoQuickDialog()),
-                    ),
-                  if (widget.canSwitchQuality && widget.onSwitchQuality != null)
-                    _osdButton(
-                      icon: osdQualityButtonIcon(
-                        useMobile: widget.currentUseMobile,
-                      ),
-                      label: osdQualityButtonLabel(
-                        useMobile: widget.currentUseMobile,
-                      ),
-                      onPressed: _switchingChannel
-                          ? null
-                          : () => unawaited(_executeQualitySwitch()),
-                    ),
-                  if (widget.live &&
-                      _sameChannelRecording &&
-                      _activeSameChannelSchedule != null &&
-                      widget.onStopCurrentProgramRecording != null)
-                    _osdButton(
-                      icon: Icons.stop_circle_outlined,
-                      label: '録画を停止',
-                      onPressed: _recordingActionBusy
-                          ? null
-                          : () => unawaited(_confirmAndStopLiveRecording()),
-                    )
-                  else if (widget.live &&
-                      !_sameChannelRecording &&
-                      widget.onStartCurrentProgramRecording != null)
-                    _osdButton(
-                      icon: Icons.fiber_manual_record,
-                      label: 'この番組を録画',
-                      onPressed: _recordingActionBusy
-                          ? null
-                          : () => unawaited(_confirmAndStartLiveRecording()),
-                    ),
-                  if (_hasProgramDetail)
-                    _osdButton(
-                      focusNode: _osdDetailButtonFocusNode,
-                      icon: Icons.info_outline,
-                      label: _detailOpen ? '詳細を閉じる' : '番組詳細',
-                      onPressed: () =>
-                          _detailOpen ? _closeDetail() : _openDetail(),
-                    ),
-                  _osdButton(
-                    icon: Icons.close,
-                    label: playerOsdCloseMenuLabel,
-                    onPressed: _closeOsd,
                   ),
                 ],
-            ),
-          ],
-        ),
+              ),
             ),
           ),
         ),
