@@ -443,13 +443,13 @@ class JikkyoChannelLiveInfo {
 }
 
 enum JikkyoTextSizePreset {
-  small('小', 0.82),
-  normal('標準', 1.0),
-  large('大', 1.22);
+  small('小', 0.052),
+  normal('標準', 0.066),
+  large('大', 0.082);
 
-  const JikkyoTextSizePreset(this.label, this.scaleFactor);
+  const JikkyoTextSizePreset(this.label, this.viewportHeightFactor);
   final String label;
-  final double scaleFactor;
+  final double viewportHeightFactor;
 }
 
 enum JikkyoSpeedPreset {

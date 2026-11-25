@@ -12468,6 +12468,25 @@ void main() {
         expect(await kv.read('firetv_jikkyo_enabled'), 'true');
       },
     );
+
+    test('resolveJikkyoBaseFontSize scales presets to 5.2%/6.6%/8.2% of viewport height with upper clamp', () {
+      expect(
+        resolveJikkyoBaseFontSize(JikkyoTextSizePreset.small, 540.0),
+        closeTo(28.08, 1e-6),
+      );
+      expect(
+        resolveJikkyoBaseFontSize(JikkyoTextSizePreset.normal, 540.0),
+        closeTo(35.64, 1e-6),
+      );
+      expect(
+        resolveJikkyoBaseFontSize(JikkyoTextSizePreset.large, 540.0),
+        closeTo(44.28, 1e-6),
+      );
+      expect(
+        resolveJikkyoBaseFontSize(JikkyoTextSizePreset.large, 2000.0),
+        84.0,
+      );
+    });
   });
 }
 

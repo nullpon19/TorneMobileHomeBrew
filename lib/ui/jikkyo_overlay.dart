@@ -12,6 +12,20 @@ import 'package:material_ui/material_ui.dart';
 
 import '../core/jikkyo/jikkyo_models.dart';
 
+/// Computes the base Niconico Jikkyo comment font size in logical pixels for
+/// [viewportHeight], aligned with Fire TV 10-foot viewing & subtitle sizing.
+double resolveJikkyoBaseFontSize(
+  JikkyoTextSizePreset preset,
+  double viewportHeight,
+) {
+  final safeHeight = viewportHeight.isFinite && viewportHeight > 0
+      ? viewportHeight
+      : 540.0;
+  return (safeHeight * preset.viewportHeightFactor)
+      .clamp(14.0, 84.0)
+      .toDouble();
+}
+
 class JikkyoDanmakuController {
   final List<void Function(List<JikkyoComment>)> _commentListeners = [];
   final List<VoidCallback> _clearListeners = [];
@@ -183,10 +197,8 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     _repaintTick.value++;
   }
 
-  double _resolvedBaseFontSize(double viewHeight) {
-    final base = (viewHeight * 0.044).clamp(15.0, 38.0);
-    return (base * widget.settings.textSize.scaleFactor).clamp(12.0, 48.0);
-  }
+  double _resolvedBaseFontSize(double viewHeight) =>
+      resolveJikkyoBaseFontSize(widget.settings.textSize, viewHeight);
 
   double _commentFontSize(JikkyoComment comment, double baseFontSize) {
     switch (comment.size) {
@@ -212,7 +224,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
 
     final fillColor = Color(comment.colorValue).withValues(alpha: opacity);
     final strokeAlpha = (opacity * 0.92).clamp(0.1, 1.0);
-    final strokeWidth = (fontSize * 0.14).clamp(1.6, 5.0);
+    final strokeWidth = (fontSize * 0.14).clamp(1.8, 6.8);
 
     final strokePainter = TextPainter(
       text: TextSpan(
@@ -266,7 +278,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
   }
 
   int _usableLaneCount(double viewHeight, double baseFontSize) {
-    final laneHeight = math.max(18.0, baseFontSize * 1.28);
+    final laneHeight = math.max(18.0, baseFontSize * 1.22);
     final usableRatio =
         (widget.avoidBottomSubtitles && widget.settings.avoidSubtitleArea)
         ? 0.72
@@ -467,7 +479,7 @@ class _JikkyoDanmakuPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (activeItems.isEmpty || size.width <= 0 || size.height <= 0) return;
 
-    final laneHeight = math.max(18.0, baseFontSize * 1.28);
+    final laneHeight = math.max(18.0, baseFontSize * 1.22);
     final usableRatio = avoidSubtitleArea ? 0.72 : 0.94;
     final usableHeight = math.max(laneHeight, (size.height - 16.0) * usableRatio);
     final laneCount = math.max(2, (usableHeight / laneHeight).floor());
