@@ -11,6 +11,8 @@ import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/core/core.dart';
 import 'package:tmhb/ui/error_messages.dart';
 import 'package:tmhb/ui/playback_launcher.dart';
+import 'package:tmhb/ui/player_cache_policy.dart';
+import 'package:tmhb/ui/player_screen.dart';
 
 void main() {
   group('userMessageForError carries no transport codes', () {
@@ -121,6 +123,77 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.textContaining('分類: http'), findsOneWidget);
       expect(find.textContaining('コード: 514'), findsOneWidget);
+    });
+
+    testWidgets('shows 再試行 button and resolves true when canRetry is true', (
+      tester,
+    ) async {
+      final error = NasneError.unreachable('dtcp:http');
+      bool? lastResult;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => TextButton(
+                onPressed: () async {
+                  lastResult = await showPlaybackErrorDialog(
+                    context,
+                    error,
+                    canRetry: true,
+                  );
+                },
+                child: const Text('開く'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('開く'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('再試行'), findsOneWidget);
+      await tester.tap(find.text('再試行'));
+      await tester.pumpAndSettle();
+      expect(lastResult, isTrue);
+    });
+  });
+
+  group('Field-test buffer & throughput helpers', () {
+    test('computeResumeWatchdogTimeout scales safely above rebuffer wait', () {
+      expect(
+        computeResumeWatchdogTimeout(live: true, rebufferWaitSeconds: 0),
+        const Duration(seconds: 45),
+      );
+      expect(
+        computeResumeWatchdogTimeout(live: true, rebufferWaitSeconds: 15),
+        const Duration(seconds: 45),
+      );
+      expect(
+        computeResumeWatchdogTimeout(live: true, rebufferWaitSeconds: 30),
+        const Duration(seconds: 60),
+      );
+    });
+
+    test('computeSlidingThroughputMbps and formatThroughputMbps measure Mbps accurately', () {
+      final t0 = DateTime.utc(2026, 11, 27, 6, 0, 0);
+      expect(computeSlidingThroughputMbps([(at: t0, bytes: 1000)]), isNull);
+      expect(
+        computeSlidingThroughputMbps([
+          (at: t0, bytes: 0),
+          (at: t0.add(const Duration(milliseconds: 500)), bytes: 500000),
+        ]),
+        isNull,
+      );
+      // 1,500,000 bytes over 4.0 seconds = 3.0 Mbps
+      final mbps = computeSlidingThroughputMbps([
+        (at: t0, bytes: 100000),
+        (at: t0.add(const Duration(seconds: 4)), bytes: 1600000),
+      ]);
+      expect(mbps, closeTo(3.0, 0.001));
+      expect(formatThroughputMbps(mbps), '受信 3.0 Mbps');
+      expect(formatThroughputMbps(null), isNull);
+      expect(formatThroughputMbps(double.nan), isNull);
+      expect(formatThroughputMbps(-1.0), isNull);
     });
   });
 }

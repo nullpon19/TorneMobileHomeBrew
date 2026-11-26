@@ -31,40 +31,54 @@ Future<void> startPlaybackAndShowPlayer({
   required String unsupportedSubject,
   String startFailureMessage = '再生を開始できませんでした',
 }) async {
-  try {
-    final session = await start();
-    if (!context.mounted) {
-      await session.stop();
+  while (true) {
+    try {
+      final session = await start();
+      if (!context.mounted) {
+        await session.stop();
+        return;
+      }
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(builder: (_) => buildPlayer(session)),
+      );
+      return;
+    } on NasneError catch (e) {
+      if (!context.mounted) return;
+      if (e.category == NasneErrorCategory.unsupported) {
+        await showPlaybackUnsupportedDialog(
+          context,
+          subject: unsupportedSubject,
+        );
+        return;
+      } else if (e.category == NasneErrorCategory.validation) {
+        await showCredentialGuidanceDialog(context, userMessageForError(e));
+        return;
+      } else {
+        // Name the failing stage instead of collapsing everything
+        // into one opaque snack (plan 28): the dialog leads with
+        // the plain explanation and what to do next, and keeps
+        // the classification in its detail section (plan 86).
+        // The failure is also recorded under the ui category
+        // when debug mode is on. No credential or key material
+        // is included.
+        ref.read(diagLogProvider)(DiagCategory.ui, 'playback start failed: $e');
+        final retry = await showPlaybackErrorDialog(
+          context,
+          e,
+          canRetry: true,
+        );
+        if (!retry || !context.mounted) return;
+      }
+    } catch (e) {
+      if (!context.mounted) return;
+      ref.read(diagLogProvider)(
+        DiagCategory.ui,
+        'playback start failed (unclassified): $e',
+      );
+      showSnack(context, startFailureMessage);
       return;
     }
-    await Navigator.push(
-      context,
-      MaterialPageRoute<void>(builder: (_) => buildPlayer(session)),
-    );
-  } on NasneError catch (e) {
-    if (!context.mounted) return;
-    if (e.category == NasneErrorCategory.unsupported) {
-      await showPlaybackUnsupportedDialog(context, subject: unsupportedSubject);
-    } else if (e.category == NasneErrorCategory.validation) {
-      await showCredentialGuidanceDialog(context, userMessageForError(e));
-    } else {
-      // Name the failing stage instead of collapsing everything
-      // into one opaque snack (plan 28): the dialog leads with
-      // the plain explanation and what to do next, and keeps
-      // the classification in its detail section (plan 86).
-      // The failure is also recorded under the ui category
-      // when debug mode is on. No credential or key material
-      // is included.
-      ref.read(diagLogProvider)(DiagCategory.ui, 'playback start failed: $e');
-      await showPlaybackErrorDialog(context, e);
-    }
-  } catch (e) {
-    if (!context.mounted) return;
-    ref.read(diagLogProvider)(
-      DiagCategory.ui,
-      'playback start failed (unclassified): $e',
-    );
-    showSnack(context, startFailureMessage);
   }
 }
 
@@ -78,9 +92,13 @@ Future<void> startPlaybackAndShowPlayer({
 /// now sits in a collapsed 「詳細」 section at the bottom;
 /// the same facts are in the diagnostic log as well, so
 /// nothing is lost by moving them out of the way.
-Future<void> showPlaybackErrorDialog(BuildContext context, NasneError e) {
+Future<bool> showPlaybackErrorDialog(
+  BuildContext context,
+  NasneError e, {
+  bool canRetry = false,
+}) async {
   final nextStep = errorNextStepForError(e);
-  return showDialog<void>(
+  final retry = await showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
       title: const Text('再生を開始できませんでした'),
@@ -114,13 +132,21 @@ Future<void> showPlaybackErrorDialog(BuildContext context, NasneError e) {
       ),
       actions: [
         TextButton(
-          autofocus: true,
-          onPressed: () => Navigator.of(context).pop(),
+          autofocus: !canRetry,
+          onPressed: () => Navigator.of(context).pop(false),
           child: const Text('閉じる'),
         ),
+        if (canRetry)
+          FilledButton.icon(
+            autofocus: true,
+            onPressed: () => Navigator.of(context).pop(true),
+            icon: const Icon(Icons.refresh),
+            label: const Text('再試行'),
+          ),
       ],
     ),
   );
+  return retry ?? false;
 }
 
 /// Guidance shown when the credential pair has not been imported.

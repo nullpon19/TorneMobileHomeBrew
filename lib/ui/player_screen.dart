@@ -2363,6 +2363,32 @@ int computePreBufferSeconds({
   return best.clamp(0.0, targetSeconds.toDouble()).floor();
 }
 
+/// Computes sliding-window receive throughput in Mbps from monotonic byte
+/// snapshots, returning `null` until at least [minSpan] has elapsed.
+double? computeSlidingThroughputMbps(
+  List<({DateTime at, int bytes})> samples, {
+  Duration minSpan = const Duration(milliseconds: 800),
+}) {
+  if (samples.length < 2) return null;
+  final first = samples.first;
+  final last = samples.last;
+  final elapsed = last.at.difference(first.at);
+  if (elapsed < minSpan) return null;
+  final deltaBytes = last.bytes - first.bytes;
+  if (deltaBytes < 0) return null;
+  final elapsedSec = elapsed.inMicroseconds / 1000000.0;
+  if (!elapsedSec.isFinite || elapsedSec <= 0) return null;
+  final mbps = (deltaBytes * 8.0) / (elapsedSec * 1000000.0);
+  return mbps.isFinite && mbps >= 0 ? mbps : null;
+}
+
+/// Formats a measured receive bitrate for the OSD header badge, or `null` when
+/// no valid measurement is available yet.
+String? formatThroughputMbps(double? mbps) {
+  if (mbps == null || !mbps.isFinite || mbps < 0) return null;
+  return '受信 ${mbps.toStringAsFixed(1)} Mbps';
+}
+
 /// Outcome for resolving a system Back (`PopScope`) while the player is open.
 enum PlayerBackOutcome {
   suppressed,
@@ -3044,6 +3070,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _proxyReconnecting = false;
   int _stallDeferCount = 0;
   Timer? _proxyReconnectTimer;
+  final List<({DateTime at, int bytes})> _throughputSamples = [];
+  double? _recentThroughputMbps;
   Duration _timeSeekBaseOffset = Duration.zero;
   bool _timeSeeking = false;
 
@@ -3300,6 +3328,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   final FocusNode _closeBannerFocusNode = FocusNode(
     debugLabel: 'playerCloseBannerButton',
   );
+  final FocusNode _errorRetryFocusNode = FocusNode(
+    debugLabel: 'playerErrorRetry',
+  );
   final FocusNode _errorBackFocusNode = FocusNode(
     debugLabel: 'playerErrorBack',
   );
@@ -3500,9 +3531,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   int get _effectiveLoadingCurrentSeconds {
-    final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
-    if (target > 0 && _isPreBuffering) {
+    final activeTarget = _initialPlaybackStarted
+        ? (_bufferPlan?.rebufferWaitSeconds ?? 0)
+        : (_bufferPlan?.cachePauseWaitSeconds ?? 0);
+    if (activeTarget > 0 && _isPreBuffering) {
       return _effectivePreBufferSeconds;
+    }
+    if (activeTarget > 0) {
+      return computePreBufferSeconds(
+        targetSeconds: activeTarget,
+        demuxerCacheDuration: _bufferedAheadSeconds,
+        bufferingPercentage: _bufferingPercentage,
+        bufferDeltaSeconds: _bufferDeltaSeconds,
+        liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
+      );
     }
     final best = math.max(
       _bufferedAheadSeconds,
@@ -3661,6 +3703,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (latched ||
           (_shouldPollLiveBuffering &&
               (nextLoadSec != prevLoadSec || nextPct != prevPct)) ||
+          (_proxyReconnecting &&
+              _bufferedAheadSeconds.floor() != prevAheadFloor) ||
           (_seekHudVisible &&
               (_bufferedAheadSeconds.floor() != prevAheadFloor ||
                   liveRangeChanged)) ||
@@ -3806,6 +3850,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(seconds: 1),
       (_) {
         if (!mounted || _conflictHandled || _switchingChannel) return;
+        _sampleThroughputTick();
         final next = _readProxyReconnecting();
         if (next != _proxyReconnecting) {
           setState(() => _proxyReconnecting = next);
@@ -3922,6 +3967,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         }
         final changed = _buffering != buffering;
+        if (buffering && !_buffering && _initialPlaybackStarted && widget.live) {
+          _liveTransferAccumulatedSeconds = 0.0;
+          _lastLiveTransferTickAt = null;
+          if (widget.session case final StreamTransferMetrics metrics) {
+            _lastObservedServedBytes = metrics.servedBytes;
+          }
+        }
         _buffering = buffering;
         if (_shouldPollLiveBuffering) {
           _startPreBufferPoller();
@@ -4336,13 +4388,58 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!allowAfterConflict && (_conflictHandled || _switchingChannel)) return;
     setState(() => _error = error);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted &&
-          _error != null &&
-          (allowAfterConflict || (!_conflictHandled && !_switchingChannel)) &&
-          _errorBackFocusNode.canRequestFocus) {
+      if (!mounted ||
+          _error == null ||
+          (!allowAfterConflict && (_conflictHandled || _switchingChannel))) {
+        return;
+      }
+      if (_errorRetryFocusNode.canRequestFocus) {
+        _errorRetryFocusNode.requestFocus();
+      } else if (_errorBackFocusNode.canRequestFocus) {
         _errorBackFocusNode.requestFocus();
       }
     });
+  }
+
+  Future<void> _retryFromStartError() async {
+    if (!mounted || _conflictHandled || _switchingChannel) return;
+    _watchdog?.cancel();
+    _stopPreBufferPoller();
+    _stopStartupTraceTimer();
+    if (widget.live) {
+      if (widget.session case final LiveEdgeResettable resettable) {
+        try {
+          await resettable.resetToLiveEdge();
+        } catch (e) {
+          _diag(
+            DiagCategory.playback,
+            'player: retry resetToLiveEdge failed: $e',
+          );
+        }
+      }
+    }
+    if (!mounted || _conflictHandled || _switchingChannel) return;
+    setState(() {
+      _error = null;
+      _playing = false;
+      _playingNow = false;
+      _completed = false;
+      _buffering = true;
+      _hasVideoFrame = false;
+      _initialPlaybackStarted = false;
+      _positionAtFirstFrame = null;
+      _bufferedAheadSeconds = 0.0;
+      _bufferingPercentage = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
+    });
+    if (_rootFocusNode.canRequestFocus) {
+      _rootFocusNode.requestFocus();
+    }
+    await _open();
   }
 
   void _enterInterruptedState(String? detail) {
@@ -5014,7 +5111,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _lastLiveTransferTickAt = null;
       _liveTransferAccumulatedSeconds = 0.0;
     });
-    if (_isPreBuffering) {
+    if (_shouldPollLiveBuffering) {
       _startPreBufferPoller();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -5025,7 +5122,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _rootFocusNode.requestFocus();
       }
     });
-    _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
+    final resumeTimeout = computeResumeWatchdogTimeout(
+      live: widget.live,
+      rebufferWaitSeconds: _bufferPlan?.rebufferWaitSeconds ?? 0,
+    );
+    _resumeWatchdogTimer = Timer(resumeTimeout, () {
       if (!mounted ||
           _playingNow ||
           _completed ||
@@ -5044,6 +5145,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     try {
       await _applyPlayerVolume();
       if (!mounted || _conflictHandled || _switchingChannel) return;
+      var resumeUri = widget.session.mediaUri;
+      if (widget.live) {
+        if (widget.session case final LiveEdgeResettable resettable) {
+          await resettable.resetToLiveEdge();
+        }
+        if (!mounted || _conflictHandled || _switchingChannel) return;
+        resumeUri = resumeUri.replace(
+          queryParameters: {'live_edge': '${++_liveEdgeSeq}'},
+        );
+      }
       var resumeStart = (!widget.live && _effectiveRecordedPosition > Duration.zero)
           ? _effectiveRecordedPosition
           : null;
@@ -5055,7 +5166,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
       await _player.open(
         Media(
-          widget.session.mediaUri.toString(),
+          resumeUri.toString(),
           start: resumeStart,
         ),
       );
@@ -6063,6 +6174,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final waitingForInitial = _isPreBuffering;
         if (mounted &&
             ((waitingForInitial && _effectivePreBufferSeconds != prevPreSec) ||
+                (_proxyReconnecting && clamped.floor() != prevFloor) ||
                 (_seekHudVisible && clamped.floor() != prevFloor) ||
                 (_osdOpen && _syncDisplayedBufferBadge()))) {
           setState(() {});
@@ -6787,6 +6899,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _detailScrollController.dispose();
             _resumeButtonFocusNode.dispose();
             _closeBannerFocusNode.dispose();
+            _errorRetryFocusNode.dispose();
             _errorBackFocusNode.dispose();
             _nextPlayNowFocusNode.dispose();
             _nextCancelFocusNode.dispose();
@@ -7044,6 +7157,35 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         curve: Curves.easeOut,
       ),
     );
+  }
+
+  void _sampleThroughputTick() {
+    int? currentBytes;
+    if (widget.session case final StreamDiagnosticMetrics diagMetrics) {
+      if (diagMetrics.cipherBytes > 0) {
+        currentBytes = diagMetrics.cipherBytes;
+      }
+    }
+    if (currentBytes == null) {
+      if (widget.session case final StreamTransferMetrics transfer) {
+        if (transfer.servedBytes > 0) {
+          currentBytes = transfer.servedBytes;
+        }
+      }
+    }
+    if (currentBytes == null) return;
+    final now = _now();
+    if (_throughputSamples.isNotEmpty &&
+        currentBytes < _throughputSamples.last.bytes) {
+      _throughputSamples.clear();
+    }
+    _throughputSamples.add((at: now, bytes: currentBytes));
+    final cutoff = now.subtract(const Duration(seconds: 5));
+    while (_throughputSamples.length > 2 &&
+        _throughputSamples.first.at.isBefore(cutoff)) {
+      _throughputSamples.removeAt(0);
+    }
+    _recentThroughputMbps = computeSlidingThroughputMbps(_throughputSamples);
   }
 
   bool _syncDisplayedBufferBadge({bool force = false}) {
@@ -8920,12 +9062,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 16),
-                        FilledButton.icon(
-                          focusNode: _errorBackFocusNode,
-                          autofocus: true,
-                          onPressed: () => Navigator.of(context).pop(),
-                          icon: const Icon(Icons.arrow_back),
-                          label: const Text('戻る'),
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          alignment: WrapAlignment.center,
+                          children: [
+                            FilledButton.icon(
+                              focusNode: _errorRetryFocusNode,
+                              autofocus: true,
+                              onPressed: _retryFromStartError,
+                              icon: const Icon(Icons.refresh),
+                              label: const Text('再試行'),
+                            ),
+                            OutlinedButton.icon(
+                              focusNode: _errorBackFocusNode,
+                              onPressed: () => Navigator.of(context).pop(),
+                              icon: const Icon(Icons.arrow_back),
+                              label: const Text('戻る'),
+                            ),
+                          ],
                         ),
                         const SizedBox(height: 16),
                         ExpansionTile(
@@ -9891,6 +10046,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
+  Widget _buildThroughputBadge() {
+    if (!_osdOpen) return const SizedBox.shrink();
+    final label = formatThroughputMbps(_recentThroughputMbps);
+    if (label == null) return const SizedBox.shrink();
+    return buildPlayerOsdStatusBadge(
+      label: label,
+      color: const Color(0xB3000000),
+      textColor: Colors.lightBlueAccent,
+    );
+  }
+
   List<Widget> _buildChannelSwitchPreviewCards({double horizontalInset = 0.0}) {
     final now = _now();
     final prevEntry = _previewTargetFor(ChannelSwitchDirection.previous);
@@ -10480,6 +10646,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         : widget.title;
     final statusBadges = <Widget>[
       _buildBufferBadge(),
+      if (_osdOpen && formatThroughputMbps(_recentThroughputMbps) != null)
+        _buildThroughputBadge(),
       if (widget.live && _sameChannelRecording)
         buildPlayerOsdStatusBadge(
           label: '録画中',

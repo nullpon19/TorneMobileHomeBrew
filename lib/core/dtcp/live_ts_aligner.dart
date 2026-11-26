@@ -41,6 +41,8 @@ class LiveTsContinuityAligner {
   bool _passthrough = false;
   bool _resyncNeeded = false;
   bool _needsRebase = false;
+  bool _rebaseSawPcr = false;
+  bool _rebaseSawAnyTs = false;
   bool _markDiscontinuityAfterReconnect = false;
   final Set<int> _discontinuityEmittedPids = <int>{};
 
@@ -67,6 +69,8 @@ class LiveTsContinuityAligner {
     _passthrough = false;
     _resyncNeeded = false;
     _needsRebase = false;
+    _rebaseSawPcr = false;
+    _rebaseSawAnyTs = false;
     _markDiscontinuityAfterReconnect = false;
     _discontinuityEmittedPids.clear();
     _ptsOffset90k = 0;
@@ -84,6 +88,8 @@ class LiveTsContinuityAligner {
   void beginNewSegment() {
     _carry = Uint8List(0);
     _pendingRebasePackets.clear();
+    _rebaseSawPcr = false;
+    _rebaseSawAnyTs = false;
     if (_passthrough) return;
     _resyncNeeded = true;
     if (_maxEmittedPts90k != null) {
@@ -132,9 +138,49 @@ class LiveTsContinuityAligner {
     final pktSize = _packetSize!;
     final tsOffsetInPacket = pktSize == _ttsPacketSize ? 4 : 0;
     final out = BytesBuilder(copy: false);
+    Uint8List? singleChunkResult;
 
+    void emitRun(int runStart, int runEnd) {
+      if (runEnd <= runStart) return;
+      final needsWrite =
+          _ptsOffset90k != 0 ||
+          _ttsOffset30 != 0 ||
+          _markDiscontinuityAfterReconnect;
+      final Uint8List slice;
+      if (!needsWrite) {
+        for (var p = runStart; p < runEnd; p += pktSize) {
+          _observeRawPacketInPlace(combined, p, tsOffsetInPacket);
+        }
+        slice = (runStart == 0 && runEnd == combined.length)
+            ? combined
+            : Uint8List.sublistView(combined, runStart, runEnd);
+      } else {
+        final copy = Uint8List.fromList(
+          Uint8List.sublistView(combined, runStart, runEnd),
+        );
+        for (var p = 0; p < copy.length; p += pktSize) {
+          _rewriteAndTrackPacketAt(copy, p, tsOffsetInPacket);
+        }
+        slice = copy;
+      }
+      if (out.isEmpty && singleChunkResult == null) {
+        singleChunkResult = slice;
+      } else {
+        if (singleChunkResult != null) {
+          out.add(singleChunkResult!);
+          singleChunkResult = null;
+        }
+        out.add(slice);
+      }
+    }
+
+    var runStart = -1;
     while (offset + pktSize <= combined.length) {
       if (combined[offset + tsOffsetInPacket] != 0x47) {
+        if (runStart >= 0) {
+          emitRun(runStart, offset);
+          runStart = -1;
+        }
         // Sync lost inside stream: re-scan for next packet boundary.
         final resync = _detectSyncOffset(
           combined,
@@ -145,42 +191,118 @@ class LiveTsContinuityAligner {
         offset = resync.$2;
         continue;
       }
-      final rawPkt = Uint8List.sublistView(combined, offset, offset + pktSize);
+      final pktStart = offset;
       offset += pktSize;
 
       if (_needsRebase) {
-        _pendingRebasePackets.add(Uint8List.fromList(rawPkt));
-        final firstPts = _extractFirstPts90k(rawPkt, tsOffsetInPacket);
-        if (firstPts != null ||
+        _pendingRebasePackets.add(
+          Uint8List.fromList(Uint8List.sublistView(combined, pktStart, offset)),
+        );
+        final ts = _extractPacketTimestamps90k(
+          combined,
+          pktStart,
+          tsOffsetInPacket,
+        );
+        if (ts.pcr != null) {
+          _rebaseSawPcr = true;
+          _rebaseSawAnyTs = true;
+        } else if (ts.dts != null || ts.pts != null) {
+          _rebaseSawAnyTs = true;
+        }
+        if (_rebaseSawPcr ||
             _pendingRebasePackets.length >= _maxRebaseBufferPackets) {
-          if (firstPts != null && _maxEmittedPts90k != null) {
-            final targetPts = (_maxEmittedPts90k! + _reconnectGap90k) & _ptsMask33;
-            _ptsOffset90k = (targetPts - firstPts) & _ptsMask33;
-          }
-          if (pktSize == _ttsPacketSize && _lastEmittedTts30 != null) {
-            final firstTts = _findFirstTts30(_pendingRebasePackets);
-            if (firstTts != null) {
-              final targetTts =
-                  (_lastEmittedTts30! + _reconnectGap27M) & _ttsMask30;
-              _ttsOffset30 = (targetTts - firstTts) & _ttsMask30;
+          _flushPendingRebase(tsOffsetInPacket, pktSize, (flushed) {
+            if (out.isEmpty && singleChunkResult == null) {
+              singleChunkResult = flushed;
+            } else {
+              if (singleChunkResult != null) {
+                out.add(singleChunkResult!);
+                singleChunkResult = null;
+              }
+              out.add(flushed);
             }
-          }
-          _needsRebase = false;
-          for (final buffered in _pendingRebasePackets) {
-            out.add(_rewriteAndTrackPacket(buffered, tsOffsetInPacket));
-          }
-          _pendingRebasePackets.clear();
+          });
         }
         continue;
       }
 
-      out.add(_rewriteAndTrackPacket(Uint8List.fromList(rawPkt), tsOffsetInPacket));
+      if (runStart < 0) runStart = pktStart;
+    }
+
+    if (runStart >= 0) {
+      emitRun(runStart, offset);
+    }
+
+    if (_needsRebase && _rebaseSawAnyTs && _pendingRebasePackets.isNotEmpty) {
+      _flushPendingRebase(tsOffsetInPacket, pktSize, (flushed) {
+        if (out.isEmpty && singleChunkResult == null) {
+          singleChunkResult = flushed;
+        } else {
+          if (singleChunkResult != null) {
+            out.add(singleChunkResult!);
+            singleChunkResult = null;
+          }
+          out.add(flushed);
+        }
+      });
     }
 
     if (offset < combined.length) {
       _carry = Uint8List.fromList(Uint8List.sublistView(combined, offset));
     }
-    return out.takeBytes();
+    if (singleChunkResult != null) return singleChunkResult!;
+    return out.isEmpty ? Uint8List(0) : out.takeBytes();
+  }
+
+  void _flushPendingRebase(
+    int tsOffsetInPacket,
+    int pktSize,
+    void Function(Uint8List bytes) emit,
+  ) {
+    if (_pendingRebasePackets.isEmpty) {
+      _needsRebase = false;
+      return;
+    }
+    int? earliestTs;
+    for (final pkt in _pendingRebasePackets) {
+      final ts = _extractPacketTimestamps90k(pkt, 0, tsOffsetInPacket);
+      for (final candidate in [ts.pcr, ts.dts, ts.pts]) {
+        if (candidate == null) continue;
+        if (earliestTs == null) {
+          earliestTs = candidate;
+        } else {
+          final signedDiff =
+              ((candidate - earliestTs + 0x100000000) & _ptsMask33) -
+              0x100000000;
+          if (signedDiff < 0) {
+            earliestTs = candidate;
+          }
+        }
+      }
+    }
+    if (earliestTs != null && _maxEmittedPts90k != null) {
+      final targetPts = (_maxEmittedPts90k! + _reconnectGap90k) & _ptsMask33;
+      _ptsOffset90k = (targetPts - earliestTs) & _ptsMask33;
+    }
+    if (pktSize == _ttsPacketSize && _lastEmittedTts30 != null) {
+      final firstTts = _findFirstTts30(_pendingRebasePackets);
+      if (firstTts != null) {
+        final targetTts = (_lastEmittedTts30! + _reconnectGap27M) & _ttsMask30;
+        _ttsOffset30 = (targetTts - firstTts) & _ttsMask30;
+      }
+    }
+    _needsRebase = false;
+    _rebaseSawPcr = false;
+    _rebaseSawAnyTs = false;
+    final out = Uint8List(_pendingRebasePackets.length * pktSize);
+    var writePos = 0;
+    for (final buffered in _pendingRebasePackets) {
+      out.setRange(writePos, writePos + pktSize, buffered);
+      _rewriteAndTrackPacketAt(out, writePos, tsOffsetInPacket);
+      writePos += pktSize;
+    }
+    _pendingRebasePackets.clear();
+    emit(out);
   }
 
   (int packetSize, int offset)? _detectSyncOffset(
@@ -214,132 +336,159 @@ class LiveTsContinuityAligner {
 
   static int? _findFirstTts30(List<Uint8List> packets) {
     if (packets.isEmpty) return null;
-    return _readTts30(packets.first);
+    return _readTts30At(packets.first, 0);
   }
 
-  static int _readTts30(Uint8List pkt) {
-    return (((pkt[0] & 0x3F) << 24) |
-            (pkt[1] << 16) |
-            (pkt[2] << 8) |
-            pkt[3]) &
+  static int _readTts30At(Uint8List buf, int base) {
+    return (((buf[base] & 0x3F) << 24) |
+            (buf[base + 1] << 16) |
+            (buf[base + 2] << 8) |
+            buf[base + 3]) &
         _ttsMask30;
   }
 
-  static void _writeTts30(Uint8List pkt, int tts30) {
+  static void _writeTts30At(Uint8List buf, int base, int tts30) {
     final masked = tts30 & _ttsMask30;
-    pkt[0] = (pkt[0] & 0xC0) | ((masked >> 24) & 0x3F);
-    pkt[1] = (masked >> 16) & 0xFF;
-    pkt[2] = (masked >> 8) & 0xFF;
-    pkt[3] = masked & 0xFF;
+    buf[base] = (buf[base] & 0xC0) | ((masked >> 24) & 0x3F);
+    buf[base + 1] = (masked >> 16) & 0xFF;
+    buf[base + 2] = (masked >> 8) & 0xFF;
+    buf[base + 3] = masked & 0xFF;
   }
 
-  static int? _extractFirstPts90k(Uint8List pkt, int tsOff) {
-    if (tsOff + _tsPacketSize > pkt.length || pkt[tsOff] != 0x47) return null;
-    final pusi = (pkt[tsOff + 1] & 0x40) != 0;
-    final afc = (pkt[tsOff + 3] >> 4) & 0x03;
+  static ({int? pcr, int? dts, int? pts}) _extractPacketTimestamps90k(
+    Uint8List buf,
+    int pktOffset,
+    int tsOff,
+  ) {
+    final tsStart = pktOffset + tsOff;
+    if (tsStart + _tsPacketSize > buf.length || buf[tsStart] != 0x47) {
+      return (pcr: null, dts: null, pts: null);
+    }
+    int? pcr;
+    int? pts;
+    int? dts;
+    final pusi = (buf[tsStart + 1] & 0x40) != 0;
+    final afc = (buf[tsStart + 3] >> 4) & 0x03;
 
     if (afc == 2 || afc == 3) {
-      final afl = pkt[tsOff + 4];
-      if (afl >= 7 && tsOff + 5 + afl <= tsOff + _tsPacketSize) {
-        final flags = pkt[tsOff + 5];
+      final afl = buf[tsStart + 4];
+      if (afl >= 7 && 5 + afl <= _tsPacketSize) {
+        final flags = buf[tsStart + 5];
         if ((flags & 0x10) != 0) {
-          return _readPcrBase33(pkt, tsOff + 6);
+          pcr = _readPcrBase33(buf, tsStart + 6);
         }
       }
     }
 
     if (pusi && (afc == 1 || afc == 3)) {
-      final payloadStart = afc == 1 ? tsOff + 4 : tsOff + 5 + pkt[tsOff + 4];
-      if (payloadStart + 14 <= tsOff + _tsPacketSize &&
-          pkt[payloadStart] == 0x00 &&
-          pkt[payloadStart + 1] == 0x00 &&
-          pkt[payloadStart + 2] == 0x01 &&
-          _streamHasOptionalPesHeader(pkt[payloadStart + 3])) {
-        final ptsDtsFlags = (pkt[payloadStart + 7] >> 6) & 0x03;
-        final pesHeaderDataLen = pkt[payloadStart + 8];
-        if ((ptsDtsFlags == 2 || ptsDtsFlags == 3) &&
-            pesHeaderDataLen >= 5 &&
-            payloadStart + 14 <= tsOff + _tsPacketSize) {
-          return _readPesTimestamp33(pkt, payloadStart + 9);
+      final payloadRel = afc == 1 ? 4 : 5 + buf[tsStart + 4];
+      final payloadStart = tsStart + payloadRel;
+      if (payloadRel + 14 <= _tsPacketSize &&
+          buf[payloadStart] == 0x00 &&
+          buf[payloadStart + 1] == 0x00 &&
+          buf[payloadStart + 2] == 0x01 &&
+          _streamHasOptionalPesHeader(buf[payloadStart + 3])) {
+        final ptsDtsFlags = (buf[payloadStart + 7] >> 6) & 0x03;
+        final pesHeaderDataLen = buf[payloadStart + 8];
+        if ((ptsDtsFlags == 2 || ptsDtsFlags == 3) && pesHeaderDataLen >= 5) {
+          pts = _readPesTimestamp33(buf, payloadStart + 9);
+        }
+        if (ptsDtsFlags == 3 &&
+            pesHeaderDataLen >= 10 &&
+            payloadRel + 19 <= _tsPacketSize) {
+          dts = _readPesTimestamp33(buf, payloadStart + 14);
         }
       }
     }
-    return null;
+    return (pcr: pcr, dts: dts, pts: pts);
   }
 
-  Uint8List _rewriteAndTrackPacket(Uint8List pkt, int tsOff) {
+  void _observeRawPacketInPlace(Uint8List buf, int pktOffset, int tsOff) {
     if (tsOff == 4) {
-      final rawTts = _readTts30(pkt);
+      _lastEmittedTts30 = _readTts30At(buf, pktOffset);
+    }
+    final ts = _extractPacketTimestamps90k(buf, pktOffset, tsOff);
+    if (ts.pcr != null) _observeEmittedPts90k(ts.pcr!);
+    if (ts.pts != null) _observeEmittedPts90k(ts.pts!);
+  }
+
+  void _rewriteAndTrackPacketAt(Uint8List buf, int pktOffset, int tsOff) {
+    if (tsOff == 4) {
+      final rawTts = _readTts30At(buf, pktOffset);
       final shiftedTts = (rawTts + _ttsOffset30) & _ttsMask30;
       if (_ptsOffset90k != 0 || _ttsOffset30 != 0) {
-        _writeTts30(pkt, shiftedTts);
+        _writeTts30At(buf, pktOffset, shiftedTts);
       }
       _lastEmittedTts30 = shiftedTts;
     }
 
-    final pid = ((pkt[tsOff + 1] & 0x1F) << 8) | pkt[tsOff + 2];
-    final pusi = (pkt[tsOff + 1] & 0x40) != 0;
-    final afc = (pkt[tsOff + 3] >> 4) & 0x03;
+    final tsStart = pktOffset + tsOff;
+    final pid = ((buf[tsStart + 1] & 0x1F) << 8) | buf[tsStart + 2];
+    final pusi = (buf[tsStart + 1] & 0x40) != 0;
+    final afc = (buf[tsStart + 3] >> 4) & 0x03;
 
     if (afc == 2 || afc == 3) {
-      final afl = pkt[tsOff + 4];
-      final afEnd = tsOff + 5 + afl;
-      if (afl >= 1 && afEnd <= tsOff + _tsPacketSize) {
+      final afl = buf[tsStart + 4];
+      final afEnd = tsStart + 5 + afl;
+      if (afl >= 1 && 5 + afl <= _tsPacketSize) {
         if (_markDiscontinuityAfterReconnect &&
             _discontinuityEmittedPids.add(pid)) {
-          pkt[tsOff + 5] |= 0x80; // discontinuity_indicator
+          buf[tsStart + 5] |= 0x80; // discontinuity_indicator
           if (_discontinuityEmittedPids.length > 64) {
             _markDiscontinuityAfterReconnect = false;
           }
         }
-        final flags = pkt[tsOff + 5];
-        var cursor = tsOff + 6;
+        final flags = buf[tsStart + 5];
+        var cursor = tsStart + 6;
         if ((flags & 0x10) != 0 && cursor + 6 <= afEnd) {
-          final pcrBase = _readPcrBase33(pkt, cursor);
+          final pcrBase = _readPcrBase33(buf, cursor);
           final nextPcr = (pcrBase + _ptsOffset90k) & _ptsMask33;
           if (_ptsOffset90k != 0) {
-            _writePcrBase33(pkt, cursor, nextPcr);
+            _writePcrBase33(buf, cursor, nextPcr);
           }
           _observeEmittedPts90k(nextPcr);
           cursor += 6;
         }
         if ((flags & 0x08) != 0 && cursor + 6 <= afEnd) {
           if (_ptsOffset90k != 0) {
-            final opcrBase = _readPcrBase33(pkt, cursor);
-            _writePcrBase33(pkt, cursor, (opcrBase + _ptsOffset90k) & _ptsMask33);
+            final opcrBase = _readPcrBase33(buf, cursor);
+            _writePcrBase33(
+              buf,
+              cursor,
+              (opcrBase + _ptsOffset90k) & _ptsMask33,
+            );
           }
         }
       }
     }
 
     if (pusi && (afc == 1 || afc == 3)) {
-      final payloadStart = afc == 1 ? tsOff + 4 : tsOff + 5 + pkt[tsOff + 4];
-      if (payloadStart + 14 <= tsOff + _tsPacketSize &&
-          pkt[payloadStart] == 0x00 &&
-          pkt[payloadStart + 1] == 0x00 &&
-          pkt[payloadStart + 2] == 0x01 &&
-          _streamHasOptionalPesHeader(pkt[payloadStart + 3])) {
-        final ptsDtsFlags = (pkt[payloadStart + 7] >> 6) & 0x03;
-        final pesHeaderDataLen = pkt[payloadStart + 8];
-        if ((ptsDtsFlags == 2 || ptsDtsFlags == 3) &&
-            pesHeaderDataLen >= 5 &&
-            payloadStart + 14 <= tsOff + _tsPacketSize) {
-          final pts = _readPesTimestamp33(pkt, payloadStart + 9);
+      final payloadRel = afc == 1 ? 4 : 5 + buf[tsStart + 4];
+      final payloadStart = tsStart + payloadRel;
+      if (payloadRel + 14 <= _tsPacketSize &&
+          buf[payloadStart] == 0x00 &&
+          buf[payloadStart + 1] == 0x00 &&
+          buf[payloadStart + 2] == 0x01 &&
+          _streamHasOptionalPesHeader(buf[payloadStart + 3])) {
+        final ptsDtsFlags = (buf[payloadStart + 7] >> 6) & 0x03;
+        final pesHeaderDataLen = buf[payloadStart + 8];
+        if ((ptsDtsFlags == 2 || ptsDtsFlags == 3) && pesHeaderDataLen >= 5) {
+          final pts = _readPesTimestamp33(buf, payloadStart + 9);
           if (pts != null) {
             final nextPts = (pts + _ptsOffset90k) & _ptsMask33;
             if (_ptsOffset90k != 0) {
-              _writePesTimestamp33(pkt, payloadStart + 9, nextPts);
+              _writePesTimestamp33(buf, payloadStart + 9, nextPts);
             }
             _observeEmittedPts90k(nextPts);
           }
         }
         if (ptsDtsFlags == 3 &&
             pesHeaderDataLen >= 10 &&
-            payloadStart + 19 <= tsOff + _tsPacketSize) {
-          final dts = _readPesTimestamp33(pkt, payloadStart + 14);
+            payloadRel + 19 <= _tsPacketSize) {
+          final dts = _readPesTimestamp33(buf, payloadStart + 14);
           if (dts != null && _ptsOffset90k != 0) {
             _writePesTimestamp33(
-              pkt,
+              buf,
               payloadStart + 14,
               (dts + _ptsOffset90k) & _ptsMask33,
             );
@@ -347,8 +496,6 @@ class LiveTsContinuityAligner {
         }
       }
     }
-
-    return pkt;
   }
 
   void _observeEmittedPts90k(int pts90k) {

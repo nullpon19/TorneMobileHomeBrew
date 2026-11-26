@@ -289,6 +289,16 @@ Duration computeEffectiveStallTimeout({
   return Duration(seconds: math.max(30, wait + 20));
 }
 
+/// Computes the watchdog timeout for `_resume()` recovery so slower cellular
+/// connections have sufficient headroom for [rebufferWaitSeconds] + AKE/HTTP.
+Duration computeResumeWatchdogTimeout({
+  required bool live,
+  required int rebufferWaitSeconds,
+}) {
+  final wait = rebufferWaitSeconds < 0 ? 0 : rebufferWaitSeconds;
+  return Duration(seconds: math.max(45, wait + 30));
+}
+
 /// Human-readable Japanese label for a buffer duration in seconds.
 String formatBufferDurationLabel(int seconds) {
   if (seconds <= 0) return '標準 (0秒)';

@@ -577,7 +577,7 @@ class DtcpProxy {
 
   /// Time-seek attempts per producer before serving from the
   /// source's start byte as a last resort (plan 61).
-  static const int maxSeekAttempts = 4;
+  static const int maxSeekAttempts = 5;
 
   /// How long a ranged request waits for its seek pipeline to
   /// establish before failing (plan 61).
@@ -665,12 +665,20 @@ class DtcpProxy {
     return proxy;
   }
 
-  static bool _shouldReauthenticate(Object? error, int consecutiveErrors) {
-    if (consecutiveErrors >= 2) return true;
+  /// Returns whether upstream recovery should force a fresh DTCP-IP AKE
+  /// handshake before reconnecting.
+  ///
+  /// Explicit HTTP auth/busy errors trigger immediate re-authentication, whereas
+  /// pure transport drops throttle reauth (3rd attempt, then every 6th) so
+  /// brief cellular dead zones resume streaming without blocking on AKE.
+  static bool shouldReauthenticate(Object? error, int consecutiveErrors) {
     if (error is NasneError && error.category == NasneErrorCategory.http) {
-      return const {'401', '403', '500', '503', '512'}.contains(error.code);
+      if (const {'401', '403', '500', '503', '512'}.contains(error.code)) {
+        return true;
+      }
     }
-    return false;
+    return consecutiveErrors == 3 ||
+        (consecutiveErrors > 3 && (consecutiveErrors - 3) % 6 == 0);
   }
 
   static bool _isTransientReconnectError(NasneError error) {
@@ -911,7 +919,7 @@ class DtcpProxy {
           return;
         }
         _fetcher.resetClient();
-        if (_shouldReauthenticate(attemptError, consecutiveErrors)) {
+        if (shouldReauthenticate(attemptError, consecutiveErrors)) {
           try {
             await _onReauthenticate?.call();
           } catch (e) {
@@ -1267,6 +1275,13 @@ class DtcpProxy {
     try {
       var attempts = 0;
       var fellBackToPlain = false;
+      var overshootCount = 0;
+      var undershootRefined = false;
+      final total = _totalBytes;
+      final nearEnd =
+          total != null &&
+          total > 4 * 1024 * 1024 &&
+          (total - target) <= 1024 * 1024;
       while (!producer.cancelled && !_stopRequested) {
         attempts++;
         final HttpClientResponse response;
@@ -1281,7 +1296,19 @@ class DtcpProxy {
         } else {
           final map = _seekMap!;
           final estimated = map.timeForByte(target);
-          var requested = estimated - seekMarginSeconds;
+          final double margin;
+          if (overshootCount > 0) {
+            const overshootMargins = [5.0, 10.0, 20.0];
+            margin = overshootMargins[min(
+              overshootCount - 1,
+              overshootMargins.length - 1,
+            )];
+          } else if (undershootRefined || nearEnd) {
+            margin = 0.5;
+          } else {
+            margin = seekMarginSeconds;
+          }
+          var requested = estimated - margin;
           if (requested < 0) requested = 0;
           final TimeSeekResponse tsr;
           try {
@@ -1317,6 +1344,7 @@ class DtcpProxy {
             'at byte $startByte (attempt $attempts)',
           );
           if (startByte > target && attempts < maxSeekAttempts) {
+            overshootCount++;
             unawaited(_discardResponse(tsr.response));
             continue;
           }
@@ -1324,8 +1352,9 @@ class DtcpProxy {
               (target - startByte) > maxSkipPlaintextBytes &&
               attempts < maxSeekAttempts &&
               startSeconds != null) {
-            final refined = map.timeForByte(target) - seekMarginSeconds;
-            if (refined > startSeconds + 0.5 && refined > requested + 1.0) {
+            final refined = max(0.0, map.timeForByte(target) - 0.5);
+            if (refined > startSeconds + 0.5 && refined > requested + 0.5) {
+              undershootRefined = true;
               _diag(
                 DiagCategory.playback,
                 'proxy: seek undershot by ${target - startByte} B '
@@ -1634,7 +1663,7 @@ class DtcpProxy {
             return;
           }
           _fetcher.resetClient();
-          if (_shouldReauthenticate(e, establishAttempts)) {
+          if (shouldReauthenticate(e, establishAttempts)) {
             try {
               await _onReauthenticate?.call();
             } catch (reauthErr) {
@@ -1757,7 +1786,7 @@ class DtcpProxy {
               }
               if (_stopRequested || generation != _serveGeneration) break;
               _fetcher.resetClient();
-              if (_shouldReauthenticate(
+              if (shouldReauthenticate(
                 lastError,
                 consecutiveReconnectErrors,
               )) {
@@ -1875,7 +1904,7 @@ class DtcpProxy {
               break;
             }
             _fetcher.resetClient();
-            if (_shouldReauthenticate(null, stalledRestarts)) {
+            if (shouldReauthenticate(null, stalledRestarts)) {
               try {
                 await _onReauthenticate?.call();
               } catch (e) {

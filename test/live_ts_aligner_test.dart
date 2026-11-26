@@ -169,5 +169,45 @@ void main() {
       expect(aligner.isPassthrough, isTrue);
       expect(out, raw);
     });
+
+    test('uses earlier PCR/DTS across B-frame PTS ahead of PCR so PCR never jumps backwards', () {
+      final aligner = LiveTsContinuityAligner();
+      final seg1 = Uint8List.fromList([
+        ..._makeTsPacket(pid: 0x0100, pcrBase90k: 900000, pts90k: 903000),
+        ..._makeTsPacket(pid: 0x0100, pcrBase90k: 909000, pts90k: 912000),
+      ]);
+      final out1 = aligner.process(seg1);
+      expect(out1.length, 376);
+
+      aligner.beginNewSegment();
+      // First packet has a B-frame PTS=7000 ahead of the second packet's PCR=1000.
+      final pBFrame = _makeTsPacket(pid: 0x0100, pts90k: 7000);
+      final pPcrAnchor = _makeTsPacket(
+        pid: 0x0100,
+        pcrBase90k: 1000,
+        pts90k: 4000,
+        dts90k: 1000,
+      );
+      final out2 = aligner.process(Uint8List.fromList([...pBFrame, ...pPcrAnchor]));
+      expect(out2.length, 376);
+
+      final rebasedPcr = _readPcr(Uint8List.sublistView(out2, 188, 376), 6);
+      // 912000 + 9000 = 921000; PCR must be 921000 (not skewed backwards by B-frame PTS).
+      expect(rebasedPcr, 921000);
+      final rebasedBFramePts = _readPesTs(Uint8List.sublistView(out2, 0, 188), 6 + 9);
+      expect(rebasedBFramePts, 921000 + 6000);
+    });
+
+    test('streams multi-chunk TS fast path cleanly without corrupting packets', () {
+      final aligner = LiveTsContinuityAligner();
+      final p1 = _makeTsPacket(pid: 0x0100, pcrBase90k: 10000, pts90k: 13000);
+      final p2 = _makeTsPacket(pid: 0x0100, pcrBase90k: 19000, pts90k: 22000);
+      final p3 = _makeTsPacket(pid: 0x0100, pcrBase90k: 28000, pts90k: 31000);
+      // Split across odd byte boundaries.
+      final full = Uint8List.fromList([...p1, ...p2, ...p3]);
+      final c1 = aligner.process(Uint8List.sublistView(full, 0, 250));
+      final c2 = aligner.process(Uint8List.sublistView(full, 250, 564));
+      expect([...c1, ...c2], full);
+    });
   });
 }

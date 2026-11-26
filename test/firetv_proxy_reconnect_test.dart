@@ -652,5 +652,104 @@ void main() {
         expect(proxy.plaintextBytes, greaterThanOrEqualTo(totalBytes));
       },
     );
+
+    test('shouldReauthenticate triggers on auth/busy HTTP errors and throttles unreachable retries', () {
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(401, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(403, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(503, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(512, 't'), 1), isTrue);
+
+      final netErr = NasneError.unreachable('t');
+      expect(DtcpProxy.shouldReauthenticate(netErr, 1), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(netErr, 2), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(netErr, 3), isTrue);
+      for (var i = 4; i <= 8; i++) {
+        expect(DtcpProxy.shouldReauthenticate(netErr, i), isFalse);
+      }
+      expect(DtcpProxy.shouldReauthenticate(netErr, 9), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(null, 2), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(null, 3), isTrue);
+    });
+
+    test(
+      'seekable proxy widens time-seek margin after VBR overshoot and recovers',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        const totalBytes = 65536;
+        final fullPlaintext = Uint8List.fromList(
+          List.generate(totalBytes, (i) => (i * 29 + 11) & 0xFF),
+        );
+        final requestedNpts = <double>[];
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          final tsHeader = request.headers.value('timeseekrange.dlna.org');
+          if (tsHeader == null) {
+            final fullPkt = _buildTestPcpPacket(exchangeKey, fullPlaintext);
+            request.response.statusCode = HttpStatus.ok;
+            request.response.contentLength = fullPkt.length;
+            request.response.add(fullPkt);
+            await request.response.close();
+            return;
+          }
+          final nptMatch = RegExp(r'npt=([0-9.]+)-').firstMatch(tsHeader)!;
+          final npt = double.parse(nptMatch.group(1)!);
+          requestedNpts.add(npt);
+          // Simulate VBR overshoot: npt >= 7.0 snaps past byte 32768 (36000),
+          // while widened margin (npt < 7.0) lands safely at byte 24576.
+          final startByte = npt >= 7.0 ? 36000 : 24576;
+          final pkt = _buildTestPcpPacket(
+            exchangeKey,
+            Uint8List.sublistView(fullPlaintext, startByte, totalBytes),
+          );
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.set(
+            'TimeSeekRange.dlna.org',
+            'npt=${npt.toStringAsFixed(3)}-20.000/20.000 '
+                'bytes=$startByte-${totalBytes - 1}/$totalBytes',
+          );
+          request.response.contentLength = pkt.length;
+          request.response.add(pkt);
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/vbr'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: totalBytes,
+          totalDuration: const Duration(seconds: 20),
+          windowCapBytesOverride: 8192,
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        req.headers.set('Range', 'bytes=32768-${totalBytes - 1}');
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.partialContent);
+        final received = BytesBuilder(copy: false);
+        await for (final chunk in resp.timeout(const Duration(seconds: 3))) {
+          received.add(chunk);
+        }
+        expect(
+          received.toBytes(),
+          Uint8List.sublistView(fullPlaintext, 32768, totalBytes),
+        );
+        // Attempt 1 aimed at 10.0 - 2.0 = 8.0s (overshot); attempt 2 widened by 5.0s!
+        expect(requestedNpts.length, 2);
+        expect(requestedNpts[0], closeTo(8.0, 0.01));
+        expect(requestedNpts[1], lessThan(7.0));
+      },
+    );
   });
 }

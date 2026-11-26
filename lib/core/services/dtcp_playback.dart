@@ -93,8 +93,18 @@ class PlaybackKeySource {
   /// Forces a fresh AKE authentication even when the local key cache is
   /// populated (used after prolonged cellular outages).
   Future<void> forceReauthenticate() async {
-    final fresh = await _reauthenticateOnce();
-    await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 20));
+    final future = () async {
+      final fresh = await _reauthenticateOnce();
+      await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 10));
+    }();
+    unawaited(future.then((_) {}, onError: (_) {}));
+    await future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () => throw NasneError.unreachable(
+        'dtcp:ake',
+        cause: 're-authentication timed out after 15s',
+      ),
+    );
   }
 
   Future<ExchangeKeySession> _reauthenticateOnce() async {
