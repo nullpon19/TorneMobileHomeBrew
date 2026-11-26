@@ -915,7 +915,7 @@ void main() {
             body: Stack(
               children: [
                 PlayerOsdClockOverlay(
-                  now: DateTime(2026, 11, 26, 9, 36),
+                  now: DateTime.utc(2026, 11, 26, 0, 36),
                   top: 76,
                   left: 18,
                   fontSize: 40,
