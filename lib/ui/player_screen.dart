@@ -3040,6 +3040,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _hasVideoFrame = false;
   String? _error;
 
+  static int _mpvCacheSessionSeq = 0;
+  bool _proxyReconnecting = false;
+  int _stallDeferCount = 0;
+  Timer? _proxyReconnectTimer;
+  Duration _timeSeekBaseOffset = Duration.zero;
+  bool _timeSeeking = false;
+
+  bool _readProxyReconnecting() {
+    final s = widget.session;
+    if (s is StreamDiagnosticMetrics) {
+      return (s as StreamDiagnosticMetrics).isReconnectingUpstream;
+    }
+    return false;
+  }
+
+  bool _canAbsorbTransientInterruption() {
+    return shouldDeferPlayerInterruption(
+      playingNow: _playingNow,
+      bufferedAheadSeconds: _bufferedAheadSeconds,
+      bufferDeltaSeconds: _bufferDeltaSeconds,
+      proxyReconnecting: _readProxyReconnecting() || _proxyReconnecting,
+      buffering: _buffering,
+    );
+  }
+
+  Duration get _effectiveRecordedPosition =>
+      (!widget.live && widget.session is TimeSeekableSession)
+      ? (_timeSeekBaseOffset + _lastPosition)
+      : _lastPosition;
+
   /// Interruption state (plan 80): playback that had started
   /// stopped mid-stream — a fatal player error after the
   /// start, or the silent stall of plan 78 — and the notice
@@ -3343,7 +3373,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       playingNow: _playingNow,
       buffering: _buffering,
       positionAtFirstFrame: _positionAtFirstFrame,
-      currentPosition: _lastPosition,
+      currentPosition: _effectiveRecordedPosition,
       preBufferTargetSeconds: targetSec,
       preBufferCurrentSeconds: _effectivePreBufferSeconds.toDouble(),
     );
@@ -3352,6 +3382,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _maybeCancelStartWatchdog();
     _stopStartupTraceTimer();
     _startTraceCompleted = true;
+    final plan = _bufferPlan;
+    final platform = _player.platform;
+    if (plan != null &&
+        plan.rebufferWaitSeconds != plan.cachePauseWaitSeconds &&
+        platform is NativePlayer) {
+      unawaited(
+        platform.setProperty('cache-pause-wait', '${plan.rebufferWaitSeconds}'),
+      );
+      _diag(
+        DiagCategory.playback,
+        'player: post-start cache-pause-wait -> ${plan.rebufferWaitSeconds}s',
+      );
+    }
     if (!_buffering) {
       _stopPreBufferPoller();
     }
@@ -3431,21 +3474,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   double get _bufferDeltaSeconds {
     if (_bufferEndPosition <= Duration.zero) return 0.0;
-    final base = _lastPosition > Duration.zero
-        ? _lastPosition
+    final base = _effectiveRecordedPosition > Duration.zero
+        ? _effectiveRecordedPosition
         : _initialBufferPosition;
     if (base == null) return 0.0;
     final diff = _bufferEndPosition - base;
     return diff > Duration.zero ? diff.inMilliseconds / 1000.0 : 0.0;
   }
 
-  int get _effectivePreBufferSeconds => computePreBufferSeconds(
-    targetSeconds: _bufferPlan?.cachePauseWaitSeconds ?? 0,
-    demuxerCacheDuration: _bufferedAheadSeconds,
-    bufferingPercentage: _bufferingPercentage,
-    bufferDeltaSeconds: _bufferDeltaSeconds,
-    liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
-  );
+  int get _effectivePreBufferSeconds {
+    final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
+    final transferFallback = widget.live
+        ? _liveTransferAccumulatedSeconds
+        : math.min(
+            _liveTransferAccumulatedSeconds,
+            math.max(0, target - 1).toDouble(),
+          );
+    return computePreBufferSeconds(
+      targetSeconds: target,
+      demuxerCacheDuration: _bufferedAheadSeconds,
+      bufferingPercentage: _bufferingPercentage,
+      bufferDeltaSeconds: _bufferDeltaSeconds,
+      liveTransferSeconds: transferFallback,
+    );
+  }
 
   int get _effectiveLoadingCurrentSeconds {
     final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
@@ -3578,7 +3630,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         } catch (_) {}
       }
-      if (widget.live && _shouldPollLiveBuffering) {
+      if (_shouldPollLiveBuffering) {
         if (widget.session case final StreamTransferMetrics metrics) {
           final next = advanceLiveTransferSeconds(
             currentAccumulatedSeconds: _liveTransferAccumulatedSeconds,
@@ -3750,6 +3802,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
+    _proxyReconnectTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (!mounted || _conflictHandled || _switchingChannel) return;
+        final next = _readProxyReconnecting();
+        if (next != _proxyReconnecting) {
+          setState(() => _proxyReconnecting = next);
+        }
+        if (next && _initialPlaybackStarted && !_interrupted) {
+          unawaited(_pollMpvBufferProperties());
+        }
+      },
+    );
     _superimposeSyncTimer = Timer.periodic(
       const Duration(milliseconds: 500),
       (_) => _syncSuperimposeTick(),
@@ -3814,6 +3879,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
           _stallTimer?.cancel();
+          _stallDeferCount = 0;
           _bufferingSincePlaying = false;
           if (widget.live && _liveDelayedByPause) {
             unawaited(_updateLiveCatchUpSpeed(immediate: true));
@@ -4079,6 +4145,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _handleRecordedCompletion('trailing error near end: $error');
             return;
           }
+          if (_canAbsorbTransientInterruption()) {
+            _diag(
+              DiagCategory.playback,
+              'player: deferring interruption to preserve buffer '
+              '(ahead=${_bufferedAheadSeconds.toStringAsFixed(1)}s, '
+              'reconnecting=${_readProxyReconnecting()})',
+            );
+            if (_stallTimer == null || !_stallTimer!.isActive) {
+              final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+              final timeout = computeEffectiveStallTimeout(
+                live: widget.live,
+                rebufferWaitSeconds: waitSec,
+              );
+              _stallTimer = Timer(timeout, _onStallTimeout);
+            }
+            return;
+          }
           // The failure arrived after playback had started
           // (plan 80): an interruption, not a failed start.
           // Keep the frozen frame and offer the in-place
@@ -4335,7 +4418,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _onStartTimeout() {
     if (!mounted ||
-        _playing ||
+        _initialPlaybackStarted ||
         _error != null ||
         _conflictHandled ||
         _switchingChannel) {
@@ -4827,14 +4910,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _handleRecordedCompletion('stopped after buffering near end');
       return;
     }
+    final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+    final effectiveStallTimeout =
+        (_bufferPlan != null && (widget.live || waitSec > 0))
+        ? computeEffectiveStallTimeout(
+            live: widget.live,
+            rebufferWaitSeconds: waitSec,
+          )
+        : stallTimeout;
     _diag(
       DiagCategory.playback,
       'player: playback stopped after buffering without '
       'completing; watching for a recovery for '
-      '${stallTimeout.inSeconds} seconds (plan 80)',
+      '${effectiveStallTimeout.inSeconds} seconds (plan 80)',
     );
+    _stallDeferCount = 0;
     _stallTimer?.cancel();
-    _stallTimer = Timer(stallTimeout, _onStallTimeout);
+    _stallTimer = Timer(effectiveStallTimeout, _onStallTimeout);
   }
 
   void _onStallTimeout() {
@@ -4848,6 +4940,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (!widget.live && _isEffectivelyCompleted) {
       _handleRecordedCompletion('stall timeout near end');
+      return;
+    }
+    var recentTransfer = false;
+    if (widget.session case final StreamTransferMetrics metrics) {
+      final lastAt = metrics.lastByteServedAt;
+      if (lastAt != null &&
+          _now().difference(lastAt) < const Duration(seconds: 15)) {
+        recentTransfer = true;
+      }
+    }
+    final canDefer =
+        _stallDeferCount < 12 &&
+        (_canAbsorbTransientInterruption() || recentTransfer);
+    if (canDefer) {
+      _stallDeferCount++;
+      _diag(
+        DiagCategory.playback,
+        'player: deferring stall timeout #$_stallDeferCount '
+        '(ahead=${_bufferedAheadSeconds.toStringAsFixed(1)}s, '
+        'reconnecting=${_readProxyReconnecting()}, recent=$recentTransfer)',
+      );
+      _stallTimer?.cancel();
+      _stallTimer = Timer(const Duration(seconds: 10), _onStallTimeout);
       return;
     }
     _diag(
@@ -4929,12 +5044,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     try {
       await _applyPlayerVolume();
       if (!mounted || _conflictHandled || _switchingChannel) return;
+      var resumeStart = (!widget.live && _effectiveRecordedPosition > Duration.zero)
+          ? _effectiveRecordedPosition
+          : null;
+      if (resumeStart != null && widget.session is TimeSeekableSession) {
+        _timeSeekBaseOffset = resumeStart;
+        _lastPosition = Duration.zero;
+        await (widget.session as TimeSeekableSession).seekToTime(resumeStart);
+        resumeStart = null;
+      }
       await _player.open(
         Media(
           widget.session.mediaUri.toString(),
-          start: (!widget.live && _lastPosition > Duration.zero)
-              ? _lastPosition
-              : null,
+          start: resumeStart,
         ),
       );
       if (!mounted || _conflictHandled || _switchingChannel) return;
@@ -5284,7 +5406,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     if (!_playingNow || _buffering || _interrupted) return;
     final incoming = controller.pollRecordedComments(
-      position: _lastPosition,
+      position: _effectiveRecordedPosition,
       offsetSeconds: _jikkyoManualOffsetSeconds,
     );
     if (incoming.isNotEmpty) {
@@ -6277,7 +6399,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _liveSeekDebounceTimer?.cancel();
       _liveCommittedSeekSec = null;
       _liveCommittedSeekHoldTimer?.cancel();
-      _usedDiskCacheDir = plan.useDiskCache ? cacheDir : null;
+      Directory? sessionCacheDir;
+      if (plan.useDiskCache && cacheDir != null) {
+        final seq = ++_mpvCacheSessionSeq;
+        sessionCacheDir = Directory(
+          '${cacheDir.path}/s_${DateTime.now().microsecondsSinceEpoch}_$seq',
+        );
+        try {
+          await sessionCacheDir.create(recursive: true);
+        } catch (_) {
+          sessionCacheDir = cacheDir;
+        }
+      }
+      if (!mounted) return;
+      _usedDiskCacheDir = sessionCacheDir;
       _watchdog?.cancel();
       _watchdog = Timer(
         Duration(seconds: plan.startTimeoutSeconds),
@@ -6343,6 +6478,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             '$liveDemuxerAnalyzeDurationSeconds',
           );
           await platform.setProperty('demuxer-lavf-probesize', '$probeSize');
+        } else {
+          final probeSize = recordedDemuxerProbeSizeBytes(
+            useMobile: widget.currentUseMobile,
+          );
+          await platform.setProperty(
+            'demuxer-lavf-analyzeduration',
+            '$liveDemuxerAnalyzeDurationSeconds',
+          );
+          await platform.setProperty('demuxer-lavf-probesize', '$probeSize');
         }
         await platform.setProperty('cache', plan.useCache ? 'yes' : 'no');
         if (plan.useCache) {
@@ -6376,9 +6520,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             await platform.setProperty('force-seekable', 'yes');
             await platform.setProperty('demuxer-seekable-cache', 'yes');
           }
-          if (plan.useDiskCache && plan.cacheDirPath != null) {
+          final cachePath = _usedDiskCacheDir?.path ?? plan.cacheDirPath;
+          if (plan.useDiskCache && cachePath != null) {
+            await platform.setProperty('demuxer-cache-dir', cachePath);
             await platform.setProperty('cache-on-disk', 'yes');
-            await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
           } else {
             await platform.setProperty('cache-on-disk', 'no');
           }
@@ -6398,22 +6543,28 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _startPreBufferPoller();
         }
       }
-      final start =
+      final rawStart =
           (!widget.live &&
               widget.initialStart != null &&
               widget.initialStart! > Duration.zero)
           ? widget.initialStart
           : null;
-      if (start != null) {
+      var openMediaStart = rawStart;
+      if (rawStart != null && widget.session is TimeSeekableSession) {
+        _timeSeekBaseOffset = rawStart;
+        await (widget.session as TimeSeekableSession).seekToTime(rawStart);
+        openMediaStart = null;
+      }
+      if (rawStart != null) {
         _diag(
           DiagCategory.playback,
-          'player: opening at the resume position ${start.inSeconds}s '
+          'player: opening at the resume position ${rawStart.inSeconds}s '
           '(plan 86)',
         );
       }
       await _applyPlayerVolume();
       await _player.open(
-        Media(widget.session.mediaUri.toString(), start: start),
+        Media(widget.session.mediaUri.toString(), start: openMediaStart),
       );
       await _applyPlayerVolume();
       _diag(DiagCategory.playback, 'player: open completed');
@@ -6454,7 +6605,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return resumePositionToReport(
       started: _playing,
       completed: _completed,
-      position: _lastPosition,
+      position: _effectiveRecordedPosition,
     );
   }
 
@@ -6510,8 +6661,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (cacheDir != null) {
       try {
         if (await cacheDir.exists()) {
-          await for (final entry in cacheDir.list()) {
-            await entry.delete(recursive: true);
+          if (cacheDir.parent.path.endsWith('mpv_cache')) {
+            await cacheDir.delete(recursive: true);
+          } else {
+            await for (final entry in cacheDir.list()) {
+              await entry.delete(recursive: true);
+            }
           }
         }
       } catch (_) {}
@@ -6548,6 +6703,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
         (name: 'startup trace timer', run: () => _stopStartupTraceTimer()),
+        (
+          name: 'proxy reconnect timer',
+          run: () => _proxyReconnectTimer?.cancel(),
+        ),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
         (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
         (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
@@ -7093,6 +7252,41 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _resetOsdTimer();
   }
 
+  Future<void> _performTimeSeek(Duration target) async {
+    if (widget.live || widget.session is! TimeSeekableSession) return;
+    final dur = _effectiveDuration;
+    final clamped = target.isNegative
+        ? Duration.zero
+        : (dur > Duration.zero && target > dur ? dur : target);
+    if (_timeSeeking) return;
+    _timeSeeking = true;
+    try {
+      setState(() {
+        _timeSeekBaseOffset = clamped;
+        _lastPosition = Duration.zero;
+        _buffering = true;
+        _bufferedAheadSeconds = 0.0;
+        _bufferEndPosition = Duration.zero;
+      });
+      final timeSeekable = widget.session as TimeSeekableSession;
+      await timeSeekable.seekToTime(clamped);
+      if (!mounted || _conflictHandled || _switchingChannel) return;
+      await _player.open(
+        Media(
+          widget.session.mediaUri
+              .replace(queryParameters: {'t': '${clamped.inMilliseconds}'})
+              .toString(),
+        ),
+      );
+      if (!mounted) return;
+      await _applyPlayerVolume();
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: time seek failed: $e');
+    } finally {
+      _timeSeeking = false;
+    }
+  }
+
   void _onRecordedScrubEnd(double fraction) {
     final dur = _effectiveDuration;
     if (dur <= Duration.zero) {
@@ -7112,7 +7306,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     setState(() => _scrubbingPosition = null);
     _clearDisplayedSubtitles();
     _resetSubtitleTrackTracking();
-    unawaited(_player.seek(target));
+    if (widget.session is TimeSeekableSession && !_seekable.value) {
+      unawaited(_performTimeSeek(target));
+    } else {
+      unawaited(_player.seek(target));
+    }
     _resetOsdTimer();
   }
 
@@ -7640,7 +7838,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _queueRelativeSeek(Duration delta) {
     if (widget.live) return;
-    _seekBasePosition ??= _committedSeekTarget ?? _player.state.position;
+    _seekBasePosition ??= _committedSeekTarget ?? _effectiveRecordedPosition;
     _pendingSeekOffset += delta;
     _showSeekHud(
       _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_10,
@@ -7676,7 +7874,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles();
     _resetSubtitleTrackTracking();
     try {
-      await _player.seek(target);
+      if (widget.session is TimeSeekableSession && !_seekable.value) {
+        await _performTimeSeek(target);
+      } else {
+        await _player.seek(target);
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dpad seek failed: $e');
     }
@@ -7754,6 +7956,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
+    _proxyReconnectTimer?.cancel();
     _watchdog?.cancel();
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
@@ -7870,8 +8073,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     _closeOsd();
     final nextUseMobile = !widget.currentUseMobile;
-    final resumeFrom = _lastPosition > Duration.zero
-        ? _lastPosition
+    final resumeFrom = _effectiveRecordedPosition > Duration.zero
+        ? _effectiveRecordedPosition
         : (widget.initialStart ?? Duration.zero);
     _switchingChannelLabel = nextUseMobile ? 'モバイル画質' : '元画質';
 
@@ -8853,6 +9056,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                             customText: _customCornerNoticeText,
                             recordingNotice: _cornerRecordingNotice,
                           ),
+                        if (_proxyReconnecting &&
+                            _initialPlaybackStarted &&
+                            !_interrupted &&
+                            _error == null &&
+                            !_switchingChannel)
+                          _buildReconnectPill(
+                            belowCornerNotice: shouldShowPlayerCornerNotice(
+                              cornerRecordingNotice: _cornerRecordingNotice,
+                              customCornerNoticeText: _customCornerNoticeText,
+                              osdOpen: _osdOpen,
+                              detailOpen: _detailOpen,
+                              interrupted: _interrupted,
+                              error: _error,
+                              switchingChannel: _switchingChannel,
+                            ),
+                          ),
                         if (uiMode.isDesktop && canLiveSwitch)
                           DesktopChannelEdgeZones(
                             enabled: true,
@@ -9180,6 +9399,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 PlayerCornerNotice(
                   customText: _customCornerNoticeText,
                   recordingNotice: _cornerRecordingNotice,
+                ),
+              if (_proxyReconnecting &&
+                  _initialPlaybackStarted &&
+                  !_interrupted &&
+                  _error == null &&
+                  !_switchingChannel)
+                _buildReconnectPill(
+                  belowCornerNotice: shouldShowPlayerCornerNotice(
+                    cornerRecordingNotice: _cornerRecordingNotice,
+                    customCornerNoticeText: _customCornerNoticeText,
+                    osdOpen: false,
+                    detailOpen: false,
+                    interrupted: _interrupted,
+                    error: _error,
+                    switchingChannel: _switchingChannel,
+                  ),
                 ),
               if (canSwipeChannels) ..._buildChannelSwitchPreviewCards(),
               if (_touchPortraitOverlayOpen &&
@@ -9537,12 +9772,54 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return '$sec秒';
   }
 
+  Widget _buildReconnectPill({required bool belowCornerNotice}) {
+    final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
+    final label = aheadSec >= 1
+        ? '回線再接続中…（バッファ残 ${_formatShortDurationSeconds(aheadSec)}）'
+        : '回線再接続中…';
+    return Positioned(
+      top: belowCornerNotice ? 52 : 16,
+      right: 20,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: const Color(0xCC262218),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: Colors.amberAccent.withValues(alpha: 0.7),
+              width: 1,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.sync, size: 13, color: Colors.amberAccent),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildLoadingOverlay(String fallbackLabel) {
     final plan = _bufferPlan;
+    final targetSeconds = _initialPlaybackStarted
+        ? (plan?.rebufferWaitSeconds ?? 0)
+        : (plan?.cachePauseWaitSeconds ?? 0);
     final spec = liveLoadingOverlaySpec(
       isLive: widget.live,
       isPreBuffering: _isPreBuffering,
-      targetSeconds: plan?.cachePauseWaitSeconds ?? 0,
+      targetSeconds: targetSeconds,
       currentSeconds: _effectiveLoadingCurrentSeconds,
       bufferingPercentage: _bufferingPercentage,
       fallbackLabel: fallbackLabel,
@@ -9794,7 +10071,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       initialData: _lastPosition,
       builder: (context, snapshot) {
         final dur = _effectiveDuration;
-        final pos = _seekHudPositionOverride ?? (snapshot.data ?? _lastPosition);
+        final rawStreamPos = snapshot.data ?? _lastPosition;
+        final effectivePos =
+            (!widget.live && widget.session is TimeSeekableSession)
+            ? (_timeSeekBaseOffset + rawStreamPos)
+            : rawStreamPos;
+        final pos = _seekHudPositionOverride ?? effectivePos;
         final clampedPos = dur > Duration.zero && pos > dur
             ? dur
             : (pos.isNegative ? Duration.zero : pos);
@@ -9802,7 +10084,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             ? (clampedPos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
             : 0.0;
         final aheadMillis =
-            _lastPosition.inMilliseconds +
+            effectivePos.inMilliseconds +
             (_bufferedAheadSeconds * 1000).round();
         final maxBufferMillis = math.max(
           _bufferEndPosition.inMilliseconds,

@@ -16,6 +16,7 @@ import '../app/state.dart';
 import '../app/store_directory.dart';
 import '../app/ui_control_mode.dart';
 import '../core/core.dart';
+import 'dlna_browser_view.dart';
 import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
@@ -56,6 +57,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
     final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
     final videoHwdecMode = ref.watch(videoHwdecModeProvider);
+    final dlnaServers = ref.watch(dlnaServersProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(
@@ -474,6 +476,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               context,
               MaterialPageRoute<void>(
                 builder: (_) => const DtcpCredentialScreen(),
+              ),
+            ),
+          ),
+          ListTile(
+            title: const Text('汎用 DLNA / DTCP-IP レコーダー'),
+            subtitle: Text(
+              dlnaServers.isEmpty
+                  ? '未登録（自宅 LAN 内の他社レコーダーを追加・視聴）'
+                  : '${dlnaServers.length}台登録済み（${dlnaServers.map((s) => s.friendlyName).join('、')}）',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => const DlnaServerSettingsScreen(),
               ),
             ),
           ),

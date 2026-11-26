@@ -64,6 +64,14 @@ final discoveryServiceProvider = Provider<DiscoveryService>(
   ]),
 );
 
+/// Discovery service dedicated to generic DLNA / DTCP-IP MediaServers.
+final dlnaDiscoveryProvider = Provider<SsdpDiscoveryService>(
+  (ref) => SsdpDiscoveryService(
+    client: ref.watch(httpClientProvider),
+    lockGuard: MethodChannelMulticastLockGuard(),
+  ),
+);
+
 final registrationServiceProvider = Provider<RegistrationService>(
   (ref) => WebApiRegistrationService(client: ref.watch(httpClientProvider)),
 );

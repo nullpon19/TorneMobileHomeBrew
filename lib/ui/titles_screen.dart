@@ -68,6 +68,7 @@ import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 import 'channel_badge.dart';
+import 'dlna_browser_view.dart';
 import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
@@ -656,6 +657,7 @@ class TitlesScreen extends ConsumerStatefulWidget {
 
 class _TitlesScreenState extends ConsumerState<TitlesScreen> {
   String? _selectedKey;
+  String? _selectedSourceId;
   final FocusNode _detailPlayFocusNode = FocusNode(debugLabel: 'titlePlay');
 
   @override
@@ -672,11 +674,103 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
     final activeRegs = regs.length > 1
         ? regs
         : (reg != null ? [reg] : const <RegisteredNasne>[]);
+    final dlnaServers = ref.watch(dlnaServersProvider);
+    final hasNasne = reg != null;
+
+    RegisteredDlnaServer? activeDlna;
+    if (dlnaServers.isNotEmpty) {
+      if (_selectedSourceId != null && _selectedSourceId!.startsWith('dlna:')) {
+        final targetId = _selectedSourceId!.substring(5);
+        for (final s in dlnaServers) {
+          if (s.id == targetId) {
+            activeDlna = s;
+            break;
+          }
+        }
+      }
+      if (!hasNasne && activeDlna == null) {
+        activeDlna = dlnaServers.first;
+      }
+    }
+
+    final Widget nasneBody = reg == null
+        ? NoDeviceView(
+            onRegister: () =>
+                ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
+          )
+        : _TitleList(
+            reg: reg,
+            activeRegs: activeRegs,
+            selectedKey: _selectedKey,
+            detailPlayFocusNode: _detailPlayFocusNode,
+            onSelect: (title, owner, showNasneName, twoPane) {
+              if (twoPane) {
+                setState(() => _selectedKey = ownedItemKey(owner, title.id));
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted && _detailPlayFocusNode.canRequestFocus) {
+                    _detailPlayFocusNode.requestFocus();
+                  }
+                });
+              } else {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => TitleDetailPage(
+                      reg: owner,
+                      titleId: title.id,
+                      showNasneName: showNasneName,
+                    ),
+                  ),
+                );
+              }
+            },
+          );
+
+    final Widget body;
+    if (dlnaServers.isEmpty) {
+      body = nasneBody;
+    } else {
+      body = Column(
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Row(
+              children: [
+                if (hasNasne) ...[
+                  ChoiceChip(
+                    label: const Text('nasne 録画'),
+                    selected: activeDlna == null,
+                    onSelected: (_) => setState(() => _selectedSourceId = 'nasne'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                for (final s in dlnaServers) ...[
+                  ChoiceChip(
+                    avatar: const Icon(Icons.dns_outlined, size: 16),
+                    label: Text(s.friendlyName),
+                    selected: activeDlna?.id == s.id,
+                    onSelected: (_) =>
+                        setState(() => _selectedSourceId = 'dlna:${s.id}'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+          Expanded(
+            child: activeDlna != null
+                ? DlnaBrowserView(server: activeDlna)
+                : nasneBody,
+          ),
+        ],
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('録画済み'),
         actions: [
-          if (reg != null)
+          if (reg != null && activeDlna == null)
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
@@ -689,37 +783,7 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
             ),
         ],
       ),
-      body: reg == null
-          ? NoDeviceView(
-              onRegister: () =>
-                  ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
-            )
-          : _TitleList(
-              reg: reg,
-              activeRegs: activeRegs,
-              selectedKey: _selectedKey,
-              detailPlayFocusNode: _detailPlayFocusNode,
-              onSelect: (title, owner, showNasneName, twoPane) {
-                if (twoPane) {
-                  setState(() => _selectedKey = ownedItemKey(owner, title.id));
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (mounted && _detailPlayFocusNode.canRequestFocus) {
-                      _detailPlayFocusNode.requestFocus();
-                    }
-                  });
-                } else {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => TitleDetailPage(
-                        reg: owner,
-                        titleId: title.id,
-                        showNasneName: showNasneName,
-                      ),
-                    ),
-                  );
-                }
-              },
-            ),
+      body: body,
     );
   }
 }

@@ -557,5 +557,100 @@ void main() {
         );
       },
     );
+
+    test(
+      'seekable proxy retries on 0-byte establish failure and mid-stream early EOF without prematurely latching EOF',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        const totalBytes = 65536; // 64 KiB (not near 0)
+        final fullPlaintext = Uint8List.fromList(
+          List.generate(totalBytes, (i) => (i * 23 + 7) & 0xFF),
+        );
+        // Make totalBytes large enough so _window.end=0 is NOT nearDeclaredEnd.
+        const fakeTotalBytes = 10 * 1024 * 1024;
+        var upstreamAttempt = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          if (upstreamAttempt == 1) {
+            // Transient 503 on initial byte 0 establish.
+            request.response.statusCode = HttpStatus.serviceUnavailable;
+            await request.response.close();
+            return;
+          }
+          if (upstreamAttempt == 2) {
+            // Deliver first 16384 bytes cleanly, then close early (well short of 10 MiB).
+            final pkt = _buildTestPcpPacket(
+              exchangeKey,
+              Uint8List.sublistView(fullPlaintext, 0, 16384),
+            );
+            request.response.statusCode = HttpStatus.ok;
+            request.response.contentLength = pkt.length;
+            request.response.add(pkt);
+            await request.response.close();
+            return;
+          }
+          // Reconnect attempt returns remainder from byte 16384.
+          final pkt = _buildTestPcpPacket(
+            exchangeKey,
+            Uint8List.sublistView(fullPlaintext, 16384, totalBytes),
+          );
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.set(
+            'TimeSeekRange.dlna.org',
+            'npt=00:00:05.000-00:01:00.000/00:01:00.000 '
+                'bytes=16384-${fakeTotalBytes - 1}/$fakeTotalBytes',
+          );
+          request.response.contentLength = pkt.length;
+          request.response.add(pkt);
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/pvr_retry'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: fakeTotalBytes,
+          totalDuration: const Duration(minutes: 1),
+          autoReconnect: true,
+          reconnectBackoff: const [Duration(milliseconds: 10)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+
+        final collected = <int>[];
+        final done = Completer<void>();
+        late StreamSubscription<List<int>> sub;
+        sub = resp.listen(
+          (chunk) {
+            collected.addAll(chunk);
+            if (collected.length >= totalBytes && !done.isCompleted) {
+              done.complete();
+            }
+          },
+          onError: (_) {},
+        );
+        addTearDown(sub.cancel);
+        await done.future.timeout(const Duration(seconds: 5));
+        expect(collected.sublist(0, totalBytes), fullPlaintext);
+        expect(upstreamAttempt, greaterThanOrEqualTo(3));
+        expect(proxy.servedBytes, greaterThanOrEqualTo(totalBytes));
+        expect(proxy.plaintextBytes, greaterThanOrEqualTo(totalBytes));
+      },
+    );
   });
 }

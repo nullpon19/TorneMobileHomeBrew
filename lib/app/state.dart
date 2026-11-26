@@ -8,6 +8,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -438,3 +439,78 @@ void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
   ref.invalidate(titleCountsProvider(reg));
   ref.invalidate(liveChannelsProvider(reg));
 }
+
+/// Persisted list of registered generic DLNA / DTCP-IP MediaServers
+/// (`keyValueStoreProvider` under key `dlna_servers_v1`).
+class DlnaServersNotifier extends Notifier<List<RegisteredDlnaServer>> {
+  static const _key = 'dlna_servers_v1';
+  bool _dirty = false;
+
+  @override
+  List<RegisteredDlnaServer> build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (_dirty || raw == null || raw.isEmpty) return;
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is! List) return;
+        final list = [
+          for (final item in decoded)
+            if (item is Map)
+              RegisteredDlnaServer.fromJson(item.cast<String, dynamic>()),
+        ];
+        if (!_dirty) {
+          state = list;
+        }
+      } catch (_) {}
+    });
+    return const [];
+  }
+
+  Future<void> addOrReplace(RegisteredDlnaServer server) async {
+    _dirty = true;
+    final next = [
+      for (final existing in state)
+        if (existing.id != server.id) existing,
+      server,
+    ];
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> remove(String id) async {
+    _dirty = true;
+    final next = [
+      for (final existing in state)
+        if (existing.id != id) existing,
+    ];
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> _persist(List<RegisteredDlnaServer> list) {
+    return ref.read(keyValueStoreProvider).write(
+      _key,
+      jsonEncode([for (final s in list) s.toJson()]),
+    );
+  }
+}
+
+final dlnaServersProvider =
+    NotifierProvider<DlnaServersNotifier, List<RegisteredDlnaServer>>(
+      DlnaServersNotifier.new,
+    );
+
+/// ContentDirectory:1 Browse response for a generic DLNA server container.
+final dlnaBrowseProvider = FutureProvider.family<
+  DidlDocument,
+  ({String controlUrl, String objectId})
+>((ref, req) {
+  final service = DlnaMetadataService(
+    soap: SoapTransport(client: ref.watch(httpClientProvider)),
+    controlUrl: Uri.parse(req.controlUrl),
+  );
+  return service.browse(req.objectId);
+});

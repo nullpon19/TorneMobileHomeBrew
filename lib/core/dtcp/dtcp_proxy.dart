@@ -34,6 +34,7 @@ import 'dart:typed_data';
 import '../diagnostics.dart';
 import '../errors.dart';
 import 'arib_ts_caption_tap.dart';
+import 'live_ts_aligner.dart';
 import 'pcp.dart';
 
 /// The source's answer to a time-seek content request (plan 61):
@@ -73,17 +74,22 @@ class DtcpMediaFetcher {
   DtcpMediaFetcher({
     HttpClient Function()? clientFactory,
     this.diag = const DiagLog.none(),
+    this.responseHeaderTimeout = const Duration(seconds: 12),
   }) : _clientFactory = clientFactory ?? HttpClient.new;
 
   final HttpClient Function() _clientFactory;
 
   /// Diagnostics sink (plan 28), category network.
   final DiagLog diag;
+
+  /// Upper bound waiting for upstream HTTP response headers so dead LTE
+  /// sockets fail cleanly instead of stalling forever on `request.close()`.
+  final Duration responseHeaderTimeout;
   HttpClient? _client;
 
   HttpClient get _http =>
       _client ??= _clientFactory()
-        ..connectionTimeout = const Duration(seconds: 15);
+        ..connectionTimeout = const Duration(seconds: 12);
 
   /// Closes any pooled sockets so reconnects after a network drop open fresh
   /// TCP connections rather than reusing half-open ones.
@@ -110,7 +116,7 @@ class DtcpMediaFetcher {
     try {
       final request = await _http.headUrl(contentUrl);
       _applyHeaders(request);
-      final response = await request.close();
+      final response = await request.close().timeout(responseHeaderTimeout);
       final rawType =
           response.headers.value(HttpHeaders.contentTypeHeader) ?? '';
       final (mediaType, params) = _parseContentType(rawType);
@@ -147,6 +153,14 @@ class DtcpMediaFetcher {
       return (host, port);
     } on NasneError {
       rethrow;
+    } on TimeoutException catch (e) {
+      resetClient();
+      throw NasneError.unreachable(
+        'dtcp:http',
+        cause:
+            'HEAD response headers timed out after '
+            '${responseHeaderTimeout.inSeconds}s: $e',
+      );
     } catch (e) {
       // Socket/HTTP failures are reachability failures; classify
       // them so the UI (and the debug log) can name the stage.
@@ -181,7 +195,7 @@ class DtcpMediaFetcher {
     try {
       final request = await _http.getUrl(contentUrl);
       _applyHeaders(request);
-      final response = await request.close();
+      final response = await request.close().timeout(responseHeaderTimeout);
       diag(
         DiagCategory.network,
         'GET ${contentUrl.host}:${contentUrl.port} -> '
@@ -197,17 +211,48 @@ class DtcpMediaFetcher {
       return response;
     } on NasneError {
       rethrow;
+    } on TimeoutException catch (e) {
+      resetClient();
+      throw NasneError.unreachable(
+        'dtcp:http',
+        cause:
+            'GET response headers timed out after '
+            '${responseHeaderTimeout.inSeconds}s: $e',
+      );
     } catch (e) {
       throw NasneError.unreachable('dtcp:http', cause: '$e');
     }
   }
 
   static final RegExp _timeSeekNptPattern = RegExp(
-    r'npt=([0-9.]+)-([0-9.]+)/([0-9.]+)',
+    r'npt=([0-9:.]+)-([0-9:.]*)/([0-9:.]+|\*)',
   );
   static final RegExp _timeSeekBytesPattern = RegExp(
     r'bytes=(\d+)-(\d+)/(\d+)',
   );
+
+  /// Parses DLNA NPT timestamps (`600.000` or `01:45:02.000`) into seconds.
+  static double? parseDlnaNptSeconds(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty || trimmed == '*') return null;
+    if (!trimmed.contains(':')) {
+      final v = double.tryParse(trimmed);
+      return (v != null && v.isFinite && v >= 0) ? v : null;
+    }
+    final parts = trimmed.split(':');
+    if (parts.length < 2 || parts.length > 3) return null;
+    if (parts.length == 2) {
+      final m = int.tryParse(parts[0]);
+      final s = double.tryParse(parts[1]);
+      if (m == null || s == null || !s.isFinite) return null;
+      return m * 60.0 + s;
+    }
+    final h = int.tryParse(parts[0]);
+    final m = int.tryParse(parts[1]);
+    final s = double.tryParse(parts[2]);
+    if (h == null || m == null || s == null || !s.isFinite) return null;
+    return h * 3600.0 + m * 60.0 + s;
+  }
 
   /// Opens the GET response for a DLNA time seek (plan 61): the
   /// source starts the PCP stream at its own byte position for
@@ -232,7 +277,7 @@ class DtcpMediaFetcher {
         'npt=${seconds.toStringAsFixed(3)}-',
         preserveHeaderCase: true,
       );
-      final response = await request.close();
+      final response = await request.close().timeout(responseHeaderTimeout);
       diag(
         DiagCategory.network,
         'GET (time seek npt=${seconds.toStringAsFixed(3)}) '
@@ -250,7 +295,22 @@ class DtcpMediaFetcher {
       final bytes = header == null
           ? null
           : _timeSeekBytesPattern.firstMatch(header);
-      if (npt == null || bytes == null) {
+      final startSeconds = npt == null ? null : parseDlnaNptSeconds(npt.group(1)!);
+      final totalSeconds = npt == null ? null : parseDlnaNptSeconds(npt.group(3)!);
+      if (bytes == null) {
+        if (startSeconds != null) {
+          diag(
+            DiagCategory.network,
+            'time seek: source maps npt=$startSeconds (chunked/no byte range, '
+            'total=$totalSeconds s)',
+          );
+          return TimeSeekResponse(
+            response: response,
+            startByte: 0,
+            startSeconds: startSeconds,
+            totalSeconds: totalSeconds,
+          );
+        }
         // The source ignored the seek and is streaming from 0.
         diag(
           DiagCategory.network,
@@ -260,22 +320,29 @@ class DtcpMediaFetcher {
         return TimeSeekResponse(response: response, startByte: 0);
       }
       final startByte = int.parse(bytes.group(1)!);
-      final startSeconds = double.parse(npt.group(1)!);
       diag(
         DiagCategory.network,
         'time seek: source maps npt $startSeconds to byte '
         '$startByte (total ${bytes.group(3)} bytes / '
-        '${npt.group(3)} s)',
+        '${npt?.group(3)} s)',
       );
       return TimeSeekResponse(
         response: response,
         startByte: startByte,
         startSeconds: startSeconds,
         totalBytes: int.parse(bytes.group(3)!),
-        totalSeconds: double.parse(npt.group(3)!),
+        totalSeconds: totalSeconds,
       );
     } on NasneError {
       rethrow;
+    } on TimeoutException catch (e) {
+      resetClient();
+      throw NasneError.unreachable(
+        'dtcp:http',
+        cause:
+            'TimeSeek GET headers timed out after '
+            '${responseHeaderTimeout.inSeconds}s: $e',
+      );
     } catch (e) {
       throw NasneError.unreachable('dtcp:http', cause: '$e');
     }
@@ -329,14 +396,18 @@ class DtcpProxy {
     Duration? totalDuration,
     int? windowCapBytesOverride,
     bool isLive = false,
+    bool isEncrypted = true,
+    bool supportsTimeSeek = false,
     bool autoReconnect = false,
     int maxInitialReconnectAttempts = 3,
+    Duration? stallTimeoutOverride,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
-      Duration(seconds: 3),
-      Duration(seconds: 5),
+      Duration(seconds: 1),
+      Duration(seconds: 2),
+      Duration(seconds: 4),
+      Duration(seconds: 6),
       Duration(seconds: 8),
-      Duration(seconds: 10),
     ],
   }) : _window = _WindowCache(
          capBytes: windowCapBytesOverride ?? windowCapBytes,
@@ -348,9 +419,12 @@ class DtcpProxy {
        _totalBytes = totalBytes, // ignore: prefer_initializing_formals
        _totalDuration = totalDuration, // ignore: prefer_initializing_formals
        _isLive = isLive, // ignore: prefer_initializing_formals
+       _isEncrypted = isEncrypted, // ignore: prefer_initializing_formals
+       _supportsTimeSeek = supportsTimeSeek, // ignore: prefer_initializing_formals
        _autoReconnect = autoReconnect, // ignore: prefer_initializing_formals
        // ignore: prefer_initializing_formals
        _maxInitialReconnectAttempts = maxInitialReconnectAttempts,
+       _stallTimeoutOverride = stallTimeoutOverride, // ignore: prefer_initializing_formals
        _onReauthenticate = onReauthenticate, // ignore: prefer_initializing_formals
        _reconnectBackoff = reconnectBackoff; // ignore: prefer_initializing_formals
 
@@ -364,8 +438,11 @@ class DtcpProxy {
   final DtcpMediaFetcher _fetcher;
   final DiagLog _diag;
   final bool _isLive;
+  final bool _isEncrypted;
+  final bool _supportsTimeSeek;
   final bool _autoReconnect;
   final int _maxInitialReconnectAttempts;
+  final Duration? _stallTimeoutOverride;
   final Future<void> Function()? _onReauthenticate;
   final List<Duration> _reconnectBackoff;
 
@@ -395,7 +472,10 @@ class DtcpProxy {
   DateTime? _lastServedAt;
   int _consecutiveReconnectErrors = 0;
   Object? _lastUpstreamError;
+  bool _isReconnectingUpstream = false;
   int _requestCount = 0;
+  final LiveTsContinuityAligner _liveTsAligner = LiveTsContinuityAligner();
+  double? _streamingTimeSeekStartSeconds;
 
   /// Total ciphertext bytes received from upstream so far.
   int get cipherBytes => _cipherBytes;
@@ -411,6 +491,15 @@ class DtcpProxy {
 
   /// Most recent upstream error / unexpected EOF recorded by the proxy, if any.
   Object? get lastUpstreamError => _lastUpstreamError;
+
+  /// Whether the proxy is currently attempting an upstream reconnect.
+  bool get isReconnectingUpstream => _isReconnectingUpstream;
+
+  /// Known duration of the content, if supplied by metadata.
+  Duration? get totalDuration => _totalDuration;
+
+  /// Whether [seekToTime] is supported for chunked time-seek recordings.
+  bool get supportsTimeSeek => _supportsTimeSeek && !_seekable;
 
   /// Wall-clock time when the first plaintext byte was sent on the active
   /// legacy stream, or `null` if nothing has been served yet.
@@ -452,6 +541,21 @@ class DtcpProxy {
   /// applies its 30 s timeout as the socket read timeout; an
   /// unbounded wait here left the player spinning forever.
   static const Duration stallTimeout = Duration(seconds: 30);
+
+  /// Fast upstream stall detection for live LTE connections so buffered
+  /// seconds in mpv can be preserved while reconnecting upstream.
+  static const Duration liveStallTimeout = Duration(seconds: 8);
+
+  /// Upstream stall detection for recorded connections.
+  static const Duration recordedStallTimeout = Duration(seconds: 12);
+
+  /// Maximum forward plaintext discard accepted on a VBR time-seek undershoot
+  /// before refining using the learned map.
+  static const int maxSkipPlaintextBytes = 2 * 1024 * 1024;
+
+  Duration get _effectiveStallTimeout =>
+      _stallTimeoutOverride ??
+      (_isLive ? liveStallTimeout : recordedStallTimeout);
 
   /// Prefetch bound: the pump pauses upstream reads while this
   /// much decrypted plaintext is waiting for the player. Bounds
@@ -507,14 +611,18 @@ class DtcpProxy {
     Duration? totalDuration,
     int? windowCapBytesOverride,
     bool isLive = false,
+    bool isEncrypted = true,
+    bool supportsTimeSeek = false,
     bool autoReconnect = false,
     int maxInitialReconnectAttempts = 3,
+    Duration? stallTimeoutOverride,
     Future<void> Function()? onReauthenticate,
     List<Duration> reconnectBackoff = const [
-      Duration(seconds: 3),
-      Duration(seconds: 5),
+      Duration(seconds: 1),
+      Duration(seconds: 2),
+      Duration(seconds: 4),
+      Duration(seconds: 6),
       Duration(seconds: 8),
-      Duration(seconds: 10),
     ],
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -529,8 +637,11 @@ class DtcpProxy {
       totalDuration: totalDuration,
       windowCapBytesOverride: windowCapBytesOverride,
       isLive: isLive,
+      isEncrypted: isEncrypted,
+      supportsTimeSeek: supportsTimeSeek,
       autoReconnect: autoReconnect,
       maxInitialReconnectAttempts: maxInitialReconnectAttempts,
+      stallTimeoutOverride: stallTimeoutOverride,
       onReauthenticate: onReauthenticate,
       reconnectBackoff: reconnectBackoff,
     );
@@ -595,29 +706,46 @@ class DtcpProxy {
     var lastMilestone = 0;
     var firstPlainLogged = false;
     var consecutiveErrors = 0;
+    var startedNewSegment = false;
     _legacyPumpActive = true;
+    final stallLimit = _effectiveStallTimeout;
     try {
       while (pumpGen == _pumpGeneration &&
           !_stopRequested &&
           !_downstreamGone) {
         Object? attemptError;
         var unexpectedEof = false;
+        if (startedNewSegment && _isLive) {
+          _liveTsAligner.beginNewSegment();
+        }
         try {
           _diag(
             DiagCategory.playback,
             'proxy: prefetch started, content GET started',
           );
-          final response = await _fetcher.openContent(_contentUrl);
-          final decryptor = PcpDecryptor(keyForLabel: _keyForLabel);
+          final HttpClientResponse response;
+          final seekStartSec = _streamingTimeSeekStartSeconds;
+          if (!_isLive && seekStartSec != null && seekStartSec > 0) {
+            final tsr = await _fetcher.openContentAtTime(
+              _contentUrl,
+              seekStartSec,
+            );
+            response = tsr.response;
+          } else {
+            response = await _fetcher.openContent(_contentUrl);
+          }
+          final decryptor = _isEncrypted
+              ? PcpDecryptor(keyForLabel: _keyForLabel)
+              : null;
           final timed = response.timeout(
-            stallTimeout,
+            stallLimit,
             onTimeout: (sink) {
               sink.addError(
                 NasneError.unreachable(
                   'dtcp:proxy',
                   cause:
                       'the content stream stalled for '
-                      '${stallTimeout.inSeconds} seconds',
+                      '${stallLimit.inSeconds} seconds',
                 ),
               );
               sink.close();
@@ -646,14 +774,29 @@ class DtcpProxy {
               }
               final chunk = iterator.current;
               _cipherBytes += chunk.length;
-              final pieces = await decryptor.add(chunk);
-              packets = decryptor.packetsDecrypted;
-              plainBytes = decryptor.plaintextBytes;
-              for (final piece in pieces) {
+              final List<Uint8List> rawPieces;
+              if (decryptor != null) {
+                rawPieces = await decryptor.add(chunk);
+                packets = decryptor.packetsDecrypted;
+                plainBytes = decryptor.plaintextBytes;
+              } else {
+                final u8 = chunk is Uint8List
+                    ? chunk
+                    : Uint8List.fromList(chunk);
+                rawPieces = u8.isEmpty ? const <Uint8List>[] : [u8];
+                plainBytes += u8.length;
+              }
+              for (final rawPiece in rawPieces) {
                 if (pumpGen != _pumpGeneration) break;
+                final piece = _isLive
+                    ? _liveTsAligner.process(rawPiece)
+                    : rawPiece;
                 consecutiveErrors = 0;
                 _consecutiveReconnectErrors = 0;
                 _lastUpstreamError = null;
+                _isReconnectingUpstream = false;
+                if (piece.isEmpty) continue;
+                startedNewSegment = true;
                 _plaintextBytes += piece.length;
                 if (!firstPlainLogged) {
                   firstPlainLogged = true;
@@ -738,7 +881,9 @@ class DtcpProxy {
         _lastUpstreamError = recordedError;
         consecutiveErrors++;
         _consecutiveReconnectErrors = consecutiveErrors;
-        if (plainBytes == 0 && consecutiveErrors > _maxInitialReconnectAttempts) {
+        if (_plaintextBytes == 0 &&
+            plainBytes == 0 &&
+            consecutiveErrors > _maxInitialReconnectAttempts) {
           _diag(
             DiagCategory.playback,
             'proxy: initial stream failed after $_maxInitialReconnectAttempts '
@@ -747,6 +892,7 @@ class DtcpProxy {
           queue.close(recordedError);
           return;
         }
+        _isReconnectingUpstream = true;
         final rawDelay = _backoffForAttempt(consecutiveErrors - 1);
         final delay = (plainBytes == 0 && rawDelay > const Duration(seconds: 2))
             ? const Duration(seconds: 2)
@@ -780,6 +926,7 @@ class DtcpProxy {
     } finally {
       if (pumpGen == _pumpGeneration) {
         _legacyPumpActive = false;
+        _isReconnectingUpstream = false;
       }
     }
   }
@@ -813,6 +960,41 @@ class DtcpProxy {
     }
     _fetcher.resetClient();
     _queue = _PlaintextQueue();
+    _liveTsAligner.reset();
+    _isReconnectingUpstream = false;
+    _aribCaptionTap.resetAll();
+    _firstServedAt = null;
+    _lastServedAt = null;
+    _downstreamGone = false;
+    _legacyPumpActive = true;
+    _pumpFuture = _pump();
+  }
+
+  /// Repositions a chunked time-seekable recorded stream to [target] using
+  /// `TimeSeekRange.dlna.org: npt=<t>-` without re-running DTCP-IP AKE.
+  Future<void> seekToTime(Duration target) async {
+    if (_seekable || _isLive || _stopRequested || !_supportsTimeSeek) return;
+    final clampedMs = target.isNegative ? 0 : target.inMilliseconds;
+    _streamingTimeSeekStartSeconds = clampedMs / 1000.0;
+    _diag(
+      DiagCategory.playback,
+      'proxy: time-seeking chunked stream to '
+      '${_streamingTimeSeekStartSeconds!.toStringAsFixed(3)}s',
+    );
+    ++_legacyGeneration;
+    ++_pumpGeneration;
+    _queue.close();
+    final oldIter = _iterator;
+    _iterator = null;
+    if (oldIter != null) {
+      await oldIter.cancel().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
+    }
+    _fetcher.resetClient();
+    _queue = _PlaintextQueue();
+    _isReconnectingUpstream = false;
     _aribCaptionTap.resetAll();
     _firstServedAt = null;
     _lastServedAt = null;
@@ -1138,6 +1320,22 @@ class DtcpProxy {
             unawaited(_discardResponse(tsr.response));
             continue;
           }
+          if (startByte <= target &&
+              (target - startByte) > maxSkipPlaintextBytes &&
+              attempts < maxSeekAttempts &&
+              startSeconds != null) {
+            final refined = map.timeForByte(target) - seekMarginSeconds;
+            if (refined > startSeconds + 0.5 && refined > requested + 1.0) {
+              _diag(
+                DiagCategory.playback,
+                'proxy: seek undershot by ${target - startByte} B '
+                '(> ${maxSkipPlaintextBytes ~/ (1024 * 1024)} MiB); refining '
+                'to npt ${refined.toStringAsFixed(3)} s',
+              );
+              unawaited(_discardResponse(tsr.response));
+              continue;
+            }
+          }
           response = tsr.response;
         }
         if (producer.cancelled || _stopRequested) {
@@ -1188,16 +1386,19 @@ class DtcpProxy {
     required int skipPlaintext,
     required Stopwatch stopwatch,
   }) async {
-    final decryptor = PcpDecryptor(keyForLabel: _keyForLabel);
+    final decryptor = _isEncrypted
+        ? PcpDecryptor(keyForLabel: _keyForLabel)
+        : null;
+    final stallLimit = _effectiveStallTimeout;
     final timed = response.timeout(
-      stallTimeout,
+      stallLimit,
       onTimeout: (sink) {
         sink.addError(
           NasneError.unreachable(
             'dtcp:proxy',
             cause:
                 'the content stream stalled for '
-                '${stallTimeout.inSeconds} seconds',
+                '${stallLimit.inSeconds} seconds',
           ),
         );
         sink.close();
@@ -1225,8 +1426,19 @@ class DtcpProxy {
           continue;
         }
         if (!await iterator.moveNext()) break;
-        final pieces = await decryptor.add(iterator.current);
+        final chunk = iterator.current;
+        _cipherBytes += chunk.length;
+        final List<Uint8List> pieces;
+        if (decryptor != null) {
+          pieces = await decryptor.add(chunk);
+        } else {
+          final u8 = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+          pieces = u8.isEmpty ? const <Uint8List>[] : [u8];
+        }
         for (var piece in pieces) {
+          _consecutiveReconnectErrors = 0;
+          _lastUpstreamError = null;
+          _isReconnectingUpstream = false;
           if (skip > 0) {
             if (piece.length <= skip) {
               skip -= piece.length;
@@ -1245,6 +1457,7 @@ class DtcpProxy {
             );
           }
           produced += piece.length;
+          _plaintextBytes += piece.length;
           _window.append(piece);
         }
         if (yieldWatch.elapsedMilliseconds >= 4) {
@@ -1363,23 +1576,75 @@ class DtcpProxy {
     // last-resort case documented in _runProducer).
     var serveStart = reqStart;
     if (reqStart < _window.start || reqStart > _window.end) {
-      _cancelProducer();
-      final producer = _startProducer(reqStart);
-      try {
-        serveStart = await producer.established.future.timeout(
-          seekEstablishTimeout,
-        );
-      } catch (e) {
-        _diag(
-          DiagCategory.playback,
-          'proxy: request #$requestNo: the seek to byte $reqStart '
-          'failed before serving: $e',
-        );
-        response.statusCode = HttpStatus.badGateway;
+      var establishAttempts = 0;
+      while (true) {
+        _cancelProducer();
+        final producer = _startProducer(reqStart);
         try {
-          await response.close();
-        } catch (_) {}
-        return;
+          serveStart = await producer.established.future.timeout(
+            seekEstablishTimeout,
+          );
+          _isReconnectingUpstream = false;
+          break;
+        } catch (e) {
+          if (generation != _serveGeneration || _stopRequested) {
+            try {
+              await response.close();
+            } catch (_) {}
+            return;
+          }
+          final maxRetries = _servedBytes > 0 ? 10 : _maxInitialReconnectAttempts;
+          if (!_autoReconnect || establishAttempts >= maxRetries) {
+            _isReconnectingUpstream = false;
+            _lastUpstreamError = e;
+            _diag(
+              DiagCategory.playback,
+              'proxy: request #$requestNo: the seek to byte $reqStart '
+              'failed before serving: $e',
+            );
+            response.statusCode = HttpStatus.badGateway;
+            try {
+              await response.close();
+            } catch (_) {}
+            return;
+          }
+          establishAttempts++;
+          _consecutiveReconnectErrors = establishAttempts;
+          _lastUpstreamError = e;
+          _isReconnectingUpstream = true;
+          final rawDelay = _backoffForAttempt(establishAttempts - 1);
+          final delay =
+              (_servedBytes == 0 && rawDelay > const Duration(seconds: 2))
+              ? const Duration(seconds: 2)
+              : rawDelay;
+          _diag(
+            DiagCategory.playback,
+            'proxy: request #$requestNo: seek establish attempt '
+            '$establishAttempts failed at byte $reqStart ($e); retrying in '
+            '${delay.inMilliseconds} ms',
+          );
+          if (delay > Duration.zero) {
+            await Future<void>.delayed(delay);
+          }
+          if (generation != _serveGeneration || _stopRequested) {
+            _isReconnectingUpstream = false;
+            try {
+              await response.close();
+            } catch (_) {}
+            return;
+          }
+          _fetcher.resetClient();
+          if (_shouldReauthenticate(e, establishAttempts)) {
+            try {
+              await _onReauthenticate?.call();
+            } catch (reauthErr) {
+              _diag(
+                DiagCategory.playback,
+                'proxy: seek establish reauth failed: $reauthErr',
+              );
+            }
+          }
+        }
       }
       if (generation != _serveGeneration) {
         // Superseded while establishing; the newer request owns
@@ -1432,6 +1697,8 @@ class DtcpProxy {
         if (chunk != null) {
           consecutiveReconnectErrors = 0;
           stalledRestarts = 0;
+          _consecutiveReconnectErrors = 0;
+          _isReconnectingUpstream = false;
           final take = min(chunk.length, reqEnd - pos + 1);
           final slice = take == chunk.length
               ? chunk
@@ -1446,6 +1713,10 @@ class DtcpProxy {
           response.add(slice);
           pos += take;
           servedHere += take;
+          _servedBytes += take;
+          final now = DateTime.now();
+          _firstServedAt ??= now;
+          _lastServedAt = now;
           await response.flush();
           continue;
         }
@@ -1467,10 +1738,14 @@ class DtcpProxy {
         if (error != null) {
           if (_autoReconnect) {
             Object? lastError = error;
+            _lastUpstreamError = error;
+            _isReconnectingUpstream = true;
             var reconnected = false;
+            var consecutiveOvershoots = 0;
             while (!_stopRequested && generation == _serveGeneration) {
               final delay = _backoffForAttempt(consecutiveReconnectErrors);
               consecutiveReconnectErrors++;
+              _consecutiveReconnectErrors = consecutiveReconnectErrors;
               _diag(
                 DiagCategory.playback,
                 'proxy: request #$requestNo: reconnecting at byte $pos '
@@ -1504,14 +1779,19 @@ class DtcpProxy {
                 );
                 if (actual <= pos) {
                   reconnected = true;
+                  _isReconnectingUpstream = false;
                   break;
                 }
+                consecutiveOvershoots++;
                 lastError = StateError('overshoot past $pos ($actual)');
-                break;
+                _lastUpstreamError = lastError;
+                if (consecutiveOvershoots >= 5) break;
               } catch (e) {
                 lastError = e;
+                _lastUpstreamError = e;
               }
             }
+            _isReconnectingUpstream = false;
             if (reconnected) continue;
             break;
           }
@@ -1561,9 +1841,11 @@ class DtcpProxy {
           final remaining = total - _window.end;
           final nearDeclaredEnd =
               total > 0 &&
+              _window.end > 0 &&
               (remaining <= 2 * 1024 * 1024 || remaining * 50 <= total);
-          if (nearDeclaredEnd || stalledRestarts >= 2) {
+          if (nearDeclaredEnd || (!_autoReconnect && stalledRestarts >= 2)) {
             _eofByte = _window.end;
+            _isReconnectingUpstream = false;
             _diag(
               DiagCategory.playback,
               'proxy: request #$requestNo: upstream ended cleanly at '
@@ -1572,17 +1854,37 @@ class DtcpProxy {
             break;
           }
           if (_autoReconnect) {
+            _consecutiveReconnectErrors = stalledRestarts;
+            _isReconnectingUpstream = true;
+            _lastUpstreamError ??= NasneError.unreachable(
+              'dtcp:proxy',
+              cause: 'upstream ended early at byte ${_window.end}/$total',
+            );
             final delay = _backoffForAttempt(stalledRestarts - 1);
             _diag(
               DiagCategory.playback,
               'proxy: request #$requestNo: upstream ended early at '
-              'byte ${_window.end}; retrying in ${delay.inMilliseconds} ms',
+              'byte ${_window.end}/$total; retrying in '
+              '${delay.inMilliseconds} ms',
             );
             if (delay > Duration.zero) {
               await Future<void>.delayed(delay);
             }
-            if (_stopRequested || generation != _serveGeneration) break;
+            if (_stopRequested || generation != _serveGeneration) {
+              _isReconnectingUpstream = false;
+              break;
+            }
             _fetcher.resetClient();
+            if (_shouldReauthenticate(null, stalledRestarts)) {
+              try {
+                await _onReauthenticate?.call();
+              } catch (e) {
+                _diag(
+                  DiagCategory.playback,
+                  'proxy: early-EOF reauth failed: $e',
+                );
+              }
+            }
           }
         } else {
           stalledRestarts = 0;

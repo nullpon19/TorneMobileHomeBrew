@@ -14,6 +14,20 @@ import '../transport/ssdp_transport.dart';
 import '../transport/xml_util.dart';
 import 'interfaces.dart';
 
+/// Returns whether [device] is a generic UPnP/DLNA MediaServer supporting
+/// ContentDirectory:1 viewing (excluding nasne and proprietary DTCP+ endpoints).
+bool isGenericDlnaMediaServer(NasneDevice device) {
+  if (device.isNasne) return false;
+  if (device.controlUrl('urn:schemas-upnp-org:service:ContentDirectory:1') ==
+      null) {
+    return false;
+  }
+  final isProprietaryDtcpPlus = device.services.keys.any(
+    (k) => k.contains('X_DtcpPlus'),
+  );
+  return !isProprietaryDtcpPlus;
+}
+
 class SsdpDiscoveryService implements DiscoveryService {
   SsdpDiscoveryService({
     SsdpTransport? ssdp,
@@ -67,6 +81,136 @@ class SsdpDiscoveryService implements DiscoveryService {
     }
     return parseDeviceDescription(
         utf8.decode(resp.bodyBytes, allowMalformed: true), location);
+  }
+
+  /// Scans the LAN for generic DLNA MediaServer recorders (non-nasne DMS
+  /// devices exposing `ContentDirectory:1`), deduplicated by UDN/control URL.
+  Future<List<NasneDevice>> discoverDlnaServers({
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final responses = await _ssdp.search(
+      mediaServerSearchTarget,
+      timeout: timeout,
+    );
+    final locations = <String>{};
+    for (final r in responses) {
+      final loc = r.location;
+      if (loc != null && loc.isNotEmpty) locations.add(loc);
+    }
+    final devices = <NasneDevice>[];
+    final seenIds = <String>{};
+    for (final loc in locations) {
+      try {
+        final device = await describe(Uri.parse(loc));
+        if (!isGenericDlnaMediaServer(device)) continue;
+        final cds = device.controlUrl(
+          'urn:schemas-upnp-org:service:ContentDirectory:1',
+        );
+        final key = device.udn.trim().isNotEmpty
+            ? device.udn.trim()
+            : (cds?.toString() ?? device.descriptionUrl.toString());
+        if (seenIds.add(key)) {
+          devices.add(device);
+        }
+      } on NasneError {
+        continue;
+      }
+    }
+    return devices;
+  }
+
+  /// Resolves a manually entered URL (`http://...`) or host (`192.168.x.x` /
+  /// `host:port`) into a generic DLNA MediaServer description.
+  Future<NasneDevice> probeDlnaServerAddress(
+    String rawInput, {
+    Duration probeTimeout = const Duration(seconds: 4),
+  }) async {
+    final trimmed = rawInput.trim();
+    if (trimmed.isEmpty) {
+      throw NasneError.validation('dlna:probe', 'アドレスを入力してください');
+    }
+    final candidates = <Uri>[];
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      final parsed = Uri.tryParse(trimmed);
+      if (parsed == null || parsed.host.isEmpty) {
+        throw NasneError.validation('dlna:probe', '有効な URL を入力してください');
+      }
+      if (parsed.path.isNotEmpty && parsed.path != '/') {
+        candidates.add(parsed);
+      } else {
+        for (final path in const [
+          '/description.xml',
+          '/dms/ddd.xml',
+          '/Server0/DDD_S0',
+          '/rootDesc.xml',
+          '/',
+        ]) {
+          candidates.add(parsed.replace(path: path));
+        }
+      }
+    } else {
+      final parsedHostPort = Uri.tryParse('http://$trimmed');
+      if (parsedHostPort == null || parsedHostPort.host.isEmpty) {
+        throw NasneError.validation(
+          'dlna:probe',
+          '有効な IP アドレスまたはホスト名を入力してください',
+        );
+      }
+      if (parsedHostPort.hasPort) {
+        for (final path in const [
+          '/description.xml',
+          '/dms/ddd.xml',
+          '/Server0/DDD_S0',
+          '/rootDesc.xml',
+          '/',
+        ]) {
+          candidates.add(parsedHostPort.replace(path: path));
+        }
+      } else {
+        const portPaths = <(int, String)>[
+          (20003, '/description.xml'),
+          (60606, '/Server0/DDD_S0'),
+          (55000, '/dms/ddd.xml'),
+          (8888, '/description.xml'),
+          (49152, '/description.xml'),
+          (8200, '/rootDesc.xml'),
+        ];
+        for (final (port, path) in portPaths) {
+          candidates.add(
+            Uri(
+              scheme: 'http',
+              host: parsedHostPort.host,
+              port: port,
+              path: path,
+            ),
+          );
+        }
+      }
+    }
+
+    final results = await Future.wait<NasneDevice?>([
+      for (final uri in candidates)
+        () async {
+          try {
+            final resp = await _client.get(uri).timeout(probeTimeout);
+            if (resp.statusCode != 200) return null;
+            final device = parseDeviceDescription(
+              utf8.decode(resp.bodyBytes, allowMalformed: true),
+              uri,
+            );
+            return isGenericDlnaMediaServer(device) ? device : null;
+          } catch (_) {
+            return null;
+          }
+        }(),
+    ]);
+    for (final found in results) {
+      if (found != null) return found;
+    }
+    throw NasneError.unreachable(
+      'dlna:probe',
+      cause: '指定されたアドレスから再生対応の DLNA/DTCP-IP サーバーが見つかりませんでした',
+    );
   }
 }
 

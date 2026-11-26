@@ -489,7 +489,9 @@ void main() {
       expect(hour.useDiskCache, isTrue);
       expect(hour.demuxerMaxBytes, maxDiskCacheBytes);
       expect(hour.demuxerMaxBackBytes, maxDiskBackCacheBytes);
-      expect(hour.networkTimeoutSeconds, 600);
+      expect(hour.networkTimeoutSeconds, 3720);
+      expect(hour.startTimeoutSeconds, 90);
+      expect(hour.rebufferWaitSeconds, 5);
 
       // Clamps when available disk is tight, leaving >= 1 GiB (1024 MiB) free
       // after both forward and backward disk cache layers.
@@ -577,9 +579,59 @@ void main() {
       expect(liveThreeMin.cachePauseInitial, isTrue);
       expect(liveThreeMin.cachePause, isTrue);
       expect(liveThreeMin.cachePauseWaitSeconds, 180);
+      expect(liveThreeMin.rebufferWaitSeconds, 15);
       expect(liveThreeMin.readaheadSeconds, livePauseTimeshiftSeconds);
-      expect(liveThreeMin.networkTimeoutSeconds, 210);
+      expect(liveThreeMin.networkTimeoutSeconds, 360);
       expect(liveThreeMin.startTimeoutSeconds, 225);
+
+      final live30s = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 30,
+        isAndroid: true,
+        availableDiskBytes: 4 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(live30s.cachePauseWaitSeconds, 30);
+      expect(live30s.rebufferWaitSeconds, 15);
+      expect(live30s.networkTimeoutSeconds, 360);
+
+      final live15s = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 15,
+        isAndroid: true,
+        availableDiskBytes: 4 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(live15s.cachePauseWaitSeconds, 15);
+      expect(live15s.rebufferWaitSeconds, 15);
+      expect(live15s.networkTimeoutSeconds, 360);
+
+      expect(recordedDemuxerProbeSizeBytes(useMobile: true), 512 * 1024);
+      expect(recordedDemuxerProbeSizeBytes(useMobile: false), 2 * 1024 * 1024);
+      expect(
+        shouldDeferPlayerInterruption(
+          playingNow: true,
+          bufferedAheadSeconds: 12.0,
+          bufferDeltaSeconds: 0.0,
+          proxyReconnecting: true,
+          buffering: false,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldDeferPlayerInterruption(
+          playingNow: false,
+          bufferedAheadSeconds: 0.2,
+          bufferDeltaSeconds: 0.0,
+          proxyReconnecting: false,
+          buffering: true,
+        ),
+        isFalse,
+      );
+      expect(
+        computeEffectiveStallTimeout(live: true, rebufferWaitSeconds: 15),
+        const Duration(seconds: 35),
+      );
     });
 
     testWidgets(

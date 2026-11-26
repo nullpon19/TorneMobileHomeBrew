@@ -674,8 +674,8 @@ class AkeClient {
             throw NasneError.parse('dtcp:ake', cause: 'invalid RTT_TEST frame');
           }
           receivedRttTest = frame.payload;
-          diag(DiagCategory.ake, 'rtt: test received');
           await reader.send(frame.accepted(payload: rttTestResponse!));
+          diag(DiagCategory.ake, 'rtt: test received');
         case AkeCommands.rttVerify:
           if (frame.isResponse ||
               rttExpectedTest == null ||
