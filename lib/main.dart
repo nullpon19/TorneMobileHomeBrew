@@ -199,7 +199,7 @@ class TmhbApp extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final nightMode = ref.watch(nightModeProvider);
+    final themeMode = ref.watch(effectiveThemeModeProvider);
     return MaterialApp(
       title: 'torne mobile HB',
       // Force Japanese locale so Fire OS fonts.xml picks NotoSansCJK JP
@@ -219,7 +219,7 @@ class TmhbApp extends ConsumerWidget {
       ),
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      themeMode: nightMode ? ThemeMode.dark : ThemeMode.light,
+      themeMode: themeMode,
       home: const AppShell(),
     );
   }

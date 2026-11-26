@@ -637,11 +637,11 @@ void main() {
         expect(find.byType(FireTvTextInputField), findsOneWidget);
 
         await tester.scrollUntilVisible(
-          find.text('ナイトモード'),
+          find.text('ダークモード'),
           200,
           scrollable: find.byType(Scrollable).first,
         );
-        await tester.tap(find.text('ナイトモード'));
+        await tester.tap(find.text('ダークモード'));
         await tester.pumpAndSettle();
         expect(await kv.read('firetv_night_mode'), 'true');
 

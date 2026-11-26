@@ -10,6 +10,7 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:material_ui/material_ui.dart' show ThemeMode;
 
 import '../core/core.dart';
 import '../ui/player_cache_policy.dart';
@@ -353,31 +354,97 @@ final videoHwdecModeProvider =
       VideoHwdecModeNotifier.new,
     );
 
-/// Persisted night mode preference (dark theme toggle, default off = light).
-class NightModeNotifier extends Notifier<bool> {
-  static const _key = 'firetv_night_mode';
+/// Theme appearance preference across platforms (`system` follows OS dark/light
+/// on touch/desktop while staying light on TV).
+enum AppThemePreference { system, light, dark }
+
+/// Maps [preference] to a Material [ThemeMode]; TV keeps explicit light/dark
+/// and treats `system` as [ThemeMode.light] so Fire TV visuals stay unchanged.
+ThemeMode resolveEffectiveThemeMode({
+  required AppThemePreference preference,
+  required bool isTv,
+}) {
+  return switch (preference) {
+    AppThemePreference.dark => ThemeMode.dark,
+    AppThemePreference.light => ThemeMode.light,
+    AppThemePreference.system => isTv ? ThemeMode.light : ThemeMode.system,
+  };
+}
+
+AppThemePreference? _parseAppThemePreference(String? raw) {
+  for (final value in AppThemePreference.values) {
+    if (value.name == raw) return value;
+  }
+  return null;
+}
+
+/// Persisted theme preference with backward-compatible migration from the legacy
+/// `firetv_night_mode` boolean key.
+class AppThemePreferenceNotifier extends Notifier<AppThemePreference> {
+  static const _key = 'app_theme_mode';
+  static const _legacyKey = 'firetv_night_mode';
   bool _dirty = false;
 
   @override
-  bool build() {
+  AppThemePreference build() {
     _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
       if (_dirty) return;
-      if (raw == 'true' && !state) {
-        state = true;
-      } else if (raw == 'false' && state) {
-        state = false;
+      final parsed = _parseAppThemePreference(raw);
+      if (parsed != null) {
+        if (state != parsed) state = parsed;
+        return;
+      }
+      final legacy = await store.read(_legacyKey);
+      if (_dirty) return;
+      if (legacy == 'true' && state != AppThemePreference.dark) {
+        state = AppThemePreference.dark;
+      } else if (legacy == 'false' && state != AppThemePreference.light) {
+        state = AppThemePreference.light;
       }
     });
-    return false;
+    return AppThemePreference.system;
   }
 
-  Future<void> set(bool enabled) async {
+  Future<void> set(AppThemePreference preference) async {
     _dirty = true;
-    state = enabled;
-    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+    state = preference;
+    final store = ref.read(keyValueStoreProvider);
+    await store.write(_key, preference.name);
+    if (preference == AppThemePreference.dark) {
+      await store.write(_legacyKey, 'true');
+    } else if (preference == AppThemePreference.light) {
+      await store.write(_legacyKey, 'false');
+    } else {
+      await store.delete(_legacyKey);
+    }
+  }
+}
+
+final appThemePreferenceProvider =
+    NotifierProvider<AppThemePreferenceNotifier, AppThemePreference>(
+      AppThemePreferenceNotifier.new,
+    );
+
+/// Effective [ThemeMode] factoring in TV vs non-TV platform rules.
+final effectiveThemeModeProvider = Provider<ThemeMode>((ref) {
+  final pref = ref.watch(appThemePreferenceProvider);
+  final isTv = ref.watch(uiControlModeProvider).isTv;
+  return resolveEffectiveThemeMode(preference: pref, isTv: isTv);
+});
+
+/// Dark-mode boolean view over [appThemePreferenceProvider] (kept for TV toggle
+/// and existing callers/tests).
+class NightModeNotifier extends Notifier<bool> {
+  @override
+  bool build() => ref.watch(appThemePreferenceProvider) == AppThemePreference.dark;
+
+  Future<void> set(bool enabled) async {
+    await ref
+        .read(appThemePreferenceProvider.notifier)
+        .set(enabled ? AppThemePreference.dark : AppThemePreference.light);
   }
 }
 

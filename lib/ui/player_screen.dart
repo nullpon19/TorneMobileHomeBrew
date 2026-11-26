@@ -2745,6 +2745,21 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
   }
 }
 
+/// Preserves active fullscreen/orientation state across in-playback
+/// `pushReplacement` transitions (channel switch, quality switch, next
+/// episode, failover), resetting when actually exiting playback.
+class PlayerSessionFullscreenHandoff {
+  static bool? touchFullscreenOverride;
+  static bool touchLandscapeLocked = false;
+  static bool desktopFullscreen = false;
+
+  static void reset() {
+    touchFullscreenOverride = null;
+    touchLandscapeLocked = false;
+    desktopFullscreen = false;
+  }
+}
+
 class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({
     super.key,
@@ -3693,8 +3708,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _liveGuideEvents = List<EpgEvent>.of(seeded);
       }
     }
+    _touchFullscreenOverride =
+        PlayerSessionFullscreenHandoff.touchFullscreenOverride;
+    _desktopFullscreen = PlayerSessionFullscreenHandoff.desktopFullscreen;
     _recordLiveChannelProgramSnapshot(_activeLiveChannel);
-    if (_initialUiMode.isTouch) {
+    if (_initialUiMode.isTouch &&
+        !PlayerSessionFullscreenHandoff.touchLandscapeLocked) {
       unawaited(
         SystemChrome.setPreferredOrientations(const [
           DeviceOrientation.portraitUp,
@@ -6618,6 +6637,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         (
           name: 'system ui restore',
           run: () {
+            if (_replacedByNextPlayer) return;
+            PlayerSessionFullscreenHandoff.reset();
             unawaited(
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
             );
@@ -6949,6 +6970,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _toggleDesktopFullscreen() async {
     final next = await _desktopWindow.toggleFullscreen();
+    PlayerSessionFullscreenHandoff.desktopFullscreen = next;
     if (!mounted) return;
     setState(() => _desktopFullscreen = next);
     _resetOsdTimer();
@@ -6956,6 +6978,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _setDesktopFullscreen(bool target) async {
     final next = await _desktopWindow.setFullscreen(target);
+    PlayerSessionFullscreenHandoff.desktopFullscreen = next;
     if (!mounted) return;
     setState(() => _desktopFullscreen = next);
   }
@@ -6964,6 +6987,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _orientationResetTimer?.cancel();
     final isTablet = MediaQuery.sizeOf(context).shortestSide >= 600;
     if (!currentlyFullscreen) {
+      PlayerSessionFullscreenHandoff.touchFullscreenOverride = true;
+      if (!isTablet) {
+        PlayerSessionFullscreenHandoff.touchLandscapeLocked = true;
+      }
       setState(() {
         _touchFullscreenOverride = true;
         _touchPortraitOverlayOpen = false;
@@ -6980,6 +7007,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
       return;
     }
+    PlayerSessionFullscreenHandoff.touchFullscreenOverride = false;
+    PlayerSessionFullscreenHandoff.touchLandscapeLocked = false;
     setState(() {
       _touchFullscreenOverride = false;
       _osdOpen = false;
@@ -8549,6 +8578,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (uiMode.isTouch && isLandscape != _lastPhysicalLandscape) {
       if (_lastPhysicalLandscape != null) {
         _touchFullscreenOverride = null;
+        PlayerSessionFullscreenHandoff.touchFullscreenOverride = null;
+        if (!isLandscape) {
+          PlayerSessionFullscreenHandoff.touchLandscapeLocked = false;
+        }
       }
       _lastPhysicalLandscape = isLandscape;
     }
@@ -9282,16 +9315,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } else {
       portraitDetail = null;
     }
-    final prevEntry = widget.live && _canSwitchLiveChannel
-        ? _previewTargetFor(ChannelSwitchDirection.previous)
-        : null;
-    final nextEntry = widget.live && _canSwitchLiveChannel
-        ? _previewTargetFor(ChannelSwitchDirection.next)
-        : null;
-    final prevKey = prevEntry != null ? liveServiceKey(prevEntry.channel) : null;
-    final nextKey = nextEntry != null ? liveServiceKey(nextEntry.channel) : null;
-    final prevNum = prevKey != null ? _liveChannelNumbers[prevKey] : null;
-    final nextNum = nextKey != null ? _liveChannelNumbers[nextKey] : null;
 
     return Container(
       key: const ValueKey('touch_portrait_osd_panel'),
@@ -9337,67 +9360,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             if (_jikkyoOn) ...[
               const SizedBox(height: 8),
               _buildJikkyoOsdStatusRow(),
-            ],
-            if (widget.live && _canSwitchLiveChannel) ...[
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const ValueKey('touch_portrait_prev_channel_button'),
-                      style: osdButtonStyle().copyWith(
-                        padding: const WidgetStatePropertyAll(
-                          EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        ),
-                      ),
-                      onPressed: prevEntry == null
-                          ? null
-                          : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
-                      icon: const Icon(Icons.chevron_left, size: 18),
-                      label: Text(
-                        prevEntry == null
-                            ? '前のチャンネル'
-                            : '${prevNum != null ? '$prevNum ' : ''}${prevEntry.displayChannelName}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton(
-                      key: const ValueKey('touch_portrait_next_channel_button'),
-                      style: osdButtonStyle().copyWith(
-                        padding: const WidgetStatePropertyAll(
-                          EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        ),
-                      ),
-                      onPressed: nextEntry == null
-                          ? null
-                          : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Flexible(
-                            child: Text(
-                              nextEntry == null
-                                  ? '次のチャンネル'
-                                  : '${nextNum != null ? '$nextNum ' : ''}${nextEntry.displayChannelName}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 12),
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          const Icon(Icons.chevron_right, size: 18),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
             ],
             const SizedBox(height: 10),
             Row(

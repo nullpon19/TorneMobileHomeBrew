@@ -931,5 +931,125 @@ void main() {
       final text = tester.widget<Text>(find.text('09:36'));
       expect(text.style?.fontSize, 40);
     });
+
+    test('resolveEffectiveThemeMode follows OS only on non-TV devices', () {
+      expect(
+        resolveEffectiveThemeMode(
+          preference: AppThemePreference.system,
+          isTv: false,
+        ),
+        ThemeMode.system,
+      );
+      expect(
+        resolveEffectiveThemeMode(
+          preference: AppThemePreference.system,
+          isTv: true,
+        ),
+        ThemeMode.light,
+      );
+      expect(
+        resolveEffectiveThemeMode(
+          preference: AppThemePreference.dark,
+          isTv: true,
+        ),
+        ThemeMode.dark,
+      );
+      expect(
+        resolveEffectiveThemeMode(
+          preference: AppThemePreference.light,
+          isTv: false,
+        ),
+        ThemeMode.light,
+      );
+    });
+
+    test(
+      'appThemePreferenceProvider migrates legacy key and syncs nightModeProvider',
+      () async {
+        final kv = InMemoryKeyValueStore();
+        await kv.write('firetv_night_mode', 'true');
+        final container = ProviderContainer(
+          overrides: [keyValueStoreProvider.overrideWithValue(kv)],
+        );
+        addTearDown(container.dispose);
+
+        container.read(appThemePreferenceProvider);
+        await Future<void>.delayed(Duration.zero);
+        expect(container.read(appThemePreferenceProvider), AppThemePreference.dark);
+        expect(container.read(nightModeProvider), isTrue);
+
+        await container
+            .read(appThemePreferenceProvider.notifier)
+            .set(AppThemePreference.system);
+        expect(container.read(appThemePreferenceProvider), AppThemePreference.system);
+        expect(container.read(nightModeProvider), isFalse);
+        expect(await kv.read('app_theme_mode'), 'system');
+        expect(await kv.read('firetv_night_mode'), isNull);
+      },
+    );
+
+    testWidgets(
+      'SettingsScreen shows auto/light/dark theme for non-TV and ダークモード switch for TV',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 960);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final kv = InMemoryKeyValueStore();
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kv),
+              defaultTargetUiControlModeProvider.overrideWithValue(
+                UiControlMode.touch,
+              ),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('外観テーマ'), findsOneWidget);
+        expect(find.text('ダークモード'), findsNothing);
+        expect(find.text('ダーク'), findsOneWidget);
+        await tester.tap(find.text('ダーク'));
+        await tester.pumpAndSettle();
+        expect(await kv.read('app_theme_mode'), 'dark');
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              keyValueStoreProvider.overrideWithValue(kv),
+              defaultTargetUiControlModeProvider.overrideWithValue(
+                UiControlMode.tv,
+              ),
+            ],
+            child: const MaterialApp(home: SettingsScreen()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('ダークモード'), findsOneWidget);
+        expect(find.text('外観テーマ'), findsNothing);
+      },
+    );
+
+    test('PlayerSessionFullscreenHandoff preserves and resets state cleanly', () {
+      PlayerSessionFullscreenHandoff.reset();
+      addTearDown(PlayerSessionFullscreenHandoff.reset);
+
+      PlayerSessionFullscreenHandoff.touchFullscreenOverride = true;
+      PlayerSessionFullscreenHandoff.touchLandscapeLocked = true;
+      PlayerSessionFullscreenHandoff.desktopFullscreen = true;
+
+      expect(PlayerSessionFullscreenHandoff.touchFullscreenOverride, isTrue);
+      expect(PlayerSessionFullscreenHandoff.touchLandscapeLocked, isTrue);
+      expect(PlayerSessionFullscreenHandoff.desktopFullscreen, isTrue);
+
+      PlayerSessionFullscreenHandoff.reset();
+      expect(PlayerSessionFullscreenHandoff.touchFullscreenOverride, isNull);
+      expect(PlayerSessionFullscreenHandoff.touchLandscapeLocked, isFalse);
+      expect(PlayerSessionFullscreenHandoff.desktopFullscreen, isFalse);
+    });
   });
 }

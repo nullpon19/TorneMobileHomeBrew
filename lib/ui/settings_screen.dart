@@ -176,13 +176,53 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           const Divider(),
           _sectionTitle(context, '表示'),
-          SwitchListTile(
-            title: const Text('ナイトモード'),
-            subtitle: const Text('暗い背景のダークテーマに切り替えます'),
-            value: ref.watch(nightModeProvider),
-            onChanged: (value) =>
-                ref.read(nightModeProvider.notifier).set(value),
-          ),
+          if (ref.watch(uiControlModeProvider).isTv)
+            SwitchListTile(
+              title: const Text('ダークモード'),
+              subtitle: const Text('暗い背景のダークテーマに切り替えます'),
+              value: ref.watch(nightModeProvider),
+              onChanged: (value) =>
+                  ref.read(nightModeProvider.notifier).set(value),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '外観テーマ',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  SegmentedButton<AppThemePreference>(
+                    segments: const [
+                      ButtonSegment(
+                        value: AppThemePreference.system,
+                        label: Text('自動'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemePreference.light,
+                        label: Text('ライト'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemePreference.dark,
+                        label: Text('ダーク'),
+                      ),
+                    ],
+                    selected: {ref.watch(appThemePreferenceProvider)},
+                    onSelectionChanged: (selection) => ref
+                        .read(appThemePreferenceProvider.notifier)
+                        .set(selection.first),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '「自動」はデバイスの外観設定に合わせてライト／ダークを切り替えます。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
           const Divider(),
           _sectionTitle(context, '番組表'),
           SwitchListTile(
