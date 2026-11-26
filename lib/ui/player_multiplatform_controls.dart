@@ -54,6 +54,9 @@ double? resolveLiveTimeshiftTargetSeconds({
   return cacheStartSeconds + (cacheEndSeconds - cacheStartSeconds) * normalized;
 }
 
+/// Two-step horizontal swipe action on touch live playback.
+enum TouchChannelSwipeAction { showPreview, switchChannel, dismissPreview }
+
 /// Resolves a horizontal touch swipe on the video surface to a channel switch
 /// direction (`previous` on right-ward swipe, `next` on left-ward swipe).
 ChannelSwitchDirection? resolveTouchHorizontalSwipeDirection({
@@ -62,17 +65,45 @@ ChannelSwitchDirection? resolveTouchHorizontalSwipeDirection({
   required double startX,
   required double viewportWidth,
 }) {
-  final width = viewportWidth <= 0 ? 1.0 : viewportWidth;
   final vel = primaryVelocity ?? 0.0;
   final isRightSwipe = dragDeltaX > 42.0 || (dragDeltaX > 18.0 && vel > 320.0);
   final isLeftSwipe = dragDeltaX < -42.0 || (dragDeltaX < -18.0 && vel < -320.0);
-  if (isRightSwipe && startX <= width * 0.6) {
-    return ChannelSwitchDirection.previous;
-  }
-  if (isLeftSwipe && startX >= width * 0.4) {
-    return ChannelSwitchDirection.next;
-  }
+  if (isRightSwipe) return ChannelSwitchDirection.previous;
+  if (isLeftSwipe) return ChannelSwitchDirection.next;
   return null;
+}
+
+/// Maps a touch horizontal swipe [swipeDirection] against the currently open
+/// [currentPreviewDirection]: first swipe opens the preview card, second swipe
+/// in the same direction switches channels, and opposite swipe dismisses it.
+TouchChannelSwipeAction resolveTouchChannelSwipeAction({
+  required ChannelSwitchDirection swipeDirection,
+  required ChannelSwitchDirection? currentPreviewDirection,
+}) {
+  if (currentPreviewDirection == null) {
+    return TouchChannelSwipeAction.showPreview;
+  }
+  if (currentPreviewDirection == swipeDirection) {
+    return TouchChannelSwipeAction.switchChannel;
+  }
+  return TouchChannelSwipeAction.dismissPreview;
+}
+
+/// Computes symmetric left/right inset in touch landscape fullscreen so UI
+/// overlays align with both the 16:9 video frame and notch / Dynamic Island safe
+/// areas without asymmetric cropping.
+double computeTouchLandscapeHorizontalInset({
+  required Size viewportSize,
+  required EdgeInsets safePadding,
+  double videoAspectRatio = 16 / 9,
+}) {
+  final safeSide = math.max(safePadding.left, safePadding.right);
+  final letterboxSide = math.max(
+    0.0,
+    (viewportSize.width - viewportSize.height * videoAspectRatio) / 2.0,
+  );
+  final maxAllowed = math.max(0.0, (viewportSize.width - 240.0) / 2.0);
+  return math.max(safeSide, letterboxSide).clamp(0.0, maxAllowed).toDouble();
 }
 
 /// Center transport buttons (`-10秒`, `Play/Pause`, `+10秒`) shown on hover

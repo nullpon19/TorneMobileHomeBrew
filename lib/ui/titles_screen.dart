@@ -58,12 +58,16 @@
 /// lagged, which made the recording look unrecorded.
 library;
 
+import 'dart:typed_data';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/bs_epg_providers.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'channel_badge.dart';
 import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
@@ -337,6 +341,128 @@ String? _formatRecordedDetailMeta(RecordedTitle title) {
   return null;
 }
 
+Iterable<int> _recordedChannelBandCandidates(int? broadcastingType) {
+  if (broadcastingType == terrestrialBroadcastingType ||
+      broadcastingType == bsBroadcastingType ||
+      broadcastingType == csBroadcastingType) {
+    return [broadcastingType!];
+  }
+  return const [
+    terrestrialBroadcastingType,
+    bsBroadcastingType,
+    csBroadcastingType,
+  ];
+}
+
+({String? number, Uint8List? logo}) _resolveCachedRecordedChannelMetadata(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  RecordedTitle title,
+) {
+  final serviceId = title.channel?.serviceId;
+  final channelName = title.channelName;
+  String? number;
+  Uint8List? logo;
+  for (final bandType in _recordedChannelBandCandidates(
+    title.channel?.broadcastingType,
+  )) {
+    final channels = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelsProvider(reg)).value ?? const <Channel>[],
+      bsBroadcastingType =>
+        container.read(bsChannelsProvider(reg)).value ?? const <Channel>[],
+      csBroadcastingType =>
+        container.read(csChannelsProvider(reg)).value ?? const <Channel>[],
+      _ => const <Channel>[],
+    };
+    final logos = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      bsBroadcastingType =>
+        container.read(bsChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      csBroadcastingType =>
+        container.read(csChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      _ => const <int, List<int>>{},
+    };
+    number ??= resolveRecordedChannelNumberLabel(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+    );
+    logo ??= resolveRecordedChannelLogoBytes(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+      logos: logos,
+    );
+    if (number != null && logo != null) break;
+  }
+  return (number: number, logo: logo);
+}
+
+Future<({String? number, Uint8List? logo})> _loadRecordedChannelMetadata(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  RecordedTitle title,
+) async {
+  final serviceId = title.channel?.serviceId;
+  final channelName = title.channelName;
+  String? number;
+  Uint8List? logo;
+  for (final bandType in _recordedChannelBandCandidates(
+    title.channel?.broadcastingType,
+  )) {
+    final channelProvider = switch (bandType) {
+      terrestrialBroadcastingType => channelsProvider(reg),
+      bsBroadcastingType => bsChannelsProvider(reg),
+      csBroadcastingType => csChannelsProvider(reg),
+      _ => null,
+    };
+    final logoProvider = switch (bandType) {
+      terrestrialBroadcastingType => channelLogosProvider(reg),
+      bsBroadcastingType => bsChannelLogosProvider(reg),
+      csBroadcastingType => csChannelLogosProvider(reg),
+      _ => null,
+    };
+    List<Channel> channels = const [];
+    Map<int, List<int>> logos = const {};
+    await Future.wait([
+      if (channelProvider != null)
+        () async {
+          try {
+            channels = await container
+                .read(channelProvider.future)
+                .timeout(const Duration(seconds: 6));
+          } catch (_) {}
+        }(),
+      if (logoProvider != null)
+        () async {
+          try {
+            logos = await container
+                .read(logoProvider.future)
+                .timeout(const Duration(seconds: 6));
+          } catch (_) {}
+        }(),
+    ]);
+    number ??= resolveRecordedChannelNumberLabel(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+    );
+    logo ??= resolveRecordedChannelLogoBytes(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+      logos: logos,
+    );
+    if (number != null && logo != null) break;
+  }
+  return (number: number, logo: logo);
+}
+
 Widget _buildRecordedPlayerScreen({
   required ProviderContainer container,
   required RegisteredNasne reg,
@@ -369,12 +495,21 @@ Widget _buildRecordedPlayerScreen({
     currentReg: reg,
     currentTitle: title,
   );
+  final initialChannelMeta = _resolveCachedRecordedChannelMetadata(
+    container,
+    reg,
+    title,
+  );
   return PlayerScreen(
     title: title.title,
     session: session,
     initialStart: initialStart,
     knownDuration: knownDuration,
     recordedChannelName: title.channelName,
+    initialRecordedChannelNumber: initialChannelMeta.number,
+    initialRecordedChannelLogo: initialChannelMeta.logo,
+    loadRecordedChannelMetadata: () =>
+        _loadRecordedChannelMetadata(container, reg, title),
     recordedBroadcastTimeRange: recordedBroadcastTimeRange,
     recordedScheduledStart: title.scheduledStart,
     recordedBroadcastingType: title.channel?.broadcastingType,

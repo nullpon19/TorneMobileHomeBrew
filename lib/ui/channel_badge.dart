@@ -69,6 +69,71 @@ Uint8List? resolveLiveChannelLogoBytes(
   );
 }
 
+String _normalizeChannelNameForMatch(String name) =>
+    name.trim().replaceAll(RegExp(r'[\s\u3000]+'), ' ').toLowerCase();
+
+/// Finds the [Channel] matching recorded metadata ([serviceId] first, then
+/// normalized [channelName] fallback).
+Channel? findMatchingChannelForRecorded({
+  int? serviceId,
+  String? channelName,
+  required Iterable<Channel> channels,
+}) {
+  if (serviceId != null) {
+    for (final ch in channels) {
+      if (ch.serviceId == serviceId) return ch;
+    }
+  }
+  final targetName = channelName != null
+      ? _normalizeChannelNameForMatch(channelName)
+      : '';
+  if (targetName.isNotEmpty) {
+    for (final ch in channels) {
+      if (_normalizeChannelNameForMatch(ch.serviceName) == targetName) {
+        return ch;
+      }
+    }
+  }
+  return null;
+}
+
+/// Resolves the 3-digit channel number label (`011`, `101`, etc.) for a
+/// recorded title from [channels], or `null` when unavailable.
+String? resolveRecordedChannelNumberLabel({
+  int? serviceId,
+  String? channelName,
+  required Iterable<Channel> channels,
+}) {
+  final matched = findMatchingChannelForRecorded(
+    serviceId: serviceId,
+    channelName: channelName,
+    channels: channels,
+  );
+  return formatChannelNumber3Digit(matched?.channelNumber);
+}
+
+/// Resolves cached PNG logo bytes for a recorded title from [logos] via
+/// [serviceId] or matched channel name, returning `null` when unavailable.
+Uint8List? resolveRecordedChannelLogoBytes({
+  int? serviceId,
+  String? channelName,
+  required Iterable<Channel> channels,
+  required Map<int, List<int>> logos,
+}) {
+  final matched = findMatchingChannelForRecorded(
+    serviceId: serviceId,
+    channelName: channelName,
+    channels: channels,
+  );
+  final sid = serviceId ?? matched?.serviceId;
+  if (sid == null) return null;
+  final raw = logos[sid];
+  if (raw == null || raw.isEmpty) return null;
+  return normalizeAribLogoPng(
+    raw is Uint8List ? raw : Uint8List.fromList(raw),
+  );
+}
+
 /// Renders a station logo PNG clipped directly with rounded corners inside a
 /// fixed-size slot, with no background plate or border.
 class ChannelLogoPlate extends StatelessWidget {

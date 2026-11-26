@@ -13,6 +13,7 @@ import 'package:tmhb/app/state.dart';
 import 'package:tmhb/app/ui_control_mode.dart';
 import 'package:tmhb/core/arib_chime_wav.dart';
 import 'package:tmhb/core/core.dart';
+import 'package:tmhb/ui/channel_badge.dart';
 import 'package:tmhb/ui/epg_screen.dart';
 import 'package:tmhb/ui/live_channel_switch_policy.dart';
 import 'package:tmhb/ui/player_multiplatform_controls.dart';
@@ -659,7 +660,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.text('タップで切替'), findsOneWidget);
+        expect(find.text('タップまたはもう一度スワイプで切替'), findsOneWidget);
       },
     );
 
@@ -745,6 +746,190 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('番組表'), findsOneWidget);
       expect(find.text('戻る / メニューで上部へ'), findsNothing);
+    });
+  });
+
+  group('Touch responsive & recorded metadata fixes', () {
+    test('computeTouchLandscapeHorizontalInset respects 16:9 and safe padding', () {
+      // Wide notched 21:9-ish phone (915x412, safe left 48, right 48):
+      // 16:9 width for h=412 is ~732.4 -> letterbox side ~91.3 > 48
+      final inset21by9 = computeTouchLandscapeHorizontalInset(
+        viewportSize: const Size(915, 412),
+        safePadding: const EdgeInsets.only(left: 48, right: 48),
+      );
+      expect(inset21by9, closeTo((915 - 412 * 16 / 9) / 2, 0.2));
+
+      // Standard notched phone (852x393, safe left 59, right 0):
+      // letterbox side ~76.7 > safe 59 -> symmetric 76.7 on both sides
+      final insetNotch = computeTouchLandscapeHorizontalInset(
+        viewportSize: const Size(852, 393),
+        safePadding: const EdgeInsets.only(left: 59),
+      );
+      expect(insetNotch, closeTo((852 - 393 * 16 / 9) / 2, 0.2));
+
+      // 16:9-exact panel with safe inset (e.g., 800x450, safe right 44):
+      final insetSafeOnly = computeTouchLandscapeHorizontalInset(
+        viewportSize: const Size(800, 450),
+        safePadding: const EdgeInsets.only(right: 44),
+      );
+      expect(insetSafeOnly, 44.0);
+    });
+
+    test('resolveTouchChannelSwipeAction handles 2-step swipe transitions', () {
+      expect(
+        resolveTouchChannelSwipeAction(
+          swipeDirection: ChannelSwitchDirection.next,
+          currentPreviewDirection: null,
+        ),
+        TouchChannelSwipeAction.showPreview,
+      );
+      expect(
+        resolveTouchChannelSwipeAction(
+          swipeDirection: ChannelSwitchDirection.next,
+          currentPreviewDirection: ChannelSwitchDirection.next,
+        ),
+        TouchChannelSwipeAction.switchChannel,
+      );
+      expect(
+        resolveTouchChannelSwipeAction(
+          swipeDirection: ChannelSwitchDirection.previous,
+          currentPreviewDirection: ChannelSwitchDirection.next,
+        ),
+        TouchChannelSwipeAction.dismissPreview,
+      );
+      // Center-origin swipe is also accepted.
+      expect(
+        resolveTouchHorizontalSwipeDirection(
+          dragDeltaX: -55,
+          startX: 400,
+          viewportWidth: 800,
+        ),
+        ChannelSwitchDirection.next,
+      );
+    });
+
+    test('resolveRecordedChannelNumberLabel and logo resolve by id and name', () {
+      const channels = [
+        Channel(
+          networkId: 32736,
+          transportStreamId: 32736,
+          serviceId: 1024,
+          serviceType: 1,
+          broadcastingType: 2,
+          channelNumber: 11,
+          serviceName: 'ＮＨＫ総合１・東京',
+        ),
+        Channel(
+          networkId: 4,
+          transportStreamId: 16625,
+          serviceId: 101,
+          serviceType: 1,
+          broadcastingType: 3,
+          channelNumber: 101,
+          serviceName: 'ＮＨＫ　ＢＳ',
+        ),
+      ];
+      final fakeLogo = Uint8List.fromList([
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+      ]);
+      final logos = <int, List<int>>{1024: fakeLogo, 101: fakeLogo};
+
+      expect(
+        resolveRecordedChannelNumberLabel(
+          serviceId: 1024,
+          channelName: 'NHK総合1',
+          channels: channels,
+        ),
+        '011',
+      );
+      expect(
+        resolveRecordedChannelNumberLabel(
+          serviceId: null,
+          channelName: 'ＮＨＫ ＢＳ',
+          channels: channels,
+        ),
+        '101',
+      );
+      expect(
+        resolveRecordedChannelLogoBytes(
+          serviceId: null,
+          channelName: 'ＮＨＫ総合１・東京',
+          channels: channels,
+          logos: logos,
+        ),
+        isNotNull,
+      );
+    });
+
+    testWidgets(
+      'Compact-width LiveOsdProgramSection and RecordedOsdProgramSection wrap without overflow',
+      (tester) async {
+        final liveInfo = LiveOsdProgramInfo(
+          currentTitle: 'とても長い番組タイトルが狭いスマホ画面でも省略されすぎずに複数行で読めるテスト',
+          currentStart: DateTime.utc(2026, 11, 25, 23, 15),
+          currentEnd: DateTime.utc(2026, 11, 26, 0, 55),
+          remainingMinutes: 37,
+          progress: 0.6,
+          nextTitle: '次の番組タイトル',
+          nextStart: DateTime.utc(2026, 11, 26, 0, 55),
+          nextEnd: DateTime.utc(2026, 11, 26, 1, 0),
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              backgroundColor: Colors.black,
+              body: SizedBox(
+                width: 340,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    LiveOsdProgramSection(
+                      info: liveInfo,
+                      compactWidth: true,
+                    ),
+                    const SizedBox(height: 12),
+                    const RecordedOsdProgramSection(
+                      programTitle: '録画番組のとても長いタイトルが2行で表示されるかテスト',
+                      broadcastTimeRange: '11/26(木) 08:15–09:55',
+                      compactWidth: true,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+        expect(find.text('08:15–09:55（残り 37分）'), findsOneWidget);
+        expect(find.text('11/26(木) 08:15–09:55'), findsOneWidget);
+      },
+    );
+
+    testWidgets('PlayerOsdClockOverlay places custom top below back button', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Stack(
+              children: [
+                PlayerOsdClockOverlay(
+                  now: DateTime(2026, 11, 26, 9, 36),
+                  top: 76,
+                  left: 18,
+                  fontSize: 40,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      final pos = tester.widget<Positioned>(find.byType(Positioned));
+      expect(pos.top, 76);
+      expect(pos.left, 18);
+      final text = tester.widget<Text>(find.text('09:36'));
+      expect(text.style?.fontSize, 40);
     });
   });
 }
