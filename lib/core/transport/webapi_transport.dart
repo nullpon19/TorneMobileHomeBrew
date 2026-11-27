@@ -59,9 +59,11 @@ class WebApiTransport {
     Uri uri, {
     Map<String, String>? headers,
     Object? body,
+    Duration? timeoutOverride,
   }) async {
+    final effectiveTimeout = timeoutOverride ?? timeout;
     final abortTrigger = Completer<void>();
-    final timer = Timer(timeout, () {
+    final timer = Timer(effectiveTimeout, () {
       if (!abortTrigger.isCompleted) abortTrigger.complete();
     });
     final request = http.AbortableRequest(
@@ -76,8 +78,8 @@ class WebApiTransport {
       request.bodyBytes = body;
     }
     try {
-      final streamed = await _client.send(request).timeout(timeout);
-      return await http.Response.fromStream(streamed).timeout(timeout);
+      final streamed = await _client.send(request).timeout(effectiveTimeout);
+      return await http.Response.fromStream(streamed).timeout(effectiveTimeout);
     } on TimeoutException {
       if (!abortTrigger.isCompleted) abortTrigger.complete();
       rethrow;
@@ -91,19 +93,26 @@ class WebApiTransport {
   Future<Map<String, dynamic>> getJson(
     WebApiEndpoint endpoint, {
     Map<String, String> params = const {},
+    Duration? timeoutOverride,
+    int maxAttempts = 3,
   }) async {
     _checkParams(endpoint, params);
     const source = 'webapi';
     http.Response? lastError;
-    for (var attempt = 0; attempt < 3; attempt++) {
+    final attempts = maxAttempts < 1 ? 1 : maxAttempts;
+    for (var attempt = 0; attempt < attempts; attempt++) {
       try {
-        final resp = await _sendWithAbort('GET', _uri(endpoint, params));
+        final resp = await _sendWithAbort(
+          'GET',
+          _uri(endpoint, params),
+          timeoutOverride: timeoutOverride,
+        );
         return _decodeJson(endpoint, resp);
       } on NasneError {
         rethrow;
       } catch (e) {
         lastError = null;
-        if (attempt == 2) {
+        if (attempt == attempts - 1) {
           throw NasneError.unreachable('$source:${endpoint.path}', cause: e);
         }
         await Future<void>.delayed(const Duration(milliseconds: 250));

@@ -121,6 +121,9 @@ class FakeDeviceInfo implements DeviceInfoService {
   );
 
   @override
+  Future<bool?> checkSoftwareUpdate() async => null;
+
+  @override
   Future<List<HddEntry>> listHdds() async => hddEntries;
 
   @override

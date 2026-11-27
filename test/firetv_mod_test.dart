@@ -3576,12 +3576,14 @@ void main() {
         await tester.pumpAndSettle();
 
         await tester.scrollUntilVisible(
-          find.text('録画予約済みの表示'),
+          find.text('赤枠'),
           200,
           scrollable: find.byType(Scrollable).first,
         );
         final segFinder = find.byType(SegmentedButton<EpgReservedStyle>);
         expect(segFinder, findsOneWidget);
+        await tester.ensureVisible(segFinder);
+        await tester.pumpAndSettle();
         expect(
           tester.widget<SegmentedButton<EpgReservedStyle>>(segFinder).selected,
           {EpgReservedStyle.fill},
@@ -5234,18 +5236,31 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(liveFetches, 1);
-        expect(epgFetches, 1);
+        expect(liveFetches, 0);
+        expect(epgFetches, 0);
 
         final container = ProviderScope.containerOf(
           tester.element(find.byType(AppShell)),
         );
         container.read(tabIndexProvider.notifier).select(AppTabs.live);
         await tester.pumpAndSettle();
+        expect(liveFetches, 1);
+        expect(find.textContaining('Live節目#1'), findsOneWidget);
+
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+        expect(epgFetches, 1);
+
+        container.read(tabIndexProvider.notifier).select(AppTabs.live);
+        await tester.pump();
+        expect(find.byType(LoadingView), findsNothing);
+        await tester.pumpAndSettle();
         expect(liveFetches, 2);
         expect(find.textContaining('Live節目#2'), findsOneWidget);
 
         container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pump();
+        expect(find.byType(LoadingView), findsNothing);
         await tester.pumpAndSettle();
         expect(epgFetches, 2);
       },

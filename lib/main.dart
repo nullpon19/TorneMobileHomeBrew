@@ -33,6 +33,7 @@ Future<void> main() async {
   // Split the legacy shared key-value file into per-purpose
   // files before anything reads the stores (plan 96).
   await migrateLegacyKeyValueFiles(storeDirectory);
+  final initialStartupTab = await loadInitialStartupTab(storeDirectory);
   final tempDir = await getTemporaryDirectory();
   final mpvCacheDir = Directory('${tempDir.path}/mpv_cache');
   try {
@@ -58,6 +59,7 @@ Future<void> main() async {
     mpvCacheDirectory: mpvCacheDir,
     androidSdkInt: androidSdkInt,
     defaultUiControlMode: defaultUiControlMode,
+    initialStartupTab: initialStartupTab,
   );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed

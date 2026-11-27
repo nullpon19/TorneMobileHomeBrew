@@ -7,6 +7,8 @@
 /// the accumulated entries reach the response's TotalMatches.
 library;
 
+import 'dart:async';
+
 import '../transport/soap_transport.dart';
 
 /// Upper bound on the pages fetched for one list. The largest
@@ -32,7 +34,7 @@ const int maxListPages = 100;
 /// for the remaining pages.
 Future<void> fetchAllListPages({
   required Future<SoapResponse> Function(int startingIndex) requestPage,
-  required int Function(SoapResponse response) consumePage,
+  required FutureOr<int> Function(SoapResponse response) consumePage,
   void Function()? onPage,
   int initialStartingIndex = 0,
   bool Function()? shouldCancel,
@@ -43,7 +45,7 @@ Future<void> fetchAllListPages({
     if (shouldCancel?.call() == true) break;
     final response = await requestPage(startingIndex);
     if (shouldCancel?.call() == true) break;
-    accumulated += consumePage(response);
+    accumulated += await consumePage(response);
     onPage?.call();
     if (shouldCancel?.call() == true) break;
     final numberReturned = int.tryParse(

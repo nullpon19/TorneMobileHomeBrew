@@ -1043,6 +1043,77 @@ final uiControlModeProvider = Provider<UiControlMode>((ref) {
   }
 });
 
+/// Initial tab selected when the app boots (`tabIndex` matches `AppTabs` constants).
+enum StartupTabPreference {
+  home(0, 'ホーム'),
+  live(1, 'TV視聴'),
+  schedules(2, '予約'),
+  titles(3, '録画済み'),
+  epg(4, '番組表');
+
+  const StartupTabPreference(this.tabIndex, this.label);
+
+  final int tabIndex;
+  final String label;
+
+  String get storageValue => name;
+
+  static StartupTabPreference fromStorage(String? raw) {
+    for (final value in StartupTabPreference.values) {
+      if (value.storageValue == raw) return value;
+    }
+    return StartupTabPreference.home;
+  }
+}
+
+/// Preloaded initial startup tab injected before `runApp` (defaults to `home`).
+final initialStartupTabProvider = Provider<StartupTabPreference>(
+  (ref) => StartupTabPreference.home,
+);
+
+/// Enables sequential background prefetch after the startup tab settles
+/// (enabled in real app `fileStoreContainer`, disabled by default in tests).
+final startupPrefetchEnabledProvider = Provider<bool>((ref) => false);
+
+/// Enables non-blocking `/status/updateCheck` lookup on Home
+/// (enabled in real app `fileStoreContainer`, disabled by default in tests).
+final softwareUpdateCheckEnabledProvider = Provider<bool>((ref) => false);
+
+/// Persisted startup tab preference displayed and editable in Settings.
+class StartupTabPreferenceNotifier extends Notifier<StartupTabPreference> {
+  static const storageKey = 'startup_tab';
+  bool _dirty = false;
+
+  @override
+  StartupTabPreference build() {
+    _dirty = false;
+    final initial = ref.watch(initialStartupTabProvider);
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(storageKey);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = StartupTabPreference.fromStorage(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return initial;
+  }
+
+  Future<void> set(StartupTabPreference preference) async {
+    _dirty = true;
+    state = preference;
+    await ref
+        .read(keyValueStoreProvider)
+        .write(storageKey, preference.storageValue);
+  }
+}
+
+final startupTabPreferenceProvider =
+    NotifierProvider<StartupTabPreferenceNotifier, StartupTabPreference>(
+      StartupTabPreferenceNotifier.new,
+    );
+
 /// Persisted player volume (`0.0..100.0`, defaults to `100.0`).
 class PlayerVolumeNotifier extends Notifier<double> {
   static const _key = 'player_volume';

@@ -42,6 +42,7 @@ abstract interface class RegistrationService {
 /// Read-side device information (WebAPI `status/*`, plan 12.1).
 abstract interface class DeviceInfoService {
   Future<DeviceInfo> getDeviceInfo();
+  Future<bool?> checkSoftwareUpdate();
   Future<List<HddEntry>> listHdds();
   Future<HddInfo> getHddInfo(int id);
   Future<NetworkInfo> getNetworkInfo();

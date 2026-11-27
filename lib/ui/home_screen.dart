@@ -225,6 +225,9 @@ class _DeviceSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final info = ref.watch(deviceInfoProvider(reg));
+    final softwareUpdate =
+        info.value?.updateExists ??
+        ref.watch(softwareUpdateAvailableProvider(reg)).value;
     return SectionCard(
       title: '本体情報',
       icon: Icons.router_outlined,
@@ -248,11 +251,15 @@ class _DeviceSection extends ConsumerWidget {
                 value: areaLabel(d.areaIdentifierCode, d.pref),
               ),
             FieldRow(label: 'アドレス', value: reg.host),
-            if (d.updateExists == true)
+            if (d.updateExists == true ||
+                (d.updateExists == null && softwareUpdate == true))
               const FieldRow(label: '更新', value: 'ソフトウェア更新があります'),
           ],
         ),
-        onRetry: () => ref.invalidate(deviceInfoProvider(reg)),
+        onRetry: () {
+          ref.invalidate(deviceInfoProvider(reg));
+          ref.invalidate(softwareUpdateAvailableProvider(reg));
+        },
       ),
     );
   }

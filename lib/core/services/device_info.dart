@@ -17,13 +17,18 @@ class WebApiDeviceInfoService implements DeviceInfoService {
 
   @override
   Future<DeviceInfo> getDeviceInfo() async {
-    final name = await _transport.getJson(WebApiEndpoints.boxNameGet);
-    final version =
-        await _transport.getJson(WebApiEndpoints.softwareVersionGet);
-    final date = await _transport.getJson(WebApiEndpoints.currDateGet);
-    final area = await _transport.getJson(WebApiEndpoints.areaInfoGet);
-    final setup = await _transport.getJson(WebApiEndpoints.isFinishSetup);
-    final update = await _transport.getJson(WebApiEndpoints.updateCheck);
+    final responses = await Future.wait([
+      _transport.getJson(WebApiEndpoints.boxNameGet),
+      _transport.getJson(WebApiEndpoints.softwareVersionGet),
+      _transport.getJson(WebApiEndpoints.currDateGet),
+      _transport.getJson(WebApiEndpoints.areaInfoGet),
+      _transport.getJson(WebApiEndpoints.isFinishSetup),
+    ]);
+    final name = responses[0];
+    final version = responses[1];
+    final date = responses[2];
+    final area = responses[3];
+    final setup = responses[4];
     return DeviceInfo(
       name: optString(name, 'name') ?? '',
       softwareVersion: optString(version, 'softwareVersion') ?? '',
@@ -33,8 +38,22 @@ class WebApiDeviceInfoService implements DeviceInfoService {
       pref: optString(area, 'pref'),
       zipCode: optString(area, 'zipCode'),
       finishSetup: optBool(setup, 'finishSetUpFlag'),
-      updateExists: optBool(update, 'existFlag'),
+      updateExists: null,
     );
+  }
+
+  @override
+  Future<bool?> checkSoftwareUpdate() async {
+    try {
+      final update = await _transport.getJson(
+        WebApiEndpoints.updateCheck,
+        timeoutOverride: const Duration(seconds: 5),
+        maxAttempts: 1,
+      );
+      return optBool(update, 'existFlag');
+    } catch (_) {
+      return null;
+    }
   }
 
   @override

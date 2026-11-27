@@ -57,6 +57,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
     final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
     final videoHwdecMode = ref.watch(videoHwdecModeProvider);
+    final startupTab = ref.watch(startupTabPreferenceProvider);
     final dlnaServers = ref.watch(dlnaServersProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
@@ -225,6 +226,24 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ],
               ),
             ),
+          ListTile(
+            title: const Text('起動時に開く画面'),
+            subtitle: Text(
+              '現在: ${startupTab.label}（次回起動時から反映されます）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  startupTab.label,
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickStartupTab(startupTab),
+          ),
           const Divider(),
           _sectionTitle(context, '番組表'),
           SwitchListTile(
@@ -908,6 +927,36 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
     if (chosen != null && mounted) {
       await ref.read(videoHwdecModeProvider.notifier).set(chosen);
+    }
+  }
+
+  Future<void> _pickStartupTab(StartupTabPreference current) async {
+    final chosen = await showDialog<StartupTabPreference>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('起動時に開く画面'),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'アプリを起動した直後に最初に表示する画面を選びます（次回起動時から反映されます）。',
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final option in StartupTabPreference.values)
+            _BufferOptionTile(
+              label: option.label,
+              isRecommended: option == StartupTabPreference.home,
+              badge: option == StartupTabPreference.home ? '標準' : null,
+              selected: option == current,
+              autofocus: option == current,
+              onTap: () => Navigator.of(dialogContext).pop(option),
+            ),
+        ],
+      ),
+    );
+    if (chosen != null && mounted) {
+      await ref.read(startupTabPreferenceProvider.notifier).set(chosen);
     }
   }
 

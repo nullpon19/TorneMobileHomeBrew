@@ -114,7 +114,7 @@ final selectedRegistrationProvider = Provider<RegisteredNasne?>((ref) {
 /// (e.g. the home screen's "go register" prompt).
 class TabIndexNotifier extends Notifier<int> {
   @override
-  int build() => AppTabs.home;
+  int build() => ref.read(initialStartupTabProvider).tabIndex;
 
   void select(int index) => state = index;
 }
@@ -132,6 +132,18 @@ final deviceInfoProvider = FutureProvider.family<DeviceInfo, RegisteredNasne>(
   (ref, reg) =>
       ref.watch(deviceServicesProvider(reg)).deviceInfo.getDeviceInfo(),
 );
+
+/// Non-blocking firmware update check for Home's device section.
+final softwareUpdateAvailableProvider =
+    FutureProvider.family<bool?, RegisteredNasne>((ref, reg) {
+      if (!ref.watch(softwareUpdateCheckEnabledProvider)) {
+        return Future<bool?>.value(null);
+      }
+      return ref
+          .watch(deviceServicesProvider(reg))
+          .deviceInfo
+          .checkSoftwareUpdate();
+    });
 
 /// One HDD list entry together with its detail (null when the
 /// entry is not mounted/registered or the detail fetch failed;
@@ -444,6 +456,7 @@ void invalidateDeviceData(
   bool clearLogos = true,
 }) {
   ref.invalidate(deviceInfoProvider(reg));
+  ref.invalidate(softwareUpdateAvailableProvider(reg));
   ref.invalidate(hddDetailsProvider(reg));
   ref.invalidate(liveStatusProvider(reg));
   ref.invalidate(recNgProvider(reg));
