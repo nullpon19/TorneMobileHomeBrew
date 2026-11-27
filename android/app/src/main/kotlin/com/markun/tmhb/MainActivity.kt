@@ -48,6 +48,7 @@ import kotlin.math.sin
 
 class MainActivity : FlutterActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var multicastLockRefCount = 0
     private var akeEventSink: EventChannel.EventSink? = null
     private val akeConnections = mutableMapOf<Int, AkeSocketConnection>()
     private val akeExecutor = Executors.newCachedThreadPool()
@@ -263,6 +264,22 @@ class MainActivity : FlutterActivity() {
         akeSendExecutor.shutdownNow()
         soundGeneration.incrementAndGet()
         soundExecutor.shutdownNow()
+        while (multicastLockRefCount > 0 && multicastLock?.isHeld == true) {
+            multicastLockRefCount--
+            try {
+                multicastLock?.release()
+            } catch (_: RuntimeException) {
+                break
+            }
+        }
+        if (multicastLock?.isHeld == true) {
+            try {
+                multicastLock?.release()
+            } catch (_: RuntimeException) {
+            }
+        }
+        multicastLockRefCount = 0
+        multicastLock = null
         super.onDestroy()
     }
 
@@ -273,20 +290,30 @@ class MainActivity : FlutterActivity() {
     // SSDP M-SEARCH responses arrive as Wi-Fi multicast; without this
     // lock the driver may filter them out (plan 17).
     private fun acquireMulticastLock() {
-        if (multicastLock == null) {
-            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            multicastLock = wifi.createMulticastLock("torne-mobile-hb-ssdp").apply {
-                setReferenceCounted(false)
-            }
+        val lock = multicastLock ?: run {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
+            wifi.createMulticastLock("torne-mobile-hb-ssdp").apply {
+                setReferenceCounted(true)
+            }.also { multicastLock = it }
         }
-        if (multicastLock?.isHeld != true) {
-            multicastLock?.acquire()
+        try {
+            lock.acquire()
+            multicastLockRefCount++
+        } catch (_: RuntimeException) {
         }
     }
 
     private fun releaseMulticastLock() {
-        if (multicastLock?.isHeld == true) {
-            multicastLock?.release()
+        val lock = multicastLock ?: return
+        if (multicastLockRefCount > 0) {
+            multicastLockRefCount--
+        }
+        if (lock.isHeld) {
+            try {
+                lock.release()
+            } catch (_: RuntimeException) {
+            }
         }
     }
 

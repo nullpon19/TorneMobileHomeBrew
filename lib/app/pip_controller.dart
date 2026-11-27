@@ -30,6 +30,8 @@ class PipController {
   final EventChannel _eventChannel;
   final Stream<bool>? _eventStreamOverride;
   final bool? _isSupportedOverride;
+  StreamController<bool>? _sharedModeController;
+  StreamSubscription<dynamic>? _nativeSub;
 
   bool get _hasPlatformImplementation =>
       !kIsWeb && (Platform.isAndroid || Platform.isMacOS || Platform.isWindows);
@@ -100,12 +102,16 @@ class PipController {
         (_isSupportedOverride == null && !_hasPlatformImplementation)) {
       return const Stream<bool>.empty();
     }
-    StreamSubscription<dynamic>? sub;
+    final existing = _sharedModeController;
+    if (existing != null && !existing.isClosed) {
+      return existing.stream;
+    }
     late final StreamController<bool> controller;
     controller = StreamController<bool>.broadcast(
       onListen: () {
+        if (_nativeSub != null) return;
         try {
-          sub = _eventChannel.receiveBroadcastStream().listen(
+          _nativeSub = _eventChannel.receiveBroadcastStream().listen(
             (event) {
               if (!controller.isClosed) {
                 controller.add(event == true);
@@ -120,13 +126,14 @@ class PipController {
         }
       },
       onCancel: () {
-        final active = sub;
-        sub = null;
+        final active = _nativeSub;
+        _nativeSub = null;
         if (active != null) {
           unawaited(active.cancel().catchError((_) {}));
         }
       },
     );
+    _sharedModeController = controller;
     return controller.stream;
   }
 }

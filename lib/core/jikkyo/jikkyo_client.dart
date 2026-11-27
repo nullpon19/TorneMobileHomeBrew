@@ -11,6 +11,18 @@ import 'jikkyo_models.dart';
 
 const String _kUserAgent = 'torne-hb-firetv/1.5';
 
+class JikkyoFetchException implements Exception {
+  const JikkyoFetchException(this.message, {this.statusCode});
+
+  final String message;
+  final int? statusCode;
+
+  @override
+  String toString() => statusCode != null
+      ? 'JikkyoFetchException($statusCode): $message'
+      : 'JikkyoFetchException: $message';
+}
+
 abstract class JikkyoLiveConnection {
   bool get isConnected;
   Future<void> dispose();
@@ -151,8 +163,10 @@ class NxJikkyoClient implements JikkyoClient {
       final result = <String, JikkyoChannelLiveInfo>{};
       for (final item in decoded) {
         if (item is Map<String, dynamic>) {
-          final info = JikkyoChannelLiveInfo.fromJson(item);
-          if (info != null) result[info.id] = info;
+          try {
+            final info = JikkyoChannelLiveInfo.fromJson(item);
+            if (info != null) result[info.id] = info;
+          } catch (_) {}
         }
       }
       if (result.isNotEmpty) {
@@ -186,18 +200,29 @@ class NxJikkyoClient implements JikkyoClient {
       req.headers.set(HttpHeaders.userAgentHeader, _kUserAgent);
       req.headers.set(HttpHeaders.acceptHeader, 'application/json');
       final res = await req.close().timeout(const Duration(seconds: 12));
-      if (res.statusCode != 200) {
+      if (res.statusCode == 404) {
         await res.drain<void>();
         return const [];
+      }
+      if (res.statusCode != 200) {
+        await res.drain<void>();
+        throw JikkyoFetchException(
+          'HTTP ${res.statusCode}',
+          statusCode: res.statusCode,
+        );
       }
       final body = await res
           .transform(utf8.decoder)
           .join()
           .timeout(const Duration(seconds: 12));
       final decoded = jsonDecode(body);
-      if (decoded is! Map<String, dynamic>) return const [];
+      if (decoded is! Map<String, dynamic>) {
+        throw const JikkyoFetchException('invalid kakolog payload shape');
+      }
       final packet = decoded['packet'];
-      if (packet is! List) return const [];
+      if (packet is! List) {
+        throw const JikkyoFetchException('missing kakolog packet list');
+      }
       final comments = <JikkyoComment>[];
       for (final item in packet) {
         if (item is Map<String, dynamic>) {
@@ -214,8 +239,10 @@ class NxJikkyoClient implements JikkyoClient {
         return (a.no ?? 0).compareTo(b.no ?? 0);
       });
       return comments;
-    } catch (_) {
-      return const [];
+    } on JikkyoFetchException {
+      rethrow;
+    } catch (e) {
+      throw JikkyoFetchException('kakolog fetch failed: $e');
     }
   }
 
@@ -259,12 +286,13 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
   final void Function(JikkyoComment comment) onComment;
   final void Function(bool connected)? onConnectionChanged;
 
-  static const List<int> _reconnectBackoffSec = [3, 6, 12, 20, 30];
+  static const List<int> _reconnectBackoffSec = [3, 6, 12, 20, 30, 60];
 
   bool _disposed = false;
   bool _connected = false;
   int _reconnectAttempts = 0;
   int _generation = 0;
+  int _commentGeneration = 0;
 
   WebSocket? _watchSocket;
   WebSocket? _commentSocket;
@@ -272,6 +300,7 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
   StreamSubscription<dynamic>? _commentSub;
   Timer? _keepSeatTimer;
   Timer? _reconnectTimer;
+  Timer? _stableConnectionTimer;
   String? _currentThreadId;
 
   @override
@@ -283,6 +312,35 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
     onConnectionChanged?.call(next);
   }
 
+  Future<WebSocket> _connectWebSocket(
+    String uri, {
+    required Duration timeout,
+    required bool Function() isStale,
+  }) {
+    final connectFuture = WebSocket.connect(
+      uri,
+      headers: {HttpHeaders.userAgentHeader: _kUserAgent},
+    );
+    var timedOut = false;
+    unawaited(
+      connectFuture.then(
+        (ws) {
+          if (timedOut || isStale()) {
+            unawaited(ws.close().catchError((_) {}));
+          }
+        },
+        onError: (_) {},
+      ),
+    );
+    return connectFuture.timeout(
+      timeout,
+      onTimeout: () {
+        timedOut = true;
+        throw TimeoutException('WebSocket connect timed out', timeout);
+      },
+    );
+  }
+
   Future<void> _connect() async {
     if (_disposed) return;
     final gen = ++_generation;
@@ -290,10 +348,11 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
     if (_disposed || gen != _generation) return;
 
     try {
-      final ws = await WebSocket.connect(
+      final ws = await _connectWebSocket(
         watchUri,
-        headers: {HttpHeaders.userAgentHeader: _kUserAgent},
-      ).timeout(const Duration(seconds: 8));
+        timeout: const Duration(seconds: 8),
+        isStale: () => _disposed || gen != _generation,
+      );
       if (_disposed || gen != _generation) {
         await ws.close();
         return;
@@ -354,38 +413,69 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
     required int gen,
   }) async {
     if (_disposed || gen != _generation) return;
+    final commentGen = ++_commentGeneration;
+    _stableConnectionTimer?.cancel();
+    _stableConnectionTimer = null;
     try {
       await _commentSub?.cancel();
       _commentSub = null;
       await _commentSocket?.close();
       _commentSocket = null;
     } catch (_) {}
-    if (_disposed || gen != _generation) return;
+    if (_disposed || gen != _generation || commentGen != _commentGeneration) {
+      return;
+    }
 
     try {
-      final ws = await WebSocket.connect(
+      final ws = await _connectWebSocket(
         uri,
-        headers: {HttpHeaders.userAgentHeader: _kUserAgent},
-      ).timeout(const Duration(seconds: 8));
-      if (_disposed || gen != _generation) {
+        timeout: const Duration(seconds: 8),
+        isStale: () =>
+            _disposed || gen != _generation || commentGen != _commentGeneration,
+      );
+      if (_disposed || gen != _generation || commentGen != _commentGeneration) {
         await ws.close();
         return;
       }
       _commentSocket = ws;
-      _reconnectAttempts = 0;
       _setConnected(true);
+      _stableConnectionTimer?.cancel();
+      _stableConnectionTimer = Timer(const Duration(seconds: 15), () {
+        if (!_disposed &&
+            gen == _generation &&
+            commentGen == _commentGeneration &&
+            _connected) {
+          _reconnectAttempts = 0;
+        }
+      });
       ws.pingInterval = const Duration(seconds: 25);
       _commentSub = ws.listen(
         (event) {
-          if (_disposed || gen != _generation) return;
+          if (_disposed ||
+              gen != _generation ||
+              commentGen != _commentGeneration) {
+            return;
+          }
           if (event is! String) return;
           final comment = parseNxCommentMessage(event);
           if (comment != null) {
             onComment(comment);
           }
         },
-        onError: (_) => _scheduleReconnect(gen),
-        onDone: () => _scheduleReconnect(gen),
+        onError: (_) {
+          if (!_disposed &&
+              gen == _generation &&
+              commentGen == _commentGeneration) {
+            _scheduleReconnect(gen);
+          }
+        },
+        onDone: () {
+          if (!_disposed &&
+              gen == _generation &&
+              commentGen == _commentGeneration) {
+            _scheduleReconnect(gen);
+          }
+        },
         cancelOnError: true,
       );
       _safeSend(
@@ -409,7 +499,9 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
         ]),
       );
     } catch (_) {
-      _scheduleReconnect(gen);
+      if (!_disposed && gen == _generation && commentGen == _commentGeneration) {
+        _scheduleReconnect(gen);
+      }
     }
   }
 
@@ -423,12 +515,13 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
 
   void _scheduleReconnect(int gen) {
     if (_disposed || gen != _generation) return;
+    _stableConnectionTimer?.cancel();
+    _stableConnectionTimer = null;
     _setConnected(false);
     if (_reconnectTimer != null) return;
-    if (_reconnectAttempts >= _reconnectBackoffSec.length) {
-      return;
-    }
-    final delaySec = _reconnectBackoffSec[_reconnectAttempts++];
+    final idx = math.min(_reconnectAttempts, _reconnectBackoffSec.length - 1);
+    _reconnectAttempts++;
+    final delaySec = _reconnectBackoffSec[idx];
     _reconnectTimer = Timer(Duration(seconds: delaySec), () {
       _reconnectTimer = null;
       if (!_disposed && gen == _generation) {
@@ -438,6 +531,9 @@ class _NxJikkyoLiveConnection implements JikkyoLiveConnection {
   }
 
   Future<void> _closeSocketsOnly() async {
+    _commentGeneration++;
+    _stableConnectionTimer?.cancel();
+    _stableConnectionTimer = null;
     _keepSeatTimer?.cancel();
     _keepSeatTimer = null;
     try {

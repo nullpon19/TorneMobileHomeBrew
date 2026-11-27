@@ -66,6 +66,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  DesktopChannelsDestroy();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

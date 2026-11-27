@@ -43,10 +43,19 @@ final bsEpgGuideProvider = FutureProvider.family<EpgGuide, RegisteredNasne>(
 );
 
 final bsChannelLogosProvider =
-    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) =>
-      loadCachedOrFetchChannelLogos(ref, reg, bsBroadcastingType),
-);
+    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>((ref, reg) {
+      final sig = ref.watch(
+        bsChannelsProvider(reg).select(
+          (v) => buildChannelLogoSignature(v.value ?? const <Channel>[]),
+        ),
+      );
+      return loadCachedOrFetchChannelLogos(
+        ref,
+        reg,
+        bsBroadcastingType,
+        channelsSignature: sig,
+      );
+    });
 
 /// CS channel list, persisted through [channelCacheProvider]. Falls back to an
 /// empty list on unsupported firmware or fetch error so CS browsing degrades
@@ -68,10 +77,19 @@ final csChannelsProvider = FutureProvider.family<List<Channel>, RegisteredNasne>
 
 /// Station logos for CS (best-effort; degrades to an empty map if unsupported).
 final csChannelLogosProvider =
-    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-  (ref, reg) =>
-      loadCachedOrFetchChannelLogos(ref, reg, csBroadcastingType),
-);
+    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>((ref, reg) {
+      final sig = ref.watch(
+        csChannelsProvider(reg).select(
+          (v) => buildChannelLogoSignature(v.value ?? const <Channel>[]),
+        ),
+      );
+      return loadCachedOrFetchChannelLogos(
+        ref,
+        reg,
+        csBroadcastingType,
+        channelsSignature: sig,
+      );
+    });
 
 /// Clears persisted station logos for [reg] and awaits deletion before
 /// invalidating the corresponding Riverpod logo providers (all bands when

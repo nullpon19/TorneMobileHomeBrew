@@ -142,10 +142,27 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     super.initState();
     widget.controller?._addListeners(_handleIncomingComments, _handleClear);
     _ticker = createTicker(_onTick);
-    if (widget.isPlaying) {
-      _ticker.start();
-    }
     _syncPreviewTimer();
+    _syncTicker();
+  }
+
+  void _clearPainterCache() {
+    for (final pair in _painterCache.values) {
+      pair.fill.dispose();
+      pair.stroke.dispose();
+    }
+    _painterCache.clear();
+  }
+
+  void _syncTicker() {
+    final shouldRun = widget.isPlaying && _active.isNotEmpty;
+    if (shouldRun && !_ticker.isActive) {
+      _lastTickElapsed = null;
+      _ticker.start();
+    } else if (!shouldRun && _ticker.isActive) {
+      _ticker.stop();
+      _lastTickElapsed = null;
+    }
   }
 
   @override
@@ -161,7 +178,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     if (oldWidget.settings.opacityPercent != widget.settings.opacityPercent ||
         oldWidget.settings.textSize != widget.settings.textSize ||
         oldWidget.settings.forceWhiteText != widget.settings.forceWhiteText) {
-      _painterCache.clear();
+      _clearPainterCache();
       _repaintTick.value++;
     }
     if (oldWidget.settings.hideFixedComments !=
@@ -170,17 +187,11 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
       _active.removeWhere((item) => !widget.settings.matchesFilter(item.comment));
       _repaintTick.value++;
     }
-    if (widget.isPlaying && !_ticker.isActive) {
-      _lastTickElapsed = null;
-      _ticker.start();
-    } else if (!widget.isPlaying && _ticker.isActive) {
-      _ticker.stop();
-      _lastTickElapsed = null;
-    }
     if (oldWidget.previewLoopComments != widget.previewLoopComments ||
         oldWidget.isPlaying != widget.isPlaying) {
       _syncPreviewTimer();
     }
+    _syncTicker();
   }
 
   void _syncPreviewTimer() {
@@ -201,6 +212,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
 
   void _handleClear() {
     _active.clear();
+    _syncTicker();
     _repaintTick.value++;
   }
 
@@ -281,7 +293,11 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     );
     _painterCache[key] = entry;
     while (_painterCache.length > _maxPainterCacheEntries) {
-      _painterCache.remove(_painterCache.keys.first);
+      final evicted = _painterCache.remove(_painterCache.keys.first);
+      if (evicted != null) {
+        evicted.fill.dispose();
+        evicted.stroke.dispose();
+      }
     }
     return entry;
   }
@@ -399,13 +415,17 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
         ),
       );
     }
+    _syncTicker();
     _repaintTick.value++;
   }
 
   void _onTick(Duration elapsed) {
     final prev = _lastTickElapsed;
     _lastTickElapsed = elapsed;
-    if (prev == null || _active.isEmpty) return;
+    if (prev == null || _active.isEmpty) {
+      _syncTicker();
+      return;
+    }
     final rawDt = (elapsed - prev).inMicroseconds / 1000000.0;
     if (rawDt <= 0 || rawDt > 0.5) return;
     final rate = widget.playbackRate.clamp(0.5, 2.5);
@@ -420,6 +440,9 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
         removed = true;
       }
     }
+    if (_active.isEmpty) {
+      _syncTicker();
+    }
     if (_active.isNotEmpty || removed) {
       _repaintTick.value++;
     }
@@ -431,7 +454,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     widget.controller?._removeListeners(_handleIncomingComments, _handleClear);
     _ticker.dispose();
     _repaintTick.dispose();
-    _painterCache.clear();
+    _clearPainterCache();
     _active.clear();
     super.dispose();
   }

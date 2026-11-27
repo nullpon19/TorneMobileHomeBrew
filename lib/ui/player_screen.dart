@@ -7262,10 +7262,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             if (_initialUiMode.isDesktop && _desktopFullscreen) {
               unawaited(_desktopWindow.setFullscreen(false));
             }
-            if (_lastAutoPipSent) {
-              _lastAutoPipSent = false;
-              unawaited(_pipController.setAutoPipEnabled(false));
-            }
+            _lastAutoPipSent = false;
+            unawaited(_pipController.setAutoPipEnabled(false));
             if (_initialUiMode.isDesktop && _inPipMode) {
               unawaited(_pipController.exitPip());
             }
@@ -7643,6 +7641,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!mounted) return;
     setState(() => _pipSupported = supported);
     if (!supported) return;
+    _syncAutoPipState();
     _pipSubscription = _pipController.onPipModeChanged.listen((inPip) {
       if (!mounted) return;
       if (_uiMode.isDesktop) {

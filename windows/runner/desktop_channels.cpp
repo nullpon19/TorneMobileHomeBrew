@@ -19,12 +19,22 @@ namespace {
 class DesktopChannelsState {
  public:
   explicit DesktopChannelsState(HWND hwnd) : hwnd_(hwnd) {}
+  ~DesktopChannelsState() {
+    ::PlaySoundW(nullptr, nullptr, 0);
+    if (keep_awake_) {
+      ::SetThreadExecutionState(ES_CONTINUOUS);
+      keep_awake_ = false;
+    }
+  }
 
   bool is_fullscreen() const { return is_fullscreen_; }
 
   bool SetFullscreen(bool target) {
     if (!hwnd_ || !::IsWindow(hwnd_)) return false;
     if (target == is_fullscreen_) return is_fullscreen_;
+    if (target && in_pip_) {
+      ExitPip();
+    }
 
     DWORD style = static_cast<DWORD>(::GetWindowLongW(hwnd_, GWL_STYLE));
     if (target) {
@@ -332,4 +342,14 @@ void DesktopChannelsRegister(flutter::PluginRegistrar* registrar,
         return nullptr;
       });
   g_pip_event_channel->SetStreamHandler(std::move(pip_handler));
+}
+
+void DesktopChannelsDestroy() {
+  ::PlaySoundW(nullptr, nullptr, 0);
+  g_pip_event_channel.reset();
+  g_pip_channel.reset();
+  g_arib_sound_channel.reset();
+  g_wakelock_channel.reset();
+  g_window_channel.reset();
+  g_state.reset();
 }

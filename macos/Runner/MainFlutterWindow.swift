@@ -64,11 +64,17 @@ final class WindowControlHub {
       case "isFullscreen":
         result(isFull)
       case "toggleFullscreen":
+        if !isFull {
+          PipHub.shared.exitPipIfActive()
+        }
         window.toggleFullScreen(nil)
         result(!isFull)
       case "setFullscreen":
         let args = call.arguments as? [String: Any] ?? [:]
         let target = args["fullscreen"] as? Bool ?? false
+        if target && !isFull {
+          PipHub.shared.exitPipIfActive()
+        }
         if isFull != target {
           window.toggleFullScreen(nil)
         }
@@ -163,6 +169,24 @@ final class PipHub: NSObject, FlutterStreamHandler {
   private var savedLevel: NSWindow.Level = .normal
   private var savedCollectionBehavior: NSWindow.CollectionBehavior = []
   private var savedMovableByBackground = false
+  private var pendingPipAspect: (Int, Int)?
+  private var fullScreenExitObserver: NSObjectProtocol?
+
+  deinit {
+    clearPendingFullScreenExit()
+  }
+
+  func exitPipIfActive() {
+    _ = exitPip()
+  }
+
+  private func clearPendingFullScreenExit() {
+    if let observer = fullScreenExitObserver {
+      NotificationCenter.default.removeObserver(observer)
+      fullScreenExitObserver = nil
+    }
+    pendingPipAspect = nil
+  }
 
   func register(messenger: FlutterBinaryMessenger, window: NSWindow) {
     self.window = window
@@ -215,8 +239,33 @@ final class PipHub: NSObject, FlutterStreamHandler {
     guard let window = self.window else { return false }
     if inPip { return true }
     if window.styleMask.contains(.fullScreen) {
+      clearPendingFullScreenExit()
+      pendingPipAspect = (aspectWidth, aspectHeight)
+      fullScreenExitObserver = NotificationCenter.default.addObserver(
+        forName: NSWindow.didExitFullScreenNotification,
+        object: window,
+        queue: .main
+      ) { [weak self] _ in
+        guard let self = self, let aspect = self.pendingPipAspect,
+              let targetWindow = self.window else {
+          return
+        }
+        self.clearPendingFullScreenExit()
+        self.applyPipWindowState(
+          window: targetWindow, aspectWidth: aspect.0, aspectHeight: aspect.1)
+      }
       window.toggleFullScreen(nil)
+      return true
     }
+    applyPipWindowState(
+      window: window, aspectWidth: aspectWidth, aspectHeight: aspectHeight)
+    return true
+  }
+
+  private func applyPipWindowState(
+    window: NSWindow, aspectWidth: Int, aspectHeight: Int
+  ) {
+    if inPip { return }
     savedFrame = window.frame
     savedLevel = window.level
     savedCollectionBehavior = window.collectionBehavior
@@ -243,12 +292,17 @@ final class PipHub: NSObject, FlutterStreamHandler {
     window.setFrame(targetFrame, display: true, animate: true)
     inPip = true
     eventSink?(true)
-    return true
   }
 
   private func exitPip() -> Bool {
     guard let window = self.window else { return false }
+    if pendingPipAspect != nil && !inPip {
+      clearPendingFullScreenExit()
+      eventSink?(false)
+      return true
+    }
     if !inPip { return false }
+    clearPendingFullScreenExit()
     window.level = savedLevel
     window.collectionBehavior = savedCollectionBehavior
     window.aspectRatio = NSSize.zero

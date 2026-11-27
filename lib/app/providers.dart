@@ -162,18 +162,22 @@ final credentialSummaryProvider = FutureProvider<CredentialSummary?>((
 /// default off), persisted in the key-value store.
 class ShowSubchannelsNotifier extends Notifier<bool> {
   static const _key = 'epg_show_subchannels';
+  bool _dirty = false;
 
   @override
   bool build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       if (value != null && value == 'true' && !state) state = true;
     });
     return false;
   }
 
   Future<void> set(bool value) async {
+    _dirty = true;
     state = value;
     await ref.read(keyValueStoreProvider).write(_key, value ? 'true' : 'false');
   }
@@ -191,12 +195,16 @@ final showSubchannelsProvider = NotifierProvider<ShowSubchannelsNotifier, bool>(
 /// ARIB level-1 values.
 class HiddenEpgGenresNotifier extends Notifier<Set<int>> {
   static const _key = 'epg_hidden_genres';
+  bool _dirty = false;
 
   @override
   Set<int> build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
-      final restored = decode(await store.read(_key));
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
+      final restored = decode(raw);
       if (restored.isNotEmpty && state.isEmpty) state = restored;
     });
     return const {};
@@ -214,6 +222,7 @@ class HiddenEpgGenresNotifier extends Notifier<Set<int>> {
   }
 
   Future<void> setHidden(int genreLevel1, bool hidden) async {
+    _dirty = true;
     final next = {...state};
     if (hidden) {
       next.add(genreLevel1);
@@ -245,7 +254,7 @@ class PlaybackQualityNotifier extends Notifier<bool> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (value == 'true' && !state) {
         state = true;
       } else if (value == 'false' && state) {
@@ -278,12 +287,15 @@ final mpvCacheDirectoryProvider = Provider<Directory?>((ref) => null);
 /// Persisted recorded playback buffer target in seconds (default 5 min).
 class RecordedBufferSecondsNotifier extends Notifier<int> {
   static const _key = 'firetv_recorded_buffer_seconds';
+  bool _dirty = false;
 
   @override
   int build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           recordedBufferOptionsSeconds.contains(parsed) &&
@@ -296,6 +308,7 @@ class RecordedBufferSecondsNotifier extends Notifier<int> {
 
   Future<void> set(int seconds) async {
     if (!recordedBufferOptionsSeconds.contains(seconds)) return;
+    _dirty = true;
     state = seconds;
     await ref.read(keyValueStoreProvider).write(_key, '$seconds');
   }
@@ -309,12 +322,15 @@ final recordedBufferSecondsProvider =
 /// Persisted live playback initial buffer target in seconds (default 0 = off).
 class LiveBufferSecondsNotifier extends Notifier<int> {
   static const _key = 'firetv_live_buffer_seconds';
+  bool _dirty = false;
 
   @override
   int build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           liveBufferOptionsSeconds.contains(parsed) &&
@@ -327,6 +343,7 @@ class LiveBufferSecondsNotifier extends Notifier<int> {
 
   Future<void> set(int seconds) async {
     if (!liveBufferOptionsSeconds.contains(seconds)) return;
+    _dirty = true;
     state = seconds;
     await ref.read(keyValueStoreProvider).write(_key, '$seconds');
   }
@@ -348,7 +365,7 @@ class VideoHwdecModeNotifier extends Notifier<VideoHwdecMode> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty || raw == null) return;
+      if (!ref.mounted || _dirty || raw == null) return;
       for (final mode in VideoHwdecMode.values) {
         if (mode.name == raw && state != mode) {
           state = mode;
@@ -408,14 +425,14 @@ class AppThemePreferenceNotifier extends Notifier<AppThemePreference> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       final parsed = _parseAppThemePreference(raw);
       if (parsed != null) {
         if (state != parsed) state = parsed;
         return;
       }
       final legacy = await store.read(_legacyKey);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (legacy == 'true' && state != AppThemePreference.dark) {
         state = AppThemePreference.dark;
       } else if (legacy == 'false' && state != AppThemePreference.light) {
@@ -481,7 +498,7 @@ class GroupTitlesNotifier extends Notifier<bool> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (raw == 'true' && !state) {
         state = true;
       } else if (raw == 'false' && state) {
@@ -516,7 +533,7 @@ class EpgReservedStyleNotifier extends Notifier<EpgReservedStyle> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (raw == EpgReservedStyle.border.name &&
           state != EpgReservedStyle.border) {
         state = EpgReservedStyle.border;
@@ -560,7 +577,7 @@ class DefaultRecordingQualityNotifier extends Notifier<int> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           recordingQualityOptions.contains(parsed) &&
@@ -1096,13 +1113,17 @@ final playerMutedProvider = NotifierProvider<PlayerMutedNotifier, bool>(
 class DebugSettingsNotifier extends Notifier<DebugSettings> {
   static const _masterKey = 'debug_mode_enabled';
   static const _categoriesKey = 'debug_categories';
+  bool _dirty = false;
 
   @override
   DebugSettings build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final master = await store.read(_masterKey);
+      if (!ref.mounted || _dirty) return;
       final categories = await store.read(_categoriesKey);
+      if (!ref.mounted || _dirty) return;
       state = DebugSettings(
         master: master == 'true',
         categories: DebugSettings.decodeCategories(categories),
@@ -1112,11 +1133,13 @@ class DebugSettingsNotifier extends Notifier<DebugSettings> {
   }
 
   Future<void> setMaster(bool value) async {
+    _dirty = true;
     state = state.copyWith(master: value);
     await ref.read(keyValueStoreProvider).write(_masterKey, '$value');
   }
 
   Future<void> setCategory(DiagCategory category, bool enabled) async {
+    _dirty = true;
     final next = {...state.categories};
     if (enabled) {
       next.add(category);

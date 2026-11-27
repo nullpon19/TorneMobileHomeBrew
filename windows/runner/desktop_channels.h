@@ -6,5 +6,6 @@
 
 void DesktopChannelsRegister(flutter::PluginRegistrar* registrar,
                              HWND window_handle);
+void DesktopChannelsDestroy();
 
 #endif  // RUNNER_DESKTOP_CHANNELS_H_

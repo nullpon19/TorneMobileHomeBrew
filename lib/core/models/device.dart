@@ -140,6 +140,21 @@ class RegisteredNasne {
       },
     );
   }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RegisteredNasne &&
+          runtimeType == other.runtimeType &&
+          host == other.host &&
+          udn == other.udn &&
+          friendlyName == other.friendlyName &&
+          macAddr == other.macAddr &&
+          registeredAt == other.registeredAt;
+
+  @override
+  int get hashCode =>
+      Object.hash(host, udn, friendlyName, macAddr, registeredAt);
 }
 
 /// Aggregated device information from the `status/*Get` reads (plan 12.5).

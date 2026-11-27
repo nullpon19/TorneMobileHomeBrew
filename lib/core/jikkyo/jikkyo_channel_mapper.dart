@@ -99,7 +99,6 @@ const Map<int, String> _bsCsServiceIdToJk = {
 
 const List<({String jkId, List<String> keywords})> _bsCsStationKeywords = [
   (jkId: 'jk103', keywords: ['プレミアム4k', 'bsp4k', 'bs4k']),
-  (jkId: 'jk101', keywords: ['nhkbs', 'bs1', 'bsプレミアム']),
   (jkId: 'jk141', keywords: ['bs日テレ']),
   (jkId: 'jk151', keywords: ['bs朝日']),
   (jkId: 'jk161', keywords: ['bstbs']),
@@ -109,10 +108,11 @@ const List<({String jkId, List<String> keywords})> _bsCsStationKeywords = [
   (jkId: 'jk192', keywords: ['wowowライブ', 'wowowlive']),
   (jkId: 'jk193', keywords: ['wowowシネマ', 'wowowcinema']),
   (jkId: 'jk252', keywords: ['wowowプラス', 'wowowplus', 'シネフィル']),
-  (jkId: 'jk200', keywords: ['bs10', 'bs10スターチャンネル']),
-  (jkId: 'jk201', keywords: ['スターチャンネル', 'star']),
+  (jkId: 'jk201', keywords: ['bs10スターチャンネル', 'スターチャンネル', 'star']),
+  (jkId: 'jk200', keywords: ['bs10']),
   (jkId: 'jk211', keywords: ['bs11', 'イレブン']),
   (jkId: 'jk222', keywords: ['bs12', 'トゥエルビ']),
+  (jkId: 'jk101', keywords: ['nhkbs', 'bsプレミアム', 'bs1']),
   (jkId: 'jk236', keywords: ['アニマックス', 'animax']),
   (jkId: 'jk260', keywords: ['bs松竹東急', 'jcombs', 'j:combs']),
   (jkId: 'jk263', keywords: ['bsjapanext', 'ジャパネクスト']),
@@ -449,8 +449,10 @@ JikkyoChannelMatch resolveJikkyoChannel({
       (nameKey != null ? settings.channelOverrides[nameKey] : null);
   final matchedOverrideKey =
       (sidKey != null && settings.channelOverrides.containsKey(sidKey))
-      ? sidKey
-      : primaryKey;
+          ? sidKey
+          : (nameKey != null && settings.channelOverrides.containsKey(nameKey))
+              ? nameKey
+              : primaryKey;
   if (overrideValue == kJikkyoDisabledId) {
     return JikkyoChannelMatch(
       jkId: null,

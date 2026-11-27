@@ -14,6 +14,7 @@ import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/core.dart';
+import 'bs_epg_providers.dart';
 import 'providers.dart';
 
 /// Tab indices of the app shell (plan 5.6; live viewing added
@@ -68,18 +69,22 @@ final registrationsProvider =
 /// first registered device.
 class SelectedHostNotifier extends Notifier<String?> {
   static const _key = 'selected_host';
+  bool _dirty = false;
 
   @override
   String? build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       if (value != null && state == null) state = value;
     });
     return null;
   }
 
   Future<void> select(String? host) async {
+    _dirty = true;
     state = host;
     final store = ref.read(keyValueStoreProvider);
     if (host == null) {
@@ -221,9 +226,10 @@ Future<Map<int, List<int>>> loadCachedOrFetchChannelLogos(
   RegisteredNasne reg,
   int broadcastingType, {
   List<Channel> channels = const [],
+  String? channelsSignature,
 }) async {
   final cache = ref.watch(channelLogoCacheProvider);
-  final sig = buildChannelLogoSignature(channels);
+  final sig = channelsSignature ?? buildChannelLogoSignature(channels);
   final expectedSig = sig.isNotEmpty ? sig : null;
   final cached = await cache.load(
     reg.host,
@@ -280,10 +286,19 @@ Future<void> clearChannelLogoCache(
 /// Channel logos (terrestrial): serviceId -> PNG bytes (plan 21), backed by
 /// [channelLogoCacheProvider].
 final channelLogosProvider =
-    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-      (ref, reg) =>
-          loadCachedOrFetchChannelLogos(ref, reg, terrestrialBroadcastingType),
-    );
+    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>((ref, reg) {
+      final sig = ref.watch(
+        channelsProvider(reg).select(
+          (v) => buildChannelLogoSignature(v.value ?? const <Channel>[]),
+        ),
+      );
+      return loadCachedOrFetchChannelLogos(
+        ref,
+        reg,
+        terrestrialBroadcastingType,
+        channelsSignature: sig,
+      );
+    });
 
 /// Reservations in chronological order (the device returns them in
 /// its own order; the UI contract is time order, plan 5.6).
@@ -435,10 +450,12 @@ void invalidateDeviceData(
   ref.invalidate(networkInfoProvider(reg));
   ref.invalidate(bcasInfoProvider(reg));
   ref.invalidate(channelsProvider(reg));
+  ref.invalidate(bsChannelsProvider(reg));
+  ref.invalidate(csChannelsProvider(reg));
   ref.invalidate(epgGuideProvider(reg));
+  ref.invalidate(bsEpgGuideProvider(reg));
   if (clearLogos) {
-    unawaited(clearChannelLogoCache(ref, reg));
-    ref.invalidate(channelLogosProvider(reg));
+    unawaited(invalidateChannelLogosWithCacheReset(ref, reg));
   }
   ref.invalidate(schedulesProvider(reg));
   ref.invalidate(titlesProvider(reg));
@@ -471,7 +488,7 @@ class DlnaServersNotifier extends Notifier<List<RegisteredDlnaServer>> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty || raw == null || raw.isEmpty) return;
+      if (!ref.mounted || _dirty || raw == null || raw.isEmpty) return;
       try {
         final decoded = jsonDecode(raw);
         if (decoded is! List) return;
@@ -480,7 +497,7 @@ class DlnaServersNotifier extends Notifier<List<RegisteredDlnaServer>> {
             if (item is Map)
               RegisteredDlnaServer.fromJson(item.cast<String, dynamic>()),
         ];
-        if (!_dirty) {
+        if (ref.mounted && !_dirty) {
           state = list;
         }
       } catch (_) {}
