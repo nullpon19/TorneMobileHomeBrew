@@ -63,17 +63,16 @@ Future<void> startPlaybackAndShowPlayer({
         // when debug mode is on. No credential or key material
         // is included.
         ref.read(diagLogProvider)(DiagCategory.ui, 'playback start failed: $e');
+        debugPrint(
+          '[tmhb:play] start failed: ${e.category.name} ${e.source} '
+          'code=${e.code ?? '-'} detail=${e.detail ?? '-'}',
+        );
         final retry = await showPlaybackErrorDialog(
           context,
           e,
           canRetry: true,
         );
         if (!retry || !context.mounted) return;
-        if (e.category == NasneErrorCategory.unreachable ||
-            (e.category == NasneErrorCategory.http &&
-                const {'500', '503', '511', '512'}.contains(e.code))) {
-          ref.invalidate(httpClientProvider);
-        }
       }
     } catch (e) {
       if (!context.mounted) return;

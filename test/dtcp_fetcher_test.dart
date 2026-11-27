@@ -79,6 +79,8 @@ void main() {
       final (server, url) = await serve((request) {
         attempts++;
         request.response.statusCode = 511;
+        request.response.reasonPhrase = 'Custom Reason';
+        request.response.headers.set('Server', 'MockNasne/1.0');
       });
       final fetcher = DtcpMediaFetcher(
         headRetryDelays: const [
@@ -87,11 +89,14 @@ void main() {
         ],
       );
       await expectLater(
-        fetcher.akeEndpoint(url),
+        fetcher.akeEndpoint(url.replace(queryParameters: {'quality': 'mobile'})),
         throwsA(
           isA<NasneError>()
               .having((e) => e.category, 'category', NasneErrorCategory.http)
-              .having((e) => e.code, 'code', '511'),
+              .having((e) => e.code, 'code', '511')
+              .having((e) => e.detail, 'detail', contains('Custom Reason'))
+              .having((e) => e.detail, 'detail', contains('quality=mobile'))
+              .having((e) => e.detail, 'detail', contains('server=MockNasne/1.0')),
         ),
       );
       expect(attempts, 3);

@@ -375,7 +375,10 @@ class MainActivity : FlutterActivity() {
         try {
             val intent = Intent("com.tailscale.ipn.CONNECT_VPN").apply {
                 setClassName(TAILSCALE_PACKAGE, "com.tailscale.ipn.IPNReceiver")
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                addFlags(
+                    Intent.FLAG_INCLUDE_STOPPED_PACKAGES or
+                        Intent.FLAG_RECEIVER_FOREGROUND,
+                )
             }
             sendBroadcast(intent)
             true

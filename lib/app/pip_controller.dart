@@ -6,6 +6,7 @@
 /// PiP bridging), Web, and test environments without a registered plugin handler.
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -99,13 +100,33 @@ class PipController {
         (_isSupportedOverride == null && !_hasPlatformImplementation)) {
       return const Stream<bool>.empty();
     }
-    try {
-      return _eventChannel
-          .receiveBroadcastStream()
-          .map((event) => event == true)
-          .handleError((_) {});
-    } on MissingPluginException {
-      return const Stream<bool>.empty();
-    }
+    StreamSubscription<dynamic>? sub;
+    late final StreamController<bool> controller;
+    controller = StreamController<bool>.broadcast(
+      onListen: () {
+        try {
+          sub = _eventChannel.receiveBroadcastStream().listen(
+            (event) {
+              if (!controller.isClosed) {
+                controller.add(event == true);
+              }
+            },
+            onError: (_) {},
+          );
+        } on MissingPluginException {
+          // Safe no-op in tests or unsupported environments.
+        } on PlatformException {
+          // Safe no-op when native channel is unavailable.
+        }
+      },
+      onCancel: () {
+        final active = sub;
+        sub = null;
+        if (active != null) {
+          unawaited(active.cancel().catchError((_) {}));
+        }
+      },
+    );
+    return controller.stream;
   }
 }

@@ -139,13 +139,29 @@ class DtcpMediaFetcher {
         final (mediaType, params) = _parseContentType(rawType);
         final status = response.statusCode;
         final reason = response.reasonPhrase;
+        final diagHeaders = <String>[];
+        response.headers.forEach((name, values) {
+          final lower = name.toLowerCase();
+          if (lower == 'server' ||
+              lower == 'content-type' ||
+              lower == 'connection' ||
+              lower == 'transfermode.dlna.org' ||
+              lower.startsWith('x-av-') ||
+              lower.startsWith('x-sony-')) {
+            final joined = values.join(',');
+            if (joined.isNotEmpty) {
+              diagHeaders.add('$lower=$joined');
+            }
+          }
+        });
         await response.drain<void>();
         diag(
           DiagCategory.network,
           'HEAD ${contentUrl.host}:${contentUrl.port} -> $status'
           '${reason.isNotEmpty ? ' ($reason)' : ''} in '
           '${stopwatch.elapsedMilliseconds} ms; media=$mediaType '
-          'params=${params.keys.join(',')}',
+          'params=${params.keys.join(',')}'
+          '${diagHeaders.isNotEmpty ? ' headers=${diagHeaders.join('; ')}' : ''}',
         );
         if (status != HttpStatus.ok) {
           if (_isRetryableHeadStatus(status) &&
@@ -161,7 +177,18 @@ class DtcpMediaFetcher {
             await Future<void>.delayed(delay);
             continue;
           }
-          throw NasneError.http(status, 'dtcp:http');
+          final quality = contentUrl.queryParameters['quality'];
+          final parts = <String>[
+            'HTTP $status${reason.isNotEmpty ? ' ($reason)' : ''}',
+            'port=${contentUrl.port}',
+            if (quality != null && quality.isNotEmpty) 'quality=$quality',
+            if (diagHeaders.isNotEmpty) diagHeaders.join('; '),
+          ];
+          throw NasneError.http(
+            status,
+            'dtcp:http',
+            detail: parts.join(' / '),
+          );
         }
         if (mediaType != 'application/x-dtcp1') {
           throw NasneError.parse(

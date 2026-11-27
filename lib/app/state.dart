@@ -423,7 +423,11 @@ final titleCountsProvider = FutureProvider.family<TitleCounts, RegisteredNasne>(
 
 /// Invalidates every per-device data provider for [reg]; used by the
 /// refresh actions. The device stays the source of truth.
-void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
+void invalidateDeviceData(
+  WidgetRef ref,
+  RegisteredNasne reg, {
+  bool clearLogos = true,
+}) {
   ref.invalidate(deviceInfoProvider(reg));
   ref.invalidate(hddDetailsProvider(reg));
   ref.invalidate(liveStatusProvider(reg));
@@ -432,8 +436,10 @@ void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
   ref.invalidate(bcasInfoProvider(reg));
   ref.invalidate(channelsProvider(reg));
   ref.invalidate(epgGuideProvider(reg));
-  unawaited(clearChannelLogoCache(ref, reg));
-  ref.invalidate(channelLogosProvider(reg));
+  if (clearLogos) {
+    unawaited(clearChannelLogoCache(ref, reg));
+    ref.invalidate(channelLogosProvider(reg));
+  }
   ref.invalidate(schedulesProvider(reg));
   ref.invalidate(titlesProvider(reg));
   ref.invalidate(titleCountsProvider(reg));
@@ -449,7 +455,7 @@ void resetNetworkAndInvalidateDevices(
 ) {
   ref.invalidate(httpClientProvider);
   for (final r in regs) {
-    invalidateDeviceData(ref, r);
+    invalidateDeviceData(ref, r, clearLogos: false);
   }
 }
 

@@ -2965,21 +2965,50 @@ Future<LiveWatchedChannelTarget?> _launchLiveChannel({
     }
   }
 
+  var activeChannel = effectiveChannel;
+  var retryAttempt = 0;
+
   await startPlaybackAndShowPlayer(
     context: context,
     ref: ref,
-    start: () => _startLiveSession(
-      engine,
-      effectiveChannel,
-      useMobile: useMobile,
-      allowQualityFallback: allowQualityFallback || sameChannelRecording,
-    ),
+    start: () async {
+      if (retryAttempt++ > 0) {
+        try {
+          final freshBands = await container
+              .read(deviceServicesProvider(chosenReg))
+              .live
+              .listLiveChannels()
+              .timeout(const Duration(seconds: 4));
+          final targetKey = liveServiceKey(activeChannel);
+          for (final band in freshBands) {
+            for (final ch in band.channels) {
+              if (ch.id == activeChannel.id ||
+                  liveServiceKey(ch) == targetKey) {
+                activeChannel = ch;
+                break;
+              }
+            }
+          }
+        } catch (_) {
+          // Keep previously resolved channel if refresh fails or times out.
+        }
+      }
+      final activeEngine = container
+          .read(deviceServicesProvider(chosenReg))
+          .playback;
+      return _startLiveSession(
+        activeEngine,
+        activeChannel,
+        useMobile: useMobile,
+        allowQualityFallback: allowQualityFallback || sameChannelRecording,
+      );
+    },
     buildPlayer: (session) {
       enteredPlayer = true;
       return _buildLivePlayerScreen(
         container: container,
         reg: chosenReg,
-        channel: effectiveChannel,
+        channel: activeChannel,
         session: session,
         useMobile: useMobile,
         initialSchedules: chosenSchedules,

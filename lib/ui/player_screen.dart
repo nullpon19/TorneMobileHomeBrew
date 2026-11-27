@@ -531,6 +531,77 @@ bool canSeekWithinLiveCache({
       totalPauseLagSeconds <= configuredBufferSeconds;
 }
 
+/// Computes the seamless cache-seek target for jumping to the live edge
+/// ("現在位置へ") while preserving the configured live buffer headroom
+/// (`realtime - configuredBufferSeconds`) so mpv's `cache-pause-wait` does
+/// not trigger a 0s/Ns rebuffering stall.
+({
+  bool canStayInCache,
+  bool alreadyAtLiveTarget,
+  double targetSeconds,
+  double deltaSeconds,
+})
+resolveLiveCatchUpJumpTarget({
+  required bool useCache,
+  required int configuredBufferSeconds,
+  required int cacheWindowSeconds,
+  required double totalPauseLagSeconds,
+  required double cacheStartSeconds,
+  required double liveEdgeSeconds,
+  required double currentPosSeconds,
+  double keyframeSafetyMarginSeconds = 1.5,
+  double zeroBufferMarginSeconds = 0.5,
+}) {
+  if (!useCache ||
+      cacheWindowSeconds <= 0 ||
+      !totalPauseLagSeconds.isFinite ||
+      !cacheStartSeconds.isFinite ||
+      !liveEdgeSeconds.isFinite ||
+      !currentPosSeconds.isFinite) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  if (liveEdgeSeconds <= cacheStartSeconds + 1.0 ||
+      totalPauseLagSeconds > cacheWindowSeconds) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  final headroom = configuredBufferSeconds > 0
+      ? configuredBufferSeconds + keyframeSafetyMarginSeconds
+      : zeroBufferMarginSeconds;
+  final minSafePos = math.min(liveEdgeSeconds, cacheStartSeconds + 0.5);
+  final maxSafePos = math.max(
+    minSafePos,
+    liveEdgeSeconds - zeroBufferMarginSeconds,
+  );
+  final target = (liveEdgeSeconds - headroom)
+      .clamp(minSafePos, maxSafePos)
+      .toDouble();
+  final delta = target - currentPosSeconds;
+  if (delta <= 1.0) {
+    return (
+      canStayInCache: true,
+      alreadyAtLiveTarget: true,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  return (
+    canStayInCache: true,
+    alreadyAtLiveTarget: false,
+    targetSeconds: target,
+    deltaSeconds: delta,
+  );
+}
+
 /// Top-right overlay notice for custom live messages or recording start/end.
 class PlayerCornerNotice extends StatelessWidget {
   const PlayerCornerNotice({
@@ -1302,6 +1373,32 @@ DateTime resolveLivePlaybackClock({
   }
   if (!lagSeconds.isFinite || lagSeconds <= 0.5) return now;
   return now.subtract(Duration(milliseconds: (lagSeconds * 1000).round()));
+}
+
+/// Computes total Niconico Jikkyo delay seconds for live playback so comments
+/// stay aligned with the video timeline even when a Live buffer delay (e.g.
+/// 15s / 30s / 60s) is active.
+///
+/// While [liveDelayedByPause] is `true`, `effectivePlaybackClock` already
+/// includes the full offset from the live edge (configured buffer plus any
+/// pause/rewind lag), so only [baseLiveDelaySeconds] is returned to avoid
+/// double-subtracting.
+int resolveLiveJikkyoDelaySeconds({
+  required int baseLiveDelaySeconds,
+  required bool liveDelayedByPause,
+  required int configuredLiveBufferSeconds,
+  double? bufferedAheadSeconds,
+}) {
+  if (liveDelayedByPause || configuredLiveBufferSeconds <= 0) {
+    return baseLiveDelaySeconds;
+  }
+  final configured = configuredLiveBufferSeconds.toDouble();
+  final measured = bufferedAheadSeconds;
+  final effectiveBufferDelay =
+      (measured != null && measured.isFinite && measured > configured)
+      ? math.min(measured, configured + 5.0).round()
+      : configuredLiveBufferSeconds;
+  return baseLiveDelaySeconds + effectiveBufferDelay;
 }
 
 /// Returns `true` when cached live EPG data in the player has exceeded [maxAge]
@@ -5536,7 +5633,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (!_playingNow || _buffering || _interrupted) return;
       final incoming = controller.pollLiveComments(
         effectivePlaybackClock: playbackClock,
-        delaySeconds: settings.liveDelaySeconds,
+        delaySeconds: resolveLiveJikkyoDelaySeconds(
+          baseLiveDelaySeconds: settings.liveDelaySeconds,
+          liveDelayedByPause: _liveDelayedByPause,
+          configuredLiveBufferSeconds: _bufferPlan?.configuredSeconds ?? 0,
+          bufferedAheadSeconds: _bufferedAheadSeconds,
+        ),
         manualOffsetSeconds: _jikkyoManualOffsetSeconds,
       );
       if (incoming.isNotEmpty) {
@@ -6963,7 +7065,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         (
           name: 'subscriptions',
           run: () {
-            unawaited(_pipSubscription?.cancel());
+            final pipSub = _pipSubscription;
+            _pipSubscription = null;
+            if (pipSub != null) {
+              unawaited(pipSub.cancel().catchError((_) {}));
+            }
             for (final subscription in _subscriptions) {
               subscription.cancel();
             }
@@ -8613,40 +8719,93 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               0.0,
               _now().difference(_livePausedAt!).inMilliseconds / 1000.0,
             );
-      final totalLagSec = math.max(
-        _liveEstimatedLagSeconds + activePause,
-        _bufferedAheadSeconds,
-      );
       if (plan != null && plan.useCache && platform is NativePlayer) {
         try {
-          final rawDur = await platform.getProperty('demuxer-cache-duration');
-          final rawCacheTime = await platform.getProperty('demuxer-cache-time');
-          final rawPos = await platform.getProperty('time-pos');
-          final cacheDur = double.tryParse(rawDur);
-          final cacheTime = double.tryParse(rawCacheTime);
-          final timePos = double.tryParse(rawPos);
-          final effectiveWindowSeconds = plan.useDiskCache
-              ? math.max(plan.configuredSeconds, plan.readaheadSeconds)
-              : plan.configuredSeconds;
-          if (cacheDur != null &&
-              cacheTime != null &&
-              timePos != null &&
-              canSeekWithinLiveCache(
-                useCache: plan.useCache,
-                configuredBufferSeconds: effectiveWindowSeconds,
-                totalPauseLagSeconds: totalLagSec,
-                cacheDurationSeconds: cacheDur,
-                cacheTimeSeconds: cacheTime,
-                timePosSeconds: timePos,
-              )) {
-            final targetMs = math.max(0, ((cacheTime - 0.5) * 1000).round());
-            await _player.play();
-            await _player.seek(Duration(milliseconds: targetMs));
-            await _finishLiveCatchUp(showHud: false);
-            if (mounted) {
-              _showHudMessage(Icons.skip_next, '現在位置へ移動しました');
+          final props = await Future.wait<String>([
+            _safeGetProp(platform, 'demuxer-cache-state'),
+            _safeGetProp(platform, 'demuxer-cache-duration'),
+            _safeGetProp(platform, 'demuxer-cache-time'),
+            _safeGetProp(platform, 'playback-time'),
+            _safeGetProp(platform, 'time-pos'),
+          ]);
+          final cacheDur = double.tryParse(props[1]);
+          final cacheTime = double.tryParse(props[2]);
+          final playbackTime = double.tryParse(props[3]);
+          final timePos = double.tryParse(props[4]);
+          final range = parseDemuxerCacheStateRange(
+            props[0],
+            currentPosSeconds: playbackTime ?? timePos ?? _liveTimePosSec,
+          );
+          double? cacheStart;
+          double? liveEdge;
+          if (range != null) {
+            cacheStart = range.earliestStartSeconds ?? range.startSeconds;
+            liveEdge = range.liveEdgeSeconds ?? range.endSeconds;
+          } else if (cacheTime != null &&
+              cacheTime.isFinite &&
+              cacheDur != null &&
+              cacheDur.isFinite) {
+            cacheStart = math.max(0.0, cacheTime - cacheDur);
+            liveEdge = cacheTime;
+          }
+          if (cacheStart != null && liveEdge != null) {
+            final currentPos = resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: playbackTime,
+              timePosSeconds: timePos,
+              cacheStartSeconds: cacheStart,
+              cacheEndSeconds: liveEdge,
+              fallbackSeconds: _liveTimePosSec ?? liveEdge,
+            );
+            final measuredLagBeyondBuffer = math.max(
+              0.0,
+              (liveEdge - currentPos) - plan.configuredSeconds,
+            );
+            final totalLagSec = math.max(
+              _liveEstimatedLagSeconds + activePause,
+              measuredLagBeyondBuffer,
+            );
+            final effectiveWindowSeconds = plan.useDiskCache
+                ? math.max(
+                    plan.configuredSeconds,
+                    math.max(plan.readaheadSeconds, livePauseTimeshiftSeconds),
+                  )
+                : math.max(
+                    plan.configuredSeconds,
+                    (liveEdge - cacheStart).floor(),
+                  );
+            final jump = resolveLiveCatchUpJumpTarget(
+              useCache: plan.useCache,
+              configuredBufferSeconds: plan.configuredSeconds,
+              cacheWindowSeconds: effectiveWindowSeconds,
+              totalPauseLagSeconds: totalLagSec,
+              cacheStartSeconds: cacheStart,
+              liveEdgeSeconds: liveEdge,
+              currentPosSeconds: currentPos,
+            );
+            if (jump.canStayInCache) {
+              if (!jump.alreadyAtLiveTarget) {
+                await platform.command([
+                  'seek',
+                  jump.deltaSeconds.toStringAsFixed(3),
+                  'relative+keyframes',
+                ]);
+              }
+              _liveCacheStartSec = cacheStart;
+              _liveCacheEndSec = liveEdge;
+              _liveCacheLiveEdgeSec = liveEdge;
+              _updateLiveStreamEpochFromLiveEdge(liveEdge, _now());
+              _liveTimePosSec = jump.targetSeconds;
+              _bufferedAheadSeconds = math.max(
+                0.0,
+                liveEdge - jump.targetSeconds,
+              );
+              await _player.play();
+              await _finishLiveCatchUp(showHud: false);
+              if (mounted) {
+                _showHudMessage(Icons.skip_next, '現在位置へ移動しました');
+              }
+              return;
             }
-            return;
           }
         } catch (e) {
           _diag(

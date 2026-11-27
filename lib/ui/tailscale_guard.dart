@@ -25,8 +25,8 @@ class TailscaleGuard extends ConsumerStatefulWidget {
     super.key,
     required this.child,
     this.probeTimeout = const Duration(milliseconds: 900),
-    this.pollInterval = const Duration(milliseconds: 400),
-    this.autoConnectMaxWait = const Duration(milliseconds: 3200),
+    this.pollInterval = const Duration(milliseconds: 300),
+    this.autoConnectMaxWait = const Duration(milliseconds: 6500),
     this.postVpnReachableMaxWait = const Duration(seconds: 12),
   });
 

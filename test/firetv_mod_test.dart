@@ -324,10 +324,10 @@ void main() {
           ),
         ),
       );
-      // Let startup + 6x500ms connect polling finish.
+      // Let startup + 6.5s connect polling finish.
       await tester.pump();
-      for (var i = 0; i < 8; i++) {
-        await tester.pump(const Duration(milliseconds: 500));
+      for (var i = 0; i < 24; i++) {
+        await tester.pump(const Duration(milliseconds: 300));
       }
 
       expect(helper.volumeMaxCalls, greaterThanOrEqualTo(1));
@@ -6286,6 +6286,100 @@ void main() {
             timePosSeconds: 30,
           ),
           isFalse,
+        );
+
+        // Jumping to "現在位置へ" with 15s live buffer keeps ~16.5s headroom so
+        // mpv does not drop to 0s/15s rebuffering.
+        final jump15 = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 30,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 100,
+        );
+        expect(jump15.canStayInCache, isTrue);
+        expect(jump15.alreadyAtLiveTarget, isFalse);
+        expect(jump15.targetSeconds, closeTo(128.5, 0.01));
+        expect(jump15.deltaSeconds, closeTo(28.5, 0.01));
+
+        // Already at or past realtime-15s -> stay put inside cache without rebuffering.
+        final alreadyAtBufferTarget = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 15,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 128.0,
+        );
+        expect(alreadyAtBufferTarget.canStayInCache, isTrue);
+        expect(alreadyAtBufferTarget.alreadyAtLiveTarget, isTrue);
+        expect(alreadyAtBufferTarget.deltaSeconds, 0.0);
+
+        // 0s live buffer targets liveEdge - 0.5s.
+        final jump0 = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 0,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 20,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 120,
+        );
+        expect(jump0.canStayInCache, isTrue);
+        expect(jump0.targetSeconds, closeTo(144.5, 0.01));
+
+        // Exhausted 5-min cache window falls back to upstream live-edge reset.
+        final exhausted = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 350,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 60,
+        );
+        expect(exhausted.canStayInCache, isFalse);
+
+        // Niconico Jikkyo delay mirrors configured live buffer during normal
+        // playback without double-subtracting during paused/rewound playback.
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 0,
+            bufferedAheadSeconds: 0.5,
+          ),
+          5,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 15.0,
+          ),
+          20,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 16.4,
+          ),
+          21,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: true,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 45.0,
+          ),
+          5,
         );
       },
     );
