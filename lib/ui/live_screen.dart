@@ -178,7 +178,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                 target,
                 isMultiNasne: activeRegs.length > 1,
               ),
-              onSelect: (selectionKey, channel, candidates, twoPane) {
+              onSelect: (selectionKey, targetReg, channel, candidates, twoPane) {
                 if (twoPane) {
                   setState(() => _selectedId = selectionKey);
                   WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -190,7 +190,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                   Navigator.of(context).push(
                     MaterialPageRoute(
                       builder: (_) => LiveChannelDetailPage(
-                        reg: reg,
+                        reg: targetReg,
                         channelId: channel.id,
                         candidates: candidates,
                       ),
@@ -408,6 +408,7 @@ class _LiveList extends ConsumerStatefulWidget {
   final ValueChanged<LiveWatchedChannelTarget> onPlaybackReturned;
   final void Function(
     String selectionKey,
+    RegisteredNasne targetReg,
     LiveChannel channel,
     List<OwnedLiveChannel>? candidates,
     bool twoPane,
@@ -689,6 +690,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                       logoBytes: row.logoBytes,
                       onTap: () => widget.onSelect(
                         row.channel.id,
+                        widget.reg,
                         row.channel,
                         null,
                         twoPane,
@@ -746,8 +748,13 @@ class _LiveListState extends ConsumerState<_LiveList>
             },
           );
         },
-        skipLoadingOnReload: true,
-        onRetry: () => ref.invalidate(liveChannelsProvider(widget.reg)),
+        skipLoadingOnReload: bands.hasValue,
+        onRetry: () {
+          if (bands.hasError) {
+            ref.invalidate(httpClientProvider);
+          }
+          ref.invalidate(liveChannelsProvider(widget.reg));
+        },
       );
     }
 
@@ -769,11 +776,11 @@ class _LiveListState extends ConsumerState<_LiveList>
           reg: r,
           bands: liveBandsWithSubchannelSetting(value, showSubchannels),
         ));
+      } else if (async.isLoading) {
+        anyLoading = true;
       } else if (async.hasError) {
         failedLabels.add(nasneDisplayLabel(r));
         firstError ??= async.error;
-      } else if (async.isLoading) {
-        anyLoading = true;
       }
     }
 
@@ -785,6 +792,7 @@ class _LiveListState extends ConsumerState<_LiveList>
             ? userMessageForError(firstError)
             : '視聴可能なチャンネルを取得できませんでした',
         onRetry: () {
+          ref.invalidate(httpClientProvider);
           for (final r in widget.activeRegs) {
             ref.invalidate(liveChannelsProvider(r));
             ref.invalidate(schedulesProvider(r));
@@ -863,6 +871,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                 logoBytes: row.logoBytes,
                 onTap: () => widget.onSelect(
                   row.merged.serviceKey,
+                  row.merged.primaryReg,
                   row.merged.primary,
                   row.merged.candidates,
                   twoPane,
@@ -2319,14 +2328,28 @@ Widget _buildLivePlayerScreen({
               await nextSession.stop();
               return null;
             }
-            final freshSchedules = await _fetchFreshSchedules(container, reg);
-            final switchCtx = await _resolveLiveSwitchContext(
-              container: container,
-              currentReg: reg,
-              currentChannel: channel,
-              multiNasneRegs: multiNasneRegs,
-              refreshIfStale: true,
-            );
+            late final List<RecordSchedule> freshSchedules;
+            late final ({
+              List<LiveChannelSwitchEntry> entries,
+              int currentIndex,
+            }) switchCtx;
+            try {
+              freshSchedules = await _fetchFreshSchedules(container, reg);
+              switchCtx = await _resolveLiveSwitchContext(
+                container: container,
+                currentReg: reg,
+                currentChannel: channel,
+                multiNasneRegs: multiNasneRegs,
+                refreshIfStale: true,
+              );
+            } catch (_) {
+              await nextSession.stop();
+              rethrow;
+            }
+            if (!playerContext.mounted) {
+              await nextSession.stop();
+              return null;
+            }
             final effectiveChannel = _resolveChannelFromSwitchContext(
               switchCtx,
               ownerReg: reg,
@@ -2570,13 +2593,30 @@ Future<Widget?> _switchLivePlayerToChannel({
     useMobile: useMobile,
     allowQualityFallback: allowQualityFallback || sameChannelRecording,
   );
-  final switchCtx = await _resolveLiveSwitchContext(
-    container: container,
-    currentReg: chosenReg,
-    currentChannel: chosenChannel,
-    multiNasneRegs: multiNasneRegs,
-    refreshIfStale: true,
-  );
+  if (!playerContext.mounted) {
+    await targetSession.stop();
+    return null;
+  }
+  late final ({
+    List<LiveChannelSwitchEntry> entries,
+    int currentIndex,
+  }) switchCtx;
+  try {
+    switchCtx = await _resolveLiveSwitchContext(
+      container: container,
+      currentReg: chosenReg,
+      currentChannel: chosenChannel,
+      multiNasneRegs: multiNasneRegs,
+      refreshIfStale: true,
+    );
+  } catch (_) {
+    await targetSession.stop();
+    rethrow;
+  }
+  if (!playerContext.mounted) {
+    await targetSession.stop();
+    return null;
+  }
   final effectiveChannel = _resolveChannelFromSwitchContext(
     switchCtx,
     ownerReg: chosenReg,
@@ -2959,21 +2999,50 @@ Future<LiveWatchedChannelTarget?> _launchLiveChannel({
     }
   }
 
+  var activeChannel = effectiveChannel;
+  var retryAttempt = 0;
+
   await startPlaybackAndShowPlayer(
     context: context,
     ref: ref,
-    start: () => _startLiveSession(
-      engine,
-      effectiveChannel,
-      useMobile: useMobile,
-      allowQualityFallback: allowQualityFallback || sameChannelRecording,
-    ),
+    start: () async {
+      if (retryAttempt++ > 0) {
+        try {
+          final freshBands = await container
+              .read(deviceServicesProvider(chosenReg))
+              .live
+              .listLiveChannels()
+              .timeout(const Duration(seconds: 4));
+          final targetKey = liveServiceKey(activeChannel);
+          for (final band in freshBands) {
+            for (final ch in band.channels) {
+              if (ch.id == activeChannel.id ||
+                  liveServiceKey(ch) == targetKey) {
+                activeChannel = ch;
+                break;
+              }
+            }
+          }
+        } catch (_) {
+          // Keep previously resolved channel if refresh fails or times out.
+        }
+      }
+      final activeEngine = container
+          .read(deviceServicesProvider(chosenReg))
+          .playback;
+      return _startLiveSession(
+        activeEngine,
+        activeChannel,
+        useMobile: useMobile,
+        allowQualityFallback: allowQualityFallback || sameChannelRecording,
+      );
+    },
     buildPlayer: (session) {
       enteredPlayer = true;
       return _buildLivePlayerScreen(
         container: container,
         reg: chosenReg,
-        channel: effectiveChannel,
+        channel: activeChannel,
         session: session,
         useMobile: useMobile,
         initialSchedules: chosenSchedules,

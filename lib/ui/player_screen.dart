@@ -181,8 +181,11 @@ import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../app/desktop_window.dart';
 import '../app/firetv_helper.dart';
 import '../app/mpv_compat.dart';
+import '../app/pip_controller.dart';
+import '../app/ui_control_mode.dart';
 import 'channel_badge.dart';
 import '../app/providers.dart';
 import '../core/core.dart';
@@ -195,6 +198,7 @@ import 'jikkyo_overlay.dart';
 import 'live_channel_switch_policy.dart';
 import 'live_recording_policy.dart';
 import 'multi_nasne_policy.dart';
+import 'player_multiplatform_controls.dart';
 import 'widgets.dart';
 import 'player_cache_policy.dart';
 import 'player_chapter_policy.dart';
@@ -215,8 +219,10 @@ String? playerLoadingLabel({
   required bool playingStarted,
   required bool playingNow,
   required bool buffering,
+  bool resuming = false,
 }) {
   if (interrupted) return null;
+  if (resuming) return '再接続中…';
   if (!hasVideoFrame || !playingStarted) return '読み込み中…';
   if (buffering && playingNow) return 'バッファリング中…';
   return null;
@@ -527,6 +533,100 @@ bool canSeekWithinLiveCache({
       totalPauseLagSeconds <= configuredBufferSeconds;
 }
 
+/// Computes the seamless cache-seek target for jumping to the live edge
+/// ("現在位置へ") while preserving the configured live buffer headroom
+/// (`realtime - configuredBufferSeconds`) so mpv's `cache-pause-wait` does
+/// not trigger a 0s/Ns rebuffering stall.
+({
+  bool canStayInCache,
+  bool alreadyAtLiveTarget,
+  double targetSeconds,
+  double deltaSeconds,
+})
+resolveLiveCatchUpJumpTarget({
+  required bool useCache,
+  required int configuredBufferSeconds,
+  required int cacheWindowSeconds,
+  required double totalPauseLagSeconds,
+  required double cacheStartSeconds,
+  required double liveEdgeSeconds,
+  required double currentPosSeconds,
+  double? liveEdgeStalenessSeconds,
+  bool cacheEof = false,
+  double maxLiveEdgeStalenessSeconds = 20.0,
+  double keyframeSafetyMarginSeconds = 1.5,
+  double zeroBufferMarginSeconds = 0.5,
+}) {
+  if (!useCache ||
+      cacheWindowSeconds <= 0 ||
+      !totalPauseLagSeconds.isFinite ||
+      !cacheStartSeconds.isFinite ||
+      !liveEdgeSeconds.isFinite ||
+      !currentPosSeconds.isFinite) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  if (cacheEof || liveEdgeSeconds <= cacheStartSeconds + 1.0) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  if (liveEdgeStalenessSeconds != null && liveEdgeStalenessSeconds.isFinite) {
+    if (liveEdgeStalenessSeconds > maxLiveEdgeStalenessSeconds) {
+      return (
+        canStayInCache: false,
+        alreadyAtLiveTarget: false,
+        targetSeconds: currentPosSeconds,
+        deltaSeconds: 0.0,
+      );
+    }
+  } else if (totalPauseLagSeconds >
+      math.max(
+        cacheWindowSeconds.toDouble(),
+        liveEdgeSeconds - cacheStartSeconds,
+      )) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  final headroom = configuredBufferSeconds > 0
+      ? configuredBufferSeconds + keyframeSafetyMarginSeconds
+      : zeroBufferMarginSeconds;
+  final minSafePos = math.min(liveEdgeSeconds, cacheStartSeconds + 0.5);
+  final maxSafePos = math.max(
+    minSafePos,
+    liveEdgeSeconds - zeroBufferMarginSeconds,
+  );
+  final target = (liveEdgeSeconds - headroom)
+      .clamp(minSafePos, maxSafePos)
+      .toDouble();
+  final delta = target - currentPosSeconds;
+  if (delta <= 1.0) {
+    return (
+      canStayInCache: true,
+      alreadyAtLiveTarget: true,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  return (
+    canStayInCache: true,
+    alreadyAtLiveTarget: false,
+    targetSeconds: target,
+    deltaSeconds: delta,
+  );
+}
+
 /// Top-right overlay notice for custom live messages or recording start/end.
 class PlayerCornerNotice extends StatelessWidget {
   const PlayerCornerNotice({
@@ -620,6 +720,12 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     this.channelNumber,
     this.channelLogoBytes,
     required this.onTap,
+    this.peeking = false,
+    this.onPeekTap,
+    this.uiMode = UiControlMode.tv,
+    this.horizontalInset = 0.0,
+    this.onHoverEnter,
+    this.onHoverExit,
   });
 
   final ChannelSwitchDirection direction;
@@ -629,12 +735,25 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
   final String? channelNumber;
   final Uint8List? channelLogoBytes;
   final VoidCallback? onTap;
+  final bool peeking;
+  final VoidCallback? onPeekTap;
+  final UiControlMode uiMode;
+  final double horizontalInset;
+  final VoidCallback? onHoverEnter;
+  final VoidCallback? onHoverExit;
 
   @override
   Widget build(BuildContext context) {
     final isNext = direction == ChannelSwitchDirection.next;
     final alignment = isNext ? Alignment.centerRight : Alignment.centerLeft;
     final hiddenOffset = isNext ? const Offset(1.05, 0) : const Offset(-1.05, 0);
+    final peekOffset = isNext ? const Offset(0.84, 0) : const Offset(-0.84, 0);
+    final data = entry;
+    final isPeeking = !visible && peeking && data != null;
+    final showCard = visible || isPeeking;
+    final targetOffset = visible
+        ? Offset.zero
+        : (isPeeking ? peekOffset : hiddenOffset);
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final bgColor = isDark ? const Color(0xD90D1117) : const Color(0xF5FFFFFF);
     final accentColor = isDark ? Colors.amberAccent : const Color(0xFF3949AB);
@@ -657,33 +776,48 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
     final cardKey = ValueKey(
       isNext ? 'live_channel_preview_next' : 'live_channel_preview_previous',
     );
-    final data = entry;
     final timeRange = resolvedProgram != null
         ? resolvedProgram!.broadcastTimeRange
         : data?.broadcastTimeRange;
     final programTitle = resolvedProgram?.programTitle ?? data?.programTitle;
+    final parsedProgramTitle = programTitle != null
+        ? parseBroadcastTitleBadges(programTitle)
+        : null;
+    final attrBadges = parsedProgramTitle == null
+        ? const <String>[]
+        : parsedProgramTitle.attributeBadges.take(5).toList(growable: false);
     return Positioned.fill(
       child: IgnorePointer(
-        ignoring: !visible,
-        child: Align(
-          alignment: alignment,
-          child: AnimatedSlide(
-            offset: visible ? Offset.zero : hiddenOffset,
+        ignoring: !showCard,
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: horizontalInset),
+          child: ClipRect(
+            child: Align(
+              alignment: alignment,
+              child: AnimatedSlide(
+            offset: targetOffset,
             duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
             child: AnimatedOpacity(
-              opacity: visible && data != null ? 1.0 : 0.0,
+              opacity: showCard && data != null ? (visible ? 1.0 : 0.94) : 0.0,
               duration: const Duration(milliseconds: 180),
               child: data == null
                   ? const SizedBox.shrink()
-                  : ConstrainedBox(
-                      constraints: const BoxConstraints(
-                        minWidth: 260,
-                        maxWidth: 340,
-                      ),
-                      child: GestureDetector(
-                        onTap: onTap,
-                        child: Container(
+                  : FittedBox(
+                      fit: BoxFit.scaleDown,
+                      alignment: alignment,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          minWidth: 260,
+                          maxWidth: 340,
+                        ),
+                        child: MouseRegion(
+                          cursor: SystemMouseCursors.click,
+                          onEnter: (_) => onHoverEnter?.call(),
+                          onExit: (_) => onHoverExit?.call(),
+                          child: GestureDetector(
+                            onTap: visible ? onTap : onPeekTap,
+                            child: Container(
                           key: cardKey,
                           padding: innerPadding,
                           decoration: BoxDecoration(
@@ -765,68 +899,95 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ],
                               ),
                               const SizedBox(height: 4),
-                              BroadcastTitleLine(
-                                rawTitle: programTitle ?? data.programTitle,
+                              EpgFormattedTitleText(
+                                parsed: parsedProgramTitle!,
                                 maxLines: 2,
-                                darkSurface: isDark,
-                                badgeScale: 1.0,
-                                maxAttributeBadges: 4,
+                                badgeScale: 1.05,
                                 style: TextStyle(
                                   color: titleColor,
                                   fontSize: 14,
                                   height: 1.3,
                                 ),
                               ),
-                              if (timeRange != null) ...[
+                              if (timeRange != null || attrBadges.isNotEmpty) ...[
                                 const SizedBox(height: 4),
-                                Text(
-                                  timeRange,
-                                  style: TextStyle(
-                                    color: metaColor,
-                                    fontSize: 12,
-                                  ),
+                                Wrap(
+                                  spacing: 4,
+                                  runSpacing: 3,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: [
+                                    if (timeRange != null)
+                                      Text(
+                                        timeRange,
+                                        style: TextStyle(
+                                          color: metaColor,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    for (final tag in attrBadges)
+                                      EpgAttributeMiniBadge(
+                                        label: tag,
+                                        isDark: isDark,
+                                        badgeScale: 1.0,
+                                      ),
+                                  ],
                                 ),
                               ],
                               const SizedBox(height: 8),
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    'もう一度 ',
-                                    style: TextStyle(
-                                      color: hintColor,
-                                      fontSize: 11,
+                              if (uiMode.isTv)
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      'もう一度 ',
+                                      style: TextStyle(
+                                        color: hintColor,
+                                        fontSize: 11,
+                                      ),
                                     ),
-                                  ),
-                                  if (isNext)
-                                    Icon(
-                                      Icons.play_arrow,
-                                      size: 12,
-                                      color: hintColor,
-                                    )
-                                  else
-                                    Transform.flip(
-                                      flipX: true,
-                                      child: Icon(
+                                    if (isNext)
+                                      Icon(
                                         Icons.play_arrow,
                                         size: 12,
                                         color: hintColor,
+                                      )
+                                    else
+                                      Transform.flip(
+                                        flipX: true,
+                                        child: Icon(
+                                          Icons.play_arrow,
+                                          size: 12,
+                                          color: hintColor,
+                                        ),
+                                      ),
+                                    Text(
+                                      ' / 決定 で切替',
+                                      style: TextStyle(
+                                        color: hintColor,
+                                        fontSize: 11,
                                       ),
                                     ),
-                                  Text(
-                                    ' / 決定 で切替',
-                                    style: TextStyle(
-                                      color: hintColor,
-                                      fontSize: 11,
-                                    ),
+                                  ],
+                                )
+                              else
+                                Text(
+                                  uiMode.isDesktop
+                                      ? 'クリックで切替'
+                                      : 'タップまたはもう一度スワイプで切替',
+                                  style: TextStyle(
+                                    color: hintColor,
+                                    fontSize: 11,
                                   ),
-                                ],
-                              ),
+                                ),
                             ],
                           ),
                         ),
                       ),
                     ),
+                    ),
+                    ),
+            ),
+            ),
             ),
           ),
         ),
@@ -884,6 +1045,7 @@ class LiveDemuxerCacheRange {
     this.cacheDurationSeconds,
     this.liveEdgeSeconds,
     this.earliestStartSeconds,
+    this.eof = false,
   });
 
   final double startSeconds;
@@ -891,6 +1053,7 @@ class LiveDemuxerCacheRange {
   final double? cacheDurationSeconds;
   final double? liveEdgeSeconds;
   final double? earliestStartSeconds;
+  final bool eof;
 
   double get spanSeconds => math.max(0.0, endSeconds - startSeconds);
 }
@@ -937,6 +1100,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
     final rawCacheDur = _jsonFiniteDouble(decoded['cache-duration']);
     final cacheDur =
         (rawCacheDur != null && rawCacheDur >= 0) ? rawCacheDur : null;
+    final eof = decoded['eof'] == true;
     final rawRanges = decoded['seekable-ranges'];
     if (rawRanges is! List || rawRanges.isEmpty) return null;
     final ranges = <({double start, double end})>[];
@@ -964,6 +1128,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
             cacheDurationSeconds: cacheDur,
             liveEdgeSeconds: latestEnd,
             earliestStartSeconds: earliestStart,
+            eof: eof,
           );
         }
       }
@@ -975,6 +1140,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
       cacheDurationSeconds: cacheDur,
       liveEdgeSeconds: latestEnd,
       earliestStartSeconds: earliestStart,
+      eof: eof,
     );
   } catch (_) {
     return null;
@@ -1237,6 +1403,32 @@ DateTime resolveLivePlaybackClock({
   }
   if (!lagSeconds.isFinite || lagSeconds <= 0.5) return now;
   return now.subtract(Duration(milliseconds: (lagSeconds * 1000).round()));
+}
+
+/// Computes total Niconico Jikkyo delay seconds for live playback so comments
+/// stay aligned with the video timeline even when a Live buffer delay (e.g.
+/// 15s / 30s / 60s) is active.
+///
+/// While [liveDelayedByPause] is `true`, `effectivePlaybackClock` already
+/// includes the full offset from the live edge (configured buffer plus any
+/// pause/rewind lag), so only [baseLiveDelaySeconds] is returned to avoid
+/// double-subtracting.
+int resolveLiveJikkyoDelaySeconds({
+  required int baseLiveDelaySeconds,
+  required bool liveDelayedByPause,
+  required int configuredLiveBufferSeconds,
+  double? bufferedAheadSeconds,
+}) {
+  if (liveDelayedByPause || configuredLiveBufferSeconds <= 0) {
+    return baseLiveDelaySeconds;
+  }
+  final configured = configuredLiveBufferSeconds.toDouble();
+  final measured = bufferedAheadSeconds;
+  final effectiveBufferDelay =
+      (measured != null && measured.isFinite && measured > configured)
+      ? math.min(measured, configured + 5.0).round()
+      : configuredLiveBufferSeconds;
+  return baseLiveDelaySeconds + effectiveBufferDelay;
 }
 
 /// Returns `true` when cached live EPG data in the player has exceeded [maxAge]
@@ -1702,10 +1894,16 @@ class PlayerOsdClockOverlay extends StatelessWidget {
     super.key,
     required this.now,
     this.opacity,
+    this.top = 22.0,
+    this.left = 28.0,
+    this.fontSize = 44.0,
   });
 
   final DateTime now;
   final Animation<double>? opacity;
+  final double top;
+  final double left;
+  final double fontSize;
 
   @override
   Widget build(BuildContext context) {
@@ -1714,16 +1912,16 @@ class PlayerOsdClockOverlay extends StatelessWidget {
       style: TextStyle(
         fontFamily: 'GoogleSans',
         color: Colors.white,
-        fontSize: 44,
+        fontSize: fontSize,
         fontWeight: FontWeight.w500,
         height: 1.0,
         fontFeatures: const [FontFeature.tabularFigures()],
-        shadows: resolveOsdClockTextShadows(44),
+        shadows: resolveOsdClockTextShadows(fontSize),
       ),
     );
     return Positioned(
-      top: 22,
-      left: 28,
+      top: top,
+      left: left,
       child: IgnorePointer(
         child: opacity != null
             ? FadeTransition(opacity: opacity!, child: text)
@@ -1743,19 +1941,26 @@ class LiveProgramProgressBar extends StatelessWidget {
     this.showDetailsRow = false,
     this.barHeight = 6.0,
     this.accentColor = Colors.lightBlueAccent,
+    this.interactive = false,
+    this.onScrubFractionUpdate,
+    this.onScrubFractionEnd,
   });
 
   final LiveTimeshiftBarState state;
   final bool showDetailsRow;
   final double barHeight;
   final Color accentColor;
+  final bool interactive;
+  final ValueChanged<double>? onScrubFractionUpdate;
+  final ValueChanged<double>? onScrubFractionEnd;
 
   @override
   Widget build(BuildContext context) {
     final showTimeshiftOverlay =
         state.rewindableSeconds >= 2 || state.isTimeshifting;
+    final canScrub = interactive && showTimeshiftOverlay;
     final thumbDiameter = barHeight + 6.0;
-    final trackHeight = thumbDiameter + 4.0;
+    final trackHeight = math.max(thumbDiameter + 4.0, canScrub ? 26.0 : 0.0);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1790,7 +1995,14 @@ class LiveProgramProgressBar extends StatelessWidget {
                 width * (playbackFrac - playableStartFrac),
               );
 
-              return Stack(
+              double clampFrac(double dx) {
+                if (width <= 0) return playbackFrac;
+                return (dx / width)
+                    .clamp(playableStartFrac, liveFrac)
+                    .toDouble();
+              }
+
+              final trackStack = Stack(
                 alignment: Alignment.centerLeft,
                 children: [
                   ClipRRect(
@@ -1872,6 +2084,28 @@ class LiveProgramProgressBar extends StatelessWidget {
                   ),
                 ],
               );
+
+              if (!canScrub) return trackStack;
+              var lastFrac = playbackFrac;
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapDown: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionEnd?.call(lastFrac);
+                },
+                onHorizontalDragStart: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionUpdate?.call(lastFrac);
+                },
+                onHorizontalDragUpdate: (details) {
+                  lastFrac = clampFrac(details.localPosition.dx);
+                  onScrubFractionUpdate?.call(lastFrac);
+                },
+                onHorizontalDragEnd: (_) {
+                  onScrubFractionEnd?.call(lastFrac);
+                },
+                child: trackStack,
+              );
             },
           ),
         ),
@@ -1926,11 +2160,21 @@ class LiveOsdProgramSection extends StatelessWidget {
     required this.info,
     this.timeshift,
     this.accentColor = Colors.lightBlueAccent,
+    this.interactive = false,
+    this.compactWidth = false,
+    this.showNextProgram = true,
+    this.onScrubFractionUpdate,
+    this.onScrubFractionEnd,
   });
 
   final LiveOsdProgramInfo info;
   final LiveTimeshiftBarState? timeshift;
   final Color accentColor;
+  final bool interactive;
+  final bool compactWidth;
+  final bool showNextProgram;
+  final ValueChanged<double>? onScrubFractionUpdate;
+  final ValueChanged<double>? onScrubFractionEnd;
 
   @override
   Widget build(BuildContext context) {
@@ -1947,40 +2191,67 @@ class LiveOsdProgramSection extends StatelessWidget {
                 usesProgramTimeline: true,
               )
             : null);
+    final timeRangeLabel = info.currentTimeRange == null
+        ? null
+        : (info.remainingMinutes != null
+              ? '${info.currentTimeRange}（残り ${info.remainingMinutes}分）'
+              : info.currentTimeRange!);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: BroadcastTitleLine(
-                rawTitle: info.currentTitle,
-                maxLines: 1,
-                darkSurface: true,
-                badgeScale: 1.1,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
+        if (compactWidth) ...[
+          BroadcastTitleLine(
+            rawTitle: info.currentTitle,
+            maxLines: 2,
+            darkSurface: true,
+            badgeScale: 1.05,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          if (timeRangeLabel != null) ...[
+            const SizedBox(height: 3),
+            Text(
+              timeRangeLabel,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+                fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
-            if (info.currentTimeRange != null) ...[
-              const SizedBox(width: 12),
-              Text(
-                info.remainingMinutes != null
-                    ? '${info.currentTimeRange}（残り ${info.remainingMinutes}分）'
-                    : info.currentTimeRange!,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  fontFeatures: [FontFeature.tabularFigures()],
+          ],
+        ] else
+          Row(
+            children: [
+              Expanded(
+                child: BroadcastTitleLine(
+                  rawTitle: info.currentTitle,
+                  maxLines: 1,
+                  darkSurface: true,
+                  badgeScale: 1.1,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
+              if (timeRangeLabel != null) ...[
+                const SizedBox(width: 12),
+                Text(
+                  timeRangeLabel,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 13,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
             ],
-          ],
-        ),
+          ),
         if (effectiveTimeshift != null) ...[
           const SizedBox(height: 6),
           LiveProgramProgressBar(
@@ -1990,9 +2261,12 @@ class LiveOsdProgramSection extends StatelessWidget {
                 effectiveTimeshift.rewindableSeconds >= 2,
             barHeight: 6.0,
             accentColor: accentColor,
+            interactive: interactive,
+            onScrubFractionUpdate: onScrubFractionUpdate,
+            onScrubFractionEnd: onScrubFractionEnd,
           ),
         ],
-        if (info.nextTitle != null) ...[
+        if (showNextProgram && info.nextTitle != null) ...[
           const SizedBox(height: 6),
           Row(
             children: [
@@ -2054,13 +2328,47 @@ class RecordedOsdProgramSection extends StatelessWidget {
     super.key,
     required this.programTitle,
     this.broadcastTimeRange,
+    this.compactWidth = false,
   });
 
   final String programTitle;
   final String? broadcastTimeRange;
+  final bool compactWidth;
 
   @override
   Widget build(BuildContext context) {
+    final hasRange =
+        broadcastTimeRange != null && broadcastTimeRange!.trim().isNotEmpty;
+    if (compactWidth) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          BroadcastTitleLine(
+            rawTitle: programTitle,
+            maxLines: 2,
+            darkSurface: true,
+            badgeScale: 1.05,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          if (hasRange) ...[
+            const SizedBox(height: 3),
+            Text(
+              broadcastTimeRange!,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ],
+      );
+    }
     return Row(
       children: [
         Expanded(
@@ -2076,8 +2384,7 @@ class RecordedOsdProgramSection extends StatelessWidget {
             ),
           ),
         ),
-        if (broadcastTimeRange != null &&
-            broadcastTimeRange!.trim().isNotEmpty) ...[
+        if (hasRange) ...[
           const SizedBox(width: 12),
           Text(
             broadcastTimeRange!,
@@ -2200,6 +2507,32 @@ int computePreBufferSeconds({
       : 0.0;
   final best = mpvBest > 0 ? mpvBest : fallback;
   return best.clamp(0.0, targetSeconds.toDouble()).floor();
+}
+
+/// Computes sliding-window receive throughput in Mbps from monotonic byte
+/// snapshots, returning `null` until at least [minSpan] has elapsed.
+double? computeSlidingThroughputMbps(
+  List<({DateTime at, int bytes})> samples, {
+  Duration minSpan = const Duration(milliseconds: 800),
+}) {
+  if (samples.length < 2) return null;
+  final first = samples.first;
+  final last = samples.last;
+  final elapsed = last.at.difference(first.at);
+  if (elapsed < minSpan) return null;
+  final deltaBytes = last.bytes - first.bytes;
+  if (deltaBytes < 0) return null;
+  final elapsedSec = elapsed.inMicroseconds / 1000000.0;
+  if (!elapsedSec.isFinite || elapsedSec <= 0) return null;
+  final mbps = (deltaBytes * 8.0) / (elapsedSec * 1000000.0);
+  return mbps.isFinite && mbps >= 0 ? mbps : null;
+}
+
+/// Formats a measured receive bitrate for the OSD header badge, or `null` when
+/// no valid measurement is available yet.
+String? formatThroughputMbps(double? mbps) {
+  if (mbps == null || !mbps.isFinite || mbps < 0) return null;
+  return '受信 ${mbps.toStringAsFixed(1)} Mbps';
 }
 
 /// Outcome for resolving a system Back (`PopScope`) while the player is open.
@@ -2429,6 +2762,7 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
     required this.focusNode,
     required this.onClose,
     required this.onScrollDelta,
+    this.uiMode = UiControlMode.tv,
   });
 
   final String title;
@@ -2438,6 +2772,7 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
   final FocusNode focusNode;
   final VoidCallback onClose;
   final void Function(double delta) onScrollDelta;
+  final UiControlMode uiMode;
 
   @override
   Widget build(BuildContext context) {
@@ -2546,9 +2881,13 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  '上下キーでスクロール ／ 決定・戻るキーで閉じる',
-                  style: TextStyle(color: Colors.amberAccent, fontSize: 11),
+                Text(
+                  uiMode.isTv
+                      ? '上下キーでスクロール ／ 決定・戻るキーで閉じる'
+                      : (uiMode.isDesktop
+                            ? 'ホイールでスクロール ／ Escで閉じる'
+                            : 'スワイプでスクロール'),
+                  style: const TextStyle(color: Colors.amberAccent, fontSize: 11),
                 ),
                 const Divider(color: Colors.white24, height: 14),
                 Flexible(
@@ -2578,6 +2917,23 @@ class ProgramDetailOverlayPanel extends StatelessWidget {
   }
 }
 
+/// Preserves active fullscreen/orientation state across in-playback
+/// `pushReplacement` transitions (channel switch, quality switch, next
+/// episode, failover), resetting when actually exiting playback.
+class PlayerSessionFullscreenHandoff {
+  static bool? touchFullscreenOverride;
+  static bool touchLandscapeLocked = false;
+  static bool desktopFullscreen = false;
+  static bool desktopPip = false;
+
+  static void reset() {
+    touchFullscreenOverride = null;
+    touchLandscapeLocked = false;
+    desktopFullscreen = false;
+    desktopPip = false;
+  }
+}
+
 class PlayerScreen extends ConsumerStatefulWidget {
   const PlayerScreen({
     super.key,
@@ -2592,6 +2948,9 @@ class PlayerScreen extends ConsumerStatefulWidget {
     this.programDetailMeta,
     this.programDetailBody,
     this.recordedChannelName,
+    this.initialRecordedChannelNumber,
+    this.initialRecordedChannelLogo,
+    this.loadRecordedChannelMetadata,
     this.recordedBroadcastTimeRange,
     this.recordedScheduledStart,
     this.recordedBroadcastingType,
@@ -2693,6 +3052,16 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
   /// Recorded channel label displayed in Row 1 of the recorded OSD header.
   final String? recordedChannelName;
+
+  /// Pre-loaded 3-digit channel number for recorded OSD header.
+  final String? initialRecordedChannelNumber;
+
+  /// Pre-loaded station logo PNG bytes for recorded OSD header.
+  final Uint8List? initialRecordedChannelLogo;
+
+  /// Optional background loader for recorded channel number/logo when uncached.
+  final Future<({String? number, Uint8List? logo})> Function()?
+  loadRecordedChannelMetadata;
 
   /// Formatted recorded broadcast date/time range displayed beside the programme title.
   final String? recordedBroadcastTimeRange;
@@ -2845,6 +3214,38 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _hasVideoFrame = false;
   String? _error;
 
+  static int _mpvCacheSessionSeq = 0;
+  bool _proxyReconnecting = false;
+  int _stallDeferCount = 0;
+  Timer? _proxyReconnectTimer;
+  final List<({DateTime at, int bytes})> _throughputSamples = [];
+  double? _recentThroughputMbps;
+  Duration _timeSeekBaseOffset = Duration.zero;
+  bool _timeSeeking = false;
+
+  bool _readProxyReconnecting() {
+    final s = widget.session;
+    if (s is StreamDiagnosticMetrics) {
+      return (s as StreamDiagnosticMetrics).isReconnectingUpstream;
+    }
+    return false;
+  }
+
+  bool _canAbsorbTransientInterruption() {
+    return shouldDeferPlayerInterruption(
+      playingNow: _playingNow,
+      bufferedAheadSeconds: _bufferedAheadSeconds,
+      bufferDeltaSeconds: _bufferDeltaSeconds,
+      proxyReconnecting: _readProxyReconnecting() || _proxyReconnecting,
+      buffering: _buffering,
+    );
+  }
+
+  Duration get _effectiveRecordedPosition =>
+      (!widget.live && widget.session is TimeSeekableSession)
+      ? (_timeSeekBaseOffset + _lastPosition)
+      : _lastPosition;
+
   /// Interruption state (plan 80): playback that had started
   /// stopped mid-stream — a fatal player error after the
   /// start, or the silent stall of plan 78 — and the notice
@@ -2874,6 +3275,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _checkingConflict = false;
   bool _conflictHandled = false;
   bool _switchingChannel = false;
+  bool _switchInFlight = false;
+  bool _sessionPermanentlyStopped = false;
+  bool _exitingPlayback = false;
+  bool _resuming = false;
+  bool _userPaused = false;
+  bool _reanchorLiveEpochAfterReconnect = false;
   String? _switchingChannelLabel;
   Timer? _liveConflictPollTimer;
   DateTime? _livePausedAt;
@@ -2986,6 +3393,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   Map<String, String> _liveChannelNumbers = const {};
   Map<String, Uint8List> _liveChannelLogos = const {};
   bool _liveChannelMetaLoading = false;
+  String? _recordedChannelNumber;
+  Uint8List? _recordedChannelLogo;
+  bool _recordedChannelMetaLoading = false;
   bool _liveGuideLoading = false;
   DateTime? _lastLiveGuideAttemptAt;
   bool _liveChannelsRefreshing = false;
@@ -2994,6 +3404,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _liveDetailLoading = false;
   int _liveDetailRequestSeq = 0;
   bool _replacedByNextPlayer = false;
+  bool _isTouchSplitActive = false;
   Timer? _osdClockTimer;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
@@ -3037,6 +3448,31 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// teardown (see player_teardown_policy).
   late final DiagLog _diag;
   late final FireTvHelper _fireTvHelper;
+  late final DesktopWindowController _desktopWindow;
+  late final PipController _pipController;
+  late final UiControlMode _initialUiMode;
+
+  UiControlMode get _uiMode =>
+      mounted ? ref.read(uiControlModeProvider) : _initialUiMode;
+
+  bool _desktopFullscreen = false;
+  bool _pipSupported = false;
+  bool _inPipMode = false;
+  bool _desktopPipHover = false;
+  bool _lastAutoPipSent = false;
+  StreamSubscription<bool>? _pipSubscription;
+  bool _pointerOverControls = false;
+  ChannelSwitchDirection? _hoveredChannelEdge;
+  Timer? _desktopEdgeHideTimer;
+  Duration? _scrubbingPosition;
+  Timer? _orientationResetTimer;
+  bool _touchPortraitOverlayOpen = false;
+  Timer? _touchPortraitOverlayTimer;
+  double _touchSwipeStartX = 0.0;
+  double _touchSwipeDeltaX = 0.0;
+  bool? _touchFullscreenOverride;
+  bool? _lastPhysicalLandscape;
+  bool? _lastAppliedImmersive;
 
   final FocusNode _rootFocusNode = FocusNode(debugLabel: 'playerRoot');
   final FocusScopeNode _osdFocusScopeNode = FocusScopeNode(
@@ -3052,6 +3488,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   );
   final FocusNode _closeBannerFocusNode = FocusNode(
     debugLabel: 'playerCloseBannerButton',
+  );
+  final FocusNode _errorRetryFocusNode = FocusNode(
+    debugLabel: 'playerErrorRetry',
   );
   final FocusNode _errorBackFocusNode = FocusNode(
     debugLabel: 'playerErrorBack',
@@ -3126,7 +3565,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       playingNow: _playingNow,
       buffering: _buffering,
       positionAtFirstFrame: _positionAtFirstFrame,
-      currentPosition: _lastPosition,
+      currentPosition: _effectiveRecordedPosition,
       preBufferTargetSeconds: targetSec,
       preBufferCurrentSeconds: _effectivePreBufferSeconds.toDouble(),
     );
@@ -3135,6 +3574,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _maybeCancelStartWatchdog();
     _stopStartupTraceTimer();
     _startTraceCompleted = true;
+    final plan = _bufferPlan;
+    final platform = _player.platform;
+    if (plan != null &&
+        plan.rebufferWaitSeconds != plan.cachePauseWaitSeconds &&
+        platform is NativePlayer) {
+      unawaited(
+        platform.setProperty('cache-pause-wait', '${plan.rebufferWaitSeconds}'),
+      );
+      _diag(
+        DiagCategory.playback,
+        'player: post-start cache-pause-wait -> ${plan.rebufferWaitSeconds}s',
+      );
+    }
     if (!_buffering) {
       _stopPreBufferPoller();
     }
@@ -3214,26 +3666,46 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   double get _bufferDeltaSeconds {
     if (_bufferEndPosition <= Duration.zero) return 0.0;
-    final base = _lastPosition > Duration.zero
-        ? _lastPosition
+    final base = _effectiveRecordedPosition > Duration.zero
+        ? _effectiveRecordedPosition
         : _initialBufferPosition;
     if (base == null) return 0.0;
     final diff = _bufferEndPosition - base;
     return diff > Duration.zero ? diff.inMilliseconds / 1000.0 : 0.0;
   }
 
-  int get _effectivePreBufferSeconds => computePreBufferSeconds(
-    targetSeconds: _bufferPlan?.cachePauseWaitSeconds ?? 0,
-    demuxerCacheDuration: _bufferedAheadSeconds,
-    bufferingPercentage: _bufferingPercentage,
-    bufferDeltaSeconds: _bufferDeltaSeconds,
-    liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
-  );
+  int get _effectivePreBufferSeconds {
+    final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
+    final transferFallback = widget.live
+        ? _liveTransferAccumulatedSeconds
+        : math.min(
+            _liveTransferAccumulatedSeconds,
+            math.max(0, target - 1).toDouble(),
+          );
+    return computePreBufferSeconds(
+      targetSeconds: target,
+      demuxerCacheDuration: _bufferedAheadSeconds,
+      bufferingPercentage: _bufferingPercentage,
+      bufferDeltaSeconds: _bufferDeltaSeconds,
+      liveTransferSeconds: transferFallback,
+    );
+  }
 
   int get _effectiveLoadingCurrentSeconds {
-    final target = _bufferPlan?.cachePauseWaitSeconds ?? 0;
-    if (target > 0 && _isPreBuffering) {
+    final activeTarget = _initialPlaybackStarted
+        ? (_bufferPlan?.rebufferWaitSeconds ?? 0)
+        : (_bufferPlan?.cachePauseWaitSeconds ?? 0);
+    if (activeTarget > 0 && _isPreBuffering) {
       return _effectivePreBufferSeconds;
+    }
+    if (activeTarget > 0) {
+      return computePreBufferSeconds(
+        targetSeconds: activeTarget,
+        demuxerCacheDuration: _bufferedAheadSeconds,
+        bufferingPercentage: _bufferingPercentage,
+        bufferDeltaSeconds: _bufferDeltaSeconds,
+        liveTransferSeconds: widget.live ? _liveTransferAccumulatedSeconds : 0.0,
+      );
     }
     final best = math.max(
       _bufferedAheadSeconds,
@@ -3361,7 +3833,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         } catch (_) {}
       }
-      if (widget.live && _shouldPollLiveBuffering) {
+      if (_shouldPollLiveBuffering) {
         if (widget.session case final StreamTransferMetrics metrics) {
           final next = advanceLiveTransferSeconds(
             currentAccumulatedSeconds: _liveTransferAccumulatedSeconds,
@@ -3392,6 +3864,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (latched ||
           (_shouldPollLiveBuffering &&
               (nextLoadSec != prevLoadSec || nextPct != prevPct)) ||
+          (_proxyReconnecting &&
+              _bufferedAheadSeconds.floor() != prevAheadFloor) ||
           (_seekHudVisible &&
               (_bufferedAheadSeconds.floor() != prevAheadFloor ||
                   liveRangeChanged)) ||
@@ -3447,6 +3921,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
+    _desktopWindow = ref.read(desktopWindowControllerProvider);
+    _pipController = ref.read(pipControllerProvider);
+    _initialUiMode = ref.read(uiControlModeProvider);
     _androidSdkInt = ref.read(androidSdkIntProvider);
     _useLegacySyncMpvInit = shouldUseLegacySyncMpvInit(
       isAndroid: Platform.isAndroid,
@@ -3471,6 +3948,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         (_liveChannelNumbers.isEmpty || _liveChannelLogos.isEmpty)) {
       unawaited(_loadLiveChannelMetadata());
     }
+    _recordedChannelNumber = widget.initialRecordedChannelNumber;
+    _recordedChannelLogo = widget.initialRecordedChannelLogo;
+    if (!widget.live &&
+        widget.loadRecordedChannelMetadata != null &&
+        (_recordedChannelNumber == null || _recordedChannelLogo == null)) {
+      unawaited(_loadRecordedChannelMetadata());
+    }
     _liveBandGuideEvents = {
       for (final entry in widget.initialLiveBandGuideEvents.entries)
         entry.key: List<EpgEvent>.of(entry.value),
@@ -3482,15 +3966,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _liveGuideEvents = List<EpgEvent>.of(seeded);
       }
     }
+    _touchFullscreenOverride =
+        PlayerSessionFullscreenHandoff.touchFullscreenOverride;
+    _desktopFullscreen = PlayerSessionFullscreenHandoff.desktopFullscreen;
+    _inPipMode = PlayerSessionFullscreenHandoff.desktopPip;
+    unawaited(_initPip());
     _recordLiveChannelProgramSnapshot(_activeLiveChannel);
-    unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
-    );
-    unawaited(_fireTvHelper.setMediaVolumeMax());
+    if (_initialUiMode.isTouch &&
+        !PlayerSessionFullscreenHandoff.touchLandscapeLocked) {
+      unawaited(
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+    }
+    if (_initialUiMode.isTv) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
+      unawaited(_fireTvHelper.setMediaVolumeMax());
+    } else if (_initialUiMode.isDesktop) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
+    }
     _player = _useLegacySyncMpvInit
         ? Player(configuration: const PlayerConfiguration(async: false))
         : Player();
-    unawaited(_player.setVolume(100.0));
+    unawaited(_applyPlayerVolume());
     _videoController = _hwdecMode == VideoHwdecMode.software
         ? VideoController(
             _player,
@@ -3505,6 +4010,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _videoController.rect.addListener(_onVideoRectChanged);
     _wakelockSession = ref.read(playbackWakelockProvider).openSession();
     _watchdog = Timer(startTimeout, _onStartTimeout);
+    _proxyReconnectTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (!mounted || _conflictHandled || _switchingChannel) return;
+        _sampleThroughputTick();
+        final wasReconnecting = _proxyReconnecting;
+        final next = _readProxyReconnecting();
+        if (next != _proxyReconnecting) {
+          setState(() => _proxyReconnecting = next);
+        }
+        if (wasReconnecting && !next && widget.live) {
+          _reanchorLiveEpochAfterReconnect = true;
+          unawaited(_pollMpvBufferProperties());
+        } else if (next && _initialPlaybackStarted && !_interrupted) {
+          unawaited(_pollMpvBufferProperties());
+        }
+      },
+    );
     _superimposeSyncTimer = Timer.periodic(
       const Duration(milliseconds: 500),
       (_) => _syncSuperimposeTick(),
@@ -3527,15 +4050,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           if (!playing) {
             if (!_buffering && !_interrupted && _initialPlaybackStarted) {
               _markLivePaused(notify: false);
-            } else {
+            } else if (_liveDelayedByPause) {
               _livePausedAt ??= _now();
             }
           } else {
             if (_livePausedAt != null) {
-              final pauseDelta =
-                  _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
-              if (pauseDelta > 0) {
-                _liveEstimatedLagSeconds += pauseDelta;
+              if (_liveDelayedByPause) {
+                final pauseDelta =
+                    _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
+                if (pauseDelta > 0) {
+                  _liveEstimatedLagSeconds += pauseDelta;
+                }
               }
               _livePausedAt = null;
             }
@@ -3546,29 +4071,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _playingNow = playing;
             if (playing) {
               _playing = true;
+              _userPaused = false;
               _interrupted = false;
               _interruptDetail = null;
+              if (!_buffering) _resuming = false;
             }
             _maybeLatchInitialPlaybackStarted();
           });
         } else {
           _playingNow = playing;
-          if (playing) _playing = true;
+          if (playing) {
+            _playing = true;
+            _userPaused = false;
+            if (!_buffering) _resuming = false;
+          }
           _maybeLatchInitialPlaybackStarted();
         }
         if (playing) {
           _maybeCancelStartWatchdog();
-          _resumeWatchdogTimer?.cancel();
+          if (!_buffering) {
+            _resumeWatchdogTimer?.cancel();
+            _autoResumeAttempts = 0;
+          }
           _autoResumeTimer?.cancel();
           _autoResumeCountdown = 0;
           _autoResumeDisabled = false;
-          if (!_buffering) {
-            _autoResumeAttempts = 0;
-          }
           // A (re)start clears any interruption state
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
           _stallTimer?.cancel();
+          _stallDeferCount = 0;
           _bufferingSincePlaying = false;
           if (widget.live && _liveDelayedByPause) {
             unawaited(_updateLiveCatchUpSpeed(immediate: true));
@@ -3594,11 +4126,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // while playing is a recovery and clears it.
           _bufferingSincePlaying = buffering;
         }
-        if (!buffering && _playingNow) {
-          _autoResumeAttempts = 0;
-          if (!_decodeStatusLogged) {
-            _decodeStatusLogged = true;
-            unawaited(_logDecodeStatus());
+        if (!buffering) {
+          _stallTimer?.cancel();
+          _stallDeferCount = 0;
+          if (_playingNow) {
+            _resumeWatchdogTimer?.cancel();
+            _resuming = false;
+            _autoResumeAttempts = 0;
+            if (!_decodeStatusLogged) {
+              _decodeStatusLogged = true;
+              unawaited(_logDecodeStatus());
+            }
+          }
+        } else if (_playingNow &&
+            _initialPlaybackStarted &&
+            !_interrupted &&
+            !_userPaused) {
+          if (_stallTimer == null || !_stallTimer!.isActive) {
+            final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+            final timeout = computeEffectiveStallTimeout(
+              live: widget.live,
+              rebufferWaitSeconds: waitSec,
+            );
+            _stallTimer = Timer(timeout, _onStallTimeout);
           }
         }
         if (widget.live &&
@@ -3611,6 +4161,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           }
         }
         final changed = _buffering != buffering;
+        if (buffering && !_buffering && _initialPlaybackStarted && widget.live) {
+          _liveTransferAccumulatedSeconds = 0.0;
+          _lastLiveTransferTickAt = null;
+          if (widget.session case final StreamTransferMetrics metrics) {
+            _lastObservedServedBytes = metrics.servedBytes;
+          }
+        }
         _buffering = buffering;
         if (_shouldPollLiveBuffering) {
           _startPreBufferPoller();
@@ -3657,7 +4214,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         final committed = _committedSeekTarget;
         if (committed != null &&
-            (position - committed).abs() <= const Duration(seconds: 2)) {
+            (_effectiveRecordedPosition - committed).abs() <=
+                const Duration(seconds: 2)) {
           _committedSeekTarget = null;
           _committedSeekHoldTimer?.cancel();
           if (_seekHudVisible) shouldRebuild = true;
@@ -3821,7 +4379,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
           return;
         }
-        _wakelockSession.setPlaying(false);
         _watchdog?.cancel();
         _stopStartupTraceTimer();
         if (!mounted) return;
@@ -3831,7 +4388,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         );
         if (hasStartedFrames && _playing) {
           if (!widget.live && _isEffectivelyCompleted) {
+            _wakelockSession.setPlaying(false);
             _handleRecordedCompletion('trailing error near end: $error');
+            return;
+          }
+          if (_canAbsorbTransientInterruption()) {
+            _diag(
+              DiagCategory.playback,
+              'player: deferring interruption to preserve buffer '
+              '(ahead=${_bufferedAheadSeconds.toStringAsFixed(1)}s, '
+              'reconnecting=${_readProxyReconnecting()})',
+            );
+            if (_stallTimer == null || !_stallTimer!.isActive) {
+              final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+              final timeout = computeEffectiveStallTimeout(
+                live: widget.live,
+                rebufferWaitSeconds: waitSec,
+              );
+              _stallTimer = Timer(timeout, _onStallTimeout);
+            }
             return;
           }
           // The failure arrived after playback had started
@@ -3839,8 +4414,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // Keep the frozen frame and offer the in-place
           // resume instead of replacing the screen with the
           // start-failure message.
+          _wakelockSession.setPlaying(false);
           _enterInterruptedState(error);
         } else if (_error == null) {
+          _wakelockSession.setPlaying(false);
           _setStartError('$error\n\n${_buildCompactDiagnosticsSummary()}');
         }
       }),
@@ -3877,7 +4454,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _completed ||
       isNearRecordedEnd(
         live: widget.live,
-        position: _lastPosition,
+        position: _effectiveRecordedPosition,
         duration: _effectiveDuration,
       );
 
@@ -3911,7 +4488,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      if (!mounted || _exitingPlayback) return;
       final nav = Navigator.of(context);
       if (_exitConfirmOpen) {
         if (nav.canPop()) nav.pop(true);
@@ -3933,7 +4510,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         interrupted: _interrupted,
         hasError: _error != null,
         duration: _effectiveDuration,
-        position: _lastPosition,
+        position: _effectiveRecordedPosition,
       );
 
   Future<void> _executePlayNextEpisode() async {
@@ -3957,19 +4534,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     try {
       final nextPlayer = await launcher(context, stopCurrentSession);
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer != null) {
-        await _pushReplacementPlayer(nextPlayer);
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
         return;
       }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: next episode launch failed: $e');
     }
     if (mounted) {
-      final nav = Navigator.of(context);
-      if (nav.canPop()) {
-        nav.pop();
-      }
+      await _exitPlaybackCleanly();
     }
   }
 
@@ -3984,8 +4566,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (!mounted) return;
     if (confirmed) {
-      final nav = Navigator.of(context);
-      if (nav.canPop()) nav.pop();
+      await _exitPlaybackCleanly();
       return;
     }
     _suppressBackPopUntil = DateTime.now().add(
@@ -4001,6 +4582,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _setStartError(String error, {bool allowAfterConflict = false}) {
+    _resuming = false;
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
     _logPlaybackTrace('start error: $error');
@@ -4008,16 +4590,77 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!allowAfterConflict && (_conflictHandled || _switchingChannel)) return;
     setState(() => _error = error);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted &&
-          _error != null &&
-          (allowAfterConflict || (!_conflictHandled && !_switchingChannel)) &&
-          _errorBackFocusNode.canRequestFocus) {
+      if (!mounted ||
+          _error == null ||
+          (!allowAfterConflict && (_conflictHandled || _switchingChannel))) {
+        return;
+      }
+      if (_errorRetryFocusNode.canRequestFocus) {
+        _errorRetryFocusNode.requestFocus();
+      } else if (_errorBackFocusNode.canRequestFocus) {
         _errorBackFocusNode.requestFocus();
       }
     });
   }
 
+  Future<void> _retryFromStartError() async {
+    if (!mounted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _sessionPermanentlyStopped) {
+      return;
+    }
+    _watchdog?.cancel();
+    _stopPreBufferPoller();
+    _stopStartupTraceTimer();
+    try {
+      await _player.stop().catchError((_) {});
+    } catch (_) {}
+    await _deleteUsedDiskCacheDir();
+    if (widget.live) {
+      if (widget.session case final LiveEdgeResettable resettable) {
+        try {
+          await resettable.resetToLiveEdge();
+        } catch (e) {
+          _diag(
+            DiagCategory.playback,
+            'player: retry resetToLiveEdge failed: $e',
+          );
+        }
+      }
+    }
+    if (!mounted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _sessionPermanentlyStopped) {
+      return;
+    }
+    setState(() {
+      _error = null;
+      _resuming = false;
+      _playing = false;
+      _playingNow = false;
+      _completed = false;
+      _buffering = true;
+      _hasVideoFrame = false;
+      _initialPlaybackStarted = false;
+      _positionAtFirstFrame = null;
+      _bufferedAheadSeconds = 0.0;
+      _bufferingPercentage = 0.0;
+      _bufferEndPosition = Duration.zero;
+      _initialBufferPosition = null;
+      _lastObservedServedBytes = 0;
+      _lastLiveTransferTickAt = null;
+      _liveTransferAccumulatedSeconds = 0.0;
+    });
+    if (_rootFocusNode.canRequestFocus) {
+      _rootFocusNode.requestFocus();
+    }
+    await _open();
+  }
+
   void _enterInterruptedState(String? detail) {
+    _resuming = false;
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
     _logPlaybackTrace(
@@ -4090,7 +4733,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _onStartTimeout() {
     if (!mounted ||
-        _playing ||
+        _initialPlaybackStarted ||
         _error != null ||
         _conflictHandled ||
         _switchingChannel) {
@@ -4430,21 +5073,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles(stopTimer: true);
     _resetSubtitleTrackTracking();
     _resetLiveCatchUpState(resetPlayerRate: false);
-    _recordingStatusTimer?.cancel();
-    _cornerNoticeTimer?.cancel();
-    _customCornerNoticeTimer?.cancel();
-    _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
-    _hudTimer?.cancel();
-    _seekHudTimer?.cancel();
-    _seekDebounceTimer?.cancel();
-    _committedSeekHoldTimer?.cancel();
-    _liveSeekDebounceTimer?.cancel();
-    _liveCommittedSeekHoldTimer?.cancel();
-    _livePendingSeekBaseSec = null;
-    _livePendingSeekDeltaSec = 0.0;
-    _liveCommittedSeekSec = null;
+    _stopJikkyo(clearOverlay: true);
+    _cancelAuxTimersForTeardown();
 
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
@@ -4452,6 +5082,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _subscriptions.clear();
 
     setState(() {
+      _resuming = false;
       _interrupted = false;
       _interruptDetail = null;
       _autoResumeCountdown = 0;
@@ -4466,6 +5097,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _customCornerNoticeText = null;
     });
 
+    _sessionPermanentlyStopped = true;
     await _player.stop().timeout(
       const Duration(seconds: 2),
       onTimeout: () {},
@@ -4474,6 +5106,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(seconds: 3),
       onTimeout: () {},
     ).catchError((_) {});
+    await _deleteUsedDiskCacheDir();
     if (!mounted) return;
 
     final failoverReg = conflict.failoverRegistration;
@@ -4490,8 +5123,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
       try {
         final nextPlayer = await buildFailover(failoverReg, failoverCh, notice);
-        if (!mounted) return;
-        await _pushReplacementPlayer(nextPlayer);
+        if (!mounted) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          return;
+        }
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
         return;
       } catch (e) {
         _diag(
@@ -4520,8 +5161,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
       try {
         final nextPlayer = await buildNext(target);
-        if (!mounted) return;
-        await _pushReplacementPlayer(nextPlayer);
+        if (!mounted) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          return;
+        }
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
       } catch (e) {
         _diag(
           DiagCategory.playback,
@@ -4537,8 +5186,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
 
-    final nav = Navigator.of(context);
-    if (nav.canPop()) nav.pop();
+    await _exitPlaybackCleanly();
   }
 
   /// A playing→stopped transition (plan 80): when the
@@ -4546,7 +5194,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// grace period to recover on its own before surfacing
   /// anything.
   void _onPlaybackStopped() {
-    if (_conflictHandled || _switchingChannel) return;
+    if (_conflictHandled || _switchingChannel || _userPaused) return;
     if (!shouldSurfacePreFrameStopAsInterruption(
       hasVideoFrame: _hasVideoFrame,
       initialPlaybackStarted: _initialPlaybackStarted,
@@ -4582,19 +5230,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _handleRecordedCompletion('stopped after buffering near end');
       return;
     }
+    final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+    final effectiveStallTimeout =
+        (_bufferPlan != null && (widget.live || waitSec > 0))
+        ? computeEffectiveStallTimeout(
+            live: widget.live,
+            rebufferWaitSeconds: waitSec,
+          )
+        : stallTimeout;
     _diag(
       DiagCategory.playback,
       'player: playback stopped after buffering without '
       'completing; watching for a recovery for '
-      '${stallTimeout.inSeconds} seconds (plan 80)',
+      '${effectiveStallTimeout.inSeconds} seconds (plan 80)',
     );
+    _stallDeferCount = 0;
     _stallTimer?.cancel();
-    _stallTimer = Timer(stallTimeout, _onStallTimeout);
+    _stallTimer = Timer(effectiveStallTimeout, _onStallTimeout);
   }
 
   void _onStallTimeout() {
     if (!mounted ||
-        _playingNow ||
+        (_playingNow && !_buffering) ||
+        _userPaused ||
         _completed ||
         _error != null ||
         _conflictHandled ||
@@ -4603,6 +5261,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (!widget.live && _isEffectivelyCompleted) {
       _handleRecordedCompletion('stall timeout near end');
+      return;
+    }
+    var recentTransfer = false;
+    if (widget.session case final StreamTransferMetrics metrics) {
+      final lastAt = metrics.lastByteServedAt;
+      if (lastAt != null &&
+          _now().difference(lastAt) < const Duration(seconds: 15)) {
+        recentTransfer = true;
+      }
+    }
+    final canDefer =
+        _stallDeferCount < 12 &&
+        (_canAbsorbTransientInterruption() || recentTransfer);
+    if (canDefer) {
+      _stallDeferCount++;
+      _diag(
+        DiagCategory.playback,
+        'player: deferring stall timeout #$_stallDeferCount '
+        '(ahead=${_bufferedAheadSeconds.toStringAsFixed(1)}s, '
+        'reconnecting=${_readProxyReconnecting()}, recent=$recentTransfer)',
+      );
+      _stallTimer?.cancel();
+      _stallTimer = Timer(const Duration(seconds: 10), _onStallTimeout);
       return;
     }
     _diag(
@@ -4629,6 +5310,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _resetLiveCatchUpState(resetPlayerRate: true);
     }
     setState(() {
+      _resuming = true;
+      _userPaused = false;
       _autoResumeDisabled = false;
       _autoResumeCountdown = 0;
       _interrupted = false;
@@ -4654,7 +5337,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _lastLiveTransferTickAt = null;
       _liveTransferAccumulatedSeconds = 0.0;
     });
-    if (_isPreBuffering) {
+    if (_shouldPollLiveBuffering) {
       _startPreBufferPoller();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4665,9 +5348,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _rootFocusNode.requestFocus();
       }
     });
-    _resumeWatchdogTimer = Timer(const Duration(seconds: 25), () {
+    final resumeTimeout = computeResumeWatchdogTimeout(
+      live: widget.live,
+      rebufferWaitSeconds: _bufferPlan?.rebufferWaitSeconds ?? 0,
+    );
+    _resumeWatchdogTimer = Timer(resumeTimeout, () {
       if (!mounted ||
-          _playingNow ||
+          (_playingNow && !_buffering) ||
           _completed ||
           _interrupted ||
           _error != null ||
@@ -4682,18 +5369,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _enterInterruptedState('再接続がタイムアウトしました。電波状況を確認して再試行します。');
     });
     try {
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       if (!mounted || _conflictHandled || _switchingChannel) return;
+      var resumeUri = widget.session.mediaUri;
+      if (widget.live) {
+        if (widget.session case final LiveEdgeResettable resettable) {
+          await resettable.resetToLiveEdge();
+        }
+        if (!mounted || _conflictHandled || _switchingChannel) return;
+        resumeUri = resumeUri.replace(
+          queryParameters: {'live_edge': '${++_liveEdgeSeq}'},
+        );
+      }
+      var resumeStart = (!widget.live && _effectiveRecordedPosition > Duration.zero)
+          ? _effectiveRecordedPosition
+          : null;
+      if (resumeStart != null && widget.session is TimeSeekableSession) {
+        _timeSeekBaseOffset = resumeStart;
+        _lastPosition = Duration.zero;
+        await (widget.session as TimeSeekableSession).seekToTime(resumeStart);
+        resumeStart = null;
+      }
       await _player.open(
         Media(
-          widget.session.mediaUri.toString(),
-          start: (!widget.live && _lastPosition > Duration.zero)
-              ? _lastPosition
-              : null,
+          resumeUri.toString(),
+          start: resumeStart,
         ),
       );
       if (!mounted || _conflictHandled || _switchingChannel) return;
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
+      await _applySubtitleSelection();
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
       if (!mounted || _conflictHandled || _switchingChannel) return;
@@ -4741,6 +5446,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _usingDirectAribCaptions = false;
     _suppressedCaptionSignature = null;
     _lastSeenSubStartSeconds = null;
+    _lastPlaybackTimeSeconds = null;
   }
 
   void _clearDisplayedSubtitles({bool notify = true, bool stopTimer = false}) {
@@ -4866,7 +5572,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _syncSuperimposeTick() {
-    if (!mounted || _switchingChannel || _error != null) return;
+    if (!mounted || _conflictHandled || _switchingChannel || _error != null) {
+      return;
+    }
     final enabled = ref.read(superimposeEnabledProvider);
     if (!enabled) {
       if (_visibleSuperimposeCues.isNotEmpty) {
@@ -4891,13 +5599,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     ? -source.firstStreamPtsSeconds!
                     : 0.0));
       final playbackTime =
-          _lastPlaybackTimeSeconds ?? (_lastPosition.inMilliseconds / 1000.0);
+          _lastPlaybackTimeSeconds ??
+          (_effectiveRecordedPosition.inMilliseconds / 1000.0);
+      final now = _now();
+      var liveBufferDelaySeconds = 0.0;
+      if (widget.live) {
+        final inputs = _currentLiveSeekInputs(now);
+        final lag = resolveLivePlaybackLagSeconds(
+          liveDelayedByPause: _liveDelayedByPause,
+          cacheStartSeconds: _liveCacheStartSec,
+          cacheEndSeconds: _liveCacheEndSec,
+          liveEdgeSeconds: _liveCacheLiveEdgeSec,
+          effectivePosSeconds: inputs.effectivePos,
+          fallbackLagSeconds: inputs.fallbackLag,
+          streamEpoch: _liveStreamEpoch,
+          now: now,
+          bufferedAheadSeconds: _bufferedAheadSeconds,
+          isScrubbing: _livePendingSeekBaseSec != null,
+        );
+        final configured = (_bufferPlan?.configuredSeconds ?? 0).toDouble();
+        liveBufferDelaySeconds = lag > configured ? lag : configured;
+      }
       final resolved = resolveActiveSuperimposeCues(
         events: events,
         isLive: widget.live,
-        now: _now(),
+        now: now,
         currentPlaybackMpvPts: playbackTime,
         ptsOffset: ptsOffset,
+        liveBufferDelaySeconds: liveBufferDelaySeconds,
       );
       if (!_cuesEqual(_visibleSuperimposeCues, resolved.cues)) {
         setState(() => _visibleSuperimposeCues = resolved.cues);
@@ -4915,10 +5644,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             !(_seekDebounceTimer?.isActive ?? false) &&
             !(_liveSeekDebounceTimer?.isActive ?? false)) {
           unawaited(
-            _fireTvHelper.playAribBuiltinSound(
-              soundId,
-              urgent: resolved.isUrgent,
-            ),
+            ref
+                .read(aribSoundPlayerProvider)
+                .playAribBuiltinSound(
+                  soundId,
+                  urgent: resolved.isUrgent,
+                ),
           );
         }
       }
@@ -5006,7 +5737,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _syncJikkyoTick() {
-    if (!mounted || !_jikkyoOn || _switchingChannel || _error != null) return;
+    if (!mounted ||
+        !_jikkyoOn ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _error != null) {
+      return;
+    }
     final controller = _jikkyoController;
     if (controller == null) return;
     final settings = ref.read(jikkyoSettingsProvider);
@@ -5026,7 +5763,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (!_playingNow || _buffering || _interrupted) return;
       final incoming = controller.pollLiveComments(
         effectivePlaybackClock: playbackClock,
-        delaySeconds: settings.liveDelaySeconds,
+        delaySeconds: resolveLiveJikkyoDelaySeconds(
+          baseLiveDelaySeconds: settings.liveDelaySeconds,
+          liveDelayedByPause: _liveDelayedByPause,
+          configuredLiveBufferSeconds: _bufferPlan?.configuredSeconds ?? 0,
+          bufferedAheadSeconds: _bufferedAheadSeconds,
+        ),
         manualOffsetSeconds: _jikkyoManualOffsetSeconds,
       );
       if (incoming.isNotEmpty) {
@@ -5037,7 +5779,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     if (!_playingNow || _buffering || _interrupted) return;
     final incoming = controller.pollRecordedComments(
-      position: _lastPosition,
+      position: _effectiveRecordedPosition,
       offsetSeconds: _jikkyoManualOffsetSeconds,
     );
     if (incoming.isNotEmpty) {
@@ -5694,6 +6436,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         final waitingForInitial = _isPreBuffering;
         if (mounted &&
             ((waitingForInitial && _effectivePreBufferSeconds != prevPreSec) ||
+                (_proxyReconnecting && clamped.floor() != prevFloor) ||
                 (_seekHudVisible && clamped.floor() != prevFloor) ||
                 (_osdOpen && _syncDisplayedBufferBadge()))) {
           setState(() {});
@@ -5809,6 +6552,28 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
+  Future<void> _loadRecordedChannelMetadata() async {
+    final loader = widget.loadRecordedChannelMetadata;
+    if (widget.live || loader == null || _recordedChannelMetaLoading) return;
+    _recordedChannelMetaLoading = true;
+    try {
+      final loaded = await loader();
+      if (!mounted) return;
+      final nextNumber = loaded.number ?? _recordedChannelNumber;
+      final nextLogo = loaded.logo ?? _recordedChannelLogo;
+      if (nextNumber != _recordedChannelNumber ||
+          nextLogo != _recordedChannelLogo) {
+        setState(() {
+          _recordedChannelNumber = nextNumber;
+          _recordedChannelLogo = nextLogo;
+        });
+      }
+    } catch (_) {
+    } finally {
+      _recordedChannelMetaLoading = false;
+    }
+  }
+
   Future<void> _refreshLiveChannelSnapshots({bool force = false}) async {
     final refresher = widget.onRefreshLiveChannels;
     if (!widget.live || refresher == null || _liveChannelsRefreshing) return;
@@ -5885,7 +6650,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// has points and follow the same seekable signal as
   /// the skip buttons; a side with no point is a no-op.
   Future<void> _seekToChapter({required bool forward}) async {
-    final position = _player.state.position;
+    final position = _effectiveRecordedPosition;
     final target = forward
         ? nextChapterTarget(chapters: _chapters, position: position)
         : previousChapterTarget(chapters: _chapters, position: position);
@@ -5915,7 +6680,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles();
     _resetSubtitleTrackTracking();
     try {
-      await _player.seek(target);
+      if (widget.session is TimeSeekableSession && !_seekable.value) {
+        await _performTimeSeek(target);
+      } else {
+        await _player.seek(target);
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: chapter seek failed: $e');
     }
@@ -5961,6 +6730,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   Future<void> _open() async {
+    _userPaused = false;
     _openStartedAt = Stopwatch()..start();
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
     try {
@@ -5972,6 +6742,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           ((widget.live || bufferSeconds >= 60) && Platform.isAndroid)
           ? await _fireTvHelper.getCacheAvailableBytes()
           : null;
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        return;
+      }
       final plan = computeMpvBufferPlan(
         live: widget.live,
         bufferSeconds: bufferSeconds,
@@ -6008,7 +6781,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _liveSeekDebounceTimer?.cancel();
       _liveCommittedSeekSec = null;
       _liveCommittedSeekHoldTimer?.cancel();
-      _usedDiskCacheDir = plan.useDiskCache ? cacheDir : null;
+      Directory? sessionCacheDir;
+      if (plan.useDiskCache && cacheDir != null) {
+        final seq = ++_mpvCacheSessionSeq;
+        sessionCacheDir = Directory(
+          '${cacheDir.path}/s_${DateTime.now().microsecondsSinceEpoch}_$seq',
+        );
+        try {
+          await sessionCacheDir.create(recursive: true);
+        } catch (_) {
+          sessionCacheDir = cacheDir;
+        }
+      }
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        if (sessionCacheDir != null &&
+            sessionCacheDir.parent.path.endsWith('mpv_cache')) {
+          try {
+            if (await sessionCacheDir.exists()) {
+              await sessionCacheDir.delete(recursive: true);
+            }
+          } catch (_) {}
+        }
+        return;
+      }
+      _usedDiskCacheDir = sessionCacheDir;
       _watchdog?.cancel();
       _watchdog = Timer(
         Duration(seconds: plan.startTimeoutSeconds),
@@ -6074,6 +6870,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             '$liveDemuxerAnalyzeDurationSeconds',
           );
           await platform.setProperty('demuxer-lavf-probesize', '$probeSize');
+        } else {
+          final probeSize = recordedDemuxerProbeSizeBytes(
+            useMobile: widget.currentUseMobile,
+          );
+          await platform.setProperty(
+            'demuxer-lavf-analyzeduration',
+            '$liveDemuxerAnalyzeDurationSeconds',
+          );
+          await platform.setProperty('demuxer-lavf-probesize', '$probeSize');
         }
         await platform.setProperty('cache', plan.useCache ? 'yes' : 'no');
         if (plan.useCache) {
@@ -6107,9 +6912,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             await platform.setProperty('force-seekable', 'yes');
             await platform.setProperty('demuxer-seekable-cache', 'yes');
           }
-          if (plan.useDiskCache && plan.cacheDirPath != null) {
+          final cachePath = _usedDiskCacheDir?.path ?? plan.cacheDirPath;
+          if (plan.useDiskCache && cachePath != null) {
+            await platform.setProperty('demuxer-cache-dir', cachePath);
             await platform.setProperty('cache-on-disk', 'yes');
-            await platform.setProperty('demuxer-cache-dir', plan.cacheDirPath!);
           } else {
             await platform.setProperty('cache-on-disk', 'no');
           }
@@ -6129,24 +6935,33 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           _startPreBufferPoller();
         }
       }
-      final start =
+      final rawStart =
           (!widget.live &&
               widget.initialStart != null &&
               widget.initialStart! > Duration.zero)
           ? widget.initialStart
           : null;
-      if (start != null) {
+      var openMediaStart = rawStart;
+      if (rawStart != null && widget.session is TimeSeekableSession) {
+        _timeSeekBaseOffset = rawStart;
+        await (widget.session as TimeSeekableSession).seekToTime(rawStart);
+        openMediaStart = null;
+      }
+      if (rawStart != null) {
         _diag(
           DiagCategory.playback,
-          'player: opening at the resume position ${start.inSeconds}s '
+          'player: opening at the resume position ${rawStart.inSeconds}s '
           '(plan 86)',
         );
       }
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        return;
+      }
       await _player.open(
-        Media(widget.session.mediaUri.toString(), start: start),
+        Media(widget.session.mediaUri.toString(), start: openMediaStart),
       );
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       _diag(DiagCategory.playback, 'player: open completed');
       _logPlaybackTrace(
         'player.open completed at ${_openStartedAt?.elapsedMilliseconds ?? 0}ms',
@@ -6185,7 +7000,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return resumePositionToReport(
       started: _playing,
       completed: _completed,
-      position: _lastPosition,
+      position: _effectiveRecordedPosition,
     );
   }
 
@@ -6226,6 +7041,71 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// even when the stop fails — media_kit's own dispose also
   /// stops internally, but leaving must not depend on a
   /// single call landing.
+  Future<void> _deleteUsedDiskCacheDir() async {
+    final cacheDir = _usedDiskCacheDir;
+    _usedDiskCacheDir = null;
+    if (cacheDir == null) return;
+    try {
+      if (await cacheDir.exists()) {
+        if (cacheDir.parent.path.endsWith('mpv_cache')) {
+          await cacheDir.delete(recursive: true);
+        } else {
+          await for (final entry in cacheDir.list()) {
+            await entry.delete(recursive: true);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _cancelAuxTimersForTeardown() {
+    _superimposeSyncTimer?.cancel();
+    _proxyReconnectTimer?.cancel();
+    _recordingStatusTimer?.cancel();
+    _cornerNoticeTimer?.cancel();
+    _customCornerNoticeTimer?.cancel();
+    _channelPreviewTimer?.cancel();
+    _osdTimer?.cancel();
+    _osdClockTimer?.cancel();
+    _osdClockTimer = null;
+    _touchPortraitOverlayTimer?.cancel();
+    _orientationResetTimer?.cancel();
+    _desktopEdgeHideTimer?.cancel();
+    _hudTimer?.cancel();
+    _seekHudTimer?.cancel();
+    _seekDebounceTimer?.cancel();
+    _committedSeekHoldTimer?.cancel();
+    _liveSeekDebounceTimer?.cancel();
+    _liveCommittedSeekHoldTimer?.cancel();
+    _livePendingSeekBaseSec = null;
+    _livePendingSeekDeltaSec = 0.0;
+    _liveCommittedSeekSec = null;
+  }
+
+  void _stopOrphanedReplacementPlayer(Widget? candidate) {
+    if (candidate is PlayerScreen) {
+      unawaited(candidate.session.stop().catchError((_) {}));
+    }
+  }
+
+  Future<void> _exitPlaybackCleanly() async {
+    if (_exitingPlayback || !mounted) return;
+    _exitingPlayback = true;
+    _exitConfirmOpen = false;
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel().catchError((_) {}));
+    }
+    _subscriptions.clear();
+    unawaited(_player.stop().catchError((_) {}));
+    await _stopSession().timeout(
+      const Duration(milliseconds: 1500),
+      onTimeout: () {},
+    );
+    if (!mounted) return;
+    final nav = Navigator.of(context);
+    if (nav.canPop()) nav.pop();
+  }
+
   Future<void> _stopAndDisposePlayer() async {
     try {
       await _player.stop();
@@ -6237,23 +7117,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dispose on leaving failed: $e');
     }
-    final cacheDir = _usedDiskCacheDir;
-    if (cacheDir != null) {
-      try {
-        if (await cacheDir.exists()) {
-          await for (final entry in cacheDir.list()) {
-            await entry.delete(recursive: true);
-          }
-        }
-      } catch (_) {}
-    }
+    await _deleteUsedDiskCacheDir();
   }
 
+  Future<void>? _sessionStopFuture;
+
   /// Stops the playback session (plan 104): closes the
-  /// loopback proxy and the DTCP session behind it. A
-  /// failure is logged inside and dropped; the session's
-  /// stop can never hold up the rest of the teardown.
-  Future<void> _stopSession() async {
+  /// loopback proxy and the DTCP session behind it. Idempotent
+  /// across confirm-exit and [dispose] so callers can await it
+  /// before leaving without double-stopping. A failure is logged
+  /// inside and dropped; the session's stop can never hold up
+  /// the rest of the teardown.
+  Future<void> _stopSession() {
+    return _sessionStopFuture ??= _runStopSession();
+  }
+
+  Future<void> _runStopSession() async {
+    final sw = Stopwatch()..start();
     try {
       await widget.session.stop();
     } catch (e) {
@@ -6261,6 +7141,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         DiagCategory.playback,
         'player: session stop on leaving failed: $e',
       );
+    } finally {
+      sw.stop();
+      _logPlaybackTrace('session stopped in ${sw.elapsedMilliseconds}ms');
     }
   }
 
@@ -6279,6 +7162,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       [
         (name: 'watchdog', run: () => _watchdog?.cancel()),
         (name: 'startup trace timer', run: () => _stopStartupTraceTimer()),
+        (
+          name: 'proxy reconnect timer',
+          run: () => _proxyReconnectTimer?.cancel(),
+        ),
         (name: 'stall timer', run: () => _stallTimer?.cancel()),
         (name: 'auto resume timer', run: () => _autoResumeTimer?.cancel()),
         (name: 'resume watchdog', run: () => _resumeWatchdogTimer?.cancel()),
@@ -6321,6 +7208,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         ),
         (name: 'osd timer', run: () => _osdTimer?.cancel()),
         (name: 'osd clock timer', run: () => _osdClockTimer?.cancel()),
+        (
+          name: 'touch portrait overlay timer',
+          run: () => _touchPortraitOverlayTimer?.cancel(),
+        ),
+        (
+          name: 'orientation reset timer',
+          run: () => _orientationResetTimer?.cancel(),
+        ),
+        (
+          name: 'desktop edge hide timer',
+          run: () => _desktopEdgeHideTimer?.cancel(),
+        ),
         (name: 'hud timer', run: () => _hudTimer?.cancel()),
         (name: 'seek hud timer', run: () => _seekHudTimer?.cancel()),
         (name: 'seek debounce timer', run: () => _seekDebounceTimer?.cancel()),
@@ -6347,22 +7246,44 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _detailScrollController.dispose();
             _resumeButtonFocusNode.dispose();
             _closeBannerFocusNode.dispose();
+            _errorRetryFocusNode.dispose();
             _errorBackFocusNode.dispose();
             _nextPlayNowFocusNode.dispose();
             _nextCancelFocusNode.dispose();
+            _seekable.dispose();
             _osdFadeController.dispose();
           },
         ),
         (
           name: 'system ui restore',
-          run: () => unawaited(
-            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
-          ),
+          run: () {
+            if (_replacedByNextPlayer) return;
+            PlayerSessionFullscreenHandoff.reset();
+            unawaited(
+              SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+            );
+            if (_initialUiMode.isTouch) {
+              unawaited(SystemChrome.setPreferredOrientations(const []));
+            }
+            if (_initialUiMode.isDesktop && _desktopFullscreen) {
+              unawaited(_desktopWindow.setFullscreen(false));
+            }
+            _lastAutoPipSent = false;
+            unawaited(_pipController.setAutoPipEnabled(false));
+            if (_initialUiMode.isDesktop && _inPipMode) {
+              unawaited(_pipController.exitPip());
+            }
+          },
         ),
         (name: 'wakelock', run: () => _wakelockSession.release()),
         (
           name: 'subscriptions',
           run: () {
+            final pipSub = _pipSubscription;
+            _pipSubscription = null;
+            if (pipSub != null) {
+              unawaited(pipSub.cancel().catchError((_) {}));
+            }
             for (final subscription in _subscriptions) {
               subscription.cancel();
             }
@@ -6596,6 +7517,35 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
+  void _sampleThroughputTick() {
+    int? currentBytes;
+    if (widget.session case final StreamDiagnosticMetrics diagMetrics) {
+      if (diagMetrics.cipherBytes > 0) {
+        currentBytes = diagMetrics.cipherBytes;
+      }
+    }
+    if (currentBytes == null) {
+      if (widget.session case final StreamTransferMetrics transfer) {
+        if (transfer.servedBytes > 0) {
+          currentBytes = transfer.servedBytes;
+        }
+      }
+    }
+    if (currentBytes == null) return;
+    final now = _now();
+    if (_throughputSamples.isNotEmpty &&
+        currentBytes < _throughputSamples.last.bytes) {
+      _throughputSamples.clear();
+    }
+    _throughputSamples.add((at: now, bytes: currentBytes));
+    final cutoff = now.subtract(const Duration(seconds: 5));
+    while (_throughputSamples.length > 2 &&
+        _throughputSamples.first.at.isBefore(cutoff)) {
+      _throughputSamples.removeAt(0);
+    }
+    _recentThroughputMbps = computeSlidingThroughputMbps(_throughputSamples);
+  }
+
   bool _syncDisplayedBufferBadge({bool force = false}) {
     final actualSec = math
         .max(_bufferedAheadSeconds, _bufferDeltaSeconds)
@@ -6615,7 +7565,409 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return true;
   }
 
-  void _openOsd() {
+  Future<void> _applyPlayerVolume() async {
+    final muted = mounted ? ref.read(playerMutedProvider) : false;
+    final volume = mounted ? ref.read(playerVolumeProvider) : 100.0;
+    try {
+      await _player.setVolume(muted ? 0.0 : volume.clamp(0.0, 100.0).toDouble());
+    } catch (_) {
+      // Ignore if player is already disposing.
+    }
+  }
+
+  void _setPlayerVolume(double value) {
+    final clamped = value.clamp(0.0, 100.0).toDouble();
+    unawaited(ref.read(playerVolumeProvider.notifier).set(clamped));
+    if (clamped > 0 && ref.read(playerMutedProvider)) {
+      unawaited(ref.read(playerMutedProvider.notifier).set(false));
+    }
+    unawaited(_applyPlayerVolume());
+    _resetOsdTimer();
+  }
+
+  void _togglePlayerMute() {
+    final nextMuted = !ref.read(playerMutedProvider);
+    unawaited(ref.read(playerMutedProvider.notifier).set(nextMuted));
+    unawaited(_applyPlayerVolume());
+    _showHudMessage(
+      nextMuted ? Icons.volume_off : Icons.volume_up,
+      nextMuted ? 'ミュート' : 'ミュート解除',
+    );
+    _resetOsdTimer();
+  }
+
+  void _adjustPlayerVolume(double delta) {
+    final current = ref.read(playerVolumeProvider);
+    final next = (current + delta).clamp(0.0, 100.0).toDouble();
+    unawaited(ref.read(playerVolumeProvider.notifier).set(next));
+    if (next > 0 && ref.read(playerMutedProvider)) {
+      unawaited(ref.read(playerMutedProvider.notifier).set(false));
+    }
+    unawaited(_applyPlayerVolume());
+    _showHudMessage(
+      next <= 0 ? Icons.volume_off : Icons.volume_up,
+      '音量 ${next.round()}%',
+    );
+    _resetOsdTimer();
+  }
+
+  void _onDesktopEdgeHoverEnter(ChannelSwitchDirection dir) {
+    _desktopEdgeHideTimer?.cancel();
+    if (_hoveredChannelEdge != dir) {
+      setState(() => _hoveredChannelEdge = dir);
+    }
+  }
+
+  void _onDesktopEdgeHoverExit() {
+    _desktopEdgeHideTimer?.cancel();
+    _desktopEdgeHideTimer = Timer(const Duration(milliseconds: 250), () {
+      if (mounted && _hoveredChannelEdge != null) {
+        setState(() => _hoveredChannelEdge = null);
+      }
+    });
+  }
+
+  Future<void> _toggleDesktopFullscreen() async {
+    final next = await _desktopWindow.toggleFullscreen();
+    PlayerSessionFullscreenHandoff.desktopFullscreen = next;
+    if (!mounted) return;
+    setState(() => _desktopFullscreen = next);
+    _resetOsdTimer();
+  }
+
+  Future<void> _setDesktopFullscreen(bool target) async {
+    final next = await _desktopWindow.setFullscreen(target);
+    PlayerSessionFullscreenHandoff.desktopFullscreen = next;
+    if (!mounted) return;
+    setState(() => _desktopFullscreen = next);
+  }
+
+  Future<void> _initPip() async {
+    final supported = await _pipController.isSupported();
+    if (!mounted) return;
+    setState(() => _pipSupported = supported);
+    if (!supported) return;
+    _syncAutoPipState();
+    _pipSubscription = _pipController.onPipModeChanged.listen((inPip) {
+      if (!mounted) return;
+      if (_uiMode.isDesktop) {
+        PlayerSessionFullscreenHandoff.desktopPip = inPip;
+      }
+      setState(() {
+        _inPipMode = inPip;
+        if (inPip) {
+          _desktopPipHover = false;
+          _osdOpen = false;
+          _osdFadeController.value = 0.0;
+          _detailOpen = false;
+          _channelPreviewDirection = null;
+          _touchPortraitOverlayOpen = false;
+        }
+      });
+    });
+  }
+
+  void _syncAutoPipState() {
+    final wantAutoPip =
+        _pipSupported &&
+        _playingNow &&
+        !_interrupted &&
+        _error == null &&
+        !_switchingChannel;
+    if (wantAutoPip != _lastAutoPipSent) {
+      _lastAutoPipSent = wantAutoPip;
+      unawaited(_pipController.setAutoPipEnabled(wantAutoPip));
+    }
+  }
+
+  Future<void> _togglePip() async {
+    if (!_pipSupported || !mounted) return;
+    if (_inPipMode) {
+      final exited = await _pipController.exitPip();
+      if (!mounted) return;
+      if (exited && _uiMode.isDesktop) {
+        PlayerSessionFullscreenHandoff.desktopPip = false;
+        setState(() => _inPipMode = false);
+      }
+      return;
+    }
+    _closeOsd();
+    _dismissChannelPreview();
+    _closeDetail();
+    final entered = await _pipController.enterPip(
+      aspectWidth: 16,
+      aspectHeight: 9,
+    );
+    if (!mounted) return;
+    if (!entered) {
+      _showHudMessage(
+        Icons.picture_in_picture_alt,
+        'ピクチャ イン ピクチャを開始できませんでした',
+      );
+      return;
+    }
+    if (_uiMode.isDesktop) {
+      PlayerSessionFullscreenHandoff.desktopPip = true;
+      setState(() {
+        _inPipMode = true;
+        _desktopFullscreen = false;
+        PlayerSessionFullscreenHandoff.desktopFullscreen = false;
+      });
+    }
+  }
+
+  void _toggleTouchFullscreen(bool currentlyFullscreen) {
+    _orientationResetTimer?.cancel();
+    final isTablet = MediaQuery.sizeOf(context).shortestSide >= 600;
+    if (!currentlyFullscreen) {
+      PlayerSessionFullscreenHandoff.touchFullscreenOverride = true;
+      if (!isTablet) {
+        PlayerSessionFullscreenHandoff.touchLandscapeLocked = true;
+      }
+      setState(() {
+        _touchFullscreenOverride = true;
+        _touchPortraitOverlayOpen = false;
+      });
+      if (!isTablet) {
+        // Keep landscape orientation locked while in user-requested fullscreen
+        // so devices with portrait orientation lock enabled do not snap back.
+        unawaited(
+          SystemChrome.setPreferredOrientations(const [
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]),
+        );
+      }
+      return;
+    }
+    PlayerSessionFullscreenHandoff.touchFullscreenOverride = false;
+    PlayerSessionFullscreenHandoff.touchLandscapeLocked = false;
+    setState(() {
+      _touchFullscreenOverride = false;
+      _osdOpen = false;
+      _osdFadeController.value = 0.0;
+    });
+    if (!isTablet) {
+      unawaited(
+        SystemChrome.setPreferredOrientations(const [
+          DeviceOrientation.portraitUp,
+        ]),
+      );
+      _orientationResetTimer = Timer(const Duration(seconds: 2), () {
+        if (!mounted || !_uiMode.isTouch) return;
+        unawaited(
+          SystemChrome.setPreferredOrientations(const [
+            DeviceOrientation.portraitUp,
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]),
+        );
+      });
+    }
+  }
+
+  void _handleTouchHorizontalSwipe(ChannelSwitchDirection dir) {
+    switch (resolveTouchChannelSwipeAction(
+      swipeDirection: dir,
+      currentPreviewDirection: _channelPreviewDirection,
+    )) {
+      case TouchChannelSwipeAction.showPreview:
+        if (_osdOpen) {
+          _closeOsd();
+        }
+        _showChannelPreview(dir);
+        return;
+      case TouchChannelSwipeAction.switchChannel:
+        final target = _previewTargetFor(dir);
+        if (target != null) {
+          unawaited(_executeLiveChannelSwitch(target));
+        }
+        return;
+      case TouchChannelSwipeAction.dismissPreview:
+        _dismissChannelPreview();
+        return;
+    }
+  }
+
+  void _onDesktopHover() {
+    if (!_uiMode.isDesktop || _detailOpen || _interrupted || _error != null) {
+      return;
+    }
+    if (!_osdOpen) {
+      _openOsd(requestFocus: false);
+    } else {
+      _resetOsdTimer();
+    }
+  }
+
+  void _resetTouchPortraitOverlayTimer() {
+    _touchPortraitOverlayTimer?.cancel();
+    _touchPortraitOverlayTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && _touchPortraitOverlayOpen) {
+        setState(() => _touchPortraitOverlayOpen = false);
+      }
+    });
+  }
+
+  void _toggleTouchPortraitOverlay() {
+    setState(() => _touchPortraitOverlayOpen = !_touchPortraitOverlayOpen);
+    if (_touchPortraitOverlayOpen) {
+      _resetTouchPortraitOverlayTimer();
+    } else {
+      _touchPortraitOverlayTimer?.cancel();
+    }
+  }
+
+  void _onRecordedScrubUpdate(double fraction) {
+    final dur = _effectiveDuration;
+    if (dur <= Duration.zero) return;
+    final target = scrubFractionToDuration(fraction, dur);
+    setState(() => _scrubbingPosition = target);
+    _resetOsdTimer();
+  }
+
+  Future<void> _performTimeSeek(Duration target) async {
+    if (widget.live || widget.session is! TimeSeekableSession) return;
+    final dur = _effectiveDuration;
+    final clamped = target.isNegative
+        ? Duration.zero
+        : (dur > Duration.zero && target > dur ? dur : target);
+    if (_timeSeeking) return;
+    _timeSeeking = true;
+    try {
+      setState(() {
+        _timeSeekBaseOffset = clamped;
+        _lastPosition = Duration.zero;
+        _buffering = true;
+        _bufferedAheadSeconds = 0.0;
+        _bufferEndPosition = Duration.zero;
+      });
+      final timeSeekable = widget.session as TimeSeekableSession;
+      await timeSeekable.seekToTime(clamped);
+      if (!mounted || _conflictHandled || _switchingChannel) return;
+      await _player.open(
+        Media(
+          widget.session.mediaUri
+              .replace(queryParameters: {'t': '${clamped.inMilliseconds}'})
+              .toString(),
+        ),
+      );
+      if (!mounted) return;
+      await _applyPlayerVolume();
+    } catch (e) {
+      _diag(DiagCategory.playback, 'player: time seek failed: $e');
+    } finally {
+      _timeSeeking = false;
+    }
+  }
+
+  void _onRecordedScrubEnd(double fraction) {
+    final dur = _effectiveDuration;
+    if (dur <= Duration.zero) {
+      if (_scrubbingPosition != null) setState(() => _scrubbingPosition = null);
+      return;
+    }
+    final target = scrubFractionToDuration(fraction, dur);
+    _seekBasePosition = null;
+    _pendingSeekOffset = Duration.zero;
+    _seekDebounceTimer?.cancel();
+    _committedSeekTarget = target;
+    _committedSeekHoldTimer?.cancel();
+    _committedSeekHoldTimer = Timer(const Duration(milliseconds: 700), () {
+      _committedSeekTarget = null;
+      if (mounted) setState(() {});
+    });
+    setState(() => _scrubbingPosition = null);
+    _clearDisplayedSubtitles();
+    _resetSubtitleTrackTracking();
+    if (widget.session is TimeSeekableSession && !_seekable.value) {
+      unawaited(_performTimeSeek(target));
+    } else {
+      unawaited(_player.seek(target));
+    }
+    _resetOsdTimer();
+  }
+
+  void _onLiveScrubUpdate(double fraction, LiveTimeshiftBarState barState) {
+    _resetOsdTimer();
+    if (_liveCacheStartSec == null || _liveCacheEndSec == null) return;
+    final ch = _activeLiveChannel;
+    final now = _now();
+    final info = ch != null
+        ? resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: _guideEventsForChannel(ch),
+            now: _effectiveLivePlaybackClock(now),
+          )
+        : null;
+    final targetSec = resolveLiveTimeshiftTargetSeconds(
+      fraction: fraction,
+      liveEdgeFraction: barState.liveEdgeFraction,
+      playableStartFraction: barState.playableStartFraction,
+      usesProgramTimeline: barState.usesProgramTimeline,
+      programStart: info?.currentStart,
+      programEnd: info?.currentEnd,
+      now: now,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
+    );
+    if (targetSec == null) return;
+    final current =
+        _liveCommittedSeekSec ??
+        _liveTimePosSec ??
+        _liveCacheLiveEdgeSec ??
+        _liveCacheEndSec;
+    if (current == null) return;
+    setState(() {
+      _livePendingSeekBaseSec = current;
+      _livePendingSeekDeltaSec = targetSec - current;
+    });
+  }
+
+  void _onLiveScrubEnd(double fraction, LiveTimeshiftBarState barState) {
+    _resetOsdTimer();
+    if (fraction >= barState.liveEdgeFraction - 0.005) {
+      _livePendingSeekBaseSec = null;
+      _livePendingSeekDeltaSec = 0.0;
+      _liveSeekDebounceTimer?.cancel();
+      if (_liveDelayedByPause) {
+        unawaited(_catchUpToLiveEdge());
+      }
+      return;
+    }
+    final ch = _activeLiveChannel;
+    final now = _now();
+    final info = ch != null
+        ? resolveLiveOsdProgramInfo(
+            channel: ch,
+            guideEvents: _guideEventsForChannel(ch),
+            now: _effectiveLivePlaybackClock(now),
+          )
+        : null;
+    final targetSec = resolveLiveTimeshiftTargetSeconds(
+      fraction: fraction,
+      liveEdgeFraction: barState.liveEdgeFraction,
+      playableStartFraction: barState.playableStartFraction,
+      usesProgramTimeline: barState.usesProgramTimeline,
+      programStart: info?.currentStart,
+      programEnd: info?.currentEnd,
+      now: now,
+      cacheStartSeconds: _liveCacheStartSec,
+      cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
+    );
+    if (targetSec == null) return;
+    final current =
+        _liveCommittedSeekSec ??
+        _liveTimePosSec ??
+        _liveCacheLiveEdgeSec ??
+        _liveCacheEndSec;
+    if (current == null) return;
+    _livePendingSeekBaseSec = current;
+    _livePendingSeekDeltaSec = 0.0;
+    _queueLiveRelativeSeek(targetSec - current);
+  }
+
+  void _openOsd({bool requestFocus = true}) {
     _channelPreviewTimer?.cancel();
     _syncDisplayedBufferBadge(force: true);
     setState(() {
@@ -6639,13 +7991,27 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
     }
     _osdFadeController.forward();
+    _startOsdClockTimer();
+    unawaited(_pollMpvBufferProperties());
+    _resetOsdTimer();
+    if (requestFocus && _uiMode.isTv) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _startOsdClockTimer() {
     _osdClockTimer?.cancel();
     _osdClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted || !_osdOpen) return;
+      final active = _osdOpen || _isTouchSplitActive;
+      if (!mounted || !active) return;
       _syncDisplayedBufferBadge();
       if (shouldPollLiveCacheOnOsdTick(
         live: widget.live,
-        osdOpen: _osdOpen,
+        osdOpen: active,
         switchingChannel: _switchingChannel,
         conflictHandled: _conflictHandled,
         catchUpMonitorActive: _liveCatchUpTimer != null,
@@ -6654,7 +8020,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       )) {
         unawaited(_pollMpvBufferProperties());
       }
-      if (widget.live && _activeLiveChannel != null) {
+      if (_osdOpen && widget.live && _activeLiveChannel != null) {
         final cur = _activeLiveChannel!;
         final now = _now();
         final playbackNow = _effectiveLivePlaybackClock(now);
@@ -6681,13 +8047,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
       setState(() {});
     });
-    unawaited(_pollMpvBufferProperties());
-    _resetOsdTimer();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _osdFirstFocusNode.canRequestFocus) {
-        _osdFirstFocusNode.requestFocus();
-      }
-    });
   }
 
   void _closeOsd({bool fromBackKey = false}) {
@@ -6697,8 +8056,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
     }
     _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
+    if (!_isTouchSplitActive) {
+      _osdClockTimer?.cancel();
+      _osdClockTimer = null;
+    }
     if (!_osdOpen && !_detailOpen) return;
     _liveDetailRequestSeq++;
     setState(() {
@@ -6725,8 +8086,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _resetOsdTimer() {
     _osdTimer?.cancel();
-    _osdTimer = Timer(const Duration(seconds: 5), () {
-      if (mounted && _osdOpen && !_detailOpen) _closeOsd();
+    if (_uiMode.isDesktop && _pointerOverControls) return;
+    final timeout = _uiMode.isTv
+        ? const Duration(seconds: 5)
+        : const Duration(milliseconds: 3500);
+    _osdTimer = Timer(timeout, () {
+      if (mounted &&
+          _osdOpen &&
+          !_detailOpen &&
+          !(_uiMode.isDesktop && _pointerOverControls)) {
+        _closeOsd();
+      }
     });
   }
 
@@ -6734,6 +8104,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _duration > Duration.zero ? _duration : (widget.knownDuration ?? Duration.zero);
 
   Duration? get _seekHudPositionOverride {
+    if (_scrubbingPosition != null) return _scrubbingPosition;
     if (_seekBasePosition != null) {
       return skipSeekTarget(
         position: _seekBasePosition!,
@@ -6776,12 +8147,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   void _setLivePlaybackPaused(bool paused) {
     if (!widget.live) return;
     if (paused) {
+      _userPaused = true;
+      _bufferingSincePlaying = false;
+      _stallTimer?.cancel();
       unawaited(_player.pause());
       _markLivePaused();
       unawaited(_pollMpvBufferProperties());
       _showSeekHud(Icons.pause, '一時停止');
       return;
     }
+    _userPaused = false;
     unawaited(_resumeLivePlayback());
   }
 
@@ -6789,6 +8164,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!mounted || !widget.live || _switchingChannel || _conflictHandled) {
       return;
     }
+    _userPaused = false;
     if (_liveSeekDebounceTimer?.isActive == true ||
         _livePendingSeekDeltaSec != 0.0) {
       _liveSeekDebounceTimer?.cancel();
@@ -6796,10 +8172,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (!mounted || _switchingChannel || _conflictHandled) return;
     }
     final effectivePos = _liveCommittedSeekSec ?? _liveTimePosSec;
+    final liveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final atLiveEdge =
-        _liveCacheEndSec != null &&
+        liveEdge != null &&
         effectivePos != null &&
-        (_liveCacheEndSec! - effectivePos) <= 1.5;
+        (liveEdge - effectivePos) <= 1.5;
     await _player.play();
     if (!mounted) return;
     if (_liveDelayedByPause && atLiveEdge) {
@@ -6821,6 +8198,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (widget.live) {
       _setLivePlaybackPaused(!willPlay);
     } else {
+      _userPaused = !willPlay;
+      if (!willPlay) {
+        _bufferingSincePlaying = false;
+        _stallTimer?.cancel();
+      }
       unawaited(_player.playOrPause());
       _showSeekHud(
         willPlay ? Icons.play_arrow : Icons.pause,
@@ -6833,8 +8215,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!widget.live || _switchingChannel || _conflictHandled || _catchingUpLive) {
       return;
     }
-    _liveDelayedByPause = true;
-    _startLiveCatchUpMonitor();
     final effectiveLiveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final base =
         _livePendingSeekBaseSec ??
@@ -6856,6 +8236,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _showSeekHud(Icons.info_outline, '戻れるキャッシュ蓄積中');
       return;
     }
+    _liveDelayedByPause = true;
+    _startLiveCatchUpMonitor();
     if (deltaSec < 0) {
       _liveRewoundByUser = true;
       _liveAutoCatchUpEnabled = false;
@@ -6884,7 +8266,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
     } else if (deltaSec > 0 && clamped.hitEnd) {
       _liveRewoundByUser = false;
-      _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
+      _liveAutoCatchUpEnabled = true;
+      if (clamped.clampedDelta == 0.0 && _playingNow) {
+        unawaited(_finishLiveCatchUp(showHud: true));
+      } else {
+        _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
+      }
     } else {
       _showSeekHud(
         _livePendingSeekDeltaSec < 0 ? Icons.replay_10 : Icons.forward_10,
@@ -7050,7 +8437,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _queueRelativeSeek(Duration delta) {
     if (widget.live) return;
-    _seekBasePosition ??= _committedSeekTarget ?? _player.state.position;
+    _seekBasePosition ??= _committedSeekTarget ?? _effectiveRecordedPosition;
     _pendingSeekOffset += delta;
     _showSeekHud(
       _pendingSeekOffset.isNegative ? Icons.replay_10 : Icons.forward_10,
@@ -7086,7 +8473,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles();
     _resetSubtitleTrackTracking();
     try {
-      await _player.seek(target);
+      if (widget.session is TimeSeekableSession && !_seekable.value) {
+        await _performTimeSeek(target);
+      } else {
+        await _player.seek(target);
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dpad seek failed: $e');
     }
@@ -7164,29 +8555,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
-    _watchdog?.cancel();
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(notify: false, stopTimer: true);
     _resetSubtitleTrackTracking();
     _stopJikkyo(clearOverlay: true);
-    _recordingStatusTimer?.cancel();
-    _cornerNoticeTimer?.cancel();
-    _customCornerNoticeTimer?.cancel();
-    _channelPreviewTimer?.cancel();
-    _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
-    _hudTimer?.cancel();
-    _seekHudTimer?.cancel();
-    _seekDebounceTimer?.cancel();
-    _committedSeekHoldTimer?.cancel();
-    _liveSeekDebounceTimer?.cancel();
-    _liveCommittedSeekHoldTimer?.cancel();
-    _livePendingSeekBaseSec = null;
-    _livePendingSeekDeltaSec = 0.0;
-    _liveCommittedSeekSec = null;
+    _cancelAuxTimersForTeardown();
 
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
@@ -7196,6 +8571,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (mounted) {
       setState(() {
         _switchingChannel = true;
+        _resuming = false;
         _error = null;
         _interrupted = false;
         _interruptDetail = null;
@@ -7212,6 +8588,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
     }
 
+    _sessionPermanentlyStopped = true;
     await _player.stop().timeout(
       const Duration(seconds: 2),
       onTimeout: () {},
@@ -7220,6 +8597,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(seconds: 3),
       onTimeout: () {},
     ).catchError((_) {});
+    await _deleteUsedDiskCacheDir();
   }
 
   Future<void> _pushReplacementPlayer(Widget nextPlayer) async {
@@ -7236,9 +8614,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _executeLiveChannelSwitch(LiveChannelSwitchEntry target) async {
     final switcher = widget.onSwitchLiveChannel;
-    if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
+    if (switcher == null ||
+        !mounted ||
+        _switchInFlight ||
+        _switchingChannel ||
+        _conflictHandled) {
       return;
     }
+    _switchInFlight = true;
     _dismissChannelPreview();
     _switchingChannelLabel = target.displayChannelName;
 
@@ -7251,12 +8634,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     try {
       final nextPlayer = await switcher(context, target, stopCurrentSession);
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer == null) {
         _switchingChannelLabel = null;
         return;
       }
-      await _pushReplacementPlayer(nextPlayer);
+      try {
+        await _pushReplacementPlayer(nextPlayer);
+      } catch (_) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        rethrow;
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: live channel switch failed: $e');
       if (!mounted) return;
@@ -7270,18 +8661,25 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannelLabel = null;
         _showCustomCornerNotice('チャンネルを切り替えできませんでした');
       }
+    } finally {
+      _switchInFlight = false;
     }
   }
 
   Future<void> _executeQualitySwitch() async {
     final switcher = widget.onSwitchQuality;
-    if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
+    if (switcher == null ||
+        !mounted ||
+        _switchInFlight ||
+        _switchingChannel ||
+        _conflictHandled) {
       return;
     }
+    _switchInFlight = true;
     _closeOsd();
     final nextUseMobile = !widget.currentUseMobile;
-    final resumeFrom = _lastPosition > Duration.zero
-        ? _lastPosition
+    final resumeFrom = _effectiveRecordedPosition > Duration.zero
+        ? _effectiveRecordedPosition
         : (widget.initialStart ?? Duration.zero);
     _switchingChannelLabel = nextUseMobile ? 'モバイル画質' : '元画質';
 
@@ -7300,7 +8698,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         resumeFrom,
         stopCurrentSession,
       );
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer == null) {
         if (!sessionStopped) {
           _suppressResumeReportOnDispose = false;
@@ -7308,7 +8709,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         return;
       }
-      await _pushReplacementPlayer(nextPlayer);
+      try {
+        await _pushReplacementPlayer(nextPlayer);
+      } catch (_) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        rethrow;
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: quality switch failed: $e');
       if (!mounted) return;
@@ -7323,6 +8729,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannelLabel = null;
         _showCustomCornerNotice('画質を切り替えできませんでした');
       }
+    } finally {
+      _switchInFlight = false;
     }
   }
 
@@ -7348,7 +8756,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _updateLiveStreamEpochFromLiveEdge(double liveEdgeSec, DateTime now) {
     if (!widget.live || !liveEdgeSec.isFinite) return;
-    if (_liveStreamEpoch == null) {
+    if (_liveStreamEpoch == null || _reanchorLiveEpochAfterReconnect) {
+      _reanchorLiveEpochAfterReconnect = false;
       _liveMaxAdvancingCacheEndSec = liveEdgeSec;
       _liveStreamEpoch = now.subtract(
         Duration(milliseconds: (liveEdgeSec * 1000).round()),
@@ -7476,11 +8885,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     final targetBufferFloor = (_bufferPlan?.configuredSeconds ?? 0).toDouble();
-    final measuredAhead =
-        (_liveCacheEndSec != null && _liveTimePosSec != null)
+    final liveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
+    final measuredAhead = (liveEdge != null && _liveTimePosSec != null)
         ? math.max(
             _bufferedAheadSeconds,
-            math.max(0.0, _liveCacheEndSec! - _liveTimePosSec!),
+            math.max(0.0, liveEdge - _liveTimePosSec!),
           )
         : _bufferedAheadSeconds;
     final excessBuffered = math.max(
@@ -7548,9 +8957,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _catchUpToLiveEdge() async {
     if (!widget.live || !mounted || _catchingUpLive || _switchingChannel) return;
+    _userPaused = false;
     _catchingUpLive = true;
     _clearDisplayedSubtitles();
     _closeOsd();
+    _liveSeekDebounceTimer?.cancel();
+    _livePendingSeekBaseSec = null;
+    _livePendingSeekDeltaSec = 0.0;
     _showHudMessage(Icons.skip_next, '現在位置へ移動しています…');
     try {
       if (_liveCatchUpRate != 1.0) {
@@ -7567,40 +8980,121 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               0.0,
               _now().difference(_livePausedAt!).inMilliseconds / 1000.0,
             );
-      final totalLagSec = math.max(
-        _liveEstimatedLagSeconds + activePause,
-        _bufferedAheadSeconds,
-      );
       if (plan != null && plan.useCache && platform is NativePlayer) {
         try {
-          final rawDur = await platform.getProperty('demuxer-cache-duration');
-          final rawCacheTime = await platform.getProperty('demuxer-cache-time');
-          final rawPos = await platform.getProperty('time-pos');
-          final cacheDur = double.tryParse(rawDur);
-          final cacheTime = double.tryParse(rawCacheTime);
-          final timePos = double.tryParse(rawPos);
-          final effectiveWindowSeconds = plan.useDiskCache
-              ? math.max(plan.configuredSeconds, plan.readaheadSeconds)
-              : plan.configuredSeconds;
-          if (cacheDur != null &&
-              cacheTime != null &&
-              timePos != null &&
-              canSeekWithinLiveCache(
-                useCache: plan.useCache,
-                configuredBufferSeconds: effectiveWindowSeconds,
-                totalPauseLagSeconds: totalLagSec,
-                cacheDurationSeconds: cacheDur,
-                cacheTimeSeconds: cacheTime,
-                timePosSeconds: timePos,
-              )) {
-            final targetMs = math.max(0, ((cacheTime - 0.5) * 1000).round());
-            await _player.play();
-            await _player.seek(Duration(milliseconds: targetMs));
-            await _finishLiveCatchUp(showHud: false);
-            if (mounted) {
-              _showHudMessage(Icons.skip_next, '現在位置へ移動しました');
+          final props = await Future.wait<String>([
+            _safeGetProp(platform, 'demuxer-cache-state'),
+            _safeGetProp(platform, 'demuxer-cache-duration'),
+            _safeGetProp(platform, 'demuxer-cache-time'),
+            _safeGetProp(platform, 'playback-time'),
+            _safeGetProp(platform, 'time-pos'),
+          ]);
+          final cacheDur = double.tryParse(props[1]);
+          final cacheTime = double.tryParse(props[2]);
+          final playbackTime = double.tryParse(props[3]);
+          final timePos = double.tryParse(props[4]);
+          final range = parseDemuxerCacheStateRange(
+            props[0],
+            currentPosSeconds: playbackTime ?? timePos ?? _liveTimePosSec,
+          );
+          double? cacheStart;
+          double? liveEdge;
+          if (range != null) {
+            cacheStart = range.earliestStartSeconds ?? range.startSeconds;
+            liveEdge = range.liveEdgeSeconds ?? range.endSeconds;
+          } else if (cacheTime != null &&
+              cacheTime.isFinite &&
+              cacheDur != null &&
+              cacheDur.isFinite) {
+            cacheStart = math.max(0.0, cacheTime - cacheDur);
+            liveEdge = cacheTime;
+          }
+          if (cacheStart != null && liveEdge != null) {
+            final currentPos = resolveLiveCacheCoordinatePos(
+              playbackTimeSeconds: playbackTime,
+              timePosSeconds: timePos,
+              cacheStartSeconds: cacheStart,
+              cacheEndSeconds: liveEdge,
+              fallbackSeconds: _liveTimePosSec ?? liveEdge,
+            );
+            final measuredLagBeyondBuffer = math.max(
+              0.0,
+              (liveEdge - currentPos) - plan.configuredSeconds,
+            );
+            final totalLagSec = math.max(
+              _liveEstimatedLagSeconds + activePause,
+              measuredLagBeyondBuffer,
+            );
+            final effectiveWindowSeconds = math.max(
+              plan.configuredSeconds,
+              math.max(
+                (liveEdge - cacheStart).floor(),
+                plan.useDiskCache
+                    ? math.max(plan.readaheadSeconds, livePauseTimeshiftSeconds)
+                    : 0,
+              ),
+            );
+            final now = _now();
+            double? liveEdgeStalenessSeconds;
+            final epoch = _liveStreamEpoch;
+            if (epoch != null) {
+              final expectedLiveEdge =
+                  now.difference(epoch).inMilliseconds / 1000.0;
+              if (expectedLiveEdge.isFinite &&
+                  expectedLiveEdge >= -10.0 &&
+                  expectedLiveEdge <= 43200.0) {
+                liveEdgeStalenessSeconds = math.max(
+                  0.0,
+                  expectedLiveEdge - liveEdge,
+                );
+              }
             }
-            return;
+            final cacheEof = range?.eof ?? false;
+            final jump = resolveLiveCatchUpJumpTarget(
+              useCache: plan.useCache,
+              configuredBufferSeconds: plan.configuredSeconds,
+              cacheWindowSeconds: effectiveWindowSeconds,
+              totalPauseLagSeconds: totalLagSec,
+              cacheStartSeconds: cacheStart,
+              liveEdgeSeconds: liveEdge,
+              currentPosSeconds: currentPos,
+              liveEdgeStalenessSeconds: liveEdgeStalenessSeconds,
+              cacheEof: cacheEof,
+            );
+            _logPlaybackTrace(
+              'live catch-up stayInCache=${jump.canStayInCache} '
+              'already=${jump.alreadyAtLiveTarget} '
+              'pos=${currentPos.toStringAsFixed(1)} '
+              'edge=${liveEdge.toStringAsFixed(1)} '
+              'span=${(liveEdge - cacheStart).toStringAsFixed(1)} '
+              'stale=${liveEdgeStalenessSeconds?.toStringAsFixed(1) ?? '-'} '
+              'eof=$cacheEof '
+              'target=${jump.targetSeconds.toStringAsFixed(1)}',
+            );
+            if (jump.canStayInCache) {
+              if (!jump.alreadyAtLiveTarget) {
+                await platform.command([
+                  'seek',
+                  jump.deltaSeconds.toStringAsFixed(3),
+                  'relative+keyframes',
+                ]);
+              }
+              _liveCacheStartSec = cacheStart;
+              _liveCacheEndSec = liveEdge;
+              _liveCacheLiveEdgeSec = liveEdge;
+              _updateLiveStreamEpochFromLiveEdge(liveEdge, now);
+              _liveTimePosSec = jump.targetSeconds;
+              _bufferedAheadSeconds = math.max(
+                0.0,
+                liveEdge - jump.targetSeconds,
+              );
+              await _player.play();
+              await _finishLiveCatchUp(showHud: false);
+              if (mounted) {
+                _showHudMessage(Icons.skip_next, '現在位置へ移動しました');
+              }
+              return;
+            }
           }
         } catch (e) {
           _diag(
@@ -7636,7 +9130,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _lastLiveTransferTickAt = null;
         _liveTransferAccumulatedSeconds = 0.0;
       });
-      if (_isPreBuffering) {
+      if (_shouldPollLiveBuffering) {
         _startPreBufferPoller();
       }
       final uri = widget.session.mediaUri.replace(
@@ -7644,7 +9138,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
       await _player.open(Media(uri.toString()));
       if (!mounted) return;
-      await _player.setVolume(100.0);
+      await _applyPlayerVolume();
       await _player.play();
       await _applySubtitleSelection();
       if (mounted) {
@@ -7697,12 +9191,123 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (_detailOpen) {
       if (event is KeyDownEvent &&
           (key == LogicalKeyboardKey.escape ||
-              key == LogicalKeyboardKey.goBack)) {
+              key == LogicalKeyboardKey.goBack ||
+              (_uiMode.isDesktop && key == LogicalKeyboardKey.keyI))) {
         _closeDetail(fromBackKey: true);
       }
       return KeyEventResult.handled;
     }
-    if (_osdOpen) {
+    if (_uiMode.isDesktop) {
+      if (event is KeyDownEvent) {
+        if (key == LogicalKeyboardKey.keyF) {
+          unawaited(_toggleDesktopFullscreen());
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyP && _pipSupported) {
+          unawaited(_togglePip());
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyM) {
+          _togglePlayerMute();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyK ||
+            key == LogicalKeyboardKey.space) {
+          _togglePlayPauseWithHud();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyJ) {
+          if (widget.live) {
+            _queueLiveRelativeSeek(
+              liveDirectionKeySeekDeltaSeconds(forward: false),
+            );
+          } else {
+            _queueRelativeSeek(_rewindStep);
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyL) {
+          if (widget.live) {
+            if (_liveDelayedByPause) {
+              _queueLiveRelativeSeek(
+                liveDirectionKeySeekDeltaSeconds(forward: true),
+              );
+            }
+          } else {
+            _queueRelativeSeek(_forwardStep);
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyC &&
+            canToggleSubtitles(_realSubtitleTracks.length)) {
+          _toggleSubtitles();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyN) {
+          _toggleJikkyo();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyI && _hasProgramDetail) {
+          _openDetail();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyS &&
+            canChangePlaybackSpeed(live: widget.live)) {
+          _cyclePlaybackRate();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.keyA &&
+            canSwitchAudio(_realAudioTracks.length)) {
+          _cycleAudioTrack();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.bracketLeft ||
+            key == LogicalKeyboardKey.pageUp) {
+          if (widget.live && _canSwitchLiveChannel) {
+            final target = _previewTargetFor(ChannelSwitchDirection.previous);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else if (!widget.live && _chapters.isNotEmpty) {
+            unawaited(_seekToChapter(forward: false));
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.bracketRight ||
+            key == LogicalKeyboardKey.pageDown) {
+          if (widget.live && _canSwitchLiveChannel) {
+            final target = _previewTargetFor(ChannelSwitchDirection.next);
+            if (target != null) unawaited(_executeLiveChannelSwitch(target));
+          } else if (!widget.live && _chapters.isNotEmpty) {
+            unawaited(_seekToChapter(forward: true));
+          }
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.backspace) {
+          unawaited(_exitPlaybackCleanly());
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.escape) {
+          if (_inPipMode) {
+            unawaited(_togglePip());
+          } else if (_desktopFullscreen) {
+            unawaited(_setDesktopFullscreen(false));
+          } else if (_channelPreviewDirection != null) {
+            _dismissChannelPreview(fromBackKey: true);
+          } else {
+            unawaited(_exitPlaybackCleanly());
+          }
+          return KeyEventResult.handled;
+        }
+      }
+      if (key == LogicalKeyboardKey.arrowUp) {
+        _adjustPlayerVolume(5.0);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowDown) {
+        _adjustPlayerVolume(-5.0);
+        return KeyEventResult.handled;
+      }
+    }
+    if (_osdOpen && _uiMode.isTv) {
       if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
         _closeOsd(fromBackKey: true);
         return KeyEventResult.handled;
@@ -7718,6 +9323,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         return KeyEventResult.handled;
       }
       return KeyEventResult.ignored;
+    }
+    if (_osdOpen && _uiMode.isTouch) {
+      if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
+        _closeOsd(fromBackKey: true);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.space) {
+        _togglePlayPauseWithHud();
+        return KeyEventResult.handled;
+      }
     }
     final isRepeat = event is KeyRepeatEvent;
     if (_channelPreviewDirection != null &&
@@ -7866,17 +9481,96 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   @override
   Widget build(BuildContext context) {
+    final uiMode = ref.watch(uiControlModeProvider);
+    _syncAutoPipState();
+    final mediaSize = MediaQuery.sizeOf(context);
+    final mediaPadding = MediaQuery.paddingOf(context);
+    final isLandscape = mediaSize.width >= mediaSize.height;
+    if (uiMode.isTouch && isLandscape != _lastPhysicalLandscape) {
+      if (_lastPhysicalLandscape != null) {
+        _touchFullscreenOverride = null;
+        PlayerSessionFullscreenHandoff.touchFullscreenOverride = null;
+        if (!isLandscape) {
+          PlayerSessionFullscreenHandoff.touchLandscapeLocked = false;
+        }
+      }
+      _lastPhysicalLandscape = isLandscape;
+    }
+    final isTouchFullscreen =
+        uiMode.isTouch && (_touchFullscreenOverride ?? isLandscape);
+    final isTouchSplit = uiMode.isTouch && !isTouchFullscreen;
+    if (isTouchSplit != _isTouchSplitActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _isTouchSplitActive = isTouchSplit;
+        if (isTouchSplit) {
+          _startOsdClockTimer();
+          unawaited(_pollMpvBufferProperties());
+        } else if (!_osdOpen) {
+          _osdClockTimer?.cancel();
+          _osdClockTimer = null;
+        }
+      });
+    }
+    if (uiMode.isTouch && isTouchFullscreen != _lastAppliedImmersive) {
+      _lastAppliedImmersive = isTouchFullscreen;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        unawaited(
+          SystemChrome.setEnabledSystemUIMode(
+            isTouchFullscreen
+                ? SystemUiMode.immersiveSticky
+                : SystemUiMode.edgeToEdge,
+          ),
+        );
+      });
+    }
+    final isCompactTouchLandscape =
+        uiMode.isTouch && isTouchFullscreen && mediaSize.height < 500;
+    final touchHorizontalInset = uiMode.isTouch && isTouchFullscreen
+        ? computeTouchLandscapeHorizontalInset(
+            viewportSize: mediaSize,
+            safePadding: mediaPadding,
+          )
+        : 0.0;
     final loadingLabel = playerLoadingLabel(
       interrupted: _interrupted,
       hasVideoFrame: _hasVideoFrame,
       playingStarted: _playing,
       playingNow: _playingNow,
       buffering: _buffering,
+      resuming: _resuming,
     );
+    final canLiveSwitch =
+        widget.live &&
+        !_detailOpen &&
+        !_interrupted &&
+        _error == null &&
+        !_switchingChannel &&
+        _canSwitchLiveChannel &&
+        canSwitchLiveChannelOnDirectionKey(
+          live: widget.live,
+          liveDelayedByPause: _liveDelayedByPause,
+          playingNow: _playingNow,
+        );
+    final canTouchSwipeChannels = canLiveSwitch;
+
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
+        if (_inPipMode && uiMode.isDesktop) {
+          unawaited(_togglePip());
+          return;
+        }
+        if (uiMode.isDesktop &&
+            _desktopFullscreen &&
+            !_detailOpen &&
+            !_osdOpen &&
+            _channelPreviewDirection == null) {
+          unawaited(_setDesktopFullscreen(false));
+          return;
+        }
         switch (resolvePlayerBackOutcome(
           detailOpen: _detailOpen,
           osdOpen: _osdOpen,
@@ -7897,10 +9591,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _dismissChannelPreview(fromBackKey: true);
             return;
           case PlayerBackOutcome.confirmExit:
-            unawaited(_confirmExitPlayback());
+            if (uiMode.isTv) {
+              unawaited(_confirmExitPlayback());
+            } else {
+              unawaited(_exitPlaybackCleanly());
+            }
             return;
           case PlayerBackOutcome.popPlayer:
-            Navigator.of(context).pop();
+            unawaited(_exitPlaybackCleanly());
             return;
         }
       },
@@ -7948,12 +9646,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 16),
-                        FilledButton.icon(
-                          focusNode: _errorBackFocusNode,
-                          autofocus: true,
-                          onPressed: () => Navigator.of(context).pop(),
-                          icon: const Icon(Icons.arrow_back),
-                          label: const Text('戻る'),
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          alignment: WrapAlignment.center,
+                          children: [
+                            if (!_sessionPermanentlyStopped && !_conflictHandled)
+                              FilledButton.icon(
+                                focusNode: _errorRetryFocusNode,
+                                autofocus: true,
+                                onPressed: _retryFromStartError,
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('再試行'),
+                              ),
+                            OutlinedButton.icon(
+                              focusNode: _errorBackFocusNode,
+                              autofocus:
+                                  _sessionPermanentlyStopped ||
+                                  _conflictHandled,
+                              onPressed: () =>
+                                  unawaited(_exitPlaybackCleanly()),
+                              icon: const Icon(Icons.arrow_back),
+                              label: const Text('戻る'),
+                            ),
+                          ],
                         ),
                         const SizedBox(height: 16),
                         ExpansionTile(
@@ -7976,154 +9692,839 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                 ),
               )
+            : _inPipMode
+            ? _buildPipLayout(uiMode)
+            : isTouchSplit
+            ? _buildTouchSplitLayout(
+                loadingLabel: loadingLabel,
+                canSwipeChannels: canTouchSwipeChannels,
+              )
             : Focus(
                 focusNode: _rootFocusNode,
                 autofocus: true,
                 onKeyEvent: _handleKeyEvent,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _toggleOsd,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      Video(
-                        controller: _videoController,
-                        controls: NoVideoControls,
-                        subtitleViewConfiguration:
-                            const SubtitleViewConfiguration(visible: false),
-                      ),
-                      if (_jikkyoOn && !_switchingChannel && _error == null)
-                        Positioned.fill(
-                          child: JikkyoDanmakuOverlay(
-                            controller: _jikkyoOverlayController,
-                            settings: ref.watch(jikkyoSettingsProvider),
-                            isPlaying:
-                                _playingNow && !_buffering && !_interrupted,
-                            playbackRate: widget.live
-                                ? _liveCatchUpRate
-                                : _playbackRate,
-                            avoidBottomSubtitles:
-                                (_subtitlesOn &&
-                                    _visibleSubtitleCues.isNotEmpty) ||
-                                (ref.watch(superimposeEnabledProvider) &&
-                                    _visibleSuperimposeCues.isNotEmpty),
+                child: MouseRegion(
+                  onHover: uiMode.isDesktop ? (_) => _onDesktopHover() : null,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _toggleOsd,
+                    onDoubleTap: uiMode.isDesktop
+                        ? () => unawaited(_toggleDesktopFullscreen())
+                        : null,
+                    onHorizontalDragStart:
+                        uiMode.isTouch && canTouchSwipeChannels
+                        ? (details) {
+                            _touchSwipeStartX = details.localPosition.dx;
+                            _touchSwipeDeltaX = 0.0;
+                          }
+                        : null,
+                    onHorizontalDragUpdate:
+                        uiMode.isTouch && canTouchSwipeChannels
+                        ? (details) {
+                            _touchSwipeDeltaX += details.delta.dx;
+                          }
+                        : null,
+                    onHorizontalDragEnd:
+                        uiMode.isTouch && canTouchSwipeChannels
+                        ? (details) {
+                            final dir = resolveTouchHorizontalSwipeDirection(
+                              dragDeltaX: _touchSwipeDeltaX,
+                              primaryVelocity: details.primaryVelocity,
+                              startX: _touchSwipeStartX,
+                              viewportWidth: mediaSize.width,
+                            );
+                            if (dir != null) _handleTouchHorizontalSwipe(dir);
+                          }
+                        : null,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Video(
+                          controller: _videoController,
+                          controls: NoVideoControls,
+                          subtitleViewConfiguration:
+                              const SubtitleViewConfiguration(visible: false),
+                        ),
+                        if (_jikkyoOn && !_switchingChannel && _error == null)
+                          Positioned.fill(
+                            child: JikkyoDanmakuOverlay(
+                              controller: _jikkyoOverlayController,
+                              settings: ref.watch(jikkyoSettingsProvider),
+                              isPlaying:
+                                  _playingNow && !_buffering && !_interrupted,
+                              playbackRate: widget.live
+                                  ? _liveCatchUpRate
+                                  : _playbackRate,
+                              avoidBottomSubtitles:
+                                  (_subtitlesOn &&
+                                      _visibleSubtitleCues.isNotEmpty) ||
+                                  (ref.watch(superimposeEnabledProvider) &&
+                                      _visibleSuperimposeCues.isNotEmpty),
+                            ),
                           ),
-                        ),
-                      if (_subtitlesOn &&
-                          _visibleSubtitleCues.isNotEmpty &&
-                          !_switchingChannel &&
-                          _error == null)
-                        PlayerSubtitleOverlay(
-                          settings: ref.watch(subtitleSettingsProvider),
-                          cues: _visibleSubtitleCues,
-                          bottomSafePadding: _osdOpen
-                              ? (widget.live ? 250.0 : 176.0)
-                              : (_seekHudVisible ? 116.0 : 24.0),
-                        ),
-                      if (ref.watch(superimposeEnabledProvider) &&
-                          _visibleSuperimposeCues.isNotEmpty &&
-                          !_switchingChannel &&
-                          _error == null)
-                        PlayerSubtitleOverlay(
-                          settings: ref.watch(subtitleSettingsProvider),
-                          cues: _visibleSuperimposeCues,
-                          bottomSafePadding: _osdOpen
-                              ? (widget.live ? 250.0 : 176.0)
-                              : (_seekHudVisible ? 116.0 : 24.0),
-                        ),
-                      if (!_conflictHandled &&
-                          (loadingLabel != null ||
-                              (!_interrupted && _isPreBuffering)))
-                        _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
-                      if (_hudText != null && !_osdOpen) _buildStatusHud(),
-                      if (shouldShowPlayerCornerNotice(
-                        cornerRecordingNotice: _cornerRecordingNotice,
-                        customCornerNoticeText: _customCornerNoticeText,
-                        osdOpen: _osdOpen,
-                        detailOpen: _detailOpen,
-                        interrupted: _interrupted,
-                        error: _error,
-                        switchingChannel: _switchingChannel,
-                      ))
-                        PlayerCornerNotice(
-                          customText: _customCornerNoticeText,
-                          recordingNotice: _cornerRecordingNotice,
-                        ),
-                      if (widget.live &&
-                          !_osdOpen &&
-                          !_detailOpen &&
-                          !_interrupted &&
-                          _error == null &&
-                          !_switchingChannel &&
-                          _canSwitchLiveChannel &&
-                          canSwitchLiveChannelOnDirectionKey(
-                            live: widget.live,
-                            liveDelayedByPause: _liveDelayedByPause,
-                            playingNow: _playingNow,
-                          ))
-                        ..._buildChannelSwitchPreviewCards(),
-                      if (_seekHudVisible && !_osdOpen) _buildSeekHud(),
-                      if (_osdOpen ||
-                          _osdFadeController.status != AnimationStatus.dismissed) ...[
-                        if (!_detailOpen) _buildOsdClockOverlay(),
-                        _buildRemoteOsd(),
-                      ],
-                      if (_detailOpen && _hasProgramDetail)
-                        Positioned(
-                          top: 20,
-                          left: 28,
-                          right: 28,
-                          child: Builder(
-                            builder: (_) {
-                              if (!widget.live) {
-                                return ProgramDetailOverlayPanel(
-                                  title: widget.programDetailTitle ?? widget.title,
-                                  meta: widget.programDetailMeta,
-                                  body: widget.programDetailBody!,
-                                  scrollController: _detailScrollController,
-                                  focusNode: _detailFocusNode,
-                                  onClose: () => _closeDetail(fromBackKey: true),
-                                  onScrollDelta: _scrollDetailBy,
-                                );
+                        if (_subtitlesOn &&
+                            _visibleSubtitleCues.isNotEmpty &&
+                            !_switchingChannel &&
+                            _error == null)
+                          PlayerSubtitleOverlay(
+                            settings: ref.watch(subtitleSettingsProvider),
+                            cues: _visibleSubtitleCues,
+                            bottomSafePadding: _osdOpen
+                                ? (widget.live ? 250.0 : 176.0)
+                                : (_seekHudVisible ? 116.0 : 24.0),
+                          ),
+                        if (ref.watch(superimposeEnabledProvider) &&
+                            _visibleSuperimposeCues.isNotEmpty &&
+                            !_switchingChannel &&
+                            _error == null)
+                          PlayerSubtitleOverlay(
+                            settings: ref.watch(subtitleSettingsProvider),
+                            cues: _visibleSuperimposeCues,
+                            bottomSafePadding: _osdOpen
+                                ? (widget.live ? 250.0 : 176.0)
+                                : (_seekHudVisible ? 116.0 : 24.0),
+                          ),
+                        if (!_conflictHandled &&
+                            (loadingLabel != null ||
+                                (!_interrupted && _isPreBuffering)))
+                          _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
+                        if (_hudText != null && !_osdOpen) _buildStatusHud(),
+                        if (shouldShowPlayerCornerNotice(
+                          cornerRecordingNotice: _cornerRecordingNotice,
+                          customCornerNoticeText: _customCornerNoticeText,
+                          osdOpen: _osdOpen,
+                          detailOpen: _detailOpen,
+                          interrupted: _interrupted,
+                          error: _error,
+                          switchingChannel: _switchingChannel,
+                        ))
+                          PlayerCornerNotice(
+                            customText: _customCornerNoticeText,
+                            recordingNotice: _cornerRecordingNotice,
+                          ),
+                        if (_proxyReconnecting &&
+                            _initialPlaybackStarted &&
+                            !_interrupted &&
+                            _error == null &&
+                            !_switchingChannel)
+                          _buildReconnectPill(
+                            belowCornerNotice: shouldShowPlayerCornerNotice(
+                              cornerRecordingNotice: _cornerRecordingNotice,
+                              customCornerNoticeText: _customCornerNoticeText,
+                              osdOpen: _osdOpen,
+                              detailOpen: _detailOpen,
+                              interrupted: _interrupted,
+                              error: _error,
+                              switchingChannel: _switchingChannel,
+                            ),
+                          ),
+                        if (uiMode.isDesktop && canLiveSwitch)
+                          DesktopChannelEdgeZones(
+                            enabled: true,
+                            hasPrevious:
+                                _previewTargetFor(
+                                  ChannelSwitchDirection.previous,
+                                ) !=
+                                null,
+                            hasNext:
+                                _previewTargetFor(
+                                  ChannelSwitchDirection.next,
+                                ) !=
+                                null,
+                            onHoverDirection: (dir) {
+                              if (dir != null) {
+                                _onDesktopEdgeHoverEnter(dir);
+                              } else {
+                                _onDesktopEdgeHoverExit();
                               }
-                              final opened = _openedLiveDetail;
-                              final detailBody = (_liveDetailLoading &&
-                                      !(opened?.hasBody ?? false))
-                                  ? '番組詳細を読み込み中…'
-                                  : ((opened?.hasBody ?? false)
-                                      ? opened!.body!
-                                      : '番組詳細情報はありません');
-                              return ProgramDetailOverlayPanel(
-                                title:
-                                    opened?.title ??
-                                    widget.programDetailTitle ??
-                                    widget.title,
-                                meta: opened != null
-                                    ? opened.meta
-                                    : widget.programDetailMeta,
-                                body: detailBody,
-                                scrollController: _detailScrollController,
-                                focusNode: _detailFocusNode,
-                                onClose: () => _closeDetail(fromBackKey: true),
-                                onScrollDelta: _scrollDetailBy,
-                              );
+                            },
+                            onClickDirection: _showChannelPreview,
+                          ),
+                        if ((uiMode.isDesktop && canLiveSwitch) ||
+                            canTouchSwipeChannels)
+                          ..._buildChannelSwitchPreviewCards(
+                            horizontalInset: touchHorizontalInset,
+                          ),
+                        if (_seekHudVisible && !_osdOpen) _buildSeekHud(),
+                        if (!uiMode.isTv &&
+                            _osdOpen &&
+                            !_detailOpen &&
+                            !_interrupted &&
+                            _error == null)
+                          PlayerCenterTransportOverlay(
+                            visible: true,
+                            compact: isCompactTouchLandscape,
+                            isPlaying: _playingNow,
+                            canSeekBackward: true,
+                            canSeekForward:
+                                !widget.live || _liveDelayedByPause,
+                            onRewind: () {
+                              if (widget.live) {
+                                _queueLiveRelativeSeek(
+                                  liveDirectionKeySeekDeltaSeconds(
+                                    forward: false,
+                                  ),
+                                );
+                              } else {
+                                _queueRelativeSeek(_rewindStep);
+                              }
+                              _resetOsdTimer();
+                            },
+                            onTogglePlayPause: () {
+                              _togglePlayPauseWithHud();
+                              _resetOsdTimer();
+                            },
+                            onForward: () {
+                              if (widget.live) {
+                                _queueLiveRelativeSeek(
+                                  liveDirectionKeySeekDeltaSeconds(
+                                    forward: true,
+                                  ),
+                                );
+                              } else {
+                                _queueRelativeSeek(_forwardStep);
+                              }
+                              _resetOsdTimer();
                             },
                           ),
-                        ),
-                      if (_interrupted && !_conflictHandled && !_switchingChannel)
-                        _buildInterruptionBanner(),
-                      if (_currentNextEpisodeCountdown().visible &&
-                          !_osdOpen &&
-                          !_detailOpen &&
-                          !_seekHudVisible &&
-                          !_switchingChannel)
-                        _buildNextEpisodeCountdownCard(
-                          _currentNextEpisodeCountdown().remainingSeconds,
-                        ),
-                    ],
+                        if (!uiMode.isTv &&
+                            !isCompactTouchLandscape &&
+                            !_detailOpen &&
+                            (_osdOpen ||
+                                _osdFadeController.status !=
+                                    AnimationStatus.dismissed))
+                          Positioned(
+                            top: mediaPadding.top + 14,
+                            left: touchHorizontalInset + 18,
+                            child: IgnorePointer(
+                              ignoring: !_osdOpen,
+                              child: MouseRegion(
+                                onEnter: uiMode.isDesktop
+                                    ? (_) {
+                                        _pointerOverControls = true;
+                                        _osdTimer?.cancel();
+                                      }
+                                    : null,
+                                onExit: uiMode.isDesktop
+                                    ? (_) {
+                                        _pointerOverControls = false;
+                                        _resetOsdTimer();
+                                      }
+                                    : null,
+                                child: FadeTransition(
+                                  opacity: _osdFadeAnimation,
+                                  child: FilledButton.tonalIcon(
+                                    key: const ValueKey(
+                                      'player_top_back_button',
+                                    ),
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: Colors.black.withValues(
+                                        alpha: 0.62,
+                                      ),
+                                      foregroundColor: Colors.white,
+                                      side: const BorderSide(
+                                        color: Colors.white24,
+                                      ),
+                                    ),
+                                    onPressed: () =>
+                                        unawaited(_exitPlaybackCleanly()),
+                                    icon: const Icon(
+                                      Icons.arrow_back,
+                                      size: 18,
+                                    ),
+                                    label: const Text('戻る'),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        if (_osdOpen ||
+                            _osdFadeController.status !=
+                                AnimationStatus.dismissed) ...[
+                          if (!_detailOpen)
+                            uiMode.isTv
+                                ? _buildOsdClockOverlay()
+                                : isCompactTouchLandscape
+                                ? _buildOsdClockOverlay(
+                                    top: mediaPadding.top + 56,
+                                    left: touchHorizontalInset + 12,
+                                    fontSize: 26,
+                                  )
+                                : _buildOsdClockOverlay(
+                                    top: mediaPadding.top + 62,
+                                    left: touchHorizontalInset + 18,
+                                    fontSize: 40,
+                                  ),
+                          if (uiMode.isTv)
+                            _buildRemoteOsd()
+                          else if (isCompactTouchLandscape) ...[
+                            if (!_detailOpen)
+                              _buildCompactTouchLandscapeTopBar(
+                                topSafePadding: mediaPadding.top,
+                                horizontalInset: touchHorizontalInset,
+                              ),
+                            _buildCompactTouchLandscapeOsd(
+                              bottomSafePadding: mediaPadding.bottom,
+                              horizontalInset: touchHorizontalInset,
+                            ),
+                          ] else
+                            _buildMultiplatformFullscreenOsd(
+                              isDesktop: uiMode.isDesktop,
+                              horizontalInset: touchHorizontalInset,
+                            ),
+                        ],
+                        if (_detailOpen && _hasProgramDetail)
+                          Positioned(
+                            top: 20,
+                            left: touchHorizontalInset > 0
+                                ? touchHorizontalInset + 16
+                                : 28,
+                            right: touchHorizontalInset > 0
+                                ? touchHorizontalInset + 16
+                                : 28,
+                            child: Builder(
+                              builder: (_) {
+                                if (!widget.live) {
+                                  return ProgramDetailOverlayPanel(
+                                    title:
+                                        widget.programDetailTitle ??
+                                        widget.title,
+                                    meta: widget.programDetailMeta,
+                                    body: widget.programDetailBody!,
+                                    scrollController: _detailScrollController,
+                                    focusNode: _detailFocusNode,
+                                    uiMode: uiMode,
+                                    onClose: () =>
+                                        _closeDetail(fromBackKey: true),
+                                    onScrollDelta: _scrollDetailBy,
+                                  );
+                                }
+                                final opened = _openedLiveDetail;
+                                final detailBody =
+                                    (_liveDetailLoading &&
+                                        !(opened?.hasBody ?? false))
+                                    ? '番組詳細を読み込み中…'
+                                    : ((opened?.hasBody ?? false)
+                                          ? opened!.body!
+                                          : '番組詳細情報はありません');
+                                return ProgramDetailOverlayPanel(
+                                  title:
+                                      opened?.title ??
+                                      widget.programDetailTitle ??
+                                      widget.title,
+                                  meta: opened != null
+                                      ? opened.meta
+                                      : widget.programDetailMeta,
+                                  body: detailBody,
+                                  scrollController: _detailScrollController,
+                                  focusNode: _detailFocusNode,
+                                  uiMode: uiMode,
+                                  onClose: () =>
+                                      _closeDetail(fromBackKey: true),
+                                  onScrollDelta: _scrollDetailBy,
+                                );
+                              },
+                            ),
+                          ),
+                        if (_interrupted &&
+                            !_conflictHandled &&
+                            !_switchingChannel)
+                          _buildInterruptionBanner(),
+                        if (_currentNextEpisodeCountdown().visible &&
+                            !_osdOpen &&
+                            !_detailOpen &&
+                            !_seekHudVisible &&
+                            !_switchingChannel)
+                          _buildNextEpisodeCountdownCard(
+                            _currentNextEpisodeCountdown().remainingSeconds,
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ),
+      ),
+    );
+  }
+
+  Widget _buildPipLayout(UiControlMode uiMode) {
+    final stack = Stack(
+      key: const ValueKey('player_pip_surface'),
+      fit: StackFit.expand,
+      children: [
+        Video(
+          controller: _videoController,
+          controls: NoVideoControls,
+          subtitleViewConfiguration: const SubtitleViewConfiguration(
+            visible: false,
+          ),
+        ),
+        if (_jikkyoOn && !_switchingChannel && _error == null)
+          Positioned.fill(
+            child: JikkyoDanmakuOverlay(
+              controller: _jikkyoOverlayController,
+              settings: ref.watch(jikkyoSettingsProvider),
+              isPlaying: _playingNow && !_buffering && !_interrupted,
+              playbackRate: widget.live ? _liveCatchUpRate : _playbackRate,
+              avoidBottomSubtitles:
+                  (_subtitlesOn && _visibleSubtitleCues.isNotEmpty) ||
+                  (ref.watch(superimposeEnabledProvider) &&
+                      _visibleSuperimposeCues.isNotEmpty),
+            ),
+          ),
+        if (_subtitlesOn &&
+            _visibleSubtitleCues.isNotEmpty &&
+            !_switchingChannel &&
+            _error == null)
+          PlayerSubtitleOverlay(
+            settings: ref.watch(subtitleSettingsProvider),
+            cues: _visibleSubtitleCues,
+            bottomSafePadding: 8.0,
+            minFontSize: 9.0,
+          ),
+        if (ref.watch(superimposeEnabledProvider) &&
+            _visibleSuperimposeCues.isNotEmpty &&
+            !_switchingChannel &&
+            _error == null)
+          PlayerSubtitleOverlay(
+            settings: ref.watch(subtitleSettingsProvider),
+            cues: _visibleSuperimposeCues,
+            bottomSafePadding: 8.0,
+            minFontSize: 9.0,
+          ),
+        if (uiMode.isDesktop && _desktopPipHover) ...[
+          Positioned(
+            top: 8,
+            right: 8,
+            child: Material(
+              color: Colors.black.withValues(alpha: 0.72),
+              borderRadius: BorderRadius.circular(20),
+              child: IconButton(
+                key: const ValueKey('player_pip_exit_button'),
+                icon: const Icon(
+                  Icons.open_in_full,
+                  color: Colors.white,
+                  size: 18,
+                ),
+                tooltip: '元に戻す',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => unawaited(_togglePip()),
+              ),
+            ),
+          ),
+          Center(
+            child: Material(
+              color: Colors.black.withValues(alpha: 0.68),
+              shape: const CircleBorder(),
+              child: IconButton(
+                key: const ValueKey('player_pip_play_pause_button'),
+                icon: Icon(
+                  _playingNow ? Icons.pause : Icons.play_arrow,
+                  color: Colors.white,
+                  size: 28,
+                ),
+                tooltip: _playingNow ? '一時停止' : '再生',
+                onPressed: _togglePlayPauseWithHud,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+    if (!uiMode.isDesktop) return stack;
+    return Focus(
+      focusNode: _rootFocusNode,
+      autofocus: true,
+      onKeyEvent: _handleKeyEvent,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _desktopPipHover = true),
+        onExit: (_) => setState(() => _desktopPipHover = false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onDoubleTap: () => unawaited(_togglePip()),
+          child: stack,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTouchSplitLayout({
+    required String? loadingLabel,
+    required bool canSwipeChannels,
+  }) {
+    final mediaSize = MediaQuery.sizeOf(context);
+    final isLandscape = mediaSize.width >= mediaSize.height;
+    final isSideBySide = mediaSize.width >= 760 && isLandscape;
+    final compactPanelWidth = isSideBySide || mediaSize.width < 600;
+    final videoSurface = Container(
+      color: Colors.black,
+      child: LayoutBuilder(
+        builder: (context, constraints) => GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _toggleTouchPortraitOverlay,
+          onHorizontalDragStart: canSwipeChannels
+              ? (details) {
+                  _touchSwipeStartX = details.localPosition.dx;
+                  _touchSwipeDeltaX = 0.0;
+                }
+              : null,
+          onHorizontalDragUpdate: canSwipeChannels
+              ? (details) {
+                  _touchSwipeDeltaX += details.delta.dx;
+                }
+              : null,
+          onHorizontalDragEnd: canSwipeChannels
+              ? (details) {
+                  final dir = resolveTouchHorizontalSwipeDirection(
+                    dragDeltaX: _touchSwipeDeltaX,
+                    primaryVelocity: details.primaryVelocity,
+                    startX: _touchSwipeStartX,
+                    viewportWidth: constraints.maxWidth,
+                  );
+                  if (dir != null) _handleTouchHorizontalSwipe(dir);
+                }
+              : null,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Video(
+                controller: _videoController,
+                controls: NoVideoControls,
+                subtitleViewConfiguration: const SubtitleViewConfiguration(
+                  visible: false,
+                ),
+              ),
+              if (_jikkyoOn && !_switchingChannel && _error == null)
+                Positioned.fill(
+                  child: JikkyoDanmakuOverlay(
+                    controller: _jikkyoOverlayController,
+                    settings: ref.watch(jikkyoSettingsProvider),
+                    isPlaying: _playingNow && !_buffering && !_interrupted,
+                    playbackRate: widget.live
+                        ? _liveCatchUpRate
+                        : _playbackRate,
+                    avoidBottomSubtitles:
+                        (_subtitlesOn && _visibleSubtitleCues.isNotEmpty) ||
+                        (ref.watch(superimposeEnabledProvider) &&
+                            _visibleSuperimposeCues.isNotEmpty),
+                  ),
+                ),
+              if (_subtitlesOn &&
+                  _visibleSubtitleCues.isNotEmpty &&
+                  !_switchingChannel &&
+                  _error == null)
+                PlayerSubtitleOverlay(
+                  settings: ref.watch(subtitleSettingsProvider),
+                  cues: _visibleSubtitleCues,
+                  bottomSafePadding: 12.0,
+                  minFontSize: 10.0,
+                ),
+              if (ref.watch(superimposeEnabledProvider) &&
+                  _visibleSuperimposeCues.isNotEmpty &&
+                  !_switchingChannel &&
+                  _error == null)
+                PlayerSubtitleOverlay(
+                  settings: ref.watch(subtitleSettingsProvider),
+                  cues: _visibleSuperimposeCues,
+                  bottomSafePadding: 12.0,
+                  minFontSize: 10.0,
+                ),
+              if (!_conflictHandled &&
+                  (loadingLabel != null ||
+                      (!_interrupted && _isPreBuffering)))
+                _buildLoadingOverlay(loadingLabel ?? '読み込み中…'),
+              if (_hudText != null) _buildStatusHud(),
+              if (shouldShowPlayerCornerNotice(
+                cornerRecordingNotice: _cornerRecordingNotice,
+                customCornerNoticeText: _customCornerNoticeText,
+                osdOpen: false,
+                detailOpen: false,
+                interrupted: _interrupted,
+                error: _error,
+                switchingChannel: _switchingChannel,
+              ))
+                PlayerCornerNotice(
+                  customText: _customCornerNoticeText,
+                  recordingNotice: _cornerRecordingNotice,
+                ),
+              if (_proxyReconnecting &&
+                  _initialPlaybackStarted &&
+                  !_interrupted &&
+                  _error == null &&
+                  !_switchingChannel)
+                _buildReconnectPill(
+                  belowCornerNotice: shouldShowPlayerCornerNotice(
+                    cornerRecordingNotice: _cornerRecordingNotice,
+                    customCornerNoticeText: _customCornerNoticeText,
+                    osdOpen: false,
+                    detailOpen: false,
+                    interrupted: _interrupted,
+                    error: _error,
+                    switchingChannel: _switchingChannel,
+                  ),
+                ),
+              if (canSwipeChannels) ..._buildChannelSwitchPreviewCards(),
+              if (_touchPortraitOverlayOpen &&
+                  !_interrupted &&
+                  _error == null) ...[
+                Positioned(
+                  top: 8,
+                  left: 8,
+                  child: CircleAvatar(
+                    backgroundColor: Colors.black54,
+                    child: IconButton(
+                      key: const ValueKey('touch_portrait_back_button'),
+                      icon: const Icon(Icons.arrow_back, color: Colors.white),
+                      tooltip: '戻る',
+                      onPressed: () => unawaited(_exitPlaybackCleanly()),
+                    ),
+                  ),
+                ),
+                PlayerCenterTransportOverlay(
+                  visible: true,
+                  compact: true,
+                  isPlaying: _playingNow,
+                  canSeekBackward: true,
+                  canSeekForward: !widget.live || _liveDelayedByPause,
+                  onRewind: () {
+                    if (widget.live) {
+                      _queueLiveRelativeSeek(
+                        liveDirectionKeySeekDeltaSeconds(forward: false),
+                      );
+                    } else {
+                      _queueRelativeSeek(_rewindStep);
+                    }
+                    _resetTouchPortraitOverlayTimer();
+                  },
+                  onTogglePlayPause: () {
+                    _togglePlayPauseWithHud();
+                    _resetTouchPortraitOverlayTimer();
+                  },
+                  onForward: () {
+                    if (widget.live) {
+                      _queueLiveRelativeSeek(
+                        liveDirectionKeySeekDeltaSeconds(forward: true),
+                      );
+                    } else {
+                      _queueRelativeSeek(_forwardStep);
+                    }
+                    _resetTouchPortraitOverlayTimer();
+                  },
+                ),
+                Positioned(
+                  right: 8,
+                  bottom: 8,
+                  child: CircleAvatar(
+                    backgroundColor: Colors.black54,
+                    child: IconButton(
+                      key: const ValueKey(
+                        'touch_portrait_fullscreen_overlay_button',
+                      ),
+                      icon: const Icon(Icons.fullscreen, color: Colors.white),
+                      tooltip: '全画面',
+                      onPressed: () => _toggleTouchFullscreen(false),
+                    ),
+                  ),
+                ),
+              ],
+              if (_interrupted && !_conflictHandled && !_switchingChannel)
+                _buildInterruptionBanner(),
+              if (_currentNextEpisodeCountdown().visible && !_switchingChannel)
+                _buildNextEpisodeCountdownCard(
+                  _currentNextEpisodeCountdown().remainingSeconds,
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+    final osdPanel = _buildTouchSplitPanel(compactWidth: compactPanelWidth);
+    return SafeArea(
+      child: isSideBySide
+          ? Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: Container(
+                    color: Colors.black,
+                    child: Center(
+                      child: AspectRatio(
+                        aspectRatio: 16 / 9,
+                        child: videoSurface,
+                      ),
+                    ),
+                  ),
+                ),
+                SizedBox(width: 360, child: osdPanel),
+              ],
+            )
+          : Column(
+              children: [
+                AspectRatio(aspectRatio: 16 / 9, child: videoSurface),
+                Expanded(child: osdPanel),
+              ],
+            ),
+    );
+  }
+
+  Widget _buildTouchSplitPanel({required bool compactWidth}) {
+    final activeChannel = widget.live ? _activeLiveChannel : null;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final volume = ref.watch(playerVolumeProvider);
+    final muted = ref.watch(playerMutedProvider);
+    final now = _now();
+    final ResolvedProgramDetail? portraitDetail;
+    if (!widget.live) {
+      portraitDetail = _hasProgramDetail
+          ? ResolvedProgramDetail(
+              title: widget.programDetailTitle ?? widget.title,
+              meta: widget.programDetailMeta,
+              body: widget.programDetailBody,
+            )
+          : null;
+    } else if (activeChannel != null) {
+      portraitDetail = _resolveLiveDetailSnapshot(
+        activeChannel,
+        _effectiveLivePlaybackClock(now),
+      );
+    } else {
+      portraitDetail = null;
+    }
+
+    return Container(
+      key: const ValueKey('touch_portrait_osd_panel'),
+      width: double.infinity,
+      color: const Color(0xFF101318),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildOsdHeaderRow(
+              liveStatus: liveStatus,
+              compactWidth: compactWidth,
+            ),
+            if (widget.live &&
+                (_activeLiveChannel != null || _liveDelayedByPause)) ...[
+              const SizedBox(height: 8),
+              _buildLiveOsdProgramSection(
+                accentColor: liveStatus?.barColor ?? Colors.lightBlueAccent,
+                interactive: true,
+                compactWidth: compactWidth,
+              ),
+            ] else if (!widget.live) ...[
+              if ((widget.recordedChannelName != null &&
+                      widget.recordedChannelName!.trim().isNotEmpty) ||
+                  (widget.recordedBroadcastTimeRange != null &&
+                      widget.recordedBroadcastTimeRange!
+                          .trim()
+                          .isNotEmpty)) ...[
+                const SizedBox(height: 6),
+                RecordedOsdProgramSection(
+                  programTitle: widget.title,
+                  broadcastTimeRange: widget.recordedBroadcastTimeRange,
+                  compactWidth: compactWidth,
+                ),
+              ],
+              const SizedBox(height: 8),
+              _buildSeekBarSection(
+                isSeekingPreview: false,
+                interactive: true,
+              ),
+            ],
+            if (_jikkyoOn) ...[
+              const SizedBox(height: 8),
+              _buildJikkyoOsdStatusRow(),
+            ],
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                PlayerVolumeControl(
+                  volume: volume,
+                  muted: muted,
+                  sliderWidth: compactWidth ? 96 : 110,
+                  onToggleMute: _togglePlayerMute,
+                  onVolumeChanged: _setPlayerVolume,
+                ),
+                const Spacer(),
+                if (_pipSupported) ...[
+                  OutlinedButton.icon(
+                    key: const ValueKey('player_pip_icon_button'),
+                    style: osdButtonStyle(),
+                    onPressed: () => unawaited(_togglePip()),
+                    icon: const Icon(Icons.picture_in_picture_alt, size: 20),
+                    label: const Text('PinP'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                OutlinedButton.icon(
+                  key: const ValueKey('player_fullscreen_button'),
+                  style: osdButtonStyle(),
+                  onPressed: () => _toggleTouchFullscreen(false),
+                  icon: const Icon(Icons.fullscreen, size: 20),
+                  label: const Text('全画面'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _buildOsdButtonsList(
+                tvMode: false,
+                includeCloseButton: false,
+                includeDetailButton: false,
+                includePipButton: false,
+              ),
+            ),
+            if (portraitDetail != null) ...[
+              const SizedBox(height: 16),
+              const Divider(color: Colors.white24),
+              const SizedBox(height: 8),
+              const Text(
+                '番組詳細',
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 6),
+              if (portraitDetail.meta != null &&
+                  portraitDetail.meta!.trim().isNotEmpty) ...[
+                Text(
+                  portraitDetail.meta!,
+                  style: const TextStyle(
+                    color: Colors.white60,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+              if (portraitDetail.hasBody)
+                Text(
+                  portraitDetail.body!,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    height: 1.5,
+                  ),
+                )
+              else
+                const Text(
+                  '番組詳細情報はありません',
+                  style: TextStyle(color: Colors.white54, fontSize: 13),
+                ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -8229,12 +10630,54 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return '$sec秒';
   }
 
+  Widget _buildReconnectPill({required bool belowCornerNotice}) {
+    final aheadSec = math.max(_bufferedAheadSeconds, _bufferDeltaSeconds).floor();
+    final label = aheadSec >= 1
+        ? '回線再接続中…（バッファ残 ${_formatShortDurationSeconds(aheadSec)}）'
+        : '回線再接続中…';
+    return Positioned(
+      top: belowCornerNotice ? 52 : 16,
+      right: 20,
+      child: IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: const Color(0xCC262218),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: Colors.amberAccent.withValues(alpha: 0.7),
+              width: 1,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.sync, size: 13, color: Colors.amberAccent),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildLoadingOverlay(String fallbackLabel) {
     final plan = _bufferPlan;
+    final targetSeconds = _initialPlaybackStarted
+        ? (plan?.rebufferWaitSeconds ?? 0)
+        : (plan?.cachePauseWaitSeconds ?? 0);
     final spec = liveLoadingOverlaySpec(
       isLive: widget.live,
       isPreBuffering: _isPreBuffering,
-      targetSeconds: plan?.cachePauseWaitSeconds ?? 0,
+      targetSeconds: targetSeconds,
       currentSeconds: _effectiveLoadingCurrentSeconds,
       bufferingPercentage: _bufferingPercentage,
       fallbackLabel: fallbackLabel,
@@ -8306,7 +10749,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
-  List<Widget> _buildChannelSwitchPreviewCards() {
+  Widget _buildThroughputBadge() {
+    if (!_osdOpen) return const SizedBox.shrink();
+    final label = formatThroughputMbps(_recentThroughputMbps);
+    if (label == null) return const SizedBox.shrink();
+    return buildPlayerOsdStatusBadge(
+      label: label,
+      color: const Color(0xB3000000),
+      textColor: Colors.lightBlueAccent,
+    );
+  }
+
+  List<Widget> _buildChannelSwitchPreviewCards({double horizontalInset = 0.0}) {
     final now = _now();
     final prevEntry = _previewTargetFor(ChannelSwitchDirection.previous);
     final nextEntry = _previewTargetFor(ChannelSwitchDirection.next);
@@ -8326,25 +10780,43 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
     final prevKey = prevEntry != null ? liveServiceKey(prevEntry.channel) : null;
     final nextKey = nextEntry != null ? liveServiceKey(nextEntry.channel) : null;
+    final isDesktop = _uiMode.isDesktop;
     return [
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.previous,
-        visible: _channelPreviewDirection == ChannelSwitchDirection.previous,
+        visible:
+            _channelPreviewDirection == ChannelSwitchDirection.previous ||
+            (isDesktop &&
+                _hoveredChannelEdge == ChannelSwitchDirection.previous),
+        uiMode: _uiMode,
+        horizontalInset: horizontalInset,
         entry: prevEntry,
         resolvedProgram: prevResolved,
         channelNumber: prevKey != null ? _liveChannelNumbers[prevKey] : null,
         channelLogoBytes: prevKey != null ? _liveChannelLogos[prevKey] : null,
+        onHoverEnter: isDesktop
+            ? () => _onDesktopEdgeHoverEnter(ChannelSwitchDirection.previous)
+            : null,
+        onHoverExit: isDesktop ? _onDesktopEdgeHoverExit : null,
         onTap: prevEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(prevEntry)),
       ),
       LiveChannelSwitchPreviewCard(
         direction: ChannelSwitchDirection.next,
-        visible: _channelPreviewDirection == ChannelSwitchDirection.next,
+        visible:
+            _channelPreviewDirection == ChannelSwitchDirection.next ||
+            (isDesktop && _hoveredChannelEdge == ChannelSwitchDirection.next),
+        uiMode: _uiMode,
+        horizontalInset: horizontalInset,
         entry: nextEntry,
         resolvedProgram: nextResolved,
         channelNumber: nextKey != null ? _liveChannelNumbers[nextKey] : null,
         channelLogoBytes: nextKey != null ? _liveChannelLogos[nextKey] : null,
+        onHoverEnter: isDesktop
+            ? () => _onDesktopEdgeHoverEnter(ChannelSwitchDirection.next)
+            : null,
+        onHoverExit: isDesktop ? _onDesktopEdgeHoverExit : null,
         onTap: nextEntry == null
             ? null
             : () => unawaited(_executeLiveChannelSwitch(nextEntry)),
@@ -8356,19 +10828,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     required double posFraction,
     double? bufferFraction,
     List<double> tickFractions = const [],
+    bool interactive = false,
+    ValueChanged<double>? onScrubUpdate,
+    ValueChanged<double>? onScrubEnd,
   }) {
     const barColor = Colors.lightBlueAccent;
     final clampedPos = posFraction.clamp(0.0, 1.0);
     final clampedBuf = bufferFraction?.clamp(clampedPos, 1.0);
+    final trackHeight = interactive ? 26.0 : 18.0;
+    final thumbTop = (trackHeight - 14.0) / 2.0;
+    final tickTop = (trackHeight - 12.0) / 2.0;
     return SizedBox(
-      height: 18,
+      height: trackHeight,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final width = constraints.maxWidth;
           final thumbLeft = (width * clampedPos - 7)
               .clamp(0.0, math.max(0.0, width - 14))
               .toDouble();
-          return Stack(
+          double fractionForDx(double dx) {
+            if (width <= 0) return clampedPos;
+            return (dx / width).clamp(0.0, 1.0).toDouble();
+          }
+
+          final stack = Stack(
             alignment: Alignment.centerLeft,
             children: [
               ClipRRect(
@@ -8401,14 +10884,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   left: (width * tick - 1)
                       .clamp(0.0, math.max(0.0, width - 2))
                       .toDouble(),
-                  top: 3,
+                  top: tickTop,
                   width: 2,
                   height: 12,
                   child: const ColoredBox(color: Colors.white70),
                 ),
               Positioned(
                 left: thumbLeft,
-                top: 2,
+                top: thumbTop,
                 child: Container(
                   width: 14,
                   height: 14,
@@ -8421,18 +10904,48 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               ),
             ],
           );
+
+          if (!interactive) return stack;
+          var lastFrac = clampedPos;
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubEnd?.call(lastFrac);
+            },
+            onHorizontalDragStart: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubUpdate?.call(lastFrac);
+            },
+            onHorizontalDragUpdate: (details) {
+              lastFrac = fractionForDx(details.localPosition.dx);
+              onScrubUpdate?.call(lastFrac);
+            },
+            onHorizontalDragEnd: (_) {
+              onScrubEnd?.call(lastFrac);
+            },
+            child: stack,
+          );
         },
       ),
     );
   }
 
-  Widget _buildSeekBarSection({required bool isSeekingPreview}) {
+  Widget _buildSeekBarSection({
+    required bool isSeekingPreview,
+    bool interactive = false,
+  }) {
     return StreamBuilder<Duration>(
       stream: _player.stream.position,
       initialData: _lastPosition,
       builder: (context, snapshot) {
         final dur = _effectiveDuration;
-        final pos = _seekHudPositionOverride ?? (snapshot.data ?? _lastPosition);
+        final rawStreamPos = snapshot.data ?? _lastPosition;
+        final effectivePos =
+            (!widget.live && widget.session is TimeSeekableSession)
+            ? (_timeSeekBaseOffset + rawStreamPos)
+            : rawStreamPos;
+        final pos = _seekHudPositionOverride ?? effectivePos;
         final clampedPos = dur > Duration.zero && pos > dur
             ? dur
             : (pos.isNegative ? Duration.zero : pos);
@@ -8440,7 +10953,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             ? (clampedPos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
             : 0.0;
         final aheadMillis =
-            _lastPosition.inMilliseconds +
+            effectivePos.inMilliseconds +
             (_bufferedAheadSeconds * 1000).round();
         final maxBufferMillis = math.max(
           _bufferEndPosition.inMilliseconds,
@@ -8470,6 +10983,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               posFraction: posFraction,
               bufferFraction: bufferFraction,
               tickFractions: ticks,
+              interactive: interactive && dur > Duration.zero,
+              onScrubUpdate: _onRecordedScrubUpdate,
+              onScrubEnd: _onRecordedScrubEnd,
             ),
             const SizedBox(height: 4),
             Row(
@@ -8749,22 +11265,42 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
-  Widget _buildOsdClockOverlay() =>
-      PlayerOsdClockOverlay(now: _now(), opacity: _osdFadeAnimation);
+  Widget _buildOsdClockOverlay({
+    double top = 22.0,
+    double left = 28.0,
+    double fontSize = 44.0,
+  }) => PlayerOsdClockOverlay(
+    now: _now(),
+    opacity: _osdFadeAnimation,
+    top: top,
+    left: left,
+    fontSize: fontSize,
+  );
 
   Widget _buildLiveOsdProgramSection({
     Color accentColor = Colors.lightBlueAccent,
+    bool interactive = false,
+    bool compactWidth = false,
+    bool showNextProgram = true,
   }) {
     final now = _now();
     final playbackNow = _effectiveLivePlaybackClock(now);
     final channel = _activeLiveChannel;
     if (channel == null) {
       if (!_liveDelayedByPause) return const SizedBox.shrink();
+      final barState = _currentLiveTimeshiftBarState(null, now);
       return LiveProgramProgressBar(
-        state: _currentLiveTimeshiftBarState(null, now),
+        state: barState,
         showDetailsRow: true,
         barHeight: 6.0,
         accentColor: accentColor,
+        interactive: interactive,
+        onScrubFractionUpdate: interactive
+            ? (frac) => _onLiveScrubUpdate(frac, barState)
+            : null,
+        onScrubFractionEnd: interactive
+            ? (frac) => _onLiveScrubEnd(frac, barState)
+            : null,
       );
     }
     final info = resolveLiveOsdProgramInfo(
@@ -8772,24 +11308,785 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       guideEvents: _guideEventsForChannel(channel),
       now: playbackNow,
     );
+    final barState = _currentLiveTimeshiftBarState(info, now);
     return LiveOsdProgramSection(
       info: info,
-      timeshift: _currentLiveTimeshiftBarState(info, now),
+      timeshift: barState,
       accentColor: accentColor,
+      interactive: interactive,
+      compactWidth: compactWidth,
+      showNextProgram: showNextProgram,
+      onScrubFractionUpdate: interactive
+          ? (frac) => _onLiveScrubUpdate(frac, barState)
+          : null,
+      onScrubFractionEnd: interactive
+          ? (frac) => _onLiveScrubEnd(frac, barState)
+          : null,
     );
   }
 
-  Widget _buildRemoteOsd() {
+  Widget _buildOsdHeaderRow({
+    ({List<({String label, Color color})> badges, Color barColor})? liveStatus,
+    bool compactWidth = false,
+  }) {
     final activeChannel = widget.live ? _activeLiveChannel : null;
     final activeServiceKey = activeChannel != null
         ? liveServiceKey(activeChannel)
         : null;
-    final activeLogoBytes = activeServiceKey != null
-        ? _liveChannelLogos[activeServiceKey]
+    final activeLogoBytes = widget.live
+        ? (activeServiceKey != null ? _liveChannelLogos[activeServiceKey] : null)
+        : _recordedChannelLogo;
+    final activeChannelNumber = widget.live
+        ? (activeServiceKey != null
+              ? _liveChannelNumbers[activeServiceKey]
+              : null)
+        : _recordedChannelNumber;
+    final channelLabel =
+        (!widget.live &&
+            widget.recordedChannelName != null &&
+            widget.recordedChannelName!.trim().isNotEmpty)
+        ? widget.recordedChannelName!.trim()
+        : widget.title;
+    final statusBadges = <Widget>[
+      _buildBufferBadge(),
+      if (_osdOpen && formatThroughputMbps(_recentThroughputMbps) != null)
+        _buildThroughputBadge(),
+      if (widget.live && _sameChannelRecording)
+        buildPlayerOsdStatusBadge(
+          label: '録画中',
+          color: const Color(0xFFC62828),
+          icon: Icons.fiber_manual_record,
+        ),
+      if (liveStatus != null)
+        for (final badge in liveStatus.badges)
+          buildPlayerOsdStatusBadge(
+            label: badge.label,
+            color: badge.color,
+          ),
+    ];
+    if (compactWidth) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (activeLogoBytes != null) ...[
+                ChannelLogoPlate(
+                  bytes: activeLogoBytes,
+                  width: 38,
+                  height: 22,
+                  darkSurface: true,
+                ),
+                const SizedBox(width: 6),
+              ],
+              if (activeChannelNumber != null) ...[
+                ChannelNumberBadge(
+                  label: activeChannelNumber,
+                  darkSurface: true,
+                  compact: true,
+                ),
+                const SizedBox(width: 6),
+              ],
+              Expanded(
+                child: Text(
+                  channelLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Wrap(spacing: 6, runSpacing: 4, children: statusBadges),
+        ],
+      );
+    }
+    return Row(
+      children: [
+        if (activeLogoBytes != null) ...[
+          ChannelLogoPlate(
+            bytes: activeLogoBytes,
+            width: 42,
+            height: 24,
+            darkSurface: true,
+          ),
+          const SizedBox(width: 8),
+        ],
+        if (activeChannelNumber != null) ...[
+          ChannelNumberBadge(
+            label: activeChannelNumber,
+            darkSurface: true,
+          ),
+          const SizedBox(width: 8),
+        ],
+        Expanded(
+          child: Text(
+            channelLabel,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        for (final badge in statusBadges) ...[
+          const SizedBox(width: 8),
+          badge,
+        ],
+      ],
+    );
+  }
+
+  List<Widget> _buildOsdButtonsList({
+    required bool tvMode,
+    required bool includeCloseButton,
+    required bool includeDetailButton,
+    bool includeTransportButtons = true,
+    bool includePipButton = true,
+    bool compact = false,
+  }) {
+    void onInteraction() {
+      if (tvMode) {
+        _resetOsdTimer();
+      } else {
+        _resetOsdTimer();
+        _resetTouchPortraitOverlayTimer();
+      }
+    }
+
+    return [
+      if (includeTransportButtons)
+        _osdButton(
+          focusNode: tvMode ? _osdFirstFocusNode : null,
+          autofocus: tvMode,
+          icon: _playingNow ? Icons.pause : Icons.play_arrow,
+          label: _playingNow ? '一時停止' : '再生',
+          compact: compact,
+          onPressed: () {
+            _togglePlayPauseWithHud();
+            onInteraction();
+          },
+        ),
+      if (widget.live && _liveDelayedByPause) ...[
+        if (includeTransportButtons) ...[
+          _osdButton(
+            icon: Icons.replay_10,
+            label: '-10秒',
+            compact: compact,
+            onPressed: () {
+              _queueLiveRelativeSeek(
+                liveDirectionKeySeekDeltaSeconds(forward: false),
+              );
+              onInteraction();
+            },
+          ),
+          _osdButton(
+            icon: Icons.forward_10,
+            label: '+10秒',
+            compact: compact,
+            onPressed: () {
+              _queueLiveRelativeSeek(
+                liveDirectionKeySeekDeltaSeconds(forward: true),
+              );
+              onInteraction();
+            },
+          ),
+        ],
+        _osdButton(
+          icon: Icons.skip_next,
+          label: '現在位置へ',
+          compact: compact,
+          onPressed: _catchingUpLive
+              ? null
+              : () => unawaited(_catchUpToLiveEdge()),
+        ),
+        _osdButton(
+          icon: Icons.speed,
+          label: _liveAutoCatchUpEnabled ? '等速に戻す' : '倍速追いかけ',
+          compact: compact,
+          onPressed: _catchingUpLive ? null : _toggleLiveAutoCatchUp,
+        ),
+      ],
+      if (!widget.live) ...[
+        if (includeTransportButtons) ...[
+          _osdButton(
+            icon: Icons.replay_10,
+            label: '-10秒',
+            compact: compact,
+            onPressed: () {
+              _queueRelativeSeek(_rewindStep);
+              onInteraction();
+            },
+          ),
+          _osdButton(
+            icon: Icons.forward_10,
+            label: '+10秒',
+            compact: compact,
+            onPressed: () {
+              _queueRelativeSeek(_forwardStep);
+              onInteraction();
+            },
+          ),
+        ],
+        if (_chapters.isNotEmpty) ...[
+          _osdButton(
+            icon: Icons.fast_rewind,
+            label: '前チャプター',
+            compact: compact,
+            onPressed: () {
+              unawaited(_seekToChapter(forward: false));
+              onInteraction();
+            },
+          ),
+          _osdButton(
+            icon: Icons.fast_forward,
+            label: '次チャプター',
+            compact: compact,
+            onPressed: () {
+              unawaited(_seekToChapter(forward: true));
+              onInteraction();
+            },
+          ),
+        ],
+      ],
+      if (canChangePlaybackSpeed(live: widget.live))
+        _osdButton(
+          icon: Icons.speed,
+          label: '速度 ${playbackSpeedLabel(_playbackRate)}',
+          compact: compact,
+          onPressed: _cyclePlaybackRate,
+        ),
+      if (canSwitchAudio(_realAudioTracks.length))
+        _osdButton(
+          icon: Icons.audiotrack,
+          label: audioTrackLabel(_selectedAudioIndex),
+          compact: compact,
+          onPressed: _cycleAudioTrack,
+        ),
+      if (canToggleSubtitles(_realSubtitleTracks.length))
+        _osdButton(
+          icon: _subtitlesOn
+              ? Icons.closed_caption
+              : Icons.closed_caption_off,
+          label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
+          compact: compact,
+          onPressed: () {
+            _toggleSubtitles();
+            onInteraction();
+          },
+        ),
+      _osdButton(
+        icon: _jikkyoOn ? Icons.chat_bubble : Icons.chat_bubble_outline,
+        label: _jikkyoOn ? '実況 ON' : '実況 OFF',
+        compact: compact,
+        onPressed: () {
+          _toggleJikkyo();
+          onInteraction();
+        },
+      ),
+      if (_jikkyoOn)
+        _osdButton(
+          icon: Icons.tune,
+          label: '実況調整',
+          compact: compact,
+          onPressed: () => unawaited(_openJikkyoQuickDialog()),
+        ),
+      if (widget.canSwitchQuality && widget.onSwitchQuality != null)
+        _osdButton(
+          icon: osdQualityButtonIcon(useMobile: widget.currentUseMobile),
+          label: osdQualityButtonLabel(useMobile: widget.currentUseMobile),
+          compact: compact,
+          onPressed: _switchingChannel
+              ? null
+              : () => unawaited(_executeQualitySwitch()),
+        ),
+      if (widget.live &&
+          _sameChannelRecording &&
+          _activeSameChannelSchedule != null &&
+          widget.onStopCurrentProgramRecording != null)
+        _osdButton(
+          icon: Icons.stop_circle_outlined,
+          label: '録画を停止',
+          compact: compact,
+          onPressed: _recordingActionBusy
+              ? null
+              : () => unawaited(_confirmAndStopLiveRecording()),
+        )
+      else if (widget.live &&
+          !_sameChannelRecording &&
+          widget.onStartCurrentProgramRecording != null)
+        _osdButton(
+          icon: Icons.fiber_manual_record,
+          label: 'この番組を録画',
+          compact: compact,
+          onPressed: _recordingActionBusy
+              ? null
+              : () => unawaited(_confirmAndStartLiveRecording()),
+        ),
+      if (includePipButton && _pipSupported)
+        _osdButton(
+          key: const ValueKey('player_pip_button'),
+          icon: Icons.picture_in_picture_alt,
+          label: 'ピクチャ イン ピクチャ',
+          compact: compact,
+          onPressed: () => unawaited(_togglePip()),
+        ),
+      if (includeDetailButton && _hasProgramDetail)
+        _osdButton(
+          focusNode: tvMode ? _osdDetailButtonFocusNode : null,
+          icon: Icons.info_outline,
+          label: _detailOpen ? '詳細を閉じる' : '番組詳細',
+          compact: compact,
+          onPressed: () => _detailOpen ? _closeDetail() : _openDetail(),
+        ),
+      if (includeCloseButton)
+        _osdButton(
+          icon: Icons.close,
+          label: playerOsdCloseMenuLabel,
+          compact: compact,
+          onPressed: _closeOsd,
+        ),
+    ];
+  }
+
+  Widget _buildCompactTouchLandscapeTopBar({
+    required double topSafePadding,
+    required double horizontalInset,
+  }) {
+    final now = _now();
+    final playbackNow = _effectiveLivePlaybackClock(now);
+    final activeChannel = widget.live ? _activeLiveChannel : null;
+    final activeServiceKey = activeChannel != null
+        ? liveServiceKey(activeChannel)
         : null;
-    final activeChannelNumber = activeServiceKey != null
-        ? _liveChannelNumbers[activeServiceKey]
+    final activeLogoBytes = widget.live
+        ? (activeServiceKey != null ? _liveChannelLogos[activeServiceKey] : null)
+        : _recordedChannelLogo;
+    final activeChannelNumber = widget.live
+        ? (activeServiceKey != null
+              ? _liveChannelNumbers[activeServiceKey]
+              : null)
+        : _recordedChannelNumber;
+    final channelLabel =
+        (!widget.live &&
+            widget.recordedChannelName != null &&
+            widget.recordedChannelName!.trim().isNotEmpty)
+        ? widget.recordedChannelName!.trim()
+        : (activeChannel?.channelName ?? widget.title);
+    final liveInfo = activeChannel != null
+        ? resolveLiveOsdProgramInfo(
+            channel: activeChannel,
+            guideEvents: _guideEventsForChannel(activeChannel),
+            now: playbackNow,
+          )
         : null;
+    final programHeadline = widget.live
+        ? (liveInfo != null && liveInfo.currentTitle.isNotEmpty
+              ? liveInfo.currentTitle
+              : widget.title)
+        : widget.title;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    return Positioned(
+      top: 0,
+      left: horizontalInset,
+      right: horizontalInset,
+      child: IgnorePointer(
+        ignoring: !_osdOpen,
+        child: ExcludeFocus(
+          excluding: !_osdOpen,
+          child: FadeTransition(
+            opacity: _osdFadeAnimation,
+            child: Container(
+              key: const ValueKey('compact_touch_landscape_top_bar'),
+              padding: EdgeInsets.fromLTRB(12, topSafePadding + 8, 12, 16),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.black87, Colors.black54, Colors.transparent],
+                ),
+              ),
+              child: Row(
+                children: [
+                  FilledButton.tonalIcon(
+                    key: const ValueKey('player_top_back_button'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.black.withValues(alpha: 0.62),
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white24),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      minimumSize: const Size(0, 34),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    onPressed: () => unawaited(_exitPlaybackCleanly()),
+                    icon: const Icon(Icons.arrow_back, size: 16),
+                    label: const Text('戻る', style: TextStyle(fontSize: 12)),
+                  ),
+                  const SizedBox(width: 8),
+                  if (activeLogoBytes != null) ...[
+                    ChannelLogoPlate(
+                      bytes: activeLogoBytes,
+                      width: 34,
+                      height: 20,
+                      darkSurface: true,
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  if (activeChannelNumber != null) ...[
+                    ChannelNumberBadge(
+                      label: activeChannelNumber,
+                      darkSurface: true,
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  Expanded(
+                    child: Text(
+                      '$channelLabel  $programHeadline',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _buildBufferBadge(),
+                  if (widget.live && _sameChannelRecording) ...[
+                    const SizedBox(width: 6),
+                    buildPlayerOsdStatusBadge(
+                      label: '録画中',
+                      color: const Color(0xFFC62828),
+                      icon: Icons.fiber_manual_record,
+                    ),
+                  ],
+                  if (liveStatus != null)
+                    for (final badge in liveStatus.badges) ...[
+                      const SizedBox(width: 6),
+                      buildPlayerOsdStatusBadge(
+                        label: badge.label,
+                        color: badge.color,
+                      ),
+                    ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCompactTouchLandscapeOsd({
+    required double bottomSafePadding,
+    required double horizontalInset,
+  }) {
+    final now = _now();
+    final playbackNow = _effectiveLivePlaybackClock(now);
+    final channel = _activeLiveChannel;
+    final liveInfo = widget.live && channel != null
+        ? resolveLiveOsdProgramInfo(
+            channel: channel,
+            guideEvents: _guideEventsForChannel(channel),
+            now: playbackNow,
+          )
+        : null;
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final accentColor = liveStatus?.barColor ?? Colors.lightBlueAccent;
+    final liveBarState = widget.live && (channel != null || _liveDelayedByPause)
+        ? _currentLiveTimeshiftBarState(liveInfo, now)
+        : null;
+    final volume = ref.watch(playerVolumeProvider);
+    final muted = ref.watch(playerMutedProvider);
+    final buttons = _buildOsdButtonsList(
+      tvMode: false,
+      includeCloseButton: false,
+      includeDetailButton: true,
+      includeTransportButtons: false,
+      includePipButton: false,
+      compact: true,
+    );
+    return Positioned(
+      left: horizontalInset,
+      right: horizontalInset,
+      bottom: 0,
+      child: IgnorePointer(
+        ignoring: !_osdOpen,
+        child: ExcludeFocus(
+          excluding: !_osdOpen,
+          child: FadeTransition(
+            opacity: _osdFadeAnimation,
+            child: Container(
+              key: const ValueKey('compact_touch_landscape_osd'),
+              padding: EdgeInsets.fromLTRB(
+                12,
+                10,
+                12,
+                math.max(bottomSafePadding, 8.0),
+              ),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.transparent, Colors.black87, Colors.black],
+                ),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (liveBarState != null)
+                    LiveProgramProgressBar(
+                      state: liveBarState,
+                      showDetailsRow:
+                          liveBarState.isTimeshifting ||
+                          liveBarState.rewindableSeconds >= 2,
+                      barHeight: 5.0,
+                      accentColor: accentColor,
+                      interactive: true,
+                      onScrubFractionUpdate: (frac) =>
+                          _onLiveScrubUpdate(frac, liveBarState),
+                      onScrubFractionEnd: (frac) =>
+                          _onLiveScrubEnd(frac, liveBarState),
+                    )
+                  else if (!widget.live)
+                    _buildSeekBarSection(
+                      isSeekingPreview: false,
+                      interactive: true,
+                    ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              PlayerVolumeControl(
+                                volume: volume,
+                                muted: muted,
+                                sliderWidth: 78,
+                                onToggleMute: _togglePlayerMute,
+                                onVolumeChanged: _setPlayerVolume,
+                              ),
+                              for (final btn in buttons) ...[
+                                const SizedBox(width: 6),
+                                btn,
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      if (_pipSupported)
+                        IconButton(
+                          key: const ValueKey('player_pip_icon_button'),
+                          icon: const Icon(
+                            Icons.picture_in_picture_alt,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          tooltip: 'ピクチャ イン ピクチャ',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => unawaited(_togglePip()),
+                        ),
+                      IconButton(
+                        key: const ValueKey('player_fullscreen_button'),
+                        icon: const Icon(
+                          Icons.fullscreen_exit,
+                          color: Colors.white,
+                          size: 22,
+                        ),
+                        tooltip: '全画面解除',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _toggleTouchFullscreen(true),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMultiplatformFullscreenOsd({
+    required bool isDesktop,
+    double horizontalInset = 0.0,
+  }) {
+    final liveStatus = widget.live
+        ? liveStatusPresentation(
+            liveDelayedByPause: _liveDelayedByPause,
+            liveCatchUpRate: _liveCatchUpRate,
+            isPaused: !_playingNow || _livePausedAt != null,
+            isRewoundPlayback: _liveRewoundByUser,
+          )
+        : null;
+    final volume = ref.watch(playerVolumeProvider);
+    final muted = ref.watch(playerMutedProvider);
+    return Positioned(
+      left: horizontalInset,
+      right: horizontalInset,
+      bottom: 0,
+      child: IgnorePointer(
+        ignoring: !_osdOpen,
+        child: ExcludeFocus(
+          excluding: !_osdOpen,
+          child: MouseRegion(
+            onEnter: isDesktop
+                ? (_) {
+                    _pointerOverControls = true;
+                    _osdTimer?.cancel();
+                  }
+                : null,
+            onExit: isDesktop
+                ? (_) {
+                    _pointerOverControls = false;
+                    _resetOsdTimer();
+                  }
+                : null,
+            child: FadeTransition(
+              opacity: _osdFadeAnimation,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(24, 18, 24, 20),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Colors.transparent, Colors.black87, Colors.black],
+                  ),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildOsdHeaderRow(liveStatus: liveStatus),
+                    if (widget.live &&
+                        (_activeLiveChannel != null ||
+                            _liveDelayedByPause)) ...[
+                      const SizedBox(height: 6),
+                      _buildLiveOsdProgramSection(
+                        accentColor:
+                            liveStatus?.barColor ?? Colors.lightBlueAccent,
+                        interactive: true,
+                      ),
+                    ] else if (!widget.live) ...[
+                      if ((widget.recordedChannelName != null &&
+                              widget.recordedChannelName!.trim().isNotEmpty) ||
+                          (widget.recordedBroadcastTimeRange != null &&
+                              widget.recordedBroadcastTimeRange!
+                                  .trim()
+                                  .isNotEmpty)) ...[
+                        const SizedBox(height: 4),
+                        RecordedOsdProgramSection(
+                          programTitle: widget.title,
+                          broadcastTimeRange: widget.recordedBroadcastTimeRange,
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      _buildSeekBarSection(
+                        isSeekingPreview: false,
+                        interactive: true,
+                      ),
+                    ],
+                    if (_jikkyoOn) ...[
+                      const SizedBox(height: 6),
+                      _buildJikkyoOsdStatusRow(),
+                    ],
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        PlayerVolumeControl(
+                          volume: volume,
+                          muted: muted,
+                          onToggleMute: _togglePlayerMute,
+                          onVolumeChanged: _setPlayerVolume,
+                        ),
+                        const Spacer(),
+                        if (_pipSupported)
+                          IconButton(
+                            key: const ValueKey('player_pip_icon_button'),
+                            icon: const Icon(
+                              Icons.picture_in_picture_alt,
+                              color: Colors.white,
+                            ),
+                            tooltip: 'ピクチャ イン ピクチャ',
+                            onPressed: () => unawaited(_togglePip()),
+                          ),
+                        IconButton(
+                          key: const ValueKey('player_fullscreen_button'),
+                          icon: Icon(
+                            isDesktop
+                                ? (_desktopFullscreen
+                                      ? Icons.fullscreen_exit
+                                      : Icons.fullscreen)
+                                : Icons.fullscreen_exit,
+                            color: Colors.white,
+                          ),
+                          tooltip: isDesktop
+                              ? (_desktopFullscreen ? '全画面解除' : '全画面')
+                              : '全画面解除',
+                          onPressed: () {
+                            if (isDesktop) {
+                              unawaited(_toggleDesktopFullscreen());
+                            } else {
+                              _toggleTouchFullscreen(true);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _buildOsdButtonsList(
+                        tvMode: false,
+                        includeCloseButton: false,
+                        includeDetailButton: true,
+                        includePipButton: false,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteOsd() {
     final liveStatus = widget.live
         ? liveStatusPresentation(
             liveDelayedByPause: _liveDelayedByPause,
@@ -8818,262 +12115,50 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ),
               ),
               child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                if (widget.live && activeLogoBytes != null) ...[
-                  ChannelLogoPlate(
-                    bytes: activeLogoBytes,
-                    width: 42,
-                    height: 24,
-                    darkSurface: true,
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                if (widget.live && activeChannelNumber != null) ...[
-                  ChannelNumberBadge(
-                    label: activeChannelNumber,
-                    darkSurface: true,
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                Expanded(
-                  child: Text(
-                    (!widget.live &&
-                            widget.recordedChannelName != null &&
-                            widget.recordedChannelName!.trim().isNotEmpty)
-                        ? widget.recordedChannelName!.trim()
-                        : widget.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildOsdHeaderRow(liveStatus: liveStatus),
+                  if (widget.live &&
+                      (_activeLiveChannel != null || _liveDelayedByPause)) ...[
+                    const SizedBox(height: 6),
+                    _buildLiveOsdProgramSection(
+                      accentColor:
+                          liveStatus?.barColor ?? Colors.lightBlueAccent,
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                _buildBufferBadge(),
-                if (widget.live && _sameChannelRecording) ...[
-                  const SizedBox(width: 8),
-                  buildPlayerOsdStatusBadge(
-                    label: '録画中',
-                    color: const Color(0xFFC62828),
-                    icon: Icons.fiber_manual_record,
-                  ),
-                ],
-                if (liveStatus != null)
-                  for (final badge in liveStatus.badges) ...[
-                    const SizedBox(width: 8),
-                    buildPlayerOsdStatusBadge(
-                      label: badge.label,
-                      color: badge.color,
-                    ),
-                  ],
-              ],
-            ),
-            if (widget.live && (_activeLiveChannel != null || _liveDelayedByPause)) ...[
-              const SizedBox(height: 6),
-              _buildLiveOsdProgramSection(
-                accentColor: liveStatus?.barColor ?? Colors.lightBlueAccent,
-              ),
-            ] else if (!widget.live) ...[
-              if ((widget.recordedChannelName != null &&
-                      widget.recordedChannelName!.trim().isNotEmpty) ||
-                  (widget.recordedBroadcastTimeRange != null &&
-                      widget.recordedBroadcastTimeRange!.trim().isNotEmpty)) ...[
-                const SizedBox(height: 4),
-                RecordedOsdProgramSection(
-                  programTitle: widget.title,
-                  broadcastTimeRange: widget.recordedBroadcastTimeRange,
-                ),
-              ],
-              const SizedBox(height: 8),
-              _buildSeekBarSection(isSeekingPreview: false),
-            ],
-            if (_jikkyoOn) ...[
-              const SizedBox(height: 6),
-              _buildJikkyoOsdStatusRow(),
-            ],
-            const SizedBox(height: 12),
-            PlayerOsdButtonBar(
-              focusScopeNode: _osdFocusScopeNode,
-              onClose: () => _closeOsd(fromBackKey: true),
-              onInteraction: _resetOsdTimer,
-              children: [
-                  _osdButton(
-                    focusNode: _osdFirstFocusNode,
-                    autofocus: true,
-                    icon: _playingNow ? Icons.pause : Icons.play_arrow,
-                    label: _playingNow ? '一時停止' : '再生',
-                    onPressed: () {
-                      _togglePlayPauseWithHud();
-                      _resetOsdTimer();
-                    },
-                  ),
-                  if (widget.live && _liveDelayedByPause) ...[
-                    _osdButton(
-                      icon: Icons.replay_10,
-                      label: '-10秒',
-                      onPressed: () {
-                        _queueLiveRelativeSeek(
-                          liveDirectionKeySeekDeltaSeconds(forward: false),
-                        );
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.forward_10,
-                      label: '+10秒',
-                      onPressed: () {
-                        _queueLiveRelativeSeek(
-                          liveDirectionKeySeekDeltaSeconds(forward: true),
-                        );
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.skip_next,
-                      label: '現在位置へ',
-                      onPressed: _catchingUpLive
-                          ? null
-                          : () => unawaited(_catchUpToLiveEdge()),
-                    ),
-                    _osdButton(
-                      icon: Icons.speed,
-                      label: _liveAutoCatchUpEnabled ? '等速に戻す' : '倍速追いかけ',
-                      onPressed:
-                          _catchingUpLive ? null : _toggleLiveAutoCatchUp,
-                    ),
-                  ],
-                  if (!widget.live) ...[
-                    _osdButton(
-                      icon: Icons.replay_10,
-                      label: '-10秒',
-                      onPressed: () {
-                        _queueRelativeSeek(_rewindStep);
-                        _resetOsdTimer();
-                      },
-                    ),
-                    _osdButton(
-                      icon: Icons.forward_10,
-                      label: '+10秒',
-                      onPressed: () {
-                        _queueRelativeSeek(_forwardStep);
-                        _resetOsdTimer();
-                      },
-                    ),
-                    if (_chapters.isNotEmpty) ...[
-                      _osdButton(
-                        icon: Icons.fast_rewind,
-                        label: '前チャプター',
-                        onPressed: () {
-                          unawaited(_seekToChapter(forward: false));
-                          _resetOsdTimer();
-                        },
-                      ),
-                      _osdButton(
-                        icon: Icons.fast_forward,
-                        label: '次チャプター',
-                        onPressed: () {
-                          unawaited(_seekToChapter(forward: true));
-                          _resetOsdTimer();
-                        },
+                  ] else if (!widget.live) ...[
+                    if ((widget.recordedChannelName != null &&
+                            widget.recordedChannelName!.trim().isNotEmpty) ||
+                        (widget.recordedBroadcastTimeRange != null &&
+                            widget.recordedBroadcastTimeRange!
+                                .trim()
+                                .isNotEmpty)) ...[
+                      const SizedBox(height: 4),
+                      RecordedOsdProgramSection(
+                        programTitle: widget.title,
+                        broadcastTimeRange: widget.recordedBroadcastTimeRange,
                       ),
                     ],
+                    const SizedBox(height: 8),
+                    _buildSeekBarSection(isSeekingPreview: false),
                   ],
-                  if (canChangePlaybackSpeed(live: widget.live))
-                    _osdButton(
-                      icon: Icons.speed,
-                      label: '速度 ${playbackSpeedLabel(_playbackRate)}',
-                      onPressed: _cyclePlaybackRate,
+                  if (_jikkyoOn) ...[
+                    const SizedBox(height: 6),
+                    _buildJikkyoOsdStatusRow(),
+                  ],
+                  const SizedBox(height: 12),
+                  PlayerOsdButtonBar(
+                    focusScopeNode: _osdFocusScopeNode,
+                    onClose: () => _closeOsd(fromBackKey: true),
+                    onInteraction: _resetOsdTimer,
+                    children: _buildOsdButtonsList(
+                      tvMode: true,
+                      includeCloseButton: true,
+                      includeDetailButton: true,
                     ),
-                  if (canSwitchAudio(_realAudioTracks.length))
-                    _osdButton(
-                      icon: Icons.audiotrack,
-                      label: audioTrackLabel(_selectedAudioIndex),
-                      onPressed: _cycleAudioTrack,
-                    ),
-                  if (canToggleSubtitles(_realSubtitleTracks.length))
-                    _osdButton(
-                      icon: _subtitlesOn
-                          ? Icons.closed_caption
-                          : Icons.closed_caption_off,
-                      label: _subtitlesOn ? '字幕 ON' : '字幕 OFF',
-                      onPressed: () {
-                        _toggleSubtitles();
-                        _resetOsdTimer();
-                      },
-                    ),
-                  _osdButton(
-                    icon: _jikkyoOn
-                        ? Icons.chat_bubble
-                        : Icons.chat_bubble_outline,
-                    label: _jikkyoOn ? '実況 ON' : '実況 OFF',
-                    onPressed: () {
-                      _toggleJikkyo();
-                      _resetOsdTimer();
-                    },
-                  ),
-                  if (_jikkyoOn)
-                    _osdButton(
-                      icon: Icons.tune,
-                      label: '実況調整',
-                      onPressed: () => unawaited(_openJikkyoQuickDialog()),
-                    ),
-                  if (widget.canSwitchQuality && widget.onSwitchQuality != null)
-                    _osdButton(
-                      icon: osdQualityButtonIcon(
-                        useMobile: widget.currentUseMobile,
-                      ),
-                      label: osdQualityButtonLabel(
-                        useMobile: widget.currentUseMobile,
-                      ),
-                      onPressed: _switchingChannel
-                          ? null
-                          : () => unawaited(_executeQualitySwitch()),
-                    ),
-                  if (widget.live &&
-                      _sameChannelRecording &&
-                      _activeSameChannelSchedule != null &&
-                      widget.onStopCurrentProgramRecording != null)
-                    _osdButton(
-                      icon: Icons.stop_circle_outlined,
-                      label: '録画を停止',
-                      onPressed: _recordingActionBusy
-                          ? null
-                          : () => unawaited(_confirmAndStopLiveRecording()),
-                    )
-                  else if (widget.live &&
-                      !_sameChannelRecording &&
-                      widget.onStartCurrentProgramRecording != null)
-                    _osdButton(
-                      icon: Icons.fiber_manual_record,
-                      label: 'この番組を録画',
-                      onPressed: _recordingActionBusy
-                          ? null
-                          : () => unawaited(_confirmAndStartLiveRecording()),
-                    ),
-                  if (_hasProgramDetail)
-                    _osdButton(
-                      focusNode: _osdDetailButtonFocusNode,
-                      icon: Icons.info_outline,
-                      label: _detailOpen ? '詳細を閉じる' : '番組詳細',
-                      onPressed: () =>
-                          _detailOpen ? _closeDetail() : _openDetail(),
-                    ),
-                  _osdButton(
-                    icon: Icons.close,
-                    label: playerOsdCloseMenuLabel,
-                    onPressed: _closeOsd,
                   ),
                 ],
-            ),
-          ],
-        ),
+              ),
             ),
           ),
         ),
@@ -9082,19 +12167,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   Widget _osdButton({
+    Key? key,
     FocusNode? focusNode,
     bool autofocus = false,
     required IconData icon,
     required String label,
     required VoidCallback? onPressed,
+    bool compact = false,
   }) {
+    final style = compact
+        ? osdButtonStyle().copyWith(
+            padding: const WidgetStatePropertyAll(
+              EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            ),
+            minimumSize: const WidgetStatePropertyAll(Size(0, 32)),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          )
+        : osdButtonStyle();
     return OutlinedButton.icon(
+      key: key,
       focusNode: focusNode,
       autofocus: autofocus,
-      style: osdButtonStyle(),
+      style: style,
       onPressed: onPressed,
-      icon: Icon(icon, size: 20),
-      label: Text(label),
+      icon: Icon(icon, size: compact ? 16 : 20),
+      label: Text(
+        label,
+        style: compact ? const TextStyle(fontSize: 12) : null,
+      ),
     );
   }
 
@@ -9104,9 +12204,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// (see [_resume]); the close button dismisses the notice
   /// and leaves the stopped frame as it is.
   Widget _buildInterruptionBanner() {
+    final uiMode = _uiMode;
+    final resumeHint = uiMode.isTv
+        ? '電波復帰を待っています…（決定キーで今すぐ再開）'
+        : (uiMode.isDesktop
+              ? '電波復帰を待っています…（クリックで今すぐ再開）'
+              : '電波復帰を待っています…（タップで今すぐ再開）');
     final countdownText = !_autoResumeDisabled && _autoResumeCountdown > 0
         ? 'あと $_autoResumeCountdown 秒で自動再接続します…（$_autoResumeAttempts回目）'
-        : '電波復帰を待っています…（決定キーで今すぐ再開）';
+        : resumeHint;
     return Positioned(
       left: 0,
       right: 0,

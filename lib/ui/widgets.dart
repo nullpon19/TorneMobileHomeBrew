@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/providers.dart';
 import '../core/core.dart';
 import 'error_messages.dart';
 
@@ -269,9 +270,11 @@ Widget asyncSection<T>(
   Widget Function(T data) builder, {
   VoidCallback? onRetry,
   bool skipLoadingOnReload = false,
+  bool? skipLoadingOnRefresh,
 }) {
   return value.when(
     skipLoadingOnReload: skipLoadingOnReload,
+    skipLoadingOnRefresh: skipLoadingOnRefresh ?? value.hasValue,
     data: builder,
     loading: () => const Padding(
       padding: EdgeInsets.all(24),
@@ -468,11 +471,25 @@ class KeyboardDismissOnTap extends StatelessWidget {
   }
 }
 
+/// Strips Fire TV remote-specific phrasing (e.g. `決定キーで入力（...）`)
+/// when rendering an inline [TextField] on touch or desktop devices.
+String? sanitizeNonTvInputHint(String? hintText) {
+  if (hintText == null) return null;
+  final match = RegExp(r'^決定キーで入力[（(](.+)[）)]$').firstMatch(hintText.trim());
+  if (match != null) {
+    return match.group(1)?.trim();
+  }
+  if (hintText.trim() == '決定キーで入力') {
+    return '入力';
+  }
+  return hintText;
+}
+
 /// Fire TV D-pad friendly text input box that avoids exposing a raw
 /// [TextField] directly on screen (which causes FireTVIME to pop up and trap
 /// D-pad focus on hover). Opens a dedicated input dialog only on explicit
 /// activation (Select / Enter / tap).
-class FireTvTextInputField extends StatefulWidget {
+class FireTvTextInputField extends ConsumerStatefulWidget {
   const FireTvTextInputField({
     super.key,
     required this.controller,
@@ -511,10 +528,11 @@ class FireTvTextInputField extends StatefulWidget {
   final ValueChanged<String>? onSubmitted;
 
   @override
-  State<FireTvTextInputField> createState() => _FireTvTextInputFieldState();
+  ConsumerState<FireTvTextInputField> createState() =>
+      _FireTvTextInputFieldState();
 }
 
-class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
+class _FireTvTextInputFieldState extends ConsumerState<FireTvTextInputField> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'fireTvTextInput');
   bool _focused = false;
 
@@ -582,10 +600,43 @@ class _FireTvTextInputFieldState extends State<FireTvTextInputField> {
 
   @override
   Widget build(BuildContext context) {
+    final uiMode = ref.watch(uiControlModeProvider);
     final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
     final text = widget.controller.text;
     final hasText = text.isNotEmpty;
+    if (!uiMode.isTv) {
+      return TextField(
+        controller: widget.controller,
+        focusNode: _focusNode,
+        autofocus: widget.autofocus,
+        keyboardType: widget.keyboardType,
+        textInputAction: widget.textInputAction,
+        minLines: widget.minLines,
+        maxLines: widget.maxLines,
+        autocorrect: widget.autocorrect,
+        enableSuggestions: widget.enableSuggestions,
+        onChanged: widget.onChanged,
+        onSubmitted: widget.onSubmitted,
+        decoration: InputDecoration(
+          labelText: widget.labelText,
+          hintText: sanitizeNonTvInputHint(widget.hintText),
+          prefixIcon: widget.prefixIcon != null
+              ? Icon(widget.prefixIcon, size: 20)
+              : null,
+          suffixText: widget.suffixText,
+          suffixIcon: widget.showClearButton && hasText
+              ? IconButton(
+                  icon: const Icon(Icons.clear),
+                  tooltip: 'クリア',
+                  onPressed: _clear,
+                )
+              : null,
+          border: const OutlineInputBorder(),
+          isDense: true,
+        ),
+      );
+    }
+    final isDark = theme.brightness == Brightness.dark;
     final borderColor = _focused
         ? (isDark ? Colors.amberAccent : Colors.amber)
         : theme.colorScheme.outlineVariant;

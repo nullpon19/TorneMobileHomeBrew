@@ -5,25 +5,39 @@
 /// discovered path) is an override here, never a UI change.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
+import 'package:material_ui/material_ui.dart' show ThemeMode;
 
 import '../core/core.dart';
 import '../ui/player_cache_policy.dart';
 import '../ui/subtitle_style_policy.dart';
 import 'ake_socket.dart';
+import 'arib_sound.dart';
 import 'debug_log.dart';
+import 'desktop_window.dart';
 import 'file_pick.dart';
 import 'firetv_helper.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
+import 'pip_controller.dart';
+import 'ui_control_mode.dart';
 import 'wakelock.dart';
 
-final httpClientProvider = Provider<http.Client>((ref) => http.Client());
+final httpClientProvider = Provider<http.Client>((ref) {
+  final io = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 8)
+    ..maxConnectionsPerHost = 6;
+  final client = IOClient(io);
+  ref.onDispose(client.close);
+  return client;
+});
 
 /// Sleep suppression for the player screen (plan 32, reworked in
 /// plan 35): a hand-rolled platform channel flips the OS switch
@@ -58,6 +72,14 @@ final discoveryServiceProvider = Provider<DiscoveryService>(
     ),
     SubnetScanDiscoveryService(client: ref.watch(httpClientProvider)),
   ]),
+);
+
+/// Discovery service dedicated to generic DLNA / DTCP-IP MediaServers.
+final dlnaDiscoveryProvider = Provider<SsdpDiscoveryService>(
+  (ref) => SsdpDiscoveryService(
+    client: ref.watch(httpClientProvider),
+    lockGuard: MethodChannelMulticastLockGuard(),
+  ),
 );
 
 final registrationServiceProvider = Provider<RegistrationService>(
@@ -141,18 +163,22 @@ final credentialSummaryProvider = FutureProvider<CredentialSummary?>((
 /// default off), persisted in the key-value store.
 class ShowSubchannelsNotifier extends Notifier<bool> {
   static const _key = 'epg_show_subchannels';
+  bool _dirty = false;
 
   @override
   bool build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       if (value != null && value == 'true' && !state) state = true;
     });
     return false;
   }
 
   Future<void> set(bool value) async {
+    _dirty = true;
     state = value;
     await ref.read(keyValueStoreProvider).write(_key, value ? 'true' : 'false');
   }
@@ -170,12 +196,16 @@ final showSubchannelsProvider = NotifierProvider<ShowSubchannelsNotifier, bool>(
 /// ARIB level-1 values.
 class HiddenEpgGenresNotifier extends Notifier<Set<int>> {
   static const _key = 'epg_hidden_genres';
+  bool _dirty = false;
 
   @override
   Set<int> build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
-      final restored = decode(await store.read(_key));
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
+      final restored = decode(raw);
       if (restored.isNotEmpty && state.isEmpty) state = restored;
     });
     return const {};
@@ -193,6 +223,7 @@ class HiddenEpgGenresNotifier extends Notifier<Set<int>> {
   }
 
   Future<void> setHidden(int genreLevel1, bool hidden) async {
+    _dirty = true;
     final next = {...state};
     if (hidden) {
       next.add(genreLevel1);
@@ -224,7 +255,7 @@ class PlaybackQualityNotifier extends Notifier<bool> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (value == 'true' && !state) {
         state = true;
       } else if (value == 'false' && state) {
@@ -257,12 +288,15 @@ final mpvCacheDirectoryProvider = Provider<Directory?>((ref) => null);
 /// Persisted recorded playback buffer target in seconds (default 5 min).
 class RecordedBufferSecondsNotifier extends Notifier<int> {
   static const _key = 'firetv_recorded_buffer_seconds';
+  bool _dirty = false;
 
   @override
   int build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           recordedBufferOptionsSeconds.contains(parsed) &&
@@ -275,6 +309,7 @@ class RecordedBufferSecondsNotifier extends Notifier<int> {
 
   Future<void> set(int seconds) async {
     if (!recordedBufferOptionsSeconds.contains(seconds)) return;
+    _dirty = true;
     state = seconds;
     await ref.read(keyValueStoreProvider).write(_key, '$seconds');
   }
@@ -288,12 +323,15 @@ final recordedBufferSecondsProvider =
 /// Persisted live playback initial buffer target in seconds (default 0 = off).
 class LiveBufferSecondsNotifier extends Notifier<int> {
   static const _key = 'firetv_live_buffer_seconds';
+  bool _dirty = false;
 
   @override
   int build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           liveBufferOptionsSeconds.contains(parsed) &&
@@ -306,6 +344,7 @@ class LiveBufferSecondsNotifier extends Notifier<int> {
 
   Future<void> set(int seconds) async {
     if (!liveBufferOptionsSeconds.contains(seconds)) return;
+    _dirty = true;
     state = seconds;
     await ref.read(keyValueStoreProvider).write(_key, '$seconds');
   }
@@ -327,7 +366,7 @@ class VideoHwdecModeNotifier extends Notifier<VideoHwdecMode> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty || raw == null) return;
+      if (!ref.mounted || _dirty || raw == null) return;
       for (final mode in VideoHwdecMode.values) {
         if (mode.name == raw && state != mode) {
           state = mode;
@@ -350,31 +389,97 @@ final videoHwdecModeProvider =
       VideoHwdecModeNotifier.new,
     );
 
-/// Persisted night mode preference (dark theme toggle, default off = light).
-class NightModeNotifier extends Notifier<bool> {
-  static const _key = 'firetv_night_mode';
+/// Theme appearance preference across platforms (`system` follows OS dark/light
+/// on touch/desktop while staying light on TV).
+enum AppThemePreference { system, light, dark }
+
+/// Maps [preference] to a Material [ThemeMode]; TV keeps explicit light/dark
+/// and treats `system` as [ThemeMode.light] so Fire TV visuals stay unchanged.
+ThemeMode resolveEffectiveThemeMode({
+  required AppThemePreference preference,
+  required bool isTv,
+}) {
+  return switch (preference) {
+    AppThemePreference.dark => ThemeMode.dark,
+    AppThemePreference.light => ThemeMode.light,
+    AppThemePreference.system => isTv ? ThemeMode.light : ThemeMode.system,
+  };
+}
+
+AppThemePreference? _parseAppThemePreference(String? raw) {
+  for (final value in AppThemePreference.values) {
+    if (value.name == raw) return value;
+  }
+  return null;
+}
+
+/// Persisted theme preference with backward-compatible migration from the legacy
+/// `firetv_night_mode` boolean key.
+class AppThemePreferenceNotifier extends Notifier<AppThemePreference> {
+  static const _key = 'app_theme_mode';
+  static const _legacyKey = 'firetv_night_mode';
   bool _dirty = false;
 
   @override
-  bool build() {
+  AppThemePreference build() {
     _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
-      if (raw == 'true' && !state) {
-        state = true;
-      } else if (raw == 'false' && state) {
-        state = false;
+      if (!ref.mounted || _dirty) return;
+      final parsed = _parseAppThemePreference(raw);
+      if (parsed != null) {
+        if (state != parsed) state = parsed;
+        return;
+      }
+      final legacy = await store.read(_legacyKey);
+      if (!ref.mounted || _dirty) return;
+      if (legacy == 'true' && state != AppThemePreference.dark) {
+        state = AppThemePreference.dark;
+      } else if (legacy == 'false' && state != AppThemePreference.light) {
+        state = AppThemePreference.light;
       }
     });
-    return false;
+    return AppThemePreference.system;
   }
 
-  Future<void> set(bool enabled) async {
+  Future<void> set(AppThemePreference preference) async {
     _dirty = true;
-    state = enabled;
-    await ref.read(keyValueStoreProvider).write(_key, '$enabled');
+    state = preference;
+    final store = ref.read(keyValueStoreProvider);
+    await store.write(_key, preference.name);
+    if (preference == AppThemePreference.dark) {
+      await store.write(_legacyKey, 'true');
+    } else if (preference == AppThemePreference.light) {
+      await store.write(_legacyKey, 'false');
+    } else {
+      await store.delete(_legacyKey);
+    }
+  }
+}
+
+final appThemePreferenceProvider =
+    NotifierProvider<AppThemePreferenceNotifier, AppThemePreference>(
+      AppThemePreferenceNotifier.new,
+    );
+
+/// Effective [ThemeMode] factoring in TV vs non-TV platform rules.
+final effectiveThemeModeProvider = Provider<ThemeMode>((ref) {
+  final pref = ref.watch(appThemePreferenceProvider);
+  final isTv = ref.watch(uiControlModeProvider).isTv;
+  return resolveEffectiveThemeMode(preference: pref, isTv: isTv);
+});
+
+/// Dark-mode boolean view over [appThemePreferenceProvider] (kept for TV toggle
+/// and existing callers/tests).
+class NightModeNotifier extends Notifier<bool> {
+  @override
+  bool build() => ref.watch(appThemePreferenceProvider) == AppThemePreference.dark;
+
+  Future<void> set(bool enabled) async {
+    await ref
+        .read(appThemePreferenceProvider.notifier)
+        .set(enabled ? AppThemePreference.dark : AppThemePreference.light);
   }
 }
 
@@ -394,7 +499,7 @@ class GroupTitlesNotifier extends Notifier<bool> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (raw == 'true' && !state) {
         state = true;
       } else if (raw == 'false' && state) {
@@ -429,7 +534,7 @@ class EpgReservedStyleNotifier extends Notifier<EpgReservedStyle> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       if (raw == EpgReservedStyle.border.name &&
           state != EpgReservedStyle.border) {
         state = EpgReservedStyle.border;
@@ -473,7 +578,7 @@ class DefaultRecordingQualityNotifier extends Notifier<int> {
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final raw = await store.read(_key);
-      if (_dirty) return;
+      if (!ref.mounted || _dirty) return;
       final parsed = raw == null ? null : int.tryParse(raw);
       if (parsed != null &&
           recordingQualityOptions.contains(parsed) &&
@@ -886,18 +991,340 @@ final autoPlayNextEpisodeProvider =
       AutoPlayNextEpisodeNotifier.new,
     );
 
+/// Platform-inferred default UI control mode, overridden in `main.dart` from the
+/// live platform & Android TV flag (defaults to `tv` in unit/widget tests so
+/// existing Fire TV test suites keep running without modification).
+final defaultTargetUiControlModeProvider = Provider<UiControlMode>(
+  (ref) => UiControlMode.tv,
+);
+
+/// Persisted user preference for UI control mode (`auto`, `tv`, `touch`, `desktop`).
+class UiControlModePreferenceNotifier extends Notifier<UiControlModePreference> {
+  static const _key = 'ui_control_mode_preference';
+  bool _dirty = false;
+
+  @override
+  UiControlModePreference build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = UiControlModePreference.fromStorage(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return UiControlModePreference.auto;
+  }
+
+  Future<void> set(UiControlModePreference preference) async {
+    _dirty = true;
+    state = preference;
+    await ref.read(keyValueStoreProvider).write(_key, preference.storageValue);
+  }
+}
+
+final uiControlModePreferenceProvider =
+    NotifierProvider<UiControlModePreferenceNotifier, UiControlModePreference>(
+      UiControlModePreferenceNotifier.new,
+    );
+
+final uiControlModeProvider = Provider<UiControlMode>((ref) {
+  final pref = ref.watch(uiControlModePreferenceProvider);
+  switch (pref) {
+    case UiControlModePreference.auto:
+      return ref.watch(defaultTargetUiControlModeProvider);
+    case UiControlModePreference.tv:
+      return UiControlMode.tv;
+    case UiControlModePreference.touch:
+      return UiControlMode.touch;
+    case UiControlModePreference.desktop:
+      return UiControlMode.desktop;
+  }
+});
+
+/// Initial tab selected when the app boots (`tabIndex` matches `AppTabs` constants).
+enum StartupTabPreference {
+  home(0, 'ホーム'),
+  live(1, 'TV視聴'),
+  schedules(2, '予約'),
+  titles(3, '録画済み'),
+  epg(4, '番組表');
+
+  const StartupTabPreference(this.tabIndex, this.label);
+
+  final int tabIndex;
+  final String label;
+
+  String get storageValue => name;
+
+  static StartupTabPreference fromStorage(String? raw) {
+    for (final value in StartupTabPreference.values) {
+      if (value.storageValue == raw) return value;
+    }
+    return StartupTabPreference.home;
+  }
+}
+
+/// Preloaded initial startup tab injected before `runApp` (defaults to `home`).
+final initialStartupTabProvider = Provider<StartupTabPreference>(
+  (ref) => StartupTabPreference.home,
+);
+
+/// Enables sequential background prefetch after the startup tab settles
+/// (enabled in real app `fileStoreContainer`, disabled by default in tests).
+final startupPrefetchEnabledProvider = Provider<bool>((ref) => false);
+
+/// Enables non-blocking `/status/updateCheck` lookup on Home
+/// (enabled in real app `fileStoreContainer`, disabled by default in tests).
+final softwareUpdateCheckEnabledProvider = Provider<bool>((ref) => false);
+
+/// Persisted startup tab preference displayed and editable in Settings.
+class StartupTabPreferenceNotifier extends Notifier<StartupTabPreference> {
+  static const storageKey = 'startup_tab';
+  bool _dirty = false;
+
+  @override
+  StartupTabPreference build() {
+    _dirty = false;
+    final initial = ref.watch(initialStartupTabProvider);
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(storageKey);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = StartupTabPreference.fromStorage(raw);
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return initial;
+  }
+
+  Future<void> set(StartupTabPreference preference) async {
+    _dirty = true;
+    state = preference;
+    await ref
+        .read(keyValueStoreProvider)
+        .write(storageKey, preference.storageValue);
+  }
+}
+
+final startupTabPreferenceProvider =
+    NotifierProvider<StartupTabPreferenceNotifier, StartupTabPreference>(
+      StartupTabPreferenceNotifier.new,
+    );
+
+/// Lifecycle stage of the hidden Home 3D assistant ("ナスカ").
+enum HomeAssistantStage { hidden, entering, idle, dismissingAuto, exiting }
+
+/// State of the Home 3D assistant Easter egg.
+class HomeAssistantState {
+  const HomeAssistantState({
+    required this.enabled,
+    required this.stage,
+    required this.triggerSeq,
+  });
+
+  final bool enabled;
+  final HomeAssistantStage stage;
+  final int triggerSeq;
+
+  HomeAssistantState copyWith({
+    bool? enabled,
+    HomeAssistantStage? stage,
+    int? triggerSeq,
+  }) => HomeAssistantState(
+    enabled: enabled ?? this.enabled,
+    stage: stage ?? this.stage,
+    triggerSeq: triggerSeq ?? this.triggerSeq,
+  );
+}
+
+/// Persisted toggle & animation stage for the Home 3D assistant ("ナスカ").
+/// Shared across all platforms; unlocked and dismissed via 5 rapid Home taps
+/// or via the non-TV Office balloon ("お前を消す方法").
+class HomeAssistantNotifier extends Notifier<HomeAssistantState> {
+  static const storageKey = 'easter_egg_assistant_enabled';
+  bool _dirty = false;
+
+  @override
+  HomeAssistantState build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(storageKey);
+      if (!ref.mounted || _dirty) return;
+      if (raw == 'true' && state.stage == HomeAssistantStage.hidden) {
+        state = HomeAssistantState(
+          enabled: true,
+          stage: HomeAssistantStage.entering,
+          triggerSeq: state.triggerSeq + 1,
+        );
+      }
+    });
+    return const HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.hidden,
+      triggerSeq: 0,
+    );
+  }
+
+  Future<void> toggleFromEasterEgg({bool autoDismissDialog = false}) async {
+    switch (state.stage) {
+      case HomeAssistantStage.hidden:
+        await activate();
+      case HomeAssistantStage.entering:
+      case HomeAssistantStage.idle:
+        if (autoDismissDialog) {
+          startAutoDismiss();
+        } else {
+          startDismiss();
+        }
+      case HomeAssistantStage.dismissingAuto:
+      case HomeAssistantStage.exiting:
+        return;
+    }
+  }
+
+  Future<void> activate() async {
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: true,
+      stage: HomeAssistantStage.entering,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    await ref.read(keyValueStoreProvider).write(storageKey, 'true');
+  }
+
+  void markEntered() {
+    if (state.stage == HomeAssistantStage.entering) {
+      state = state.copyWith(stage: HomeAssistantStage.idle);
+    }
+  }
+
+  void startAutoDismiss() {
+    if (state.stage == HomeAssistantStage.hidden ||
+        state.stage == HomeAssistantStage.dismissingAuto ||
+        state.stage == HomeAssistantStage.exiting) {
+      return;
+    }
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.dismissingAuto,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    unawaited(ref.read(keyValueStoreProvider).write(storageKey, 'false'));
+  }
+
+  void startDismiss() {
+    if (state.stage == HomeAssistantStage.hidden ||
+        state.stage == HomeAssistantStage.exiting) {
+      return;
+    }
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.exiting,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    unawaited(ref.read(keyValueStoreProvider).write(storageKey, 'false'));
+  }
+
+  void markExited() {
+    if (state.stage == HomeAssistantStage.exiting) {
+      state = state.copyWith(enabled: false, stage: HomeAssistantStage.hidden);
+    }
+  }
+}
+
+final homeAssistantProvider =
+    NotifierProvider<HomeAssistantNotifier, HomeAssistantState>(
+      HomeAssistantNotifier.new,
+    );
+
+/// Persisted player volume (`0.0..100.0`, defaults to `100.0`).
+class PlayerVolumeNotifier extends Notifier<double> {
+  static const _key = 'player_volume';
+  bool _dirty = false;
+
+  @override
+  double build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final parsed = double.tryParse(raw);
+      if (parsed == null) return;
+      final clamped = parsed.clamp(0.0, 100.0).toDouble();
+      if (clamped != state) {
+        state = clamped;
+      }
+    });
+    return 100.0;
+  }
+
+  Future<void> set(double volume) async {
+    final clamped = volume.clamp(0.0, 100.0).toDouble();
+    _dirty = true;
+    state = clamped;
+    await ref.read(keyValueStoreProvider).write(_key, clamped.toStringAsFixed(1));
+  }
+}
+
+final playerVolumeProvider = NotifierProvider<PlayerVolumeNotifier, double>(
+  PlayerVolumeNotifier.new,
+);
+
+/// Persisted player mute state (defaults to `false`).
+class PlayerMutedNotifier extends Notifier<bool> {
+  static const _key = 'player_muted';
+  bool _dirty = false;
+
+  @override
+  bool build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null) return;
+      final restored = raw == 'true';
+      if (restored != state) {
+        state = restored;
+      }
+    });
+    return false;
+  }
+
+  Future<void> set(bool muted) async {
+    _dirty = true;
+    state = muted;
+    await ref.read(keyValueStoreProvider).write(_key, '$muted');
+  }
+}
+
+final playerMutedProvider = NotifierProvider<PlayerMutedNotifier, bool>(
+  PlayerMutedNotifier.new,
+);
+
 /// Debug mode settings (plan 28): the master switch and the
 /// enabled category set, persisted in the key-value store.
 class DebugSettingsNotifier extends Notifier<DebugSettings> {
   static const _masterKey = 'debug_mode_enabled';
   static const _categoriesKey = 'debug_categories';
+  bool _dirty = false;
 
   @override
   DebugSettings build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final master = await store.read(_masterKey);
+      if (!ref.mounted || _dirty) return;
       final categories = await store.read(_categoriesKey);
+      if (!ref.mounted || _dirty) return;
       state = DebugSettings(
         master: master == 'true',
         categories: DebugSettings.decodeCategories(categories),
@@ -907,11 +1334,13 @@ class DebugSettingsNotifier extends Notifier<DebugSettings> {
   }
 
   Future<void> setMaster(bool value) async {
+    _dirty = true;
     state = state.copyWith(master: value);
     await ref.read(keyValueStoreProvider).write(_masterKey, '$value');
   }
 
   Future<void> setCategory(DiagCategory category, bool enabled) async {
+    _dirty = true;
     final next = {...state.categories};
     if (enabled) {
       next.add(category);
@@ -979,12 +1408,51 @@ final androidSdkIntProvider = Provider<int?>((ref) => null);
 /// Platform helper for Fire TV (volume max, Tailscale, local file scan).
 final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
 
+/// Whether Tailscale is installed on an Android TV device. Always `false` on
+/// non-Android/non-TV platforms or when Tailscale is not installed.
+final tailscaleInstalledProvider = FutureProvider<bool>((ref) async {
+  final helper = ref.watch(fireTvHelperProvider);
+  final uiMode = ref.watch(uiControlModeProvider);
+  if (!helper.isAndroid || !uiMode.isTv) return false;
+  return helper.isTailscaleInstalled();
+});
+
+/// Signal counter incremented when the user manually launches Tailscale from
+/// outside [TailscaleGuard] (e.g. the rail icon button), so returning to the app
+/// waits for nasne reachability and resets stale connections.
+class TailscaleLaunchSignalNotifier extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void notifyLaunched() => state++;
+}
+
+final tailscaleManualLaunchSignalProvider =
+    NotifierProvider<TailscaleLaunchSignalNotifier, int>(
+      TailscaleLaunchSignalNotifier.new,
+    );
+
+/// Cross-platform Picture-in-Picture / floating mini-window controller.
+final pipControllerProvider = Provider<PipController>(
+  (ref) => PipController(),
+);
+
+/// Cross-platform ARIB built-in chime sound player.
+final aribSoundPlayerProvider = Provider<AribSoundPlayer>(
+  (ref) => AribSoundPlayer(fireTvHelper: ref.watch(fireTvHelperProvider)),
+);
+
+/// Desktop fullscreen window controller (macOS / Windows).
+final desktopWindowControllerProvider = Provider<DesktopWindowController>(
+  (ref) => DesktopWindowController(),
+);
+
 final playbackEngineProvider = Provider<PlaybackEngine>(
   (ref) => DtcpPlaybackEngine(
     credentialStore: ref.watch(credentialStoreProvider),
     srmStore: ref.watch(srmStoreProvider),
     diag: ref.watch(diagLogProvider),
-    autoReconnect: Platform.isAndroid,
+    autoReconnect: true,
     akeConnectionFactory: (host, port) =>
         nativeAkeConnectionFactory(host, port, diag: ref.read(diagLogProvider)),
   ),
@@ -1076,7 +1544,7 @@ DeviceServices assembleDeviceServices(
           srmStore ??
           KeyValueSrmStore(srmKeyValueStore ?? InMemoryKeyValueStore()),
       diag: diagLog ?? const DiagLog.none(),
-      autoReconnect: autoReconnect ?? Platform.isAndroid,
+      autoReconnect: autoReconnect ?? true,
       akeConnectionFactory: (host, port) => nativeAkeConnectionFactory(
         host,
         port,

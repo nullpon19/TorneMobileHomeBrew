@@ -267,6 +267,10 @@ class _AribB24Decoder {
       // Two-byte set designation; ESC $ F is the G0 shorthand.
       if (at + 1 >= data.length) return at + 2;
       final next = data[at + 1];
+      if (next == 0x20) {
+        designate(0, _blank2); // G0 two-byte DRCS shorthand: ESC $ 0x20 F
+        return at + 3;
+      }
       if (next >= 0x28 && next <= 0x2b) {
         if (at + 2 < data.length && data[at + 2] == 0x20) {
           designate(next - 0x28, _blank2); // two-byte DRCS: unreadable

@@ -14,7 +14,9 @@ import '../app/log_share.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../app/store_directory.dart';
+import '../app/ui_control_mode.dart';
 import '../core/core.dart';
+import 'dlna_browser_view.dart';
 import 'dtcp_credential_screen.dart';
 import 'epg_hidden_genres_screen.dart';
 import 'error_messages.dart';
@@ -55,6 +57,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final recordedBufferSeconds = ref.watch(recordedBufferSecondsProvider);
     final liveBufferSeconds = ref.watch(liveBufferSecondsProvider);
     final videoHwdecMode = ref.watch(videoHwdecModeProvider);
+    final startupTab = ref.watch(startupTabPreferenceProvider);
+    final dlnaServers = ref.watch(dlnaServersProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(
@@ -175,12 +179,70 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           const Divider(),
           _sectionTitle(context, '表示'),
-          SwitchListTile(
-            title: const Text('ナイトモード'),
-            subtitle: const Text('暗い背景のダークテーマに切り替えます'),
-            value: ref.watch(nightModeProvider),
-            onChanged: (value) =>
-                ref.read(nightModeProvider.notifier).set(value),
+          if (ref.watch(uiControlModeProvider).isTv)
+            SwitchListTile(
+              title: const Text('ダークモード'),
+              subtitle: const Text('暗い背景のダークテーマに切り替えます'),
+              value: ref.watch(nightModeProvider),
+              onChanged: (value) =>
+                  ref.read(nightModeProvider.notifier).set(value),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '外観テーマ',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  SegmentedButton<AppThemePreference>(
+                    segments: const [
+                      ButtonSegment(
+                        value: AppThemePreference.system,
+                        label: Text('自動'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemePreference.light,
+                        label: Text('ライト'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemePreference.dark,
+                        label: Text('ダーク'),
+                      ),
+                    ],
+                    selected: {ref.watch(appThemePreferenceProvider)},
+                    onSelectionChanged: (selection) => ref
+                        .read(appThemePreferenceProvider.notifier)
+                        .set(selection.first),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '「自動」はデバイスの外観設定に合わせてライト／ダークを切り替えます。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ListTile(
+            title: const Text('起動時に開く画面'),
+            subtitle: Text(
+              '現在: ${startupTab.label}（次回起動時から反映されます）',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  startupTab.label,
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(width: 4),
+                const Icon(Icons.chevron_right),
+              ],
+            ),
+            onTap: () => _pickStartupTab(startupTab),
           ),
           const Divider(),
           _sectionTitle(context, '番組表'),
@@ -436,6 +498,66 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
           ),
+          ListTile(
+            title: const Text('汎用 DLNA / DTCP-IP レコーダー'),
+            subtitle: Text(
+              dlnaServers.isEmpty
+                  ? '未登録（自宅 LAN 内の他社レコーダーを追加・視聴）'
+                  : '${dlnaServers.length}台登録済み（${dlnaServers.map((s) => s.friendlyName).join('、')}）',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(
+                builder: (_) => const DlnaServerSettingsScreen(),
+              ),
+            ),
+          ),
+          const Divider(),
+          _sectionTitle(context, '操作'),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '操作モード（自動判定: ${ref.watch(defaultTargetUiControlModeProvider).label}）',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<UiControlModePreference>(
+                  segments: const [
+                    ButtonSegment(
+                      value: UiControlModePreference.auto,
+                      label: Text('自動'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.tv,
+                      label: Text('TV'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.touch,
+                      label: Text('タッチ'),
+                    ),
+                    ButtonSegment(
+                      value: UiControlModePreference.desktop,
+                      label: Text('PC'),
+                    ),
+                  ],
+                  selected: {ref.watch(uiControlModePreferenceProvider)},
+                  onSelectionChanged: (selection) => ref
+                      .read(uiControlModePreferenceProvider.notifier)
+                      .set(selection.first),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '現在の有効モード: ${ref.watch(uiControlModeProvider).label}'
+                  '（再生画面のホバー/タップ操作や入力欄の挙動を切り替えます）。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
           const Divider(),
           _sectionTitle(context, 'デバッグ'),
           SwitchListTile(
@@ -499,7 +621,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Text(
               '発見にはローカルネットワークへのアクセス許可が必要です (iOS では許可ダイアログが'
               '表示される場合があります)。発見できない環境では手動登録を使ってください。\n\n'
-              'torne HB FireTV $appVersionLabel',
+              'torne mobile HB $appVersionLabel',
             ),
           ),
         ],
@@ -594,15 +716,22 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       final found = await ref.read(discoveryServiceProvider).discover();
       if (!mounted) return;
       setState(() {
-        _searching = false;
         _found = found;
       });
     } on NasneError catch (e) {
       if (!mounted) return;
       setState(() {
-        _searching = false;
         _searchError = userMessageForError(e);
       });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _searchError = userMessageForError(e);
+      });
+    } finally {
+      if (mounted && _searching) {
+        setState(() => _searching = false);
+      }
     }
   }
 
@@ -626,21 +755,44 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   Future<void> _registerManual() async {
     FocusScope.of(context).unfocus();
-    final host = _manualHost.text.trim();
+    var host = _manualHost.text.trim();
+    if (host.contains('://')) {
+      final parsed = Uri.tryParse(host);
+      if (parsed != null && parsed.host.isNotEmpty) {
+        host = parsed.host;
+      }
+    }
+    host = host.replaceAll(RegExp(r'/+$'), '').trim();
     if (host.isEmpty) {
       showSnack(context, 'アドレスを入力してください');
       return;
     }
-    setState(() => _registering = true);
-    NasneDevice device;
+    final Uri describeUri;
     try {
-      device = await ref
-          .read(discoveryServiceProvider)
-          .describe(Uri(scheme: 'http', host: host, port: 58888, path: '/'));
+      describeUri = Uri(scheme: 'http', host: host, port: 58888, path: '/');
+      if (describeUri.host.isEmpty) {
+        throw const FormatException('empty host');
+      }
+    } catch (_) {
+      showSnack(context, 'アドレスの形式が正しくありません');
+      return;
+    }
+    setState(() => _registering = true);
+    NasneDevice? device;
+    try {
+      device = await ref.read(discoveryServiceProvider).describe(describeUri);
     } catch (_) {
       // The description may be unreachable while the device itself is
       // fine; registration re-verifies against the device directly.
-      device = NasneDevice.direct(host);
+      try {
+        device = NasneDevice.direct(host);
+      } catch (e) {
+        if (mounted) {
+          setState(() => _registering = false);
+          showSnack(context, userMessageForError(e));
+        }
+        return;
+      }
     }
     if (!mounted) return;
     await _registerDevice(device);
@@ -744,7 +896,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       ),
     );
-    if (chosen != null) {
+    if (chosen != null && mounted) {
       await onSelected(chosen);
     }
   }
@@ -773,8 +925,38 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       ),
     );
-    if (chosen != null) {
+    if (chosen != null && mounted) {
       await ref.read(videoHwdecModeProvider.notifier).set(chosen);
+    }
+  }
+
+  Future<void> _pickStartupTab(StartupTabPreference current) async {
+    final chosen = await showDialog<StartupTabPreference>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('起動時に開く画面'),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'アプリを起動した直後に最初に表示する画面を選びます（次回起動時から反映されます）。',
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final option in StartupTabPreference.values)
+            _BufferOptionTile(
+              label: option.label,
+              isRecommended: option == StartupTabPreference.home,
+              badge: option == StartupTabPreference.home ? '標準' : null,
+              selected: option == current,
+              autofocus: option == current,
+              onTap: () => Navigator.of(dialogContext).pop(option),
+            ),
+        ],
+      ),
+    );
+    if (chosen != null && mounted) {
+      await ref.read(startupTabPreferenceProvider.notifier).set(chosen);
     }
   }
 
@@ -849,8 +1031,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           message: '${reg.friendlyName} (${reg.host}) の登録を解除しますか？',
           confirmLabel: '解除',
         );
-        if (!ok) return;
+        if (!ok || !mounted) return;
         await ref.read(registrationsProvider.notifier).remove(reg.host);
+        if (!mounted) return;
         if (ref.read(selectedHostProvider) == reg.host) {
           await ref.read(selectedHostProvider.notifier).select(null);
         }

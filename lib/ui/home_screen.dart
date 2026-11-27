@@ -12,20 +12,40 @@ import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 import 'format.dart';
+import 'home_assistant_overlay.dart';
 import 'multi_nasne_policy.dart';
 import 'widgets.dart';
 
-class HomeScreen extends ConsumerWidget {
+class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  final ValueNotifier<bool> _nearBottom = ValueNotifier<bool>(false);
+
+  @override
+  void dispose() {
+    _nearBottom.dispose();
+    super.dispose();
+  }
+
+  void _updateNearBottom(bool nearBottom) {
+    if (_nearBottom.value != nearBottom) {
+      _nearBottom.value = nearBottom;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final registrations = ref.watch(registrationsProvider);
     final selected = ref.watch(selectedRegistrationProvider);
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('torne HB FireTV'),
+        title: const Text('torne mobile HB'),
         actions: [
           if (selected != null)
             IconButton(
@@ -45,63 +65,80 @@ class HomeScreen extends ConsumerWidget {
             ),
         ],
       ),
-      body: registrations.when(
-        loading: () => const LoadingView(),
-        error: (e, _) => ErrorView(
-          message: '登録情報の読み込みに失敗しました。',
-          onRetry: () => ref.read(registrationsProvider.notifier).reload(),
-        ),
-        data: (list) {
-          if (selected == null) {
-            return NoDeviceView(
-              onRegister: () =>
-                  ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
-            );
-          }
-          if (list.length <= 1) {
-            return _StatusList(reg: selected);
-          }
-          return Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-                child: list.length <= 4
-                    ? SegmentedButton<String>(
-                        segments: [
-                          for (final r in list)
-                            ButtonSegment<String>(
-                              value: r.host,
-                              label: Text(nasneDisplayLabel(r)),
-                            ),
-                        ],
-                        selected: {selected.host},
-                        onSelectionChanged: (sel) => ref
-                            .read(selectedHostProvider.notifier)
-                            .select(sel.first),
-                      )
-                    : SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            for (final r in list)
-                              Padding(
-                                padding: const EdgeInsets.only(right: 8),
-                                child: ChoiceChip(
+      body: Stack(
+        children: [
+          registrations.when(
+            loading: () => const LoadingView(),
+            error: (e, _) => ErrorView(
+              message: '登録情報の読み込みに失敗しました。',
+              onRetry: () => ref.read(registrationsProvider.notifier).reload(),
+            ),
+            data: (list) {
+              if (selected == null) {
+                return NoDeviceView(
+                  onRegister: () => ref
+                      .read(tabIndexProvider.notifier)
+                      .select(AppTabs.settings),
+                );
+              }
+              if (list.length <= 1) {
+                return _StatusList(
+                  reg: selected,
+                  onNearBottomChanged: _updateNearBottom,
+                );
+              }
+              return Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                    child: list.length <= 4
+                        ? SegmentedButton<String>(
+                            segments: [
+                              for (final r in list)
+                                ButtonSegment<String>(
+                                  value: r.host,
                                   label: Text(nasneDisplayLabel(r)),
-                                  selected: r.host == selected.host,
-                                  onSelected: (_) => ref
-                                      .read(selectedHostProvider.notifier)
-                                      .select(r.host),
                                 ),
-                              ),
-                          ],
-                        ),
-                      ),
-              ),
-              Expanded(child: _StatusList(reg: selected)),
-            ],
-          );
-        },
+                            ],
+                            selected: {selected.host},
+                            onSelectionChanged: (sel) => ref
+                                .read(selectedHostProvider.notifier)
+                                .select(sel.first),
+                          )
+                        : SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: [
+                                for (final r in list)
+                                  Padding(
+                                    padding: const EdgeInsets.only(right: 8),
+                                    child: ChoiceChip(
+                                      label: Text(nasneDisplayLabel(r)),
+                                      selected: r.host == selected.host,
+                                      onSelected: (_) => ref
+                                          .read(selectedHostProvider.notifier)
+                                          .select(r.host),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                  ),
+                  Expanded(
+                    child: _StatusList(
+                      reg: selected,
+                      onNearBottomChanged: _updateNearBottom,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          HomeAssistantOverlay(
+            reg: selected,
+            avoidBottomListenable: _nearBottom,
+          ),
+        ],
       ),
     );
   }
@@ -112,9 +149,10 @@ class HomeScreen extends ConsumerWidget {
 const double homeTwoColumnBreakpoint = 600;
 
 class _StatusList extends ConsumerStatefulWidget {
-  const _StatusList({required this.reg});
+  const _StatusList({required this.reg, this.onNearBottomChanged});
 
   final RegisteredNasne reg;
+  final ValueChanged<bool>? onNearBottomChanged;
 
   @override
   ConsumerState<_StatusList> createState() => _StatusListState();
@@ -124,9 +162,36 @@ class _StatusListState extends ConsumerState<_StatusList> {
   final ScrollController _scrollController = ScrollController();
 
   @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_notifyNearBottom);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _notifyNearBottom();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _StatusList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _notifyNearBottom();
+    });
+  }
+
+  @override
   void dispose() {
+    _scrollController.removeListener(_notifyNearBottom);
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _notifyNearBottom() {
+    final cb = widget.onNearBottomChanged;
+    if (cb == null || !_scrollController.hasClients) return;
+    final pos = _scrollController.position;
+    final nearBottom =
+        pos.maxScrollExtent > 0 && pos.pixels >= pos.maxScrollExtent - 32.0;
+    cb(nearBottom);
   }
 
   @override
@@ -225,6 +290,9 @@ class _DeviceSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final info = ref.watch(deviceInfoProvider(reg));
+    final softwareUpdate =
+        info.value?.updateExists ??
+        ref.watch(softwareUpdateAvailableProvider(reg)).value;
     return SectionCard(
       title: '本体情報',
       icon: Icons.router_outlined,
@@ -248,11 +316,15 @@ class _DeviceSection extends ConsumerWidget {
                 value: areaLabel(d.areaIdentifierCode, d.pref),
               ),
             FieldRow(label: 'アドレス', value: reg.host),
-            if (d.updateExists == true)
+            if (d.updateExists == true ||
+                (d.updateExists == null && softwareUpdate == true))
               const FieldRow(label: '更新', value: 'ソフトウェア更新があります'),
           ],
         ),
-        onRetry: () => ref.invalidate(deviceInfoProvider(reg)),
+        onRetry: () {
+          ref.invalidate(deviceInfoProvider(reg));
+          ref.invalidate(softwareUpdateAvailableProvider(reg));
+        },
       ),
     );
   }

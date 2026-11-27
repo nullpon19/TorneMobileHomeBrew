@@ -260,6 +260,45 @@ const double liveDemuxerAnalyzeDurationSeconds = 1.5;
 int liveDemuxerProbeSizeBytes({required bool useMobile}) =>
     useMobile ? 512 * 1024 : 2 * 1024 * 1024;
 
+/// Initial FFmpeg/mpv probe-size cap for recorded MPEG-TS startup by quality tier.
+int recordedDemuxerProbeSizeBytes({required bool useMobile}) =>
+    useMobile ? 512 * 1024 : 2 * 1024 * 1024;
+
+/// Returns whether an in-flight mpv error or buffering stop should be absorbed
+/// rather than tearing down the session and wiping out buffered data.
+bool shouldDeferPlayerInterruption({
+  required bool playingNow,
+  required double bufferedAheadSeconds,
+  required double bufferDeltaSeconds,
+  required bool proxyReconnecting,
+  required bool buffering,
+}) {
+  if (bufferedAheadSeconds > 1.5 || bufferDeltaSeconds > 1.5) return true;
+  if (buffering && proxyReconnecting) return true;
+  if (playingNow && proxyReconnecting) return true;
+  return false;
+}
+
+/// Computes the mid-stream stall timeout applied by the player screen, ensuring
+/// it always outlasts mpv's active `cache-pause-wait` window.
+Duration computeEffectiveStallTimeout({
+  required bool live,
+  required int rebufferWaitSeconds,
+}) {
+  final wait = rebufferWaitSeconds < 0 ? 0 : rebufferWaitSeconds;
+  return Duration(seconds: math.max(30, wait + 20));
+}
+
+/// Computes the watchdog timeout for `_resume()` recovery so slower cellular
+/// connections have sufficient headroom for [rebufferWaitSeconds] + AKE/HTTP.
+Duration computeResumeWatchdogTimeout({
+  required bool live,
+  required int rebufferWaitSeconds,
+}) {
+  final wait = rebufferWaitSeconds < 0 ? 0 : rebufferWaitSeconds;
+  return Duration(seconds: math.max(45, wait + 30));
+}
+
 /// Human-readable Japanese label for a buffer duration in seconds.
 String formatBufferDurationLabel(int seconds) {
   if (seconds <= 0) return '標準 (0秒)';
@@ -270,6 +309,13 @@ String formatBufferDurationLabel(int seconds) {
 /// Live pause timeshift target (seconds) buffered in the background so paused
 /// viewers can resume with variable-speed catch-up without startup delay.
 const int livePauseTimeshiftSeconds = 300;
+
+/// Upper time cap for live `demuxer-readahead-secs` (2 hours).
+/// Actual RAM/disk footprint is already bounded by `demuxerMaxBytes` and the
+/// 1 GiB free-storage guard, so keeping this generously high ensures mpv does
+/// not artificially stop receiving live broadcast while rewound 10-60+ min
+/// inside low-bitrate streams that still fit within the byte budget.
+const int liveMaxReadaheadSeconds = 7200;
 
 /// Returns the playback speed multiplier for catching up from a paused live
 /// offset, applying light hysteresis on downward transitions to prevent speed
@@ -307,6 +353,7 @@ class MpvBufferPlan {
     required this.networkTimeoutSeconds,
     required this.startTimeoutSeconds,
     required this.configuredSeconds,
+    this.rebufferWaitSeconds = 0,
     this.cachePause = true,
   });
 
@@ -321,6 +368,7 @@ class MpvBufferPlan {
   final int networkTimeoutSeconds;
   final int startTimeoutSeconds;
   final int configuredSeconds;
+  final int rebufferWaitSeconds;
   final bool cachePause;
 }
 
@@ -429,19 +477,23 @@ MpvBufferPlan computeMpvBufferPlan({
   }
 
   final readaheadSeconds = live
-      ? math.max(normalized + 15, livePauseTimeshiftSeconds)
+      ? math.max(normalized + 15, liveMaxReadaheadSeconds)
       : (normalized > 0 ? normalized + 15 : 20);
   final cachePauseInitial = normalized > 0;
   final cachePause = !live || normalized > 0;
   // Recordings start quickly (~5s) while pre-reading up to [normalized] in the
-  // background; Live waits up to [normalized] before playing.
+  // background; Live waits up to [normalized] before playing initially, then
+  // caps mid-stream rebuffer waits to min(normalized, 15s) to prevent freezes.
   final cachePauseWaitSeconds = normalized == 0
       ? 0
       : (live ? normalized : math.min(normalized, 5));
+  final rebufferWaitSeconds = normalized == 0
+      ? 0
+      : (live ? math.min(normalized, 15) : math.min(normalized, 5));
   final networkTimeoutSeconds = live
-      ? math.max(30, math.min(normalized + 30, 360))
-      : math.max(30, math.min(normalized > 0 ? normalized + 30 : 30, 600));
-  final startTimeoutSeconds = 45 + (live ? normalized : 15);
+      ? math.max(360, normalized + 120)
+      : math.max(600, normalized + 120);
+  final startTimeoutSeconds = live ? (45 + normalized) : 90;
 
   return MpvBufferPlan(
     useCache: true,
@@ -455,6 +507,7 @@ MpvBufferPlan computeMpvBufferPlan({
     networkTimeoutSeconds: networkTimeoutSeconds,
     startTimeoutSeconds: startTimeoutSeconds,
     configuredSeconds: normalized,
+    rebufferWaitSeconds: rebufferWaitSeconds,
     cachePause: cachePause,
   );
 }

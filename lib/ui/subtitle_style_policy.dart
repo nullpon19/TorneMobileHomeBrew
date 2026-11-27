@@ -1429,6 +1429,7 @@ const Duration superimposeStaleTimeout = Duration(seconds: 20);
   required DateTime now,
   double? currentPlaybackMpvPts,
   double? ptsOffset,
+  double liveBufferDelaySeconds = 0.0,
 }) {
   if (events.isEmpty) {
     return (
@@ -1441,28 +1442,69 @@ const Duration superimposeStaleTimeout = Duration(seconds: 20);
 
   AribCaptionLayoutEvent? latestEvent;
   if (isLive) {
-    latestEvent = events.last;
-    if (latestEvent.isClearOnly) {
-      return (
-        cues: const [],
-        soundSequence: null,
-        builtinSoundId: null,
-        isUrgent: false,
-      );
-    }
-    final ttlSeconds = (latestEvent.clearAfterSeconds != null &&
-            latestEvent.clearAfterSeconds! > 0)
-        ? latestEvent.clearAfterSeconds!
-        : superimposeStaleTimeout.inSeconds.toDouble();
-    final elapsedSeconds =
-        now.difference(latestEvent.receivedAt ?? now).inMilliseconds / 1000.0;
-    if (elapsedSeconds < -0.5 || elapsedSeconds >= ttlSeconds) {
-      return (
-        cues: const [],
-        soundSequence: null,
-        builtinSoundId: null,
-        isUrgent: false,
-      );
+    if (liveBufferDelaySeconds <= 0.5) {
+      latestEvent = events.last;
+      if (latestEvent.isClearOnly) {
+        return (
+          cues: const [],
+          soundSequence: null,
+          builtinSoundId: null,
+          isUrgent: false,
+        );
+      }
+      final ttlSeconds = (latestEvent.clearAfterSeconds != null &&
+              latestEvent.clearAfterSeconds! > 0)
+          ? latestEvent.clearAfterSeconds!
+          : superimposeStaleTimeout.inSeconds.toDouble();
+      final elapsedSeconds =
+          now.difference(latestEvent.receivedAt ?? now).inMilliseconds / 1000.0;
+      if (elapsedSeconds < -0.5 || elapsedSeconds >= ttlSeconds) {
+        return (
+          cues: const [],
+          soundSequence: null,
+          builtinSoundId: null,
+          isUrgent: false,
+        );
+      }
+    } else {
+      for (var i = events.length - 1; i >= 0; i--) {
+        final candidate = events[i];
+        final effectiveElapsed =
+            (now.difference(candidate.receivedAt ?? now).inMilliseconds /
+                    1000.0) -
+                liveBufferDelaySeconds;
+        if (effectiveElapsed < -0.5) continue;
+        if (candidate.isClearOnly) {
+          return (
+            cues: const [],
+            soundSequence: null,
+            builtinSoundId: null,
+            isUrgent: false,
+          );
+        }
+        final ttlSeconds = (candidate.clearAfterSeconds != null &&
+                candidate.clearAfterSeconds! > 0)
+            ? candidate.clearAfterSeconds!
+            : superimposeStaleTimeout.inSeconds.toDouble();
+        if (effectiveElapsed >= ttlSeconds) {
+          return (
+            cues: const [],
+            soundSequence: null,
+            builtinSoundId: null,
+            isUrgent: false,
+          );
+        }
+        latestEvent = candidate;
+        break;
+      }
+      if (latestEvent == null) {
+        return (
+          cues: const [],
+          soundSequence: null,
+          builtinSoundId: null,
+          isUrgent: false,
+        );
+      }
     }
   } else {
     if (currentPlaybackMpvPts == null || ptsOffset == null) {

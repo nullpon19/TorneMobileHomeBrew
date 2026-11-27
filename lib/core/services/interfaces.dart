@@ -42,6 +42,7 @@ abstract interface class RegistrationService {
 /// Read-side device information (WebAPI `status/*`, plan 12.1).
 abstract interface class DeviceInfoService {
   Future<DeviceInfo> getDeviceInfo();
+  Future<bool?> checkSoftwareUpdate();
   Future<List<HddEntry>> listHdds();
   Future<HddInfo> getHddInfo(int id);
   Future<NetworkInfo> getNetworkInfo();
@@ -214,6 +215,7 @@ abstract interface class StreamDiagnosticMetrics {
   int get plaintextBytes;
   int get downstreamRequestCount;
   Object? get lastUpstreamError;
+  bool get isReconnectingUpstream;
 }
 
 /// Optional live-edge flush hook exposed by a loopback [PlaybackSession] so the
@@ -221,6 +223,13 @@ abstract interface class StreamDiagnosticMetrics {
 /// broadcast edge without redoing DTCP-IP AKE.
 abstract interface class LiveEdgeResettable {
   Future<void> resetToLiveEdge();
+}
+
+/// Optional DLNA `TimeSeekRange` controller for chunked recorded streams that
+/// lack `dlna:cleartextSize` byte lengths and therefore seek via time ranges.
+abstract interface class TimeSeekableSession {
+  Duration? get totalDuration;
+  Future<void> seekToTime(Duration target);
 }
 
 /// Optional read-only ARIB STD-B24 caption layout & clear-event feed tapped

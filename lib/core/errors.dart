@@ -72,13 +72,15 @@ class NasneError implements Exception {
     );
   }
 
-  factory NasneError.http(int statusCode, String source) {
+  factory NasneError.http(int statusCode, String source, {String? detail}) {
     return NasneError(
       category: NasneErrorCategory.http,
       code: '$statusCode',
       source: source,
       messageKey: statusCode == 404 ? 'error.notImplemented' : 'error.http',
-      detail: 'HTTP $statusCode',
+      detail: (detail != null && detail.isNotEmpty)
+          ? detail
+          : 'HTTP $statusCode',
     );
   }
 

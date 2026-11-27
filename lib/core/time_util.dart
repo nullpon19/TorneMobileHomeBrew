@@ -18,6 +18,25 @@ DateTime? parseNasneDateTime(String? value) {
   return DateTime.tryParse(s);
 }
 
+/// Parses an ISO-8601 timestamp treating offset-less date+time strings as JST
+/// (`+09:00`). Explicit offsets (`Z` / `+HH:MM` / `-HHMM`) are preserved.
+DateTime? parseJstDateTime(String? value) {
+  if (value == null) return null;
+  var s = value.trim();
+  if (s.isEmpty) return null;
+  final compactOffset = RegExp(r'([+-]\d{2})(\d{2})$').firstMatch(s);
+  if (compactOffset != null && !s.endsWith('Z') && !s.endsWith('z')) {
+    s = '${s.substring(0, compactOffset.start)}'
+        '${compactOffset.group(1)}:${compactOffset.group(2)}';
+  } else if (RegExp(r'\d{2}:\d{2}').hasMatch(s) &&
+      !s.endsWith('Z') &&
+      !s.endsWith('z') &&
+      !RegExp(r'[+-]\d{2}:?\d{2}$').hasMatch(s)) {
+    s = '$s+09:00';
+  }
+  return DateTime.tryParse(s);
+}
+
 /// Formats [value] the way the device expects on input:
 /// `2026-11-18T04:00:00+09:00` (colon offset form, plan 11.7).
 ///

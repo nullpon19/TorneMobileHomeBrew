@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import '../errors.dart';
 import '../models/channel.dart';
 import '../models/device.dart';
 import '../models/epg.dart';
@@ -133,6 +134,14 @@ class JsonFileRegistrationStore implements RegistrationStore {
     } on FormatException {
       await _preserveCorruptFile(source);
       return [];
+    } on NasneError {
+      await _preserveCorruptFile(source);
+      return [];
+    } on TypeError {
+      await _preserveCorruptFile(source);
+      return [];
+    } on FileSystemException {
+      return [];
     }
   }
 
@@ -203,22 +212,37 @@ class JsonFileKeyValueStore implements KeyValueStore {
     final source = await _readableSource(file);
     if (source == null) return {};
     try {
-      final decoded = jsonDecode(await source.readAsString());
-      if (decoded is! Map) {
+      final raw = await source.readAsString();
+      final decoded = raw.length >= 32768
+          ? await Isolate.run(() => _decodeKeyValueMap(raw))
+          : _decodeKeyValueMap(raw);
+      if (decoded == null) {
         await _preserveCorruptFile(source);
         return {};
       }
-      return {
-        for (final e in decoded.entries) e.key.toString(): e.value.toString(),
-      };
+      return decoded;
     } on FormatException {
       await _preserveCorruptFile(source);
+      return {};
+    } on TypeError {
+      await _preserveCorruptFile(source);
+      return {};
+    } on FileSystemException {
       return {};
     }
   }
 
-  Future<void> _writeRaw(Map<String, String> values) =>
-      _writeFileAtomically(file, jsonEncode(values));
+  Future<void> _writeRaw(Map<String, String> values) async {
+    var totalLen = 0;
+    for (final e in values.entries) {
+      totalLen += e.key.length + e.value.length;
+      if (totalLen >= 32768) break;
+    }
+    final encoded = totalLen >= 32768
+        ? await Isolate.run(() => _encodeKeyValueMap(values))
+        : _encodeKeyValueMap(values);
+    await _writeFileAtomically(file, encoded);
+  }
 
   @override
   Future<String?> read(String key) =>
@@ -389,6 +413,16 @@ class EpgGuideCache {
   );
 }
 
+Map<String, String>? _decodeKeyValueMap(String raw) {
+  final decoded = jsonDecode(raw);
+  if (decoded is! Map) return null;
+  return {
+    for (final e in decoded.entries) e.key.toString(): e.value.toString(),
+  };
+}
+
+String _encodeKeyValueMap(Map<String, String> values) => jsonEncode(values);
+
 Map<int, List<EpgEvent>> _decodeEpgGuideCacheJson(String raw) {
   try {
     final decoded = jsonDecode(raw);
@@ -403,7 +437,7 @@ Map<int, List<EpgEvent>> _decodeEpgGuideCacheJson(String raw) {
               if (e is Map) EpgGuideCache._eventFromJson(e.cast<String, dynamic>()),
           ],
     };
-  } on FormatException {
+  } catch (_) {
     return const {};
   }
 }

@@ -1005,6 +1005,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
       }
     });
     final reg = ref.watch(selectedRegistrationProvider);
+    final uiMode = ref.watch(uiControlModeProvider);
     final regs =
         ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
     final activeRegs = regs.length > 1
@@ -1017,7 +1018,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
         final actionsRow = reg == null
             ? null
             : Focus(
-                focusNode: _topBarFocusNode,
+                focusNode: inlineBand ? _topBarFocusNode : null,
                 canRequestFocus: false,
                 skipTraversal: true,
                 onKeyEvent: (node, event) =>
@@ -1078,7 +1079,7 @@ class _EpgScreenState extends ConsumerState<EpgScreen>
 
         return Scaffold(
           appBar: AppBar(
-            title: inlineBand && showHint && reg != null
+            title: inlineBand && showHint && reg != null && uiMode.isTv
                 ? Row(
                     children: [
                       const Text('番組表'),
@@ -1393,11 +1394,15 @@ class _GuideView extends StatelessWidget {
     final days = <DateTime>[
       for (
         var d = firstDay;
-        !d.isAfter(lastDay);
+        !d.isAfter(lastDay) &&
+            d.difference(firstDay).inDays < 366;
         d = d.add(const Duration(days: 1))
       )
         d,
     ];
+    if (days.isEmpty) {
+      return const Center(child: Text('番組データがありません。'));
+    }
     final today = _EpgScreenState._jstDateOf(DateTime.now());
     final day = selectedDay != null && days.contains(selectedDay)
         ? selectedDay!
@@ -2334,6 +2339,7 @@ void showEpgEventDetail(
       event.end.isAfter(now) &&
       isScheduleCurrentlyRecording(existingSchedule, now: now);
   final ownerReg = existingScheduleReg ?? reg;
+  var actionInFlight = false;
   showDialog<void>(
     context: context,
     builder: (dialogContext) => EpgEventDetailDialog(
@@ -2343,7 +2349,10 @@ void showEpgEventDetail(
       isRecordingNow: recordingNow,
       onEditSchedule: existingSchedule != null
           ? () {
+              if (actionInFlight) return;
+              actionInFlight = true;
               Navigator.of(dialogContext).pop();
+              if (!context.mounted) return;
               Navigator.of(context).push(
                 MaterialPageRoute<void>(
                   builder: (_) => ScheduleDetailPage(
@@ -2357,38 +2366,49 @@ void showEpgEventDetail(
           : null,
       onStopRecording: recordingNow
           ? () async {
-              final titleText =
-                  event.title ?? existingSchedule.title ?? 'この番組';
-              final ok = await confirmDialog(
-                dialogContext,
-                title: '録画を停止しますか？',
-                message:
-                    '「$titleText」の録画を停止します。'
-                    'ここまでに録画された内容は録画済み一覧に残ります。',
-                confirmLabel: '録画を停止',
-              );
-              if (!ok) return;
-              final scopeContext =
-                  context.mounted ? context : dialogContext;
-              if (!scopeContext.mounted) return;
-              final container = ProviderScope.containerOf(scopeContext);
+              if (actionInFlight) return;
+              actionInFlight = true;
               try {
-                await container
-                    .read(deviceServicesProvider(ownerReg))
-                    .schedules
-                    .deleteSchedule(existingSchedule.id);
-              } catch (e) {
-                if (context.mounted) showSnack(context, userMessageForError(e));
-                return;
+                final titleText =
+                    event.title ?? existingSchedule.title ?? 'この番組';
+                final ok = await confirmDialog(
+                  dialogContext,
+                  title: '録画を停止しますか？',
+                  message:
+                      '「$titleText」の録画を停止します。'
+                      'ここまでに録画された内容は録画済み一覧に残ります。',
+                  confirmLabel: '録画を停止',
+                );
+                if (!ok) return;
+                final scopeContext =
+                    context.mounted ? context : dialogContext;
+                if (!scopeContext.mounted) return;
+                final container = ProviderScope.containerOf(scopeContext);
+                try {
+                  await container
+                      .read(deviceServicesProvider(ownerReg))
+                      .schedules
+                      .deleteSchedule(existingSchedule.id);
+                } catch (e) {
+                  if (context.mounted) {
+                    showSnack(context, userMessageForError(e));
+                  }
+                  return;
+                }
+                container.invalidate(schedulesProvider(ownerReg));
+                if (dialogContext.mounted) Navigator.of(dialogContext).pop();
+                if (context.mounted) showSnack(context, '録画を停止しました');
+              } finally {
+                actionInFlight = false;
               }
-              container.invalidate(schedulesProvider(ownerReg));
-              if (dialogContext.mounted) Navigator.of(dialogContext).pop();
-              if (context.mounted) showSnack(context, '録画を停止しました');
             }
           : null,
       onReserve: existingSchedule == null && event.end.isAfter(now)
           ? () {
+              if (actionInFlight) return;
+              actionInFlight = true;
               Navigator.of(dialogContext).pop();
+              if (!context.mounted) return;
               Navigator.of(context).push(
                 MaterialPageRoute<void>(
                   builder: (_) => ScheduleFormPage.fromEpg(
@@ -2402,7 +2422,10 @@ void showEpgEventDetail(
           : null,
       onWatch: watchable
           ? () {
+              if (actionInFlight) return;
+              actionInFlight = true;
               Navigator.of(dialogContext).pop();
+              if (!context.mounted) return;
               onWatch();
             }
           : null,

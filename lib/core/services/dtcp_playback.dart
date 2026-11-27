@@ -46,15 +46,24 @@ class PlaybackKeySource {
   /// Diagnostics sink, category playback.
   final DiagLog diag;
   Future<ExchangeKeySession>? _reauthInFlight;
+  bool _closed = false;
 
   /// The session currently supplying keys (the latest after any
   /// re-authentication); the playback session stops this one.
   ExchangeKeySession get currentSession => _session;
 
+  /// Permanently closes this key source and aborts any late re-authentication
+  /// result so orphaned AKE sockets cannot survive session stop.
+  Future<void> close() async {
+    _closed = true;
+    await _session.close();
+  }
+
   /// The key for [label]: immediate when already delivered, a
   /// bounded wait while the session is alive, and a
   /// re-authentication when the session has ended without it.
   Future<Uint8List> keyForLabel(int label) async {
+    if (_closed) throw AkeConnectionClosed();
     final known = _session.keyOrNull(label);
     if (known != null) return known;
     diag(DiagCategory.playback, 'waiting for exchange key, label $label');
@@ -63,47 +72,77 @@ class PlaybackKeySource {
         label,
         timeout: const Duration(seconds: 15),
       );
-    } on AkeConnectionClosed {
+    } on AkeConnectionClosed catch (_) {
+      return _reauthForLabel(label);
+    } on TimeoutException catch (_) {
       diag(
         DiagCategory.playback,
-        'the AKE session ended without label $label; '
-        're-authenticating',
+        'waiting for exchange key label $label timed out; re-authenticating',
       );
-      final fresh = await _reauthenticateOnce();
-      final firstLabel = await fresh.waitFirstExchangeKey(
-        timeout: const Duration(seconds: 20),
-      );
-      final key = fresh.keyOrNull(label);
-      if (key == null) {
-        throw NasneError.parse(
-          'dtcp:ake',
-          cause:
-              'the exchange key label still does not match after '
-              're-authentication (wanted $label, got $firstLabel)',
-        );
-      }
-      diag(
-        DiagCategory.playback,
-        're-authenticated; exchange key label $firstLabel in hand',
-      );
-      return key;
+      unawaited(_session.close());
+      return _reauthForLabel(label);
     }
+  }
+
+  Future<Uint8List> _reauthForLabel(int label) async {
+    diag(
+      DiagCategory.playback,
+      'the AKE session ended without label $label; re-authenticating',
+    );
+    final fresh = await _reauthenticateOnce();
+    final firstLabel = await fresh.waitFirstExchangeKey(
+      timeout: const Duration(seconds: 20),
+    );
+    final key = fresh.keyOrNull(label);
+    if (key == null) {
+      throw NasneError.parse(
+        'dtcp:ake',
+        cause:
+            'the exchange key label still does not match after '
+            're-authentication (wanted $label, got $firstLabel)',
+      );
+    }
+    diag(
+      DiagCategory.playback,
+      're-authenticated; exchange key label $firstLabel in hand',
+    );
+    return key;
   }
 
   /// Forces a fresh AKE authentication even when the local key cache is
   /// populated (used after prolonged cellular outages).
   Future<void> forceReauthenticate() async {
-    final fresh = await _reauthenticateOnce();
-    await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 20));
+    final future = () async {
+      final fresh = await _reauthenticateOnce();
+      try {
+        await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 10));
+      } catch (_) {
+        unawaited(fresh.close());
+        rethrow;
+      }
+    }();
+    unawaited(future.then((_) {}, onError: (_) {}));
+    await future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () => throw NasneError.unreachable(
+        'dtcp:ake',
+        cause: 're-authentication timed out after 15s',
+      ),
+    );
   }
 
   Future<ExchangeKeySession> _reauthenticateOnce() async {
+    if (_closed) throw AkeConnectionClosed();
     final inFlight = _reauthInFlight;
     if (inFlight != null) return inFlight;
     final future = _reauthenticate();
     _reauthInFlight = future;
     try {
       final fresh = await future;
+      if (_closed) {
+        unawaited(fresh.close());
+        throw AkeConnectionClosed();
+      }
       final old = _session;
       _session = fresh;
       if (!identical(old, fresh)) unawaited(old.close());
@@ -194,6 +233,19 @@ class DtcpPlaybackEngine implements PlaybackEngine {
     return _start(res, isLive: true);
   }
 
+  static bool _isEncryptedProtocol(String protocolInfo) {
+    final lower = protocolInfo.trim().toLowerCase();
+    if (lower.isEmpty) return true;
+    return lower.contains('application/x-dtcp1');
+  }
+
+  static bool _supportsDlnaTimeSeek(String protocolInfo) {
+    return RegExp(
+      r'DLNA\.ORG_OP=1[01]',
+      caseSensitive: false,
+    ).hasMatch(protocolInfo);
+  }
+
   Future<PlaybackSession> _start(
     TitleRes res, {
     int? seekTotalBytes,
@@ -204,56 +256,73 @@ class DtcpPlaybackEngine implements PlaybackEngine {
     var stage = 'credentials';
     AkeSession? session;
     final fetcher = _fetcherFactory();
+    final isEncrypted = _isEncryptedProtocol(res.protocolInfo);
+    final supportsTimeSeek =
+        !isLive &&
+        (seekTotalBytes == null || seekTotalBytes <= 0) &&
+        seekTotalDuration != null &&
+        seekTotalDuration > Duration.zero &&
+        _supportsDlnaTimeSeek(res.protocolInfo);
     try {
-      final credentials = await credentialStore.load();
-      if (credentials == null) {
-        throw NasneError.validation(
-          'dtcp:playback',
-          'DTCP-IP の資格情報がインポートされていません。設定画面の'
-              '「DTCP-IP 資格情報」から、ご自身の対応機器のペアをインポートしてください。',
+      final contentUrl = Uri.parse(res.url);
+      PlaybackKeySource? keySource;
+      if (isEncrypted) {
+        final credentials = await credentialStore.load();
+        if (credentials == null) {
+          throw NasneError.validation(
+            'dtcp:playback',
+            'DTCP-IP の資格情報がインポートされていません。設定画面の'
+                '「DTCP-IP 資格情報」から、ご自身の対応機器のペアをインポートしてください。',
+          );
+        }
+        stage = 'head';
+        final (host, port) = await fetcher.akeEndpoint(contentUrl);
+        diag(
+          DiagCategory.playback,
+          'stage head ok (${stopwatch.elapsedMilliseconds} ms)',
+        );
+        stage = 'ake';
+        final client = _clientFactory(credentials);
+        session = await client.connect(host, port);
+        diag(
+          DiagCategory.playback,
+          'stage ake ok (${stopwatch.elapsedMilliseconds} ms)',
+        );
+        // The reference client returns from authenticate() only with
+        // the first exchange key in hand (plan 28). Waiting here
+        // keeps a missing key a start failure with a named stage,
+        // instead of a stall inside the player.
+        stage = 'exchange key';
+        final label = await session.waitFirstExchangeKey();
+        diag(
+          DiagCategory.playback,
+          'stage exchange key ok, label $label '
+          '(${stopwatch.elapsedMilliseconds} ms)',
+        );
+        stage = 'proxy';
+        // Keys for later labels (rotation) come from fresh
+        // authentications: each re-authentication builds a NEW
+        // client, because an AkeClient carries one session's state
+        // (plan 29).
+        keySource = PlaybackKeySource(
+          session: session,
+          reauthenticate: () async {
+            final freshClient = _clientFactory(credentials);
+            return freshClient.connect(host, port);
+          },
+          diag: diag,
+        );
+      } else {
+        stage = 'proxy';
+        diag(
+          DiagCategory.playback,
+          'stage head/ake skipped (clear HTTP stream)',
         );
       }
-      final contentUrl = Uri.parse(res.url);
-      stage = 'head';
-      final (host, port) = await fetcher.akeEndpoint(contentUrl);
-      diag(
-        DiagCategory.playback,
-        'stage head ok (${stopwatch.elapsedMilliseconds} ms)',
-      );
-      stage = 'ake';
-      final client = _clientFactory(credentials);
-      session = await client.connect(host, port);
-      diag(
-        DiagCategory.playback,
-        'stage ake ok (${stopwatch.elapsedMilliseconds} ms)',
-      );
-      // The reference client returns from authenticate() only with
-      // the first exchange key in hand (plan 28). Waiting here
-      // keeps a missing key a start failure with a named stage,
-      // instead of a stall inside the player.
-      stage = 'exchange key';
-      final label = await session.waitFirstExchangeKey();
-      diag(
-        DiagCategory.playback,
-        'stage exchange key ok, label $label '
-        '(${stopwatch.elapsedMilliseconds} ms)',
-      );
-      stage = 'proxy';
-      // Keys for later labels (rotation) come from fresh
-      // authentications: each re-authentication builds a NEW
-      // client, because an AkeClient carries one session's state
-      // (plan 29).
-      final keySource = PlaybackKeySource(
-        session: session,
-        reauthenticate: () async {
-          final freshClient = _clientFactory(credentials);
-          return freshClient.connect(host, port);
-        },
-        diag: diag,
-      );
       final proxy = await DtcpProxy.start(
         contentUrl: contentUrl,
-        keyForLabel: keySource.keyForLabel,
+        keyForLabel:
+            keySource?.keyForLabel ?? (_) async => Uint8List(12),
         fetcher: fetcher,
         diag: diag,
         totalBytes: seekTotalBytes,
@@ -262,15 +331,22 @@ class DtcpPlaybackEngine implements PlaybackEngine {
             ? androidProxyWindowCapBytes
             : null,
         isLive: isLive,
+        isEncrypted: isEncrypted,
+        supportsTimeSeek: supportsTimeSeek,
         autoReconnect: autoReconnect,
-        onReauthenticate: autoReconnect ? keySource.forceReauthenticate : null,
+        onReauthenticate:
+            (autoReconnect && keySource != null)
+            ? keySource.forceReauthenticate
+            : null,
       );
       diag(
         DiagCategory.playback,
         'playback ready at ${proxy.uri} '
         '(${stopwatch.elapsedMilliseconds} ms)',
       );
-      return _DtcpPlaybackSession(proxy, keySource, fetcher);
+      return supportsTimeSeek
+          ? _TimeSeekableDtcpPlaybackSession(proxy, keySource, fetcher)
+          : _DtcpPlaybackSession(proxy, keySource, fetcher);
     } catch (e) {
       diag(DiagCategory.playback, 'failed at stage "$stage": $e');
       if (session != null) await session.close();
@@ -290,7 +366,7 @@ class _DtcpPlaybackSession
   _DtcpPlaybackSession(this._proxy, this._keySource, this._fetcher);
 
   final DtcpProxy _proxy;
-  final PlaybackKeySource _keySource;
+  final PlaybackKeySource? _keySource;
   final DtcpMediaFetcher _fetcher;
   bool _stopped = false;
 
@@ -322,6 +398,9 @@ class _DtcpPlaybackSession
   Object? get lastUpstreamError => _proxy.lastUpstreamError;
 
   @override
+  bool get isReconnectingUpstream => _proxy.isReconnectingUpstream;
+
+  @override
   List<AribCaptionLayoutEvent> get aribCaptionEvents =>
       _proxy.aribCaptionEvents;
 
@@ -339,8 +418,29 @@ class _DtcpPlaybackSession
   Future<void> stop() async {
     if (_stopped) return;
     _stopped = true;
-    await _proxy.stop();
-    await _keySource.currentSession.close();
+    // Close the HTTP client synchronously before waiting on proxy/AKE teardown
+    // so the upstream TCP socket drops immediately on user exit.
     _fetcher.close();
+    try {
+      await _proxy.stop();
+      await _keySource?.close();
+    } finally {
+      _fetcher.close();
+    }
   }
+}
+
+class _TimeSeekableDtcpPlaybackSession extends _DtcpPlaybackSession
+    implements TimeSeekableSession {
+  _TimeSeekableDtcpPlaybackSession(
+    super.proxy,
+    super.keySource,
+    super.fetcher,
+  );
+
+  @override
+  Duration? get totalDuration => _proxy.totalDuration;
+
+  @override
+  Future<void> seekToTime(Duration target) => _proxy.seekToTime(target);
 }

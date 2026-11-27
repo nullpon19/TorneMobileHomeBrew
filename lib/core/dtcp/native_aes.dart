@@ -160,6 +160,15 @@ class NativeAesBackend {
     if (_disposed) {
       throw StateError('NativeAesBackend has been disposed');
     }
+    if (rk.length != 44) {
+      throw ArgumentError.value(rk.length, 'rk.length', 'must be 44');
+    }
+    if (offset < 0 || offset > data.length) {
+      throw RangeError.range(offset, 0, data.length, 'offset');
+    }
+    if (length < 0 || offset + length > data.length) {
+      throw RangeError.range(length, 0, data.length - offset, 'length');
+    }
     if (length == 0) return Uint8List(0);
     if ((length & 0x0f) != 0) {
       throw ArgumentError.value(length, 'length', 'must be a multiple of 16');

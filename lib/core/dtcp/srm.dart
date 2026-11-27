@@ -124,9 +124,12 @@ class Srm {
       }
       offset = generationEnd;
     }
+    if (generation < 0) {
+      throw parseError('SRM contains no signed generation');
+    }
     return Srm._(
       version,
-      generation < 0 ? 0 : generation,
+      generation,
       Uint8List.fromList(data),
       ranges,
     );

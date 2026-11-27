@@ -8,6 +8,7 @@ import '../errors.dart';
 import '../models/didl.dart';
 import '../models/live_channel.dart';
 import '../models/title.dart';
+import '../time_util.dart';
 import '../transport/xml_util.dart';
 
 /// Parses a DIDL-Lite document string (the `Result` of a Browse).
@@ -114,7 +115,7 @@ LiveChannel liveChannelFromDidl(DidlItem item) {
 
   DateTime? timeProp(String key) {
     final raw = item.properties[key];
-    return raw == null ? null : DateTime.tryParse(raw.trim());
+    return parseJstDateTime(raw);
   }
 
   return LiveChannel(
@@ -152,7 +153,7 @@ TitleRes _parseRes(XmlElement el) {
       final h = int.tryParse(parts[0]);
       final m = int.tryParse(parts[1]);
       final s = double.tryParse(parts[2]);
-      if (h != null && m != null && s != null) {
+      if (h != null && m != null && s != null && h >= 0 && m >= 0 && s.isFinite && s >= 0) {
         duration = Duration(
           hours: h,
           minutes: m,

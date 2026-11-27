@@ -1,0 +1,198 @@
+name: multiplatform-build
+
+on:
+  push:
+    branches: [multiplatform]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Android / Fire TV APK
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Flutter 3.50.0
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.50.0"
+          cache: true
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION="$(grep '^version:' pubspec.yaml | sed 's/^version: *//')"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Analyze, test, and build APK
+        run: |
+          flutter pub get
+          dart analyze
+          flutter test -r compact
+          flutter build apk --release
+
+      - name: Package APK
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "dist/TorneMobileHomeBrew-android-firetv.apk"
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  apple:
+    name: Apple (iOS / iPadOS & macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Flutter 3.50.0
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.50.0"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build unsigned iOS app
+        run: flutter build ios --no-codesign --release
+
+      - name: Package IPA
+        run: |
+          mkdir -p dist Payload
+          APP_PATH="$(ls -d build/ios/iphoneos/*.app | head -n 1)"
+          echo "app: ${APP_PATH}"
+          cp -r "${APP_PATH}" Payload/
+          zip -qry "dist/TorneMobileHomeBrew-ios-ipados-unsigned.ipa" Payload
+
+      - name: Build macOS app via workspace
+        run: |
+          flutter build macos --config-only --release
+          xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner \
+            -configuration Release -derivedDataPath build/macos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+      - name: Verify embedded frameworks, sign, and zip
+        run: |
+          APP="build/macos/Build/Products/Release/torne mobile HB.app"
+          for fw in Ass Mpv Avcodec media_kit_video; do
+            if [ ! -d "$APP/Contents/Frameworks/$fw.framework" ]; then
+              echo "ERROR: $fw.framework missing from $APP" >&2
+              exit 1
+            fi
+          done
+          codesign --force --deep \
+            --entitlements macos/Runner/Signing.entitlements \
+            --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q keychain-access-groups; then
+            echo "ERROR: keychain-access-groups present in signature" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/TorneMobileHomeBrew-macos.zip"
+
+      - name: Upload iOS IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: dist/*.ipa
+          if-no-files-found: error
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows Desktop App
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Flutter 3.50.0
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.50.0"
+          cache: true
+
+      - name: Build Windows app
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, staging\TorneMobileHomeBrew-windows | Out-Null
+          Copy-Item -Recurse -Force build\windows\x64\runner\Release\* staging\TorneMobileHomeBrew-windows\
+          Compress-Archive -Path staging\TorneMobileHomeBrew-windows -DestinationPath dist\TorneMobileHomeBrew-windows.zip -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Rolling Prerelease (multiplatform-dev)
+    needs: [android, apple, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish multiplatform-dev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          {
+            echo "マルチプラットフォーム統合版 (Fire TV / Android / iOS / iPadOS / macOS / Windows) のビルドです。"
+            echo ""
+            echo "- バージョン: ${VERSION}"
+            echo "- 元 commit: ${SHORT_SHA}"
+            echo "- Android / Fire TV: \`TorneMobileHomeBrew-android-firetv.apk\`"
+            echo "- iOS / iPadOS (署名なし): \`TorneMobileHomeBrew-ios-ipados-unsigned.ipa\`"
+            echo "- macOS: \`TorneMobileHomeBrew-macos.zip\`"
+            echo "- Windows: \`TorneMobileHomeBrew-windows.zip\`"
+          } > notes.md
+          if ! gh release view multiplatform-dev > /dev/null 2>&1; then
+            gh release create multiplatform-dev \
+              --prerelease \
+              --title "Multiplatform Dev (4 OS)" \
+              --notes-file notes.md \
+              --target "${GITHUB_SHA}"
+          fi
+          gh release upload multiplatform-dev dist/* --clobber
+          gh release edit multiplatform-dev \
+            --prerelease \
+            --title "Multiplatform Dev (4 OS)" \
+            --notes-file notes.md

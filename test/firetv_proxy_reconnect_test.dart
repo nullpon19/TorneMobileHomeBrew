@@ -557,5 +557,375 @@ void main() {
         );
       },
     );
+
+    test(
+      'seekable proxy retries on 0-byte establish failure and mid-stream early EOF without prematurely latching EOF',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        const totalBytes = 65536; // 64 KiB (not near 0)
+        final fullPlaintext = Uint8List.fromList(
+          List.generate(totalBytes, (i) => (i * 23 + 7) & 0xFF),
+        );
+        // Make totalBytes large enough so _window.end=0 is NOT nearDeclaredEnd.
+        const fakeTotalBytes = 10 * 1024 * 1024;
+        var upstreamAttempt = 0;
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          upstreamAttempt++;
+          if (upstreamAttempt == 1) {
+            // Transient 503 on initial byte 0 establish.
+            request.response.statusCode = HttpStatus.serviceUnavailable;
+            await request.response.close();
+            return;
+          }
+          if (upstreamAttempt == 2) {
+            // Deliver first 16384 bytes cleanly, then close early (well short of 10 MiB).
+            final pkt = _buildTestPcpPacket(
+              exchangeKey,
+              Uint8List.sublistView(fullPlaintext, 0, 16384),
+            );
+            request.response.statusCode = HttpStatus.ok;
+            request.response.contentLength = pkt.length;
+            request.response.add(pkt);
+            await request.response.close();
+            return;
+          }
+          // Reconnect attempt returns remainder from byte 16384.
+          final pkt = _buildTestPcpPacket(
+            exchangeKey,
+            Uint8List.sublistView(fullPlaintext, 16384, totalBytes),
+          );
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.set(
+            'TimeSeekRange.dlna.org',
+            'npt=00:00:05.000-00:01:00.000/00:01:00.000 '
+                'bytes=16384-${fakeTotalBytes - 1}/$fakeTotalBytes',
+          );
+          request.response.contentLength = pkt.length;
+          request.response.add(pkt);
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/pvr_retry'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: fakeTotalBytes,
+          totalDuration: const Duration(minutes: 1),
+          autoReconnect: true,
+          reconnectBackoff: const [Duration(milliseconds: 10)],
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+
+        final collected = <int>[];
+        final done = Completer<void>();
+        late StreamSubscription<List<int>> sub;
+        sub = resp.listen(
+          (chunk) {
+            collected.addAll(chunk);
+            if (collected.length >= totalBytes && !done.isCompleted) {
+              done.complete();
+            }
+          },
+          onError: (_) {},
+        );
+        addTearDown(sub.cancel);
+        await done.future.timeout(const Duration(seconds: 5));
+        expect(collected.sublist(0, totalBytes), fullPlaintext);
+        expect(upstreamAttempt, greaterThanOrEqualTo(3));
+        expect(proxy.servedBytes, greaterThanOrEqualTo(totalBytes));
+        expect(proxy.plaintextBytes, greaterThanOrEqualTo(totalBytes));
+      },
+    );
+
+    test('shouldReauthenticate triggers on auth/busy HTTP errors and throttles unreachable retries', () {
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(401, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(403, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(503, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(511, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(512, 't'), 1), isTrue);
+
+      final netErr = NasneError.unreachable('t');
+      expect(DtcpProxy.shouldReauthenticate(netErr, 1), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(netErr, 2), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(netErr, 3), isTrue);
+      for (var i = 4; i <= 8; i++) {
+        expect(DtcpProxy.shouldReauthenticate(netErr, i), isFalse);
+      }
+      expect(DtcpProxy.shouldReauthenticate(netErr, 9), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(null, 2), isFalse);
+      expect(DtcpProxy.shouldReauthenticate(null, 3), isTrue);
+    });
+
+    test(
+      'seekable proxy widens time-seek margin after VBR overshoot and recovers',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        const totalBytes = 65536;
+        final fullPlaintext = Uint8List.fromList(
+          List.generate(totalBytes, (i) => (i * 29 + 11) & 0xFF),
+        );
+        final requestedNpts = <double>[];
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          final tsHeader = request.headers.value('timeseekrange.dlna.org');
+          if (tsHeader == null) {
+            final fullPkt = _buildTestPcpPacket(exchangeKey, fullPlaintext);
+            request.response.statusCode = HttpStatus.ok;
+            request.response.contentLength = fullPkt.length;
+            request.response.add(fullPkt);
+            await request.response.close();
+            return;
+          }
+          final nptMatch = RegExp(r'npt=([0-9.]+)-').firstMatch(tsHeader)!;
+          final npt = double.parse(nptMatch.group(1)!);
+          requestedNpts.add(npt);
+          // Simulate VBR overshoot: npt >= 7.0 snaps past byte 32768 (36000),
+          // while widened margin (npt < 7.0) lands safely at byte 24576.
+          final startByte = npt >= 7.0 ? 36000 : 24576;
+          final pkt = _buildTestPcpPacket(
+            exchangeKey,
+            Uint8List.sublistView(fullPlaintext, startByte, totalBytes),
+          );
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.set(
+            'TimeSeekRange.dlna.org',
+            'npt=${npt.toStringAsFixed(3)}-20.000/20.000 '
+                'bytes=$startByte-${totalBytes - 1}/$totalBytes',
+          );
+          request.response.contentLength = pkt.length;
+          request.response.add(pkt);
+          await request.response.close();
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/vbr'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: totalBytes,
+          totalDuration: const Duration(seconds: 20),
+          windowCapBytesOverride: 8192,
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        req.headers.set('Range', 'bytes=32768-${totalBytes - 1}');
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.partialContent);
+        final received = BytesBuilder(copy: false);
+        await for (final chunk in resp.timeout(const Duration(seconds: 3))) {
+          received.add(chunk);
+        }
+        expect(
+          received.toBytes(),
+          Uint8List.sublistView(fullPlaintext, 32768, totalBytes),
+        );
+        // Attempt 1 aimed at 10.0 - 2.0 = 8.0s (overshot); attempt 2 widened by 5.0s!
+        expect(requestedNpts.length, 2);
+        expect(requestedNpts[0], closeTo(8.0, 0.01));
+        expect(requestedNpts[1], lessThan(7.0));
+      },
+    );
+
+    test(
+      'DtcpProxy.stop() force-closes an active endless upstream stream immediately',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final plaintext = Uint8List.fromList(
+          List.generate(12288, (i) => (i * 13 + 7) & 0xFF),
+        );
+        final packet = _buildTestPcpPacket(exchangeKey, plaintext);
+        final upstreamConnected = Completer<void>();
+        final upstreamSocketClosed = Completer<void>();
+
+        final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(server.close);
+        server.listen((socket) async {
+          if (!upstreamConnected.isCompleted) upstreamConnected.complete();
+          final headerBuf = <int>[];
+          await for (final chunk in socket) {
+            headerBuf.addAll(chunk);
+            if (String.fromCharCodes(headerBuf).contains('\r\n\r\n')) {
+              break;
+            }
+          }
+          socket.write(
+            'HTTP/1.1 200 OK\r\n'
+            'Content-Type: application/x-dtcp1\r\n\r\n',
+          );
+          socket.add(packet);
+          await socket.flush();
+          // Keep the connection open endlessly like a live stream;
+          // wait until the client side resets/closes the TCP socket.
+          try {
+            await socket.drain<void>();
+          } catch (_) {
+            // Connection reset by peer is expected when force-closed.
+          } finally {
+            await socket.close();
+            if (!upstreamSocketClosed.isCompleted) {
+              upstreamSocketClosed.complete();
+            }
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/live'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+
+        final firstChunk = Completer<void>();
+        final sub = resp.listen(
+          (chunk) {
+            if (chunk.isNotEmpty && !firstChunk.isCompleted) {
+              firstChunk.complete();
+            }
+          },
+          onError: (_) {},
+          cancelOnError: false,
+        );
+        addTearDown(sub.cancel);
+
+        await upstreamConnected.future.timeout(const Duration(seconds: 2));
+        await firstChunk.future.timeout(const Duration(seconds: 2));
+
+        final sw = Stopwatch()..start();
+        await proxy.stop();
+        sw.stop();
+
+        expect(sw.elapsedMilliseconds, lessThan(1500));
+        await upstreamSocketClosed.future.timeout(const Duration(seconds: 2));
+      },
+    );
+
+    test(
+      'seekable proxy cancels superseded producer before stale plaintext hits re-anchored window',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final firstRegion = Uint8List.fromList(List.filled(12288, 0x11));
+        final secondRegion = Uint8List.fromList(List.filled(12288, 0x22));
+        final firstPacket = _buildTestPcpPacket(exchangeKey, firstRegion);
+        final secondPacket = _buildTestPcpPacket(exchangeKey, secondRegion);
+        final firstStarted = Completer<void>();
+        final releaseFirstStale = Completer<void>();
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          final tsr = request.headers.value('timeseekrange.dlna.org') ?? 'npt=0.000-';
+          final nptStr = tsr.split('=').last.split('-').first;
+          final npt = double.tryParse(nptStr) ?? 0.0;
+          if (npt < 5.0) {
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.set(
+              'TimeSeekRange.dlna.org',
+              'npt=0.000-20.000/20.000 bytes=0-49151/49152',
+            );
+            // Send first half of PCP header + stall so first request stays waiting
+            // across moveNext() while second range seek arrives and re-anchors window.
+            request.response.add(firstPacket.sublist(0, 64));
+            await request.response.flush();
+            if (!firstStarted.isCompleted) firstStarted.complete();
+            await releaseFirstStale.future.timeout(
+              const Duration(seconds: 3),
+              onTimeout: () {},
+            );
+            request.response.add(firstPacket.sublist(64));
+            await request.response.close();
+          } else {
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.set(
+              'TimeSeekRange.dlna.org',
+              'npt=10.000-20.000/20.000 bytes=24576-49151/49152',
+            );
+            request.response.add(secondPacket);
+            await request.response.close();
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/seek_race'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: 49152,
+          totalDuration: const Duration(seconds: 20),
+          windowCapBytesOverride: 8192,
+        );
+        addTearDown(proxy.stop);
+
+        // Request 1 starts producer at byte 0 and stalls mid-packet.
+        final client1 = HttpClient();
+        addTearDown(() => client1.close(force: true));
+        final req1 = await client1.getUrl(proxy.uri);
+        req1.headers.set('Range', 'bytes=0-12287');
+        unawaited(req1.close().then((r) => r.drain<void>()).catchError((_) {}));
+        await firstStarted.future.timeout(const Duration(seconds: 2));
+
+        // Request 2 seeks to 24576 (npt >= 5) while stale producer is in flight.
+        final client2 = HttpClient();
+        addTearDown(() => client2.close(force: true));
+        final req2 = await client2.getUrl(proxy.uri);
+        req2.headers.set('Range', 'bytes=24576-36863');
+        final resp2 = await req2.close();
+        expect(resp2.statusCode, HttpStatus.partialContent);
+        if (!releaseFirstStale.isCompleted) releaseFirstStale.complete();
+        final out = BytesBuilder(copy: false);
+        await for (final c in resp2.timeout(const Duration(seconds: 3))) {
+          out.add(c);
+        }
+        final bytes = out.toBytes();
+        expect(bytes, isNotEmpty);
+        expect(bytes.every((b) => b == 0x22), isTrue);
+      },
+    );
   });
 }

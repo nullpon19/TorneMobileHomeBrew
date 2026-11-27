@@ -428,15 +428,17 @@ class JikkyoChannelLiveInfo {
         }
       }
     }
+    final presentRaw = json['program_present'];
+    final followingRaw = json['program_following'];
     return JikkyoChannelLiveInfo(
       id: id,
       name: name,
-      programPresent: JikkyoProgramInfo.fromJson(
-        json['program_present'] as Map<String, dynamic>?,
-      ),
-      programFollowing: JikkyoProgramInfo.fromJson(
-        json['program_following'] as Map<String, dynamic>?,
-      ),
+      programPresent: presentRaw is Map
+          ? JikkyoProgramInfo.fromJson(presentRaw.cast<String, dynamic>())
+          : null,
+      programFollowing: followingRaw is Map
+          ? JikkyoProgramInfo.fromJson(followingRaw.cast<String, dynamic>())
+          : null,
       jikkyoForce: force,
     );
   }

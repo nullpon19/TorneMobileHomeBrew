@@ -58,12 +58,17 @@
 /// lagged, which made the recording look unrecorded.
 library;
 
+import 'dart:typed_data';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../app/bs_epg_providers.dart';
 import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'channel_badge.dart';
+import 'dlna_browser_view.dart';
 import 'epg_title_badges.dart';
 import 'error_messages.dart';
 import 'format.dart';
@@ -337,6 +342,128 @@ String? _formatRecordedDetailMeta(RecordedTitle title) {
   return null;
 }
 
+Iterable<int> _recordedChannelBandCandidates(int? broadcastingType) {
+  if (broadcastingType == terrestrialBroadcastingType ||
+      broadcastingType == bsBroadcastingType ||
+      broadcastingType == csBroadcastingType) {
+    return [broadcastingType!];
+  }
+  return const [
+    terrestrialBroadcastingType,
+    bsBroadcastingType,
+    csBroadcastingType,
+  ];
+}
+
+({String? number, Uint8List? logo}) _resolveCachedRecordedChannelMetadata(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  RecordedTitle title,
+) {
+  final serviceId = title.channel?.serviceId;
+  final channelName = title.channelName;
+  String? number;
+  Uint8List? logo;
+  for (final bandType in _recordedChannelBandCandidates(
+    title.channel?.broadcastingType,
+  )) {
+    final channels = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelsProvider(reg)).value ?? const <Channel>[],
+      bsBroadcastingType =>
+        container.read(bsChannelsProvider(reg)).value ?? const <Channel>[],
+      csBroadcastingType =>
+        container.read(csChannelsProvider(reg)).value ?? const <Channel>[],
+      _ => const <Channel>[],
+    };
+    final logos = switch (bandType) {
+      terrestrialBroadcastingType =>
+        container.read(channelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      bsBroadcastingType =>
+        container.read(bsChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      csBroadcastingType =>
+        container.read(csChannelLogosProvider(reg)).value ??
+            const <int, List<int>>{},
+      _ => const <int, List<int>>{},
+    };
+    number ??= resolveRecordedChannelNumberLabel(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+    );
+    logo ??= resolveRecordedChannelLogoBytes(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+      logos: logos,
+    );
+    if (number != null && logo != null) break;
+  }
+  return (number: number, logo: logo);
+}
+
+Future<({String? number, Uint8List? logo})> _loadRecordedChannelMetadata(
+  ProviderContainer container,
+  RegisteredNasne reg,
+  RecordedTitle title,
+) async {
+  final serviceId = title.channel?.serviceId;
+  final channelName = title.channelName;
+  String? number;
+  Uint8List? logo;
+  for (final bandType in _recordedChannelBandCandidates(
+    title.channel?.broadcastingType,
+  )) {
+    final channelProvider = switch (bandType) {
+      terrestrialBroadcastingType => channelsProvider(reg),
+      bsBroadcastingType => bsChannelsProvider(reg),
+      csBroadcastingType => csChannelsProvider(reg),
+      _ => null,
+    };
+    final logoProvider = switch (bandType) {
+      terrestrialBroadcastingType => channelLogosProvider(reg),
+      bsBroadcastingType => bsChannelLogosProvider(reg),
+      csBroadcastingType => csChannelLogosProvider(reg),
+      _ => null,
+    };
+    List<Channel> channels = const [];
+    Map<int, List<int>> logos = const {};
+    await Future.wait([
+      if (channelProvider != null)
+        () async {
+          try {
+            channels = await container
+                .read(channelProvider.future)
+                .timeout(const Duration(seconds: 6));
+          } catch (_) {}
+        }(),
+      if (logoProvider != null)
+        () async {
+          try {
+            logos = await container
+                .read(logoProvider.future)
+                .timeout(const Duration(seconds: 6));
+          } catch (_) {}
+        }(),
+    ]);
+    number ??= resolveRecordedChannelNumberLabel(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+    );
+    logo ??= resolveRecordedChannelLogoBytes(
+      serviceId: serviceId,
+      channelName: channelName,
+      channels: channels,
+      logos: logos,
+    );
+    if (number != null && logo != null) break;
+  }
+  return (number: number, logo: logo);
+}
+
 Widget _buildRecordedPlayerScreen({
   required ProviderContainer container,
   required RegisteredNasne reg,
@@ -369,12 +496,21 @@ Widget _buildRecordedPlayerScreen({
     currentReg: reg,
     currentTitle: title,
   );
+  final initialChannelMeta = _resolveCachedRecordedChannelMetadata(
+    container,
+    reg,
+    title,
+  );
   return PlayerScreen(
     title: title.title,
     session: session,
     initialStart: initialStart,
     knownDuration: knownDuration,
     recordedChannelName: title.channelName,
+    initialRecordedChannelNumber: initialChannelMeta.number,
+    initialRecordedChannelLogo: initialChannelMeta.logo,
+    loadRecordedChannelMetadata: () =>
+        _loadRecordedChannelMetadata(container, reg, title),
     recordedBroadcastTimeRange: recordedBroadcastTimeRange,
     recordedScheduledStart: title.scheduledStart,
     recordedBroadcastingType: title.channel?.broadcastingType,
@@ -388,12 +524,14 @@ Widget _buildRecordedPlayerScreen({
     nextEpisodeTitle: nextTarget?.title.title,
     onPlayNextEpisode: nextTarget != null
         ? (playerContext, stopCurrentSession) async {
-            await _reportResumePositionWithContainer(
-              container: container,
-              reg: reg,
-              titleId: title.id,
-              position: Duration.zero,
-            );
+            try {
+              await _reportResumePositionWithContainer(
+                container: container,
+                reg: reg,
+                titleId: title.id,
+                position: Duration.zero,
+              );
+            } catch (_) {}
             await stopCurrentSession();
             final nextTitle = nextTarget.title;
             final nextReg = nextTarget.reg;
@@ -521,6 +659,7 @@ class TitlesScreen extends ConsumerStatefulWidget {
 
 class _TitlesScreenState extends ConsumerState<TitlesScreen> {
   String? _selectedKey;
+  String? _selectedSourceId;
   final FocusNode _detailPlayFocusNode = FocusNode(debugLabel: 'titlePlay');
 
   @override
@@ -537,11 +676,103 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
     final activeRegs = regs.length > 1
         ? regs
         : (reg != null ? [reg] : const <RegisteredNasne>[]);
+    final dlnaServers = ref.watch(dlnaServersProvider);
+    final hasNasne = reg != null;
+
+    RegisteredDlnaServer? activeDlna;
+    if (dlnaServers.isNotEmpty) {
+      if (_selectedSourceId != null && _selectedSourceId!.startsWith('dlna:')) {
+        final targetId = _selectedSourceId!.substring(5);
+        for (final s in dlnaServers) {
+          if (s.id == targetId) {
+            activeDlna = s;
+            break;
+          }
+        }
+      }
+      if (!hasNasne && activeDlna == null) {
+        activeDlna = dlnaServers.first;
+      }
+    }
+
+    final Widget nasneBody = reg == null
+        ? NoDeviceView(
+            onRegister: () =>
+                ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
+          )
+        : _TitleList(
+            reg: reg,
+            activeRegs: activeRegs,
+            selectedKey: _selectedKey,
+            detailPlayFocusNode: _detailPlayFocusNode,
+            onSelect: (title, owner, showNasneName, twoPane) {
+              if (twoPane) {
+                setState(() => _selectedKey = ownedItemKey(owner, title.id));
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted && _detailPlayFocusNode.canRequestFocus) {
+                    _detailPlayFocusNode.requestFocus();
+                  }
+                });
+              } else {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => TitleDetailPage(
+                      reg: owner,
+                      titleId: title.id,
+                      showNasneName: showNasneName,
+                    ),
+                  ),
+                );
+              }
+            },
+          );
+
+    final Widget body;
+    if (dlnaServers.isEmpty) {
+      body = nasneBody;
+    } else {
+      body = Column(
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Row(
+              children: [
+                if (hasNasne) ...[
+                  ChoiceChip(
+                    label: const Text('nasne 録画'),
+                    selected: activeDlna == null,
+                    onSelected: (_) => setState(() => _selectedSourceId = 'nasne'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                for (final s in dlnaServers) ...[
+                  ChoiceChip(
+                    avatar: const Icon(Icons.dns_outlined, size: 16),
+                    label: Text(s.friendlyName),
+                    selected: activeDlna?.id == s.id,
+                    onSelected: (_) =>
+                        setState(() => _selectedSourceId = 'dlna:${s.id}'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+          Expanded(
+            child: activeDlna != null
+                ? DlnaBrowserView(server: activeDlna)
+                : nasneBody,
+          ),
+        ],
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('録画済み'),
         actions: [
-          if (reg != null)
+          if (reg != null && activeDlna == null)
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: '更新',
@@ -554,37 +785,7 @@ class _TitlesScreenState extends ConsumerState<TitlesScreen> {
             ),
         ],
       ),
-      body: reg == null
-          ? NoDeviceView(
-              onRegister: () =>
-                  ref.read(tabIndexProvider.notifier).select(AppTabs.settings),
-            )
-          : _TitleList(
-              reg: reg,
-              activeRegs: activeRegs,
-              selectedKey: _selectedKey,
-              detailPlayFocusNode: _detailPlayFocusNode,
-              onSelect: (title, owner, showNasneName, twoPane) {
-                if (twoPane) {
-                  setState(() => _selectedKey = ownedItemKey(owner, title.id));
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (mounted && _detailPlayFocusNode.canRequestFocus) {
-                      _detailPlayFocusNode.requestFocus();
-                    }
-                  });
-                } else {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => TitleDetailPage(
-                        reg: owner,
-                        titleId: title.id,
-                        showNasneName: showNasneName,
-                      ),
-                    ),
-                  );
-                }
-              },
-            ),
+      body: body,
     );
   }
 }
@@ -1371,12 +1572,14 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
   @override
   void didUpdateWidget(covariant TitleDetailView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.title.id != widget.title.id) {
+    if (oldWidget.title.id != widget.title.id ||
+        oldWidget.reg.host != widget.reg.host) {
       _useMobileChoice = null;
     }
   }
 
   Future<void> _toggleProtection(bool protect) async {
+    if (_protectBusy) return;
     setState(() => _protectBusy = true);
     try {
       await setRecordedTitleProtection(
@@ -1545,27 +1748,27 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
     final res = useMobile
         ? (title.mobileRes ?? title.originalRes ?? title.res.first)
         : (title.originalRes ?? title.mobileRes ?? title.res.first);
-    // Resume (plan 86): a title the viewer stopped midway offers
-    // its recorded position. Ask before starting — beginning a
-    // session is the expensive step, and the choice belongs
-    // before it, not after.
-    var initialStart = resumeStartOf(title);
-    if (initialStart != null) {
-      final resume = await showResumeChoiceDialog(context, initialStart);
-      if (!context.mounted) return;
-      if (resume == null) return;
-      // Continuing opens a little before the recorded position:
-      // the context rewind of resumeRewind (plan 98 / 102).
-      initialStart = resume ? resumePlaybackStartOf(title) : null;
-    }
-    final detailMeta = _formatRecordedDetailMeta(title);
-    final detailBody = formatProgramDetailBody(
-      description: title.description,
-      longDescription: title.longDescription,
-    );
-    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _starting = true);
     try {
+      // Resume (plan 86): a title the viewer stopped midway offers
+      // its recorded position. Ask before starting — beginning a
+      // session is the expensive step, and the choice belongs
+      // before it, not after.
+      var initialStart = resumeStartOf(title);
+      if (initialStart != null) {
+        final resume = await showResumeChoiceDialog(context, initialStart);
+        if (!context.mounted) return;
+        if (resume == null) return;
+        // Continuing opens a little before the recorded position:
+        // the context rewind of resumeRewind (plan 98 / 102).
+        initialStart = resume ? resumePlaybackStartOf(title) : null;
+      }
+      final detailMeta = _formatRecordedDetailMeta(title);
+      final detailBody = formatProgramDetailBody(
+        description: title.description,
+        longDescription: title.longDescription,
+      );
+      final container = ProviderScope.containerOf(context, listen: false);
       await startPlaybackAndShowPlayer(
         context: context,
         ref: ref,

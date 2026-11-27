@@ -7,6 +7,7 @@
 #include <flutter/plugin_registrar_windows.h>
 
 #include "ake_socket.h"
+#include "desktop_channels.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -44,6 +45,12 @@ bool FlutterWindow::OnCreate() {
                                     ->GetRegistrarForPlugin("AkeSocket"));
   AkeSocketRegister(ake_registrar, GetHandle());
 
+  auto* desktop_registrar = flutter::PluginRegistrarManager::GetInstance()
+                                ->GetRegistrar<flutter::PluginRegistrarWindows>(
+                                    flutter_controller_->engine()
+                                        ->GetRegistrarForPlugin("DesktopChannels"));
+  DesktopChannelsRegister(desktop_registrar, GetHandle());
+
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -59,6 +66,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  DesktopChannelsDestroy();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

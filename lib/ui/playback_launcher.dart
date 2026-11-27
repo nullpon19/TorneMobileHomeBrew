@@ -8,6 +8,8 @@
 /// screen and the wording differ.
 library;
 
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -16,6 +18,8 @@ import '../core/core.dart';
 import 'dtcp_credential_screen.dart';
 import 'error_messages.dart';
 import 'widgets.dart';
+
+enum _PlaybackErrorAction { close, retry, waitForTuner }
 
 /// Starts a session via [start] and shows the player built by
 /// [buildPlayer]. A start that finishes after the caller has
@@ -30,41 +34,109 @@ Future<void> startPlaybackAndShowPlayer({
   required Widget Function(PlaybackSession session) buildPlayer,
   required String unsupportedSubject,
   String startFailureMessage = '再生を開始できませんでした',
+  Duration tunerWaitInterval = const Duration(seconds: 5),
+  Duration tunerWaitMaxDuration = const Duration(seconds: 150),
 }) async {
-  try {
-    final session = await start();
-    if (!context.mounted) {
-      await session.stop();
-      return;
+  NasneError? pendingError;
+  while (true) {
+    if (pendingError == null) {
+      try {
+        final session = await start();
+        if (!context.mounted) {
+          await session.stop();
+          return;
+        }
+        await Navigator.push(
+          context,
+          MaterialPageRoute<void>(builder: (_) => buildPlayer(session)),
+        );
+        return;
+      } on NasneError catch (e) {
+        if (!context.mounted) return;
+        pendingError = e;
+      } catch (e) {
+        if (!context.mounted) return;
+        ref.read(diagLogProvider)(
+          DiagCategory.ui,
+          'playback start failed (unclassified): $e',
+        );
+        showSnack(context, startFailureMessage);
+        return;
+      }
     }
-    await Navigator.push(
-      context,
-      MaterialPageRoute<void>(builder: (_) => buildPlayer(session)),
-    );
-  } on NasneError catch (e) {
+
+    final e = pendingError;
+    pendingError = null;
     if (!context.mounted) return;
     if (e.category == NasneErrorCategory.unsupported) {
-      await showPlaybackUnsupportedDialog(context, subject: unsupportedSubject);
-    } else if (e.category == NasneErrorCategory.validation) {
-      await showCredentialGuidanceDialog(context, userMessageForError(e));
-    } else {
-      // Name the failing stage instead of collapsing everything
-      // into one opaque snack (plan 28): the dialog leads with
-      // the plain explanation and what to do next, and keeps
-      // the classification in its detail section (plan 86).
-      // The failure is also recorded under the ui category
-      // when debug mode is on. No credential or key material
-      // is included.
-      ref.read(diagLogProvider)(DiagCategory.ui, 'playback start failed: $e');
-      await showPlaybackErrorDialog(context, e);
+      await showPlaybackUnsupportedDialog(
+        context,
+        subject: unsupportedSubject,
+      );
+      return;
     }
-  } catch (e) {
-    if (!context.mounted) return;
-    ref.read(diagLogProvider)(
-      DiagCategory.ui,
-      'playback start failed (unclassified): $e',
+    if (e.category == NasneErrorCategory.validation) {
+      await showCredentialGuidanceDialog(context, userMessageForError(e));
+      return;
+    }
+
+    // Name the failing stage instead of collapsing everything
+    // into one opaque snack (plan 28): the dialog leads with
+    // the plain explanation and what to do next, and keeps
+    // the classification in its detail section (plan 86).
+    // The failure is also recorded under the ui category
+    // when debug mode is on. No credential or key material
+    // is included.
+    ref.read(diagLogProvider)(DiagCategory.ui, 'playback start failed: $e');
+    debugPrint(
+      '[tmhb:play] start failed: ${e.category.name} ${e.source} '
+      'code=${e.code ?? '-'} detail=${e.detail ?? '-'}',
     );
-    showSnack(context, startFailureMessage);
+    final action = await _showPlaybackErrorActionDialog(
+      context,
+      e,
+      canRetry: true,
+      allowWaitForTuner: isTunerBusyError(e),
+    );
+    if (!context.mounted) return;
+    if (action == _PlaybackErrorAction.close) return;
+    if (action == _PlaybackErrorAction.waitForTuner) {
+      final waitResult = await _showTunerBusyWaitDialog(
+        context: context,
+        start: start,
+        initialError: e,
+        pollInterval: tunerWaitInterval,
+        maxWait: tunerWaitMaxDuration,
+      );
+      if (!context.mounted) {
+        if (waitResult.session != null) {
+          await waitResult.session!.stop();
+        }
+        return;
+      }
+      if (waitResult.cancelled) return;
+      if (waitResult.session != null) {
+        await Navigator.push(
+          context,
+          MaterialPageRoute<void>(
+            builder: (_) => buildPlayer(waitResult.session!),
+          ),
+        );
+        return;
+      }
+      if (waitResult.nasneError != null) {
+        pendingError = waitResult.nasneError;
+        continue;
+      }
+      if (waitResult.unexpectedError != null) {
+        ref.read(diagLogProvider)(
+          DiagCategory.ui,
+          'playback start failed (unclassified): ${waitResult.unexpectedError}',
+        );
+        showSnack(context, startFailureMessage);
+        return;
+      }
+    }
   }
 }
 
@@ -78,9 +150,29 @@ Future<void> startPlaybackAndShowPlayer({
 /// now sits in a collapsed 「詳細」 section at the bottom;
 /// the same facts are in the diagnostic log as well, so
 /// nothing is lost by moving them out of the way.
-Future<void> showPlaybackErrorDialog(BuildContext context, NasneError e) {
+Future<bool> showPlaybackErrorDialog(
+  BuildContext context,
+  NasneError e, {
+  bool canRetry = false,
+}) async {
+  final action = await _showPlaybackErrorActionDialog(
+    context,
+    e,
+    canRetry: canRetry,
+    allowWaitForTuner: false,
+  );
+  return action == _PlaybackErrorAction.retry;
+}
+
+Future<_PlaybackErrorAction> _showPlaybackErrorActionDialog(
+  BuildContext context,
+  NasneError e, {
+  required bool canRetry,
+  required bool allowWaitForTuner,
+}) async {
   final nextStep = errorNextStepForError(e);
-  return showDialog<void>(
+  final showWait = canRetry && allowWaitForTuner;
+  final action = await showDialog<_PlaybackErrorAction>(
     context: context,
     builder: (context) => AlertDialog(
       title: const Text('再生を開始できませんでした'),
@@ -114,13 +206,212 @@ Future<void> showPlaybackErrorDialog(BuildContext context, NasneError e) {
       ),
       actions: [
         TextButton(
-          autofocus: true,
-          onPressed: () => Navigator.of(context).pop(),
+          autofocus: !canRetry,
+          onPressed: () =>
+              Navigator.of(context).pop(_PlaybackErrorAction.close),
           child: const Text('閉じる'),
         ),
+        if (canRetry)
+          if (showWait)
+            OutlinedButton.icon(
+              onPressed: () =>
+                  Navigator.of(context).pop(_PlaybackErrorAction.retry),
+              icon: const Icon(Icons.refresh),
+              label: const Text('再試行'),
+            )
+          else
+            FilledButton.icon(
+              autofocus: true,
+              onPressed: () =>
+                  Navigator.of(context).pop(_PlaybackErrorAction.retry),
+              icon: const Icon(Icons.refresh),
+              label: const Text('再試行'),
+            ),
+        if (showWait)
+          FilledButton.icon(
+            autofocus: true,
+            onPressed: () =>
+                Navigator.of(context).pop(_PlaybackErrorAction.waitForTuner),
+            icon: const Icon(Icons.hourglass_top),
+            label: const Text('空きを待って自動再生'),
+          ),
       ],
     ),
   );
+  return action ?? _PlaybackErrorAction.close;
+}
+
+class _TunerWaitResult {
+  const _TunerWaitResult._({
+    this.session,
+    this.nasneError,
+    this.unexpectedError,
+    this.cancelled = false,
+  });
+
+  const _TunerWaitResult.cancelled() : this._(cancelled: true);
+
+  const _TunerWaitResult.success(PlaybackSession session)
+      : this._(session: session);
+
+  const _TunerWaitResult.nasneError(NasneError error)
+      : this._(nasneError: error);
+
+  const _TunerWaitResult.unexpectedError(Object error)
+      : this._(unexpectedError: error);
+
+  final PlaybackSession? session;
+  final NasneError? nasneError;
+  final Object? unexpectedError;
+  final bool cancelled;
+}
+
+Future<_TunerWaitResult> _showTunerBusyWaitDialog({
+  required BuildContext context,
+  required Future<PlaybackSession> Function() start,
+  required NasneError initialError,
+  required Duration pollInterval,
+  required Duration maxWait,
+}) async {
+  final result = await showDialog<_TunerWaitResult>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => _TunerBusyWaitDialog(
+      start: start,
+      initialError: initialError,
+      pollInterval: pollInterval,
+      maxWait: maxWait,
+    ),
+  );
+  return result ?? const _TunerWaitResult.cancelled();
+}
+
+class _TunerBusyWaitDialog extends StatefulWidget {
+  const _TunerBusyWaitDialog({
+    required this.start,
+    required this.initialError,
+    required this.pollInterval,
+    required this.maxWait,
+  });
+
+  final Future<PlaybackSession> Function() start;
+  final NasneError initialError;
+  final Duration pollInterval;
+  final Duration maxWait;
+
+  @override
+  State<_TunerBusyWaitDialog> createState() => _TunerBusyWaitDialogState();
+}
+
+class _TunerBusyWaitDialogState extends State<_TunerBusyWaitDialog> {
+  final Stopwatch _sw = Stopwatch();
+  Timer? _pollTimer;
+  late NasneError _lastError = widget.initialError;
+  bool _cancelled = false;
+  bool _popped = false;
+  bool _checking = false;
+  int _attempt = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _sw.start();
+    _pollTimer = Timer(widget.pollInterval, _attemptStart);
+  }
+
+  @override
+  void dispose() {
+    _cancelled = true;
+    _pollTimer?.cancel();
+    _sw.stop();
+    super.dispose();
+  }
+
+  void _popOnce(_TunerWaitResult result) {
+    if (_popped || !mounted) return;
+    _popped = true;
+    _cancelled = true;
+    _pollTimer?.cancel();
+    Navigator.of(context).pop(result);
+  }
+
+  void _cancel() => _popOnce(const _TunerWaitResult.cancelled());
+
+  Future<void> _attemptStart() async {
+    if (_cancelled || !mounted) return;
+    if (_sw.elapsed >= widget.maxWait) {
+      _popOnce(_TunerWaitResult.nasneError(_lastError));
+      return;
+    }
+    setState(() {
+      _attempt++;
+      _checking = true;
+    });
+    try {
+      final session = await widget.start();
+      if (_cancelled || !mounted) {
+        await session.stop();
+        return;
+      }
+      _popOnce(_TunerWaitResult.success(session));
+    } on NasneError catch (e) {
+      if (_cancelled || !mounted) return;
+      if (isTunerBusyError(e) && _sw.elapsed < widget.maxWait) {
+        _lastError = e;
+        setState(() => _checking = false);
+        _pollTimer = Timer(widget.pollInterval, _attemptStart);
+      } else {
+        _popOnce(_TunerWaitResult.nasneError(e));
+      }
+    } catch (e) {
+      if (_cancelled || !mounted) return;
+      _popOnce(_TunerWaitResult.unexpectedError(e));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final statusText = _checking
+        ? 'チューナーの空きを確認しています（$_attempt 回目）...'
+        : _attempt == 0
+            ? 'チューナーが空くのを待っています...'
+            : '引き続き待機しています（$_attempt 回確認済み）...';
+    return AlertDialog(
+      title: const Text('チューナーの空きを待機中'),
+      content: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 2.5),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(statusText),
+                const SizedBox(height: 6),
+                Text(
+                  '空き次第、自動で再生を開始します（最大 ${widget.maxWait.inSeconds} 秒）。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          autofocus: true,
+          onPressed: _cancel,
+          child: const Text('キャンセル'),
+        ),
+      ],
+    );
+  }
 }
 
 /// Guidance shown when the credential pair has not been imported.

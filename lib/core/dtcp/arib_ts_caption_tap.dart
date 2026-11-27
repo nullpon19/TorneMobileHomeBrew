@@ -3,6 +3,7 @@
 /// directly from decrypted streams passing through `DtcpProxy`.
 library;
 
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -295,12 +296,13 @@ class AribTsCaptionTap {
   final Map<int, AribDrcsGlyph> _drcsGlyphs = {};
   final List<AribCaptionLayoutEvent> _superimposeEvents = [];
   final Map<int, AribDrcsGlyph> _superimposeDrcsGlyphs = {};
+  int _skipPrefixBytes = 0;
 
-  List<AribCaptionLayoutEvent> get events => List<AribCaptionLayoutEvent>.unmodifiable(_events);
+  List<AribCaptionLayoutEvent> get events => UnmodifiableListView(_events);
   List<AribCaptionLayoutEvent> get superimposeEvents =>
-      List<AribCaptionLayoutEvent>.unmodifiable(_superimposeEvents);
+      UnmodifiableListView(_superimposeEvents);
   Map<int, AribDrcsGlyph> get drcsGlyphs =>
-      Map<int, AribDrcsGlyph>.unmodifiable(_drcsGlyphs);
+      UnmodifiableMapView(_drcsGlyphs);
   double? get firstStreamPtsSeconds => _firstStreamPtsSeconds;
   int? get captionPid => _captionPid >= 0 ? _captionPid : null;
   int? get superimposePid => _superimposePid >= 0 ? _superimposePid : null;
@@ -309,6 +311,7 @@ class AribTsCaptionTap {
   /// discovered PIDs, anchor PTS, DRCS glyphs, and buffered events.
   void resetFraming() {
     _carry = Uint8List(0);
+    _skipPrefixBytes = 0;
     _patSection = null;
     _patExpectedLen = 0;
     _pmtSection = null;
@@ -343,13 +346,23 @@ class AribTsCaptionTap {
   void feed(List<int> chunk) {
     if (chunk.isEmpty) return;
 
+    var raw = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+    if (_skipPrefixBytes > 0) {
+      if (raw.length <= _skipPrefixBytes) {
+        _skipPrefixBytes -= raw.length;
+        return;
+      }
+      raw = Uint8List.sublistView(raw, _skipPrefixBytes);
+      _skipPrefixBytes = 0;
+    }
+
     final Uint8List buf;
     if (_carry.isEmpty) {
-      buf = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+      buf = raw;
     } else {
-      final combined = Uint8List(_carry.length + chunk.length);
+      final combined = Uint8List(_carry.length + raw.length);
       combined.setAll(0, _carry);
-      combined.setAll(_carry.length, chunk);
+      combined.setAll(_carry.length, raw);
       buf = combined;
       _carry = Uint8List(0);
     }
@@ -380,7 +393,7 @@ class AribTsCaptionTap {
       _processTsPacket(buf, pos);
       final nextPos = pos + _packetStride;
       if (nextPos > buf.length) {
-        _carry = Uint8List.fromList(buf.sublist(pos));
+        _skipPrefixBytes = nextPos - buf.length;
         return;
       }
       pos = nextPos;

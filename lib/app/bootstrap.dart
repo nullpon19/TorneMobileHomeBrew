@@ -12,6 +12,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/core.dart';
 import 'providers.dart';
+import 'ui_control_mode.dart';
 
 /// File and directory names used inside the store directory.
 const registrationFileName = 'registrations.json';
@@ -21,6 +22,22 @@ const channelLogoCacheFileName = 'channel_logo_cache.json';
 const epgCacheFileName = 'epg_cache.json';
 const srmFileName = 'dtcp_srm.json';
 const debugLogsDirectoryName = 'debug_logs';
+
+/// Reads the persisted startup tab before `fileStoreContainer` is constructed
+/// so the first frame opens on the user's chosen screen.
+Future<StartupTabPreference> loadInitialStartupTab(
+  Directory storeDirectory,
+) async {
+  try {
+    final store = JsonFileKeyValueStore(
+      File('${storeDirectory.path}/$keyValueFileName'),
+    );
+    final raw = await store.read(StartupTabPreferenceNotifier.storageKey);
+    return StartupTabPreference.fromStorage(raw);
+  } catch (_) {
+    return StartupTabPreference.home;
+  }
+}
 
 /// A [ProviderContainer] with the local stores wired to JSON
 /// files inside [storeDirectory], instead of the in-memory
@@ -37,6 +54,8 @@ ProviderContainer fileStoreContainer(
   Directory storeDirectory, {
   Directory? mpvCacheDirectory,
   int? androidSdkInt,
+  UiControlMode? defaultUiControlMode,
+  StartupTabPreference initialStartupTab = StartupTabPreference.home,
 }) {
   File file(String name) => File('${storeDirectory.path}/$name');
   return ProviderContainer(
@@ -60,10 +79,17 @@ ProviderContainer fileStoreContainer(
         JsonFileKeyValueStore(file(srmFileName)),
       ),
       storeDirectoryProvider.overrideWithValue(storeDirectory),
+      initialStartupTabProvider.overrideWithValue(initialStartupTab),
+      startupPrefetchEnabledProvider.overrideWithValue(true),
+      softwareUpdateCheckEnabledProvider.overrideWithValue(true),
       if (mpvCacheDirectory != null)
         mpvCacheDirectoryProvider.overrideWithValue(mpvCacheDirectory),
       if (androidSdkInt != null)
         androidSdkIntProvider.overrideWithValue(androidSdkInt),
+      if (defaultUiControlMode != null)
+        defaultTargetUiControlModeProvider.overrideWithValue(
+          defaultUiControlMode,
+        ),
     ],
   );
 }

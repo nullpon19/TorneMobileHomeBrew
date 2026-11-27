@@ -13,10 +13,12 @@ import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/app/bs_epg_providers.dart';
 import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/mpv_compat.dart';
+import 'package:tmhb/app/pip_controller.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
@@ -322,10 +324,10 @@ void main() {
           ),
         ),
       );
-      // Let startup + 6x500ms connect polling finish.
+      // Let startup + 6.5s connect polling finish.
       await tester.pump();
-      for (var i = 0; i < 8; i++) {
-        await tester.pump(const Duration(milliseconds: 500));
+      for (var i = 0; i < 24; i++) {
+        await tester.pump(const Duration(milliseconds: 300));
       }
 
       expect(helper.volumeMaxCalls, greaterThanOrEqualTo(1));
@@ -359,6 +361,261 @@ void main() {
       expect(helper.tryConnectCalls, 0);
       expect(find.text('Tailscale が起動していません'), findsNothing);
     });
+
+    testWidgets(
+      'gates child until Tailscale VPN + nasne reachability settle and resets httpClientProvider',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+        var httpBuildCount = 0;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              httpClientProvider.overrideWith((ref) {
+                httpBuildCount++;
+                final client = _DummyHttpClient();
+                ref.onDispose(client.close);
+                return client;
+              }),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: const Duration(milliseconds: 50),
+                pollInterval: const Duration(milliseconds: 50),
+                autoConnectMaxWait: const Duration(milliseconds: 250),
+                postVpnReachableMaxWait: const Duration(milliseconds: 500),
+                child: Consumer(
+                  builder: (context, ref, _) {
+                    if (ref.watch(selectedRegistrationProvider) != null) {
+                      ref.watch(httpClientProvider);
+                    }
+                    return const Scaffold(body: Text('home-mounted'));
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 10));
+
+        // While waiting for Tailscale auto-connect, child must stay gated so
+        // pre-VPN requests cannot saturate sockets.
+        expect(find.text('home-mounted'), findsNothing);
+        expect(httpBuildCount, 0);
+        expect(find.text('Tailscale に自動接続しています…'), findsOneWidget);
+
+        // First VPN activates (tun interface), but nasne is not yet reachable:
+        // guard must keep waiting instead of tearing down early.
+        helper.vpnActive = true;
+        await tester.pump(const Duration(milliseconds: 60));
+        expect(find.text('home-mounted'), findsNothing);
+        expect(httpBuildCount, 0);
+        expect(find.text('Tailscale 接続済み — nasne の応答を待機中…'), findsOneWidget);
+
+        // Once nasne actually responds, guard releases child cleanly.
+        helper.reachable = true;
+        await tester.pump(const Duration(milliseconds: 60));
+        await tester.pumpAndSettle();
+        expect(find.text('home-mounted'), findsOneWidget);
+        expect(find.text('Tailscale に接続しました'), findsOneWidget);
+        expect(httpBuildCount, 1);
+      },
+    );
+
+    testWidgets(
+      'AppShell hides Tailscale rail button and bypasses gate when Tailscale is not installed',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const []),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.byIcon(Icons.vpn_lock), findsNothing);
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'tapping 再確認 re-probes reachability and releases gate without soft-lock',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: Duration(milliseconds: 20),
+                pollInterval: Duration(milliseconds: 20),
+                autoConnectMaxWait: Duration(milliseconds: 60),
+                postVpnReachableMaxWait: Duration(milliseconds: 100),
+                child: Scaffold(body: Text('home-mounted')),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        expect(find.text('home-mounted'), findsNothing);
+
+        helper.reachable = true;
+        await tester.tap(find.text('再確認'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+        expect(find.text('home-mounted'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'dismissing Tailscale dialog via barrier tap releases gate cleanly',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: Duration(milliseconds: 20),
+                pollInterval: Duration(milliseconds: 20),
+                autoConnectMaxWait: Duration(milliseconds: 60),
+                postVpnReachableMaxWait: Duration(milliseconds: 100),
+                child: Scaffold(body: Text('home-mounted')),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        await tester.tapAt(const Offset(10, 10));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+        expect(find.text('home-mounted'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'manual return via AppLifecycleState.resumed after このまま使う clears dismissed state and reconnects',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+        late WidgetRef capturedRef;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: const Duration(milliseconds: 20),
+                pollInterval: const Duration(milliseconds: 20),
+                autoConnectMaxWait: const Duration(milliseconds: 60),
+                postVpnReachableMaxWait: const Duration(milliseconds: 100),
+                child: Consumer(
+                  builder: (context, ref, _) {
+                    capturedRef = ref;
+                    return const Scaffold(body: Text('home-mounted'));
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        await tester.tap(find.text('このまま使う'));
+        await tester.pumpAndSettle();
+        expect(find.text('home-mounted'), findsOneWidget);
+
+        // User later launches Tailscale manually from rail, enables VPN, and returns.
+        capturedRef
+            .read(tailscaleManualLaunchSignalProvider.notifier)
+            .notifyLaunched();
+        await tester.pump();
+        helper.vpnActive = true;
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        await tester.pump();
+
+        // While nasne is still settling after return, guard polls post-VPN instead
+        // of aborting on stale _dismissedForSession.
+        helper.reachable = true;
+        await tester.pump(const Duration(milliseconds: 25));
+        await tester.pumpAndSettle();
+
+        expect(find.text('nasne に接続しました'), findsOneWidget);
+      },
+    );
   });
 
   group('PlayerScreen loading indicator & Android cache sizing', () {
@@ -420,6 +677,28 @@ void main() {
           playingStarted: true,
           playingNow: false,
           buffering: true,
+        ),
+        isNull,
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+          resuming: true,
+        ),
+        '再接続中…',
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: true,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+          resuming: true,
         ),
         isNull,
       );
@@ -489,7 +768,9 @@ void main() {
       expect(hour.useDiskCache, isTrue);
       expect(hour.demuxerMaxBytes, maxDiskCacheBytes);
       expect(hour.demuxerMaxBackBytes, maxDiskBackCacheBytes);
-      expect(hour.networkTimeoutSeconds, 600);
+      expect(hour.networkTimeoutSeconds, 3720);
+      expect(hour.startTimeoutSeconds, 90);
+      expect(hour.rebufferWaitSeconds, 5);
 
       // Clamps when available disk is tight, leaving >= 1 GiB (1024 MiB) free
       // after both forward and backward disk cache layers.
@@ -532,7 +813,7 @@ void main() {
       expect(liveOff.cachePauseInitial, isFalse);
       expect(liveOff.cachePause, isFalse);
       expect(liveOff.cachePauseWaitSeconds, 0);
-      expect(liveOff.readaheadSeconds, livePauseTimeshiftSeconds);
+      expect(liveOff.readaheadSeconds, liveMaxReadaheadSeconds);
       expect(liveOff.demuxerMaxBytes, 105 * 1024 * 1024);
 
       const liveTightAvail = 1400 * 1024 * 1024;
@@ -577,9 +858,59 @@ void main() {
       expect(liveThreeMin.cachePauseInitial, isTrue);
       expect(liveThreeMin.cachePause, isTrue);
       expect(liveThreeMin.cachePauseWaitSeconds, 180);
-      expect(liveThreeMin.readaheadSeconds, livePauseTimeshiftSeconds);
-      expect(liveThreeMin.networkTimeoutSeconds, 210);
+      expect(liveThreeMin.rebufferWaitSeconds, 15);
+      expect(liveThreeMin.readaheadSeconds, liveMaxReadaheadSeconds);
+      expect(liveThreeMin.networkTimeoutSeconds, 360);
       expect(liveThreeMin.startTimeoutSeconds, 225);
+
+      final live30s = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 30,
+        isAndroid: true,
+        availableDiskBytes: 4 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(live30s.cachePauseWaitSeconds, 30);
+      expect(live30s.rebufferWaitSeconds, 15);
+      expect(live30s.networkTimeoutSeconds, 360);
+
+      final live15s = computeMpvBufferPlan(
+        live: true,
+        bufferSeconds: 15,
+        isAndroid: true,
+        availableDiskBytes: 4 * 1024 * 1024 * 1024,
+        cacheDirPath: '/tmp/mpv_cache',
+      );
+      expect(live15s.cachePauseWaitSeconds, 15);
+      expect(live15s.rebufferWaitSeconds, 15);
+      expect(live15s.networkTimeoutSeconds, 360);
+
+      expect(recordedDemuxerProbeSizeBytes(useMobile: true), 512 * 1024);
+      expect(recordedDemuxerProbeSizeBytes(useMobile: false), 2 * 1024 * 1024);
+      expect(
+        shouldDeferPlayerInterruption(
+          playingNow: true,
+          bufferedAheadSeconds: 12.0,
+          bufferDeltaSeconds: 0.0,
+          proxyReconnecting: true,
+          buffering: false,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldDeferPlayerInterruption(
+          playingNow: false,
+          bufferedAheadSeconds: 0.2,
+          bufferDeltaSeconds: 0.0,
+          proxyReconnecting: false,
+          buffering: true,
+        ),
+        isFalse,
+      );
+      expect(
+        computeEffectiveStallTimeout(live: true, rebufferWaitSeconds: 15),
+        const Duration(seconds: 35),
+      );
     });
 
     testWidgets(
@@ -637,11 +968,11 @@ void main() {
         expect(find.byType(FireTvTextInputField), findsOneWidget);
 
         await tester.scrollUntilVisible(
-          find.text('ナイトモード'),
+          find.text('ダークモード'),
           200,
           scrollable: find.byType(Scrollable).first,
         );
-        await tester.tap(find.text('ナイトモード'));
+        await tester.tap(find.text('ダークモード'));
         await tester.pumpAndSettle();
         expect(await kv.read('firetv_night_mode'), 'true');
 
@@ -3229,7 +3560,7 @@ void main() {
 
   group('Phase 20: Title unification, EPG reserved settings & ruler bars', () {
     testWidgets(
-      'SettingsScreen displays torne HB FireTV footer and persists EPG reserved style',
+      'SettingsScreen displays torne mobile HB footer and persists EPG reserved style',
       (tester) async {
         tester.view.physicalSize = const Size(1280, 900);
         tester.view.devicePixelRatio = 1.0;
@@ -3245,12 +3576,14 @@ void main() {
         await tester.pumpAndSettle();
 
         await tester.scrollUntilVisible(
-          find.text('録画予約済みの表示'),
+          find.text('赤枠'),
           200,
           scrollable: find.byType(Scrollable).first,
         );
         final segFinder = find.byType(SegmentedButton<EpgReservedStyle>);
         expect(segFinder, findsOneWidget);
+        await tester.ensureVisible(segFinder);
+        await tester.pumpAndSettle();
         expect(
           tester.widget<SegmentedButton<EpgReservedStyle>>(segFinder).selected,
           {EpgReservedStyle.fill},
@@ -3265,11 +3598,11 @@ void main() {
         expect(await kv.read('firetv_epg_reserved_style'), 'fill');
 
         await tester.scrollUntilVisible(
-          find.textContaining('torne HB FireTV'),
+          find.textContaining('torne mobile HB'),
           300,
           scrollable: find.byType(Scrollable).first,
         );
-        expect(find.textContaining('torne HB FireTV'), findsOneWidget);
+        expect(find.textContaining('torne mobile HB'), findsOneWidget);
       },
     );
 
@@ -3533,7 +3866,7 @@ void main() {
         // Complete registrations load so HomeScreen builds its refresh button & cards.
         storeCompleter.complete(const [reg]);
         await tester.pumpAndSettle();
-        expect(find.text('torne HB FireTV'), findsOneWidget);
+        expect(find.text('torne mobile HB'), findsOneWidget);
         expect(find.text('本体情報'), findsOneWidget);
         expect(primaryIsInRail(), isTrue);
 
@@ -4903,18 +5236,31 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(liveFetches, 1);
-        expect(epgFetches, 1);
+        expect(liveFetches, 0);
+        expect(epgFetches, 0);
 
         final container = ProviderScope.containerOf(
           tester.element(find.byType(AppShell)),
         );
         container.read(tabIndexProvider.notifier).select(AppTabs.live);
         await tester.pumpAndSettle();
+        expect(liveFetches, 1);
+        expect(find.textContaining('Live節目#1'), findsOneWidget);
+
+        container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pumpAndSettle();
+        expect(epgFetches, 1);
+
+        container.read(tabIndexProvider.notifier).select(AppTabs.live);
+        await tester.pump();
+        expect(find.byType(LoadingView), findsNothing);
+        await tester.pumpAndSettle();
         expect(liveFetches, 2);
         expect(find.textContaining('Live節目#2'), findsOneWidget);
 
         container.read(tabIndexProvider.notifier).select(AppTabs.epg);
+        await tester.pump();
+        expect(find.byType(LoadingView), findsNothing);
         await tester.pumpAndSettle();
         expect(epgFetches, 2);
       },
@@ -6130,6 +6476,159 @@ void main() {
             timePosSeconds: 30,
           ),
           isFalse,
+        );
+
+        // Jumping to "現在位置へ" with 15s live buffer keeps ~16.5s headroom so
+        // mpv does not drop to 0s/15s rebuffering.
+        final jump15 = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 30,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 100,
+        );
+        expect(jump15.canStayInCache, isTrue);
+        expect(jump15.alreadyAtLiveTarget, isFalse);
+        expect(jump15.targetSeconds, closeTo(128.5, 0.01));
+        expect(jump15.deltaSeconds, closeTo(28.5, 0.01));
+
+        // Already at or past realtime-15s -> stay put inside cache without rebuffering.
+        final alreadyAtBufferTarget = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 15,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 128.0,
+        );
+        expect(alreadyAtBufferTarget.canStayInCache, isTrue);
+        expect(alreadyAtBufferTarget.alreadyAtLiveTarget, isTrue);
+        expect(alreadyAtBufferTarget.deltaSeconds, 0.0);
+
+        // 0s live buffer targets liveEdge - 0.5s.
+        final jump0 = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 0,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 20,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 120,
+        );
+        expect(jump0.canStayInCache, isTrue);
+        expect(jump0.targetSeconds, closeTo(144.5, 0.01));
+
+        // Exhausted 5-min cache window (unknown staleness) falls back to reset.
+        final exhausted = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 300,
+          totalPauseLagSeconds: 350,
+          cacheStartSeconds: 50,
+          liveEdgeSeconds: 145,
+          currentPosSeconds: 60,
+        );
+        expect(exhausted.canStayInCache, isFalse);
+
+        // Long 45-min rewind stays in cache as long as liveEdge is fresh.
+        final longRewindFresh = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 2680,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 2700,
+          currentPosSeconds: 5,
+          liveEdgeStalenessSeconds: 2.0,
+          cacheEof: false,
+        );
+        expect(longRewindFresh.canStayInCache, isTrue);
+        expect(longRewindFresh.alreadyAtLiveTarget, isFalse);
+        expect(longRewindFresh.targetSeconds, closeTo(2683.5, 0.01));
+
+        // Stalled cache edge (>20s behind wall clock) falls back to upstream reset.
+        final stalledEdge = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 600,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 900,
+          currentPosSeconds: 300,
+          liveEdgeStalenessSeconds: 45.0,
+          cacheEof: false,
+        );
+        expect(stalledEdge.canStayInCache, isFalse);
+
+        // Cache at EOF falls back to upstream reset even if staleness is 0.
+        final cacheAtEof = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 60,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 900,
+          currentPosSeconds: 820,
+          liveEdgeStalenessSeconds: 0.0,
+          cacheEof: true,
+        );
+        expect(cacheAtEof.canStayInCache, isFalse);
+
+        // parseDemuxerCacheStateRange extracts `eof` flag accurately.
+        final parsedEof = parseDemuxerCacheStateRange(
+          '{"eof":true,"cache-duration":12.5,"seekable-ranges":[{"start":10.0,"end":900.0}]}',
+          currentPosSeconds: 500.0,
+        );
+        expect(parsedEof, isNotNull);
+        expect(parsedEof!.eof, isTrue);
+
+        final parsedActive = parseDemuxerCacheStateRange(
+          '{"eof":false,"cache-duration":12.5,"seekable-ranges":[{"start":10.0,"end":900.0}]}',
+          currentPosSeconds: 500.0,
+        );
+        expect(parsedActive, isNotNull);
+        expect(parsedActive!.eof, isFalse);
+
+        // Niconico Jikkyo delay mirrors configured live buffer during normal
+        // playback without double-subtracting during paused/rewound playback.
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 0,
+            bufferedAheadSeconds: 0.5,
+          ),
+          5,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 15.0,
+          ),
+          20,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: false,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 16.4,
+          ),
+          21,
+        );
+        expect(
+          resolveLiveJikkyoDelaySeconds(
+            baseLiveDelaySeconds: 5,
+            liveDelayedByPause: true,
+            configuredLiveBufferSeconds: 15,
+            bufferedAheadSeconds: 45.0,
+          ),
+          5,
         );
       },
     );
@@ -11093,6 +11592,168 @@ void main() {
       );
 
       testWidgets(
+        'LiveChannelSwitchPreviewCard places attribute badges next to broadcast time below the title',
+        (tester) async {
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:preview-attr-pos',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final entry = LiveChannelSwitchEntry(
+            channel: LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+              bandId: '0/video/LiveTuner/DTTB',
+              channelName: 'テスト局',
+              programTitle: '[字][二]あいうえお番組タイトルテスト',
+              programStart: DateTime(2026, 11, 27, 10, 0),
+              programEnd: DateTime(2026, 11, 27, 11, 0),
+            ),
+            primaryReg: reg,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData.dark(),
+              home: Scaffold(
+                body: Stack(
+                  children: [
+                    LiveChannelSwitchPreviewCard(
+                      direction: ChannelSwitchDirection.next,
+                      visible: true,
+                      entry: entry,
+                      onTap: () {},
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final titleRect = tester.getRect(find.text('あいうえお番組タイトルテスト'));
+          final timeRect = tester.getRect(find.text('10:00–11:00'));
+          final jimakuRect = tester.getRect(find.text('字'));
+          final dualRect = tester.getRect(find.text('二'));
+
+          expect(jimakuRect.top, greaterThanOrEqualTo(titleRect.bottom - 2));
+          expect(jimakuRect.left, greaterThan(timeRect.right));
+          expect(dualRect.left, greaterThan(jimakuRect.right));
+        },
+      );
+
+      testWidgets(
+        'LiveScreen shows loading spinner and resets httpClientProvider on retry after error',
+        (tester) async {
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:live-retry-test',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          var shouldFail = true;
+          var httpBuilds = 0;
+          Completer<List<LiveBand>>? reloadCompleter;
+
+          await tester.pumpWidget(
+            ProviderScope(
+              retry: (_, _) => null,
+              overrides: [
+                httpClientProvider.overrideWith((ref) {
+                  httpBuilds++;
+                  final c = _DummyHttpClient();
+                  ref.onDispose(c.close);
+                  return c;
+                }),
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                channelsProvider(reg).overrideWith((ref) async => const []),
+                channelLogosProvider(reg).overrideWith((ref) async => const {}),
+                epgGuideProvider(reg).overrideWith(
+                  (ref) async => const EpgGuide(
+                    broadcastingType: terrestrialBroadcastingType,
+                    services: [],
+                  ),
+                ),
+                schedulesProvider(reg).overrideWith((ref) async => const []),
+                liveChannelsProvider(reg).overrideWith((ref) async {
+                  ref.watch(httpClientProvider);
+                  if (shouldFail) {
+                    throw NasneError.unreachable('test');
+                  }
+                  reloadCompleter = Completer<List<LiveBand>>();
+                  return reloadCompleter!.future;
+                }),
+              ],
+              child: const MaterialApp(home: LiveScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(httpBuilds, 1);
+          expect(find.text('再試行'), findsOneWidget);
+          shouldFail = false;
+          await tester.tap(find.text('再試行'));
+          await tester.pump();
+
+          expect(httpBuilds, 2);
+          expect(find.byType(CircularProgressIndicator), findsOneWidget);
+          expect(find.text('再試行'), findsNothing);
+
+          reloadCompleter?.complete(const []);
+          await tester.pumpAndSettle();
+        },
+      );
+
+      test('PipController exposes method channel controls and mode stream events', () async {
+        const methodChannel = MethodChannel('com.markun.tmhb/pip_test');
+        final calls = <MethodCall>[];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(methodChannel, (call) async {
+              calls.add(call);
+              switch (call.method) {
+                case 'isSupported':
+                  return true;
+                case 'enterPip':
+                  return true;
+                case 'exitPip':
+                  return true;
+                case 'setAutoPipEnabled':
+                  return true;
+              }
+              return null;
+            });
+        addTearDown(
+          () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+              .setMockMethodCallHandler(methodChannel, null),
+        );
+
+        final events = StreamController<bool>.broadcast();
+        addTearDown(events.close);
+
+        final pip = PipController(
+          channel: methodChannel,
+          eventStreamOverride: events.stream,
+        );
+        expect(await pip.isSupported(), isTrue);
+        expect(await pip.enterPip(aspectWidth: 16, aspectHeight: 9), isTrue);
+        await pip.setAutoPipEnabled(true);
+        expect(await pip.exitPip(), isTrue);
+        expect(
+          calls.map((c) => c.method).toList(),
+          ['isSupported', 'enterPip', 'setAutoPipEnabled', 'exitPip'],
+        );
+        expect(
+          pip.onPipModeChanged,
+          emitsInOrder([true, false]),
+        );
+        events.add(true);
+        events.add(false);
+      });
+
+      testWidgets(
         'LiveScreen renders EPG loading indicator until guide completes, then shows 3-digit number, logo plate, and next programme',
         (tester) async {
           tester.view.physicalSize = const Size(960, 540);
@@ -11872,6 +12533,43 @@ void main() {
     );
 
     test(
+      'AribTsCaptionTap does not double-process trailing packet on 192B MPEG-TTS chunk boundary',
+      () {
+        final tap = AribTsCaptionTap();
+        final rawTs = AribTsCaptionTap.buildSyntheticSuperimposeTsPacket(
+          text: '速報テスト',
+          bgColorIndex: 1,
+          fgColorIndex: 7,
+          builtinSoundId: 2,
+          clearAfterSeconds: 5.0,
+        );
+        expect(rawTs.length % 188, 0);
+        final ttsBuilder = BytesBuilder(copy: false);
+        for (var i = 0; i < rawTs.length; i += 188) {
+          ttsBuilder.add([0x00, 0x00, 0x00, (i ~/ 188) & 0xFF]);
+          ttsBuilder.add(Uint8List.sublistView(rawTs, i, i + 188));
+        }
+        final ttsChunk = ttsBuilder.toBytes();
+        expect(ttsChunk.length % 192, 0);
+
+        // Feed exact multiple of 192B MPEG-TTS packets, then a null filler TTS packet.
+        tap.feed(ttsChunk);
+        final nullTts = Uint8List(192)..fillRange(0, 192, 0xFF);
+        nullTts[0] = 0x00;
+        nullTts[1] = 0x00;
+        nullTts[2] = 0x00;
+        nullTts[3] = 0x01;
+        nullTts[4] = 0x47;
+        nullTts[5] = 0x1F;
+        nullTts[6] = 0xFF;
+        nullTts[7] = 0x10;
+        tap.feed(nullTts);
+
+        expect(tap.superimposeEvents, hasLength(1));
+      },
+    );
+
+    test(
       'resolveActiveSuperimposeCues handles live immediate display/clear/stale timeout and recorded PTS sync',
       () {
         final t0 = DateTime(2026, 11, 25, 14, 0, 0);
@@ -11947,6 +12645,34 @@ void main() {
             events: [noClearEvent],
             isLive: true,
             now: t0.add(superimposeStaleTimeout),
+          ).cues,
+          isEmpty,
+        );
+
+        // Live with 15s buffer delay: holds alert/chime until buffered video reaches t0 + 15s.
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: true,
+            now: t0.add(const Duration(seconds: 2)),
+            liveBufferDelaySeconds: 15.0,
+          ).cues,
+          isEmpty,
+        );
+        final delayedActive = resolveActiveSuperimposeCues(
+          events: [fixedEvent],
+          isLive: true,
+          now: t0.add(const Duration(seconds: 16)),
+          liveBufferDelaySeconds: 15.0,
+        );
+        expect(delayedActive.cues, hasLength(1));
+        expect(delayedActive.soundSequence, 7);
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: true,
+            now: t0.add(const Duration(seconds: 21)),
+            liveBufferDelaySeconds: 15.0,
           ).cues,
           isEmpty,
         );
@@ -12953,6 +13679,13 @@ class _StubMetadata implements MetadataService {
 class _StubLiveCatalog implements LiveCatalogService {
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _DummyHttpClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    throw UnimplementedError();
+  }
 }
 
 class _FixedTitlesNotifier extends TitlesNotifier {

@@ -144,8 +144,14 @@ class ControlFrame {
       throw NasneError.parse('dtcp:ake', cause: 'invalid AKE frame header');
     }
     final totalLength = (data[1] << 8) | data[2];
+    if (totalLength < 8) {
+      throw NasneError.parse(
+        'dtcp:ake',
+        cause: 'invalid AKE frame length $totalLength',
+      );
+    }
     final frameLength = totalLength + 3;
-    if (totalLength < 8 || data.length < frameLength) return null;
+    if (data.length < frameLength) return null;
     final frameType = data[3] & 0x0F;
     if (frameType != _frameControl && frameType != _frameAccepted) {
       throw NasneError.parse(
@@ -185,7 +191,9 @@ typedef AkeConnectionFactory = Future<AkeConnection> Function(
 );
 
 class _SocketAkeConnection implements AkeConnection {
-  _SocketAkeConnection(this._socket);
+  _SocketAkeConnection(this._socket) {
+    _socket.done.then<void>((_) {}, onError: (_) {});
+  }
   final Socket _socket;
 
   @override
@@ -196,7 +204,10 @@ class _SocketAkeConnection implements AkeConnection {
 
   @override
   Future<void> close() async {
-    await _socket.flush().catchError((_) {});
+    await _socket
+        .flush()
+        .timeout(const Duration(seconds: 1), onTimeout: () {})
+        .catchError((_) {});
     _socket.destroy();
   }
 }
@@ -674,8 +685,8 @@ class AkeClient {
             throw NasneError.parse('dtcp:ake', cause: 'invalid RTT_TEST frame');
           }
           receivedRttTest = frame.payload;
-          diag(DiagCategory.ake, 'rtt: test received');
           await reader.send(frame.accepted(payload: rttTestResponse!));
+          diag(DiagCategory.ake, 'rtt: test received');
         case AkeCommands.rttVerify:
           if (frame.isResponse ||
               rttExpectedTest == null ||
@@ -848,7 +859,13 @@ class _FrameReader {
 
   void _drain() {
     while (true) {
-      final parsed = ControlFrame.tryParse(Uint8List.fromList(_buffer));
+      final (ControlFrame, int)? parsed;
+      try {
+        parsed = ControlFrame.tryParse(Uint8List.fromList(_buffer));
+      } catch (e) {
+        _fail(e);
+        return;
+      }
       if (parsed == null) return;
       final (frame, consumed) = parsed;
       diag(

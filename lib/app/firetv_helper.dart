@@ -7,6 +7,7 @@
 /// back without throwing.
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -29,16 +30,33 @@ class CredentialCandidateFile {
 
 /// Platform channel wrapper for Fire TV specific helpers.
 class FireTvHelper {
-  FireTvHelper({MethodChannel? channel, bool? isAndroidOverride})
-    : _channel = channel ?? const MethodChannel(_channelName),
-      _isAndroidOverride = isAndroidOverride; // ignore: prefer_initializing_formals
+  FireTvHelper({
+    MethodChannel? channel,
+    bool? isAndroidOverride,
+    bool? isTvOverride,
+  }) : _channel = channel ?? const MethodChannel(_channelName),
+       _isAndroidOverride = isAndroidOverride, // ignore: prefer_initializing_formals
+       _isTvOverride = isTvOverride; // ignore: prefer_initializing_formals
 
   static const String _channelName = 'com.markun.tmhb/firetv_helper';
 
   final MethodChannel _channel;
   final bool? _isAndroidOverride;
+  final bool? _isTvOverride;
 
   bool get isAndroid => _isAndroidOverride ?? (!kIsWeb && Platform.isAndroid);
+
+  Future<bool> isTvDevice() async {
+    if (_isTvOverride != null) return _isTvOverride;
+    if (!isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('isTvDevice') ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
 
   Future<bool> setMediaVolumeMax() async {
     if (!isAndroid) return false;
@@ -219,20 +237,66 @@ class FireTvHelper {
   }
 
   /// Checks TCP reachability to [host] on nasne's WebAPI port (64210) or
-  /// UPnP port (64220).
+  /// UPnP port (64220) in parallel, returning as soon as either connects.
   Future<bool> isNasneReachable(
     String host, {
-    Duration timeout = const Duration(milliseconds: 1800),
+    Duration timeout = const Duration(milliseconds: 900),
   }) async {
-    for (final port in const [64210, 64220]) {
-      try {
-        final socket = await Socket.connect(host, port, timeout: timeout);
-        socket.destroy();
-        return true;
-      } catch (_) {
-        // Try next port or treat as unreachable.
+    final completer = Completer<bool>();
+    var remaining = 2;
+
+    void onAttemptDone(bool ok) {
+      remaining--;
+      if (ok && !completer.isCompleted) {
+        completer.complete(true);
+      } else if (remaining == 0 && !completer.isCompleted) {
+        completer.complete(false);
       }
     }
-    return false;
+
+    for (final port in const [64210, 64220]) {
+      unawaited(() async {
+        try {
+          final socket = await Socket.connect(host, port, timeout: timeout);
+          socket.destroy();
+          onAttemptDone(true);
+        } catch (_) {
+          onAttemptDone(false);
+        }
+      }());
+    }
+    return completer.future;
+  }
+
+  /// Checks TCP reachability across all [hosts] in parallel, completing `true`
+  /// as soon as any registered nasne responds.
+  Future<bool> isAnyNasneReachable(
+    Iterable<String> hosts, {
+    Duration timeout = const Duration(milliseconds: 900),
+  }) async {
+    final uniqueHosts = <String>{
+      for (final host in hosts)
+        if (host.trim().isNotEmpty) host.trim(),
+    }.toList();
+    if (uniqueHosts.isEmpty) return false;
+    final completer = Completer<bool>();
+    var remaining = uniqueHosts.length;
+    for (final host in uniqueHosts) {
+      unawaited(() async {
+        var ok = false;
+        try {
+          ok = await isNasneReachable(host, timeout: timeout);
+        } catch (_) {
+          ok = false;
+        }
+        remaining--;
+        if (ok && !completer.isCompleted) {
+          completer.complete(true);
+        } else if (remaining == 0 && !completer.isCompleted) {
+          completer.complete(false);
+        }
+      }());
+    }
+    return completer.future;
   }
 }

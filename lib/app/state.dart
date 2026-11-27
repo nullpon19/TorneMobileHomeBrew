@@ -8,11 +8,13 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/core.dart';
+import 'bs_epg_providers.dart';
 import 'providers.dart';
 
 /// Tab indices of the app shell (plan 5.6; live viewing added
@@ -67,18 +69,22 @@ final registrationsProvider =
 /// first registered device.
 class SelectedHostNotifier extends Notifier<String?> {
   static const _key = 'selected_host';
+  bool _dirty = false;
 
   @override
   String? build() {
+    _dirty = false;
     final store = ref.watch(keyValueStoreProvider);
     Future.microtask(() async {
       final value = await store.read(_key);
+      if (!ref.mounted || _dirty) return;
       if (value != null && state == null) state = value;
     });
     return null;
   }
 
   Future<void> select(String? host) async {
+    _dirty = true;
     state = host;
     final store = ref.read(keyValueStoreProvider);
     if (host == null) {
@@ -108,7 +114,7 @@ final selectedRegistrationProvider = Provider<RegisteredNasne?>((ref) {
 /// (e.g. the home screen's "go register" prompt).
 class TabIndexNotifier extends Notifier<int> {
   @override
-  int build() => AppTabs.home;
+  int build() => ref.read(initialStartupTabProvider).tabIndex;
 
   void select(int index) => state = index;
 }
@@ -126,6 +132,18 @@ final deviceInfoProvider = FutureProvider.family<DeviceInfo, RegisteredNasne>(
   (ref, reg) =>
       ref.watch(deviceServicesProvider(reg)).deviceInfo.getDeviceInfo(),
 );
+
+/// Non-blocking firmware update check for Home's device section.
+final softwareUpdateAvailableProvider =
+    FutureProvider.family<bool?, RegisteredNasne>((ref, reg) {
+      if (!ref.watch(softwareUpdateCheckEnabledProvider)) {
+        return Future<bool?>.value(null);
+      }
+      return ref
+          .watch(deviceServicesProvider(reg))
+          .deviceInfo
+          .checkSoftwareUpdate();
+    });
 
 /// One HDD list entry together with its detail (null when the
 /// entry is not mounted/registered or the detail fetch failed;
@@ -220,9 +238,10 @@ Future<Map<int, List<int>>> loadCachedOrFetchChannelLogos(
   RegisteredNasne reg,
   int broadcastingType, {
   List<Channel> channels = const [],
+  String? channelsSignature,
 }) async {
   final cache = ref.watch(channelLogoCacheProvider);
-  final sig = buildChannelLogoSignature(channels);
+  final sig = channelsSignature ?? buildChannelLogoSignature(channels);
   final expectedSig = sig.isNotEmpty ? sig : null;
   final cached = await cache.load(
     reg.host,
@@ -279,10 +298,19 @@ Future<void> clearChannelLogoCache(
 /// Channel logos (terrestrial): serviceId -> PNG bytes (plan 21), backed by
 /// [channelLogoCacheProvider].
 final channelLogosProvider =
-    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>(
-      (ref, reg) =>
-          loadCachedOrFetchChannelLogos(ref, reg, terrestrialBroadcastingType),
-    );
+    FutureProvider.family<Map<int, List<int>>, RegisteredNasne>((ref, reg) {
+      final sig = ref.watch(
+        channelsProvider(reg).select(
+          (v) => buildChannelLogoSignature(v.value ?? const <Channel>[]),
+        ),
+      );
+      return loadCachedOrFetchChannelLogos(
+        ref,
+        reg,
+        terrestrialBroadcastingType,
+        channelsSignature: sig,
+      );
+    });
 
 /// Reservations in chronological order (the device returns them in
 /// its own order; the UI contract is time order, plan 5.6).
@@ -422,19 +450,116 @@ final titleCountsProvider = FutureProvider.family<TitleCounts, RegisteredNasne>(
 
 /// Invalidates every per-device data provider for [reg]; used by the
 /// refresh actions. The device stays the source of truth.
-void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
+void invalidateDeviceData(
+  WidgetRef ref,
+  RegisteredNasne reg, {
+  bool clearLogos = true,
+}) {
   ref.invalidate(deviceInfoProvider(reg));
+  ref.invalidate(softwareUpdateAvailableProvider(reg));
   ref.invalidate(hddDetailsProvider(reg));
   ref.invalidate(liveStatusProvider(reg));
   ref.invalidate(recNgProvider(reg));
   ref.invalidate(networkInfoProvider(reg));
   ref.invalidate(bcasInfoProvider(reg));
   ref.invalidate(channelsProvider(reg));
+  ref.invalidate(bsChannelsProvider(reg));
+  ref.invalidate(csChannelsProvider(reg));
   ref.invalidate(epgGuideProvider(reg));
-  unawaited(clearChannelLogoCache(ref, reg));
-  ref.invalidate(channelLogosProvider(reg));
+  ref.invalidate(bsEpgGuideProvider(reg));
+  if (clearLogos) {
+    unawaited(invalidateChannelLogosWithCacheReset(ref, reg));
+  }
   ref.invalidate(schedulesProvider(reg));
   ref.invalidate(titlesProvider(reg));
   ref.invalidate(titleCountsProvider(reg));
   ref.invalidate(liveChannelsProvider(reg));
 }
+
+/// Closes pooled pre-VPN/stale HTTP connections and refreshes all registered
+/// nasne units. Invalidating [httpClientProvider] cascades through
+/// [deviceServicesProvider] to every per-device provider automatically.
+void resetNetworkAndInvalidateDevices(
+  WidgetRef ref,
+  Iterable<RegisteredNasne> regs,
+) {
+  ref.invalidate(httpClientProvider);
+  for (final r in regs) {
+    invalidateDeviceData(ref, r, clearLogos: false);
+  }
+}
+
+/// Persisted list of registered generic DLNA / DTCP-IP MediaServers
+/// (`keyValueStoreProvider` under key `dlna_servers_v1`).
+class DlnaServersNotifier extends Notifier<List<RegisteredDlnaServer>> {
+  static const _key = 'dlna_servers_v1';
+  bool _dirty = false;
+
+  @override
+  List<RegisteredDlnaServer> build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(_key);
+      if (!ref.mounted || _dirty || raw == null || raw.isEmpty) return;
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is! List) return;
+        final list = [
+          for (final item in decoded)
+            if (item is Map)
+              RegisteredDlnaServer.fromJson(item.cast<String, dynamic>()),
+        ];
+        if (ref.mounted && !_dirty) {
+          state = list;
+        }
+      } catch (_) {}
+    });
+    return const [];
+  }
+
+  Future<void> addOrReplace(RegisteredDlnaServer server) async {
+    _dirty = true;
+    final next = [
+      for (final existing in state)
+        if (existing.id != server.id) existing,
+      server,
+    ];
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> remove(String id) async {
+    _dirty = true;
+    final next = [
+      for (final existing in state)
+        if (existing.id != id) existing,
+    ];
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> _persist(List<RegisteredDlnaServer> list) {
+    return ref.read(keyValueStoreProvider).write(
+      _key,
+      jsonEncode([for (final s in list) s.toJson()]),
+    );
+  }
+}
+
+final dlnaServersProvider =
+    NotifierProvider<DlnaServersNotifier, List<RegisteredDlnaServer>>(
+      DlnaServersNotifier.new,
+    );
+
+/// ContentDirectory:1 Browse response for a generic DLNA server container.
+final dlnaBrowseProvider = FutureProvider.family<
+  DidlDocument,
+  ({String controlUrl, String objectId})
+>((ref, req) {
+  final service = DlnaMetadataService(
+    soap: SoapTransport(client: ref.watch(httpClientProvider)),
+    controlUrl: Uri.parse(req.controlUrl),
+  );
+  return service.browse(req.objectId);
+});

@@ -6,6 +6,8 @@
 /// (services/epg.dart). Callers see only MetadataService.
 library;
 
+import 'dart:isolate';
+
 import '../endpoints.dart';
 import '../errors.dart';
 import '../models/channel.dart';
@@ -16,6 +18,13 @@ import '../transport/soap_transport.dart';
 import 'epg.dart';
 import 'interfaces.dart';
 import 'paged_list.dart';
+
+const int _isolateDidlParseThreshold = 16384;
+
+DidlDocument _parseDidlPage(String xmlText) => parseDidl(xmlText, 'soap:Browse');
+
+Future<DidlDocument> _parseDidlPageInIsolate(String xmlText) =>
+    Isolate.run(() => _parseDidlPage(xmlText));
 
 /// ContentDirectory Browse over UPnP SOAP (plan 12.1).
 class DlnaMetadataService {
@@ -52,12 +61,14 @@ class DlnaMetadataService {
           'SortCriteria': '',
         },
       ),
-      consumePage: (resp) {
+      consumePage: (resp) async {
         final result = resp.result;
         if (result == null) {
           throw NasneError.parse('soap:Browse', cause: 'missing Result');
         }
-        final page = parseDidl(result, 'soap:Browse');
+        final page = result.length >= _isolateDidlParseThreshold
+            ? await _parseDidlPageInIsolate(result)
+            : _parseDidlPage(result);
         containers.addAll(page.containers);
         items.addAll(page.items);
         return page.containers.length + page.items.length;

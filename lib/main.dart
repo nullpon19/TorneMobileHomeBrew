@@ -23,6 +23,7 @@ import 'ui/widgets.dart';
 import 'app/lifecycle_log.dart';
 import 'app/providers.dart';
 import 'app/store_directory.dart';
+import 'app/ui_control_mode.dart';
 import 'ui/app_shell.dart';
 
 Future<void> main() async {
@@ -32,6 +33,7 @@ Future<void> main() async {
   // Split the legacy shared key-value file into per-purpose
   // files before anything reads the stores (plan 96).
   await migrateLegacyKeyValueFiles(storeDirectory);
+  final initialStartupTab = await loadInitialStartupTab(storeDirectory);
   final tempDir = await getTemporaryDirectory();
   final mpvCacheDir = Directory('${tempDir.path}/mpv_cache');
   try {
@@ -42,13 +44,22 @@ Future<void> main() async {
   } catch (_) {
     // Non-fatal: mpv falls back to RAM cache if cache directory creation fails.
   }
+  final fireTvHelper = FireTvHelper();
   final androidSdkInt = Platform.isAndroid
-      ? await FireTvHelper().getAndroidSdkInt()
+      ? await fireTvHelper.getAndroidSdkInt()
       : null;
+  final isAndroidTv = Platform.isAndroid
+      ? await fireTvHelper.isTvDevice()
+      : false;
+  final defaultUiControlMode = detectPlatformDefaultUiControlMode(
+    isAndroidTv: isAndroidTv,
+  );
   final container = fileStoreContainer(
     storeDirectory,
     mpvCacheDirectory: mpvCacheDir,
     androidSdkInt: androidSdkInt,
+    defaultUiControlMode: defaultUiControlMode,
+    initialStartupTab: initialStartupTab,
   );
   // App lifecycle transitions go to the debug log (plan 36), so a
   // field log shows when the process was suspended and resumed
@@ -190,9 +201,9 @@ class TmhbApp extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final nightMode = ref.watch(nightModeProvider);
+    final themeMode = ref.watch(effectiveThemeModeProvider);
     return MaterialApp(
-      title: 'torne HB FireTV',
+      title: 'torne mobile HB',
       // Force Japanese locale so Fire OS fonts.xml picks NotoSansCJK JP
       // (index 0) instead of zh-Hans (index 2).
       locale: const Locale('ja', 'JP'),
@@ -210,7 +221,7 @@ class TmhbApp extends ConsumerWidget {
       ),
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      themeMode: nightMode ? ThemeMode.dark : ThemeMode.light,
+      themeMode: themeMode,
       home: const AppShell(),
     );
   }

@@ -27,6 +27,8 @@ import 'bootstrap.dart';
 bool get isDesktopStorePlatform =>
     Platform.isMacOS || Platform.isLinux || Platform.isWindows;
 
+const String _legacyMigratedMarkerName = '.legacy_migrated';
+
 /// Resolves the directory that backs the file stores and the
 /// debug logs, migrating legacy desktop files on first run.
 Future<Directory> resolveStoreDirectory() async {
@@ -35,9 +37,21 @@ Future<Directory> resolveStoreDirectory() async {
   }
   final support = await getApplicationSupportDirectory();
   await support.create(recursive: true);
-  final documents = await getApplicationDocumentsDirectory();
-  if (documents.path != support.path) {
-    await migrateLegacyStoreFiles(from: documents, to: support);
+  final marker = File('${support.path}/$_legacyMigratedMarkerName');
+  final hasExistingData =
+      await marker.exists() ||
+      await File('${support.path}/$registrationFileName').exists() ||
+      await File('${support.path}/$keyValueFileName').exists();
+  if (!hasExistingData) {
+    try {
+      final documents = await getApplicationDocumentsDirectory();
+      if (documents.path != support.path) {
+        await migrateLegacyStoreFiles(from: documents, to: support);
+      }
+      await marker.writeAsString('1', flush: true);
+    } catch (_) {
+      // Legacy migration is best-effort; never block app startup.
+    }
   }
   return support;
 }

@@ -87,7 +87,8 @@ String buildXsrsDocument(String itemsXml) {
 }
 
 final RegExp _protectFlagElement = RegExp(
-  r'<titleProtectFlag>.*?</titleProtectFlag>',
+  r'<titleProtectFlag\b[^>]*(?:/>|>.*?</titleProtectFlag>)',
+  dotAll: true,
 );
 
 /// Builds the `Elements` document for an X_UpdateTitle call that

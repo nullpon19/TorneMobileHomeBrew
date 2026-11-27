@@ -63,20 +63,11 @@ class SsdpTransport {
     String searchTarget, {
     required Duration timeout,
   }) async {
-    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    RawDatagramSocket? socket;
+    StreamSubscription<RawSocketEvent>? sub;
     final responses = <SsdpResponse>[];
     final seen = <String>{};
     final done = Completer<void>();
-    final sub = socket.listen((event) {
-      if (event != RawSocketEvent.read) return;
-      final datagram = socket.receive();
-      if (datagram == null) return;
-      final parsed = _parse(datagram);
-      if (parsed == null) return;
-      final key =
-          '${parsed.from.address}|${parsed.location}|${parsed.searchTarget}';
-      if (seen.add(key)) responses.add(parsed);
-    }, onError: (_) {}, onDone: () {}, cancelOnError: false);
 
     final request = 'M-SEARCH * HTTP/1.1\r\n'
         'HOST: 239.255.255.250:1900\r\n'
@@ -85,10 +76,23 @@ class SsdpTransport {
         'ST: $searchTarget\r\n'
         '\r\n';
     try {
-      socket.send(utf8.encode(request), multicastAddress, port);
+      socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      final activeSocket = socket;
+      sub = activeSocket.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        final datagram = activeSocket.receive();
+        if (datagram == null) return;
+        final parsed = _parse(datagram);
+        if (parsed == null) return;
+        final key =
+            '${parsed.from.address}|${parsed.location}|${parsed.searchTarget}';
+        if (seen.add(key)) responses.add(parsed);
+      }, onError: (_) {}, onDone: () {}, cancelOnError: false);
+
+      activeSocket.send(utf8.encode(request), multicastAddress, port);
       // A second send improves reliability on lossy Wi-Fi.
       await Future<void>.delayed(const Duration(milliseconds: 400));
-      socket.send(utf8.encode(request), multicastAddress, port);
+      activeSocket.send(utf8.encode(request), multicastAddress, port);
       await Future<void>.delayed(timeout).whenComplete(() {
         if (!done.isCompleted) done.complete();
       });
@@ -96,8 +100,8 @@ class SsdpTransport {
     } catch (e) {
       throw NasneError.unreachable('ssdp:search', cause: e);
     } finally {
-      await sub.cancel();
-      socket.close();
+      await sub?.cancel();
+      socket?.close();
     }
     return responses;
   }

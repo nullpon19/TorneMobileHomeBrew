@@ -8,6 +8,7 @@ project(runner LANGUAGES CXX)
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
   "ake_socket.cpp"
+  "desktop_channels.cpp"
   "flutter_window.cpp"
   "main.cpp"
   "utils.cpp"
@@ -44,7 +45,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app flutter_wrapper_plugin)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # Winsock2 for the native AKE socket (windows/runner/ake_socket.cpp).
-target_link_libraries(${BINARY_NAME} PRIVATE "ws2_32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "ws2_32.lib" "winmm.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

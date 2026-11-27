@@ -42,6 +42,24 @@ final tabBackHandlersProvider = Provider<Map<int, bool Function()>>(
   (ref) => <int, bool Function()>{},
 );
 
+/// Signals whether a nested UI flow inside the active touch tab (e.g. a DLNA
+/// subfolder stack) should intercept the Android system Back button before exit.
+class TouchBackInterceptNotifier extends Notifier<bool> {
+  @override
+  bool build() => false;
+
+  void setActive(bool active) {
+    if (ref.mounted && state != active) {
+      state = active;
+    }
+  }
+}
+
+final touchBackInterceptProvider =
+    NotifierProvider<TouchBackInterceptNotifier, bool>(
+      TouchBackInterceptNotifier.new,
+    );
+
 class AppShell extends ConsumerStatefulWidget {
   const AppShell({super.key});
 
@@ -77,8 +95,14 @@ class AppShell extends ConsumerStatefulWidget {
 
 class _AppShellState extends ConsumerState<AppShell> {
   static const _destinations = AppShell._destinations;
+  static const int _assistantTapThreshold = 5;
+  static const Duration _assistantTapWindow = Duration(milliseconds: 2500);
   bool _exitDialogOpen = false;
-  bool _userMovedIntoHomePane = false;
+  bool _userMovedIntoInitialPane = false;
+  late final int _initialTab;
+  final Set<int> _mountedTabs = <int>{};
+  int _homeTapCount = 0;
+  Timer? _homeTapResetTimer;
   final FocusNode _railFocusNode = FocusNode(debugLabel: 'appShellRail');
   final FocusNode _rightPaneFocusNode = FocusNode(
     debugLabel: 'appShellRightPane',
@@ -91,9 +115,12 @@ class _AppShellState extends ConsumerState<AppShell> {
   @override
   void initState() {
     super.initState();
+    _initialTab = ref.read(tabIndexProvider);
+    _mountedTabs.add(_initialTab);
     _railFocusNode.addListener(_handleRailFocusChange);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      if (!ref.read(uiControlModeProvider).isTv) return;
       if (_railFocusNode.context != null && !_railFocusNode.hasFocus) {
         _focusSelectedRailDestination(ref.read(tabIndexProvider));
       }
@@ -102,6 +129,7 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   @override
   void dispose() {
+    _homeTapResetTimer?.cancel();
     _railFocusNode.removeListener(_handleRailFocusChange);
     _railFocusNode.dispose();
     _rightPaneFocusNode.dispose();
@@ -162,22 +190,24 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   void _handleRailFocusChange() {
     if (_railFocusNode.hasFocus) {
-      _userMovedIntoHomePane = false;
+      _userMovedIntoInitialPane = false;
     }
   }
 
-  void _restoreHomeRailFocusIfNeeded() {
-    if (ref.read(tabIndexProvider) != AppTabs.home || _userMovedIntoHomePane) {
+  void _restoreInitialRailFocusIfNeeded() {
+    if (!ref.read(uiControlModeProvider).isTv) return;
+    if (ref.read(tabIndexProvider) != _initialTab ||
+        _userMovedIntoInitialPane) {
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      if (ref.read(tabIndexProvider) != AppTabs.home ||
-          _userMovedIntoHomePane) {
+      if (ref.read(tabIndexProvider) != _initialTab ||
+          _userMovedIntoInitialPane) {
         return;
       }
       if (_railFocusNode.context != null && !_railFocusNode.hasFocus) {
-        _focusSelectedRailDestination(AppTabs.home);
+        _focusSelectedRailDestination(_initialTab);
       }
     });
   }
@@ -278,16 +308,46 @@ class _AppShellState extends ConsumerState<AppShell> {
     }
   }
 
+  void _resetHomeTapCounter() {
+    _homeTapResetTimer?.cancel();
+    _homeTapResetTimer = null;
+    _homeTapCount = 0;
+  }
+
+  void _recordHomeReselectTap() {
+    _homeTapResetTimer?.cancel();
+    _homeTapCount++;
+    if (_homeTapCount >= _assistantTapThreshold) {
+      _homeTapCount = 0;
+      _homeTapResetTimer = null;
+      final isTv = ref.read(uiControlModeProvider).isTv;
+      unawaited(
+        ref.read(homeAssistantProvider.notifier).toggleFromEasterEgg(
+          autoDismissDialog: isTv,
+        ),
+      );
+      return;
+    }
+    _homeTapResetTimer = Timer(_assistantTapWindow, () {
+      _homeTapCount = 0;
+      _homeTapResetTimer = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
+    _mountedTabs.add(tab);
+    final uiMode = ref.watch(uiControlModeProvider);
+    final showTailscaleButton =
+        ref.watch(tailscaleInstalledProvider).value ?? false;
     ref.listen<AsyncValue<List<RegisteredNasne>>>(
       registrationsProvider,
-      (prev, next) => _restoreHomeRailFocusIfNeeded(),
+      (prev, next) => _restoreInitialRailFocusIfNeeded(),
     );
     ref.listen<RegisteredNasne?>(
       selectedRegistrationProvider,
-      (prev, next) => _restoreHomeRailFocusIfNeeded(),
+      (prev, next) => _restoreInitialRailFocusIfNeeded(),
     );
     final screens = const [
       HomeScreen(),
@@ -298,23 +358,38 @@ class _AppShellState extends ConsumerState<AppShell> {
       SettingsScreen(),
     ];
     void select(int index) {
-      if (index == AppTabs.home) {
-        _userMovedIntoHomePane = true;
+      final prevTab = ref.read(tabIndexProvider);
+      final isHomeReselect = prevTab == AppTabs.home && index == AppTabs.home;
+      if (isHomeReselect) {
+        _recordHomeReselectTap();
+        // Keep TV rail focus on Home during rapid taps; ArrowRight enters pane.
+        return;
+      }
+      _resetHomeTapCounter();
+      if (index == _initialTab) {
+        _userMovedIntoInitialPane = true;
       }
       ref.read(tabIndexProvider.notifier).select(index);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _focusRightPaneFirst();
-      });
+      if (uiMode.isTv) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _focusRightPaneFirst();
+        });
+      }
     }
 
+    final touchTabInterceptsBack =
+        uiMode.isTouch &&
+        tab == AppTabs.titles &&
+        ref.watch(touchBackInterceptProvider);
     return PopScope(
-      canPop: false,
+      canPop: !uiMode.isTv && !touchTabInterceptsBack,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop || _exitDialogOpen) return;
         final activeTab = ref.read(tabIndexProvider);
         final handler = ref.read(tabBackHandlersProvider)[activeTab];
         if (handler != null && handler()) return;
+        if (!uiMode.isTv) return;
         if (!_railFocusNode.hasFocus &&
             _focusSelectedRailDestination(activeTab)) {
           return;
@@ -322,16 +397,38 @@ class _AppShellState extends ConsumerState<AppShell> {
         unawaited(_confirmExit());
       },
       child: TailscaleGuard(
-        child: LayoutBuilder(
-        builder: (context, constraints) {
-          final body = IndexedStack(
-            index: tab,
-            children: [
-              for (var i = 0; i < screens.length; i++)
-                ExcludeFocus(excluding: i != tab, child: screens[i]),
-            ],
-          );
-          if (constraints.maxWidth >= railBreakpoint) {
+        child: _ShellStartupPrefetcher(
+          initialTab: _initialTab,
+          child: LayoutBuilder(
+          builder: (context, constraints) {
+            final body = IndexedStack(
+              index: tab,
+              children: [
+                for (var i = 0; i < screens.length; i++)
+                  ExcludeFocus(
+                    excluding: i != tab,
+                    child: _mountedTabs.contains(i)
+                        ? screens[i]
+                        : const SizedBox.shrink(),
+                  ),
+              ],
+            );
+            if (constraints.maxWidth >= railBreakpoint) {
+              if (uiMode.isTv &&
+                  tab == _initialTab &&
+                  !_userMovedIntoInitialPane &&
+                  !_railFocusNode.hasFocus) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  if (ref.read(tabIndexProvider) == _initialTab &&
+                      !_userMovedIntoInitialPane &&
+                      _railFocusNode.context != null &&
+                      !_railFocusNode.hasFocus &&
+                      ModalRoute.of(context)?.isCurrent == true) {
+                    _focusSelectedRailDestination(_initialTab);
+                  }
+                });
+              }
             final reportedTopInset = MediaQuery.paddingOf(context).top;
             final extraTop = wideLayoutMinTopInset > reportedTopInset
                 ? wideLayoutMinTopInset - reportedTopInset
@@ -356,8 +453,8 @@ class _AppShellState extends ConsumerState<AppShell> {
                                       event is KeyRepeatEvent) &&
                                   event.logicalKey ==
                                       LogicalKeyboardKey.arrowRight &&
-                                  ref.read(tabIndexProvider) == AppTabs.home) {
-                                _userMovedIntoHomePane = true;
+                                  ref.read(tabIndexProvider) == _initialTab) {
+                                _userMovedIntoInitialPane = true;
                               }
                               return KeyEventResult.ignored;
                             },
@@ -378,29 +475,37 @@ class _AppShellState extends ConsumerState<AppShell> {
                                     ),
                                   ),
                               ],
-                              trailing: Padding(
-                                padding: const EdgeInsets.only(top: 12),
-                                child: IconButton(
-                                  tooltip: 'Tailscale を開く',
-                                  icon: const Icon(Icons.vpn_lock),
-                                  onPressed: () async {
-                                    final ok = await ref
-                                        .read(fireTvHelperProvider)
-                                        .launchTailscale();
-                                    if (!ok && context.mounted) {
-                                      ScaffoldMessenger.maybeOf(
-                                        context,
-                                      )?.showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Tailscale アプリが見つかりませんでした',
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                  },
-                                ),
-                              ),
+                              trailing: showTailscaleButton
+                                  ? Padding(
+                                      padding: const EdgeInsets.only(top: 12),
+                                      child: IconButton(
+                                        tooltip: 'Tailscale を開く',
+                                        icon: const Icon(Icons.vpn_lock),
+                                        onPressed: () async {
+                                          ref
+                                              .read(
+                                                tailscaleManualLaunchSignalProvider
+                                                    .notifier,
+                                              )
+                                              .notifyLaunched();
+                                          final ok = await ref
+                                              .read(fireTvHelperProvider)
+                                              .launchTailscale();
+                                          if (!ok && context.mounted) {
+                                            ScaffoldMessenger.maybeOf(
+                                              context,
+                                            )?.showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Tailscale アプリが見つかりませんでした',
+                                                ),
+                                              ),
+                                            );
+                                          }
+                                        },
+                                      ),
+                                    )
+                                  : null,
                             ),
                           ),
                         ),
@@ -420,8 +525,8 @@ class _AppShellState extends ConsumerState<AppShell> {
                                 behavior: HitTestBehavior.translucent,
                                 onPointerDown: (_) {
                                   if (ref.read(tabIndexProvider) ==
-                                      AppTabs.home) {
-                                    _userMovedIntoHomePane = true;
+                                      _initialTab) {
+                                    _userMovedIntoInitialPane = true;
                                   }
                                 },
                                 child: body,
@@ -453,7 +558,277 @@ class _AppShellState extends ConsumerState<AppShell> {
           );
         },
         ),
+        ),
       ),
     );
+  }
+}
+
+/// Runs sequential background data prefetching once the startup tab has settled
+/// (and after [TailscaleGuard] releases), skipping UI mounting and thumbnails so
+/// navigation stays responsive without starving sockets.
+class _ShellStartupPrefetcher extends ConsumerStatefulWidget {
+  const _ShellStartupPrefetcher({
+    required this.initialTab,
+    required this.child,
+  });
+
+  final int initialTab;
+  final Widget child;
+  static const Duration _initialTabWaitCap = Duration(seconds: 3);
+  static const Duration _startDelay = Duration(milliseconds: 300);
+  static const Duration _betweenTabDelay = Duration(milliseconds: 50);
+
+  @override
+  ConsumerState<_ShellStartupPrefetcher> createState() =>
+      _ShellStartupPrefetcherState();
+}
+
+class _ShellStartupPrefetcherState
+    extends ConsumerState<_ShellStartupPrefetcher> {
+  static const List<int> _prefetchOrder = [
+    AppTabs.live,
+    AppTabs.schedules,
+    AppTabs.epg,
+    AppTabs.titles,
+    AppTabs.home,
+  ];
+
+  bool _disposed = false;
+  String? _startedForKey;
+  int _runGeneration = 0;
+  final Set<Timer> _activeTimers = <Timer>{};
+  final Set<Completer<void>> _pendingVoidCompleters = <Completer<void>>{};
+  final Set<Completer<bool>> _pendingBoolCompleters = <Completer<bool>>{};
+  final Set<ProviderSubscription<dynamic>> _activeSubscriptions =
+      <ProviderSubscription<dynamic>>{};
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _runGeneration++;
+    for (final timer in _activeTimers.toList()) {
+      timer.cancel();
+    }
+    _activeTimers.clear();
+    for (final sub in _activeSubscriptions.toList()) {
+      sub.close();
+    }
+    _activeSubscriptions.clear();
+    for (final c in _pendingVoidCompleters.toList()) {
+      if (!c.isCompleted) c.complete();
+    }
+    _pendingVoidCompleters.clear();
+    for (final c in _pendingBoolCompleters.toList()) {
+      if (!c.isCompleted) c.complete(false);
+    }
+    _pendingBoolCompleters.clear();
+    super.dispose();
+  }
+
+  bool _shouldStop(int gen) {
+    if (_disposed || !mounted || gen != _runGeneration) return true;
+    final route = ModalRoute.of(context);
+    if (route != null && !route.isCurrent) return true;
+    return false;
+  }
+
+  Future<bool> _delay(Duration duration, int gen) async {
+    if (_shouldStop(gen)) return false;
+    if (duration <= Duration.zero) return true;
+    final completer = Completer<void>();
+    _pendingVoidCompleters.add(completer);
+    late final Timer timer;
+    timer = Timer(duration, () {
+      _activeTimers.remove(timer);
+      if (!completer.isCompleted) completer.complete();
+    });
+    _activeTimers.add(timer);
+    try {
+      await completer.future;
+    } finally {
+      _pendingVoidCompleters.remove(completer);
+    }
+    return !_shouldStop(gen);
+  }
+
+  Future<bool> _waitInitialWithCap(
+    Future<void> future,
+    Duration cap,
+    int gen,
+  ) async {
+    if (_shouldStop(gen)) return false;
+    final gate = Completer<bool>();
+    _pendingBoolCompleters.add(gate);
+    late final Timer timer;
+    timer = Timer(cap, () {
+      _activeTimers.remove(timer);
+      if (!gate.isCompleted) gate.complete(true);
+    });
+    _activeTimers.add(timer);
+    future.then(
+      (_) {
+        timer.cancel();
+        _activeTimers.remove(timer);
+        if (!gate.isCompleted) gate.complete(true);
+      },
+      onError: (_, _) {
+        timer.cancel();
+        _activeTimers.remove(timer);
+        if (!gate.isCompleted) gate.complete(false);
+      },
+    );
+    try {
+      final ok = await gate.future;
+      return ok && !_shouldStop(gen);
+    } finally {
+      _pendingBoolCompleters.remove(gate);
+    }
+  }
+
+  Future<void> _awaitTitles(
+    RegisteredNasne reg, {
+    required bool waitForComplete,
+  }) async {
+    if (_disposed || !mounted) return;
+    final completer = Completer<void>();
+    _pendingVoidCompleters.add(completer);
+    late final ProviderSubscription<AsyncValue<TitleListProgress>> sub;
+    sub = ref.listenManual<AsyncValue<TitleListProgress>>(
+      titlesProvider(reg),
+      (_, next) {
+        if (completer.isCompleted) return;
+        if (next.hasError) {
+          completer.completeError(next.error!, next.stackTrace);
+          return;
+        }
+        final value = next.value;
+        if (value != null && (!waitForComplete || value.complete)) {
+          completer.complete();
+        }
+      },
+      fireImmediately: true,
+    );
+    _activeSubscriptions.add(sub);
+    try {
+      await completer.future;
+    } finally {
+      _activeSubscriptions.remove(sub);
+      sub.close();
+      _pendingVoidCompleters.remove(completer);
+    }
+  }
+
+  Future<bool> _waitForInitialTab(
+    RegisteredNasne selected,
+    int gen,
+  ) async {
+    final Future<void>? primaryFuture = switch (widget.initialTab) {
+      AppTabs.home => ref.read(deviceInfoProvider(selected).future).then((_) {}),
+      AppTabs.live =>
+        ref.read(liveChannelsProvider(selected).future).then((_) {}),
+      AppTabs.schedules =>
+        ref.read(schedulesProvider(selected).future).then((_) {}),
+      AppTabs.titles => _awaitTitles(selected, waitForComplete: false),
+      AppTabs.epg => ref.read(epgGuideProvider(selected).future).then((_) {}),
+      _ => null,
+    };
+    if (primaryFuture == null) return !_shouldStop(gen);
+    return _waitInitialWithCap(
+      primaryFuture,
+      _ShellStartupPrefetcher._initialTabWaitCap,
+      gen,
+    );
+  }
+
+  Future<void> _prefetchTab(
+    int tab,
+    List<RegisteredNasne> activeRegs,
+    RegisteredNasne selected,
+    int gen,
+  ) async {
+    try {
+      switch (tab) {
+        case AppTabs.live:
+          for (final r in activeRegs) {
+            if (_shouldStop(gen)) return;
+            await ref.read(liveChannelsProvider(r).future);
+            if (_shouldStop(gen)) return;
+            await ref.read(schedulesProvider(r).future);
+          }
+        case AppTabs.schedules:
+          for (final r in activeRegs) {
+            if (_shouldStop(gen)) return;
+            await ref.read(schedulesProvider(r).future);
+            if (_shouldStop(gen)) return;
+            await ref.read(recNgProvider(r).future);
+          }
+        case AppTabs.epg:
+          if (_shouldStop(gen)) return;
+          await ref.read(channelsProvider(selected).future);
+          if (_shouldStop(gen)) return;
+          await ref.read(epgGuideProvider(selected).future);
+          if (_shouldStop(gen)) return;
+          await ref.read(channelLogosProvider(selected).future);
+        case AppTabs.titles:
+          for (final r in activeRegs) {
+            if (_shouldStop(gen)) return;
+            await ref.read(titleCountsProvider(r).future);
+            if (_shouldStop(gen)) return;
+            await _awaitTitles(r, waitForComplete: true);
+          }
+        case AppTabs.home:
+          if (_shouldStop(gen)) return;
+          await Future.wait([
+            ref.read(deviceInfoProvider(selected).future),
+            ref.read(hddDetailsProvider(selected).future),
+            ref.read(liveStatusProvider(selected).future),
+            ref.read(recNgProvider(selected).future),
+            ref.read(networkInfoProvider(selected).future),
+            ref.read(bcasInfoProvider(selected).future),
+          ]);
+      }
+    } catch (_) {
+      // Best-effort prefetch: failures are handled when the user visits the tab.
+    }
+  }
+
+  Future<void> _runPrefetch(
+    List<RegisteredNasne> regs,
+    RegisteredNasne selected,
+    int gen,
+  ) async {
+    final activeRegs = regs.length > 1 ? regs : <RegisteredNasne>[selected];
+    final initialOk = await _waitForInitialTab(selected, gen);
+    if (!initialOk || _shouldStop(gen)) return;
+    if (!await _delay(_ShellStartupPrefetcher._startDelay, gen)) return;
+
+    for (final tab in _prefetchOrder) {
+      if (tab == widget.initialTab) continue;
+      if (_shouldStop(gen)) return;
+      await _prefetchTab(tab, activeRegs, selected, gen);
+      if (!await _delay(_ShellStartupPrefetcher._betweenTabDelay, gen)) return;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (ref.watch(startupPrefetchEnabledProvider)) {
+      final regs =
+          ref.watch(registrationsProvider).value ?? const <RegisteredNasne>[];
+      final selected = ref.watch(selectedRegistrationProvider);
+      if (regs.isNotEmpty && selected != null) {
+        final key = '${regs.map((r) => r.host).join('|')}::${selected.host}';
+        if (_startedForKey != key) {
+          _startedForKey = key;
+          final gen = ++_runGeneration;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_shouldStop(gen)) return;
+            unawaited(_runPrefetch(regs, selected, gen));
+          });
+        }
+      }
+    }
+    return widget.child;
   }
 }

@@ -28,6 +28,7 @@ import 'package:material_ui/material_ui.dart';
 import '../app/bs_epg_providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
+import 'error_messages.dart';
 import 'epg_screen.dart';
 import 'epg_search.dart';
 import 'epg_title_badges.dart';
@@ -98,8 +99,10 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final terrestrial = ref.watch(epgGuideProvider(widget.reg)).value;
-    final bs = ref.watch(bsEpgGuideProvider(widget.reg)).value;
+    final terrestrialAsync = ref.watch(epgGuideProvider(widget.reg));
+    final bsAsync = ref.watch(bsEpgGuideProvider(widget.reg));
+    final terrestrial = terrestrialAsync.value;
+    final bs = bsAsync.value;
     final guides = <EpgGuide>[?terrestrial, ?bs];
     final index = _indexFor(terrestrial, bs);
     final genreValues = index.genreValues;
@@ -158,18 +161,44 @@ class _EpgSearchScreenState extends ConsumerState<EpgSearchScreen> {
             ),
           ),
           const Divider(height: 1),
-          Expanded(child: _buildResults(guides, searched, hits)),
+          Expanded(
+            child: _buildResults(
+              terrestrialAsync,
+              bsAsync,
+              guides,
+              searched,
+              hits,
+            ),
+          ),
         ],
       ),
     );
   }
 
   Widget _buildResults(
+    AsyncValue<EpgGuide> terrestrialAsync,
+    AsyncValue<EpgGuide> bsAsync,
     List<EpgGuide> guides,
     bool searched,
     List<EpgSearchHit> hits,
   ) {
-    if (guides.isEmpty) return const LoadingView();
+    if (guides.isEmpty) {
+      if (terrestrialAsync.isLoading || bsAsync.isLoading) {
+        return const LoadingView();
+      }
+      if (terrestrialAsync.hasError || bsAsync.hasError) {
+        return ErrorView(
+          message: userMessageForError(
+            terrestrialAsync.error ?? bsAsync.error!,
+          ),
+          onRetry: () {
+            ref.invalidate(epgGuideProvider(widget.reg));
+            ref.invalidate(bsEpgGuideProvider(widget.reg));
+          },
+        );
+      }
+      return const Center(child: Text('番組表データがありません。'));
+    }
     if (!searched) {
       return const Center(
         child: Padding(

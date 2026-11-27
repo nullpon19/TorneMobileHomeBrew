@@ -34,7 +34,11 @@ class NativeWakelockGuard implements WakelockGuard {
 
   final MethodChannel _channel;
 
-  bool get _supported => Platform.isIOS || Platform.isAndroid;
+  bool get _supported =>
+      Platform.isIOS ||
+      Platform.isAndroid ||
+      Platform.isMacOS ||
+      Platform.isWindows;
 
   /// The state last applied on an unsupported platform, so
   /// [read] stays consistent with [apply] there.

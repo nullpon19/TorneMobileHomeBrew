@@ -1,10 +1,13 @@
 package com.markun.tmhb
 
 import android.Manifest
+import android.app.PictureInPictureParams
+import android.app.UiModeManager
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -19,6 +22,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
 import android.provider.Settings
+import android.util.Rational
 import android.view.WindowManager
 import android.system.ErrnoException
 import android.system.Os
@@ -44,13 +48,18 @@ import kotlin.math.sin
 
 class MainActivity : FlutterActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var multicastLockRefCount = 0
     private var akeEventSink: EventChannel.EventSink? = null
     private val akeConnections = mutableMapOf<Int, AkeSocketConnection>()
     private val akeExecutor = Executors.newCachedThreadPool()
+    private val akeSendExecutor = Executors.newSingleThreadExecutor()
     private val soundExecutor = Executors.newSingleThreadExecutor()
     private val soundGeneration = AtomicInteger(0)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingStoragePermissionResult: MethodChannel.Result? = null
+    private var pipEventSink: EventChannel.EventSink? = null
+    private var autoPipEnabled = false
+    private var inPipMode = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -116,7 +125,7 @@ class MainActivity : FlutterActivity() {
                         val data = call.argument<ByteArray>("data")!!
                         val connection = synchronized(akeConnections) { akeConnections[id] }
                         if (connection != null) {
-                            akeExecutor.execute { connection.send(data) }
+                            akeSendExecutor.execute { connection.send(data) }
                         }
                         result.success(null)
                     }
@@ -148,6 +157,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "setMediaVolumeMax" -> result.success(setMediaVolumeMax())
+                    "isTvDevice" -> result.success(isTvDevice())
                     "isVpnActive" -> result.success(isVpnActive())
                     "isTailscaleInstalled" -> result.success(isTailscaleInstalled())
                     "tryConnectTailscale" -> result.success(tryConnectTailscale())
@@ -201,6 +211,44 @@ class MainActivity : FlutterActivity() {
                     akeEventSink = null
                 }
             })
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PIP_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "isSupported" -> result.success(isPipSupported())
+                    "enterPip" -> {
+                        val width = call.argument<Int>("aspectWidth") ?: 16
+                        val height = call.argument<Int>("aspectHeight") ?: 9
+                        result.success(enterPipMode(width, height))
+                    }
+                    "exitPip" -> result.success(false)
+                    "setAutoPipEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        autoPipEnabled = enabled
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isPipSupported()) {
+                            try {
+                                setPictureInPictureParams(buildPipParams(16, 9, autoEnter = enabled))
+                            } catch (_: Exception) {
+                            }
+                        }
+                        result.success(true)
+                    }
+                    "isInPipMode" -> result.success(inPipMode)
+                    else -> result.notImplemented()
+                }
+            }
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, PIP_EVENTS_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    pipEventSink = events
+                    if (inPipMode) {
+                        events?.success(true)
+                    }
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    pipEventSink = null
+                }
+            })
     }
 
     override fun onDestroy() {
@@ -213,8 +261,25 @@ class MainActivity : FlutterActivity() {
             connection.close()
         }
         akeExecutor.shutdownNow()
+        akeSendExecutor.shutdownNow()
         soundGeneration.incrementAndGet()
         soundExecutor.shutdownNow()
+        while (multicastLockRefCount > 0 && multicastLock?.isHeld == true) {
+            multicastLockRefCount--
+            try {
+                multicastLock?.release()
+            } catch (_: RuntimeException) {
+                break
+            }
+        }
+        if (multicastLock?.isHeld == true) {
+            try {
+                multicastLock?.release()
+            } catch (_: RuntimeException) {
+            }
+        }
+        multicastLockRefCount = 0
+        multicastLock = null
         super.onDestroy()
     }
 
@@ -225,20 +290,30 @@ class MainActivity : FlutterActivity() {
     // SSDP M-SEARCH responses arrive as Wi-Fi multicast; without this
     // lock the driver may filter them out (plan 17).
     private fun acquireMulticastLock() {
-        if (multicastLock == null) {
-            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            multicastLock = wifi.createMulticastLock("torne-mobile-hb-ssdp").apply {
-                setReferenceCounted(false)
-            }
+        val lock = multicastLock ?: run {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
+            wifi.createMulticastLock("torne-mobile-hb-ssdp").apply {
+                setReferenceCounted(true)
+            }.also { multicastLock = it }
         }
-        if (multicastLock?.isHeld != true) {
-            multicastLock?.acquire()
+        try {
+            lock.acquire()
+            multicastLockRefCount++
+        } catch (_: RuntimeException) {
         }
     }
 
     private fun releaseMulticastLock() {
-        if (multicastLock?.isHeld == true) {
-            multicastLock?.release()
+        val lock = multicastLock ?: return
+        if (multicastLockRefCount > 0) {
+            multicastLockRefCount--
+        }
+        if (lock.isHeld) {
+            try {
+                lock.release()
+            } catch (_: RuntimeException) {
+            }
         }
     }
 
@@ -276,6 +351,15 @@ class MainActivity : FlutterActivity() {
         }
         startActivity(Intent.createChooser(intent, "デバッグログを共有"))
     }
+
+    private fun isTvDevice(): Boolean =
+        try {
+            val uiMode = applicationContext.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+            uiMode?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+                packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+        } catch (_: Exception) {
+            false
+        }
 
     private fun setMediaVolumeMax(): Boolean =
         try {
@@ -319,13 +403,67 @@ class MainActivity : FlutterActivity() {
     private fun tryConnectTailscale(): Boolean =
         try {
             val intent = Intent("com.tailscale.ipn.CONNECT_VPN").apply {
-                setPackage(TAILSCALE_PACKAGE)
+                setClassName(TAILSCALE_PACKAGE, "com.tailscale.ipn.IPNReceiver")
+                addFlags(
+                    Intent.FLAG_INCLUDE_STOPPED_PACKAGES or
+                        Intent.FLAG_RECEIVER_FOREGROUND,
+                )
             }
             sendBroadcast(intent)
             true
         } catch (_: Exception) {
             false
         }
+
+    private fun isPipSupported(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            try {
+                packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+            } catch (_: Exception) {
+                false
+            }
+
+    private fun buildPipParams(width: Int, height: Int, autoEnter: Boolean? = null): PictureInPictureParams {
+        val safeWidth = if (width > 0 && height > 0) width else 16
+        val safeHeight = if (width > 0 && height > 0) height else 9
+        val ratio = (safeWidth.toDouble() / safeHeight.toDouble()).coerceIn(0.42, 2.38)
+        val rational = Rational((ratio * 100).toInt().coerceAtLeast(42), 100)
+        val builder = PictureInPictureParams.Builder().setAspectRatio(rational)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && autoEnter != null) {
+            builder.setAutoEnterEnabled(autoEnter)
+        }
+        return builder.build()
+    }
+
+    private fun enterPipMode(width: Int, height: Int): Boolean {
+        if (!isPipSupported()) return false
+        return try {
+            enterPictureInPictureMode(buildPipParams(width, height, autoEnter = autoPipEnabled))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (autoPipEnabled &&
+            !inPipMode &&
+            isPipSupported() &&
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+        ) {
+            enterPipMode(16, 9)
+        }
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        inPipMode = isInPictureInPictureMode
+        mainHandler.post { pipEventSink?.success(isInPictureInPictureMode) }
+    }
 
     private fun launchTailscale(): Boolean =
         try {
@@ -665,6 +803,8 @@ class MainActivity : FlutterActivity() {
         private const val AKE_SOCKET_CHANNEL = "com.markun.tmhb/ake_socket"
         private const val AKE_SOCKET_EVENTS_CHANNEL = "com.markun.tmhb/ake_socket_events"
         private const val FIRETV_HELPER_CHANNEL = "com.markun.tmhb/firetv_helper"
+        private const val PIP_CHANNEL = "com.markun.tmhb/pip"
+        private const val PIP_EVENTS_CHANNEL = "com.markun.tmhb/pip_events"
         private const val TAILSCALE_PACKAGE = "com.tailscale.ipn"
         private const val STORAGE_PERMISSION_REQUEST_CODE = 1001
         private const val MANAGE_STORAGE_REQUEST_CODE = 1002
@@ -802,8 +942,10 @@ private class AkeSocketConnection(
     }
 
     fun send(data: ByteArray) {
+        if (closed) return
         val out = output ?: return
         synchronized(out) {
+            if (closed) return
             try {
                 out.write(data)
                 out.flush()
@@ -845,6 +987,10 @@ private class AkeSocketConnection(
         } catch (_: Exception) {
         }
         if (descriptor != null) {
+            try {
+                Os.shutdown(descriptor, OsConstants.SHUT_RDWR)
+            } catch (_: Exception) {
+            }
             try {
                 Os.close(descriptor)
             } catch (_: Exception) {

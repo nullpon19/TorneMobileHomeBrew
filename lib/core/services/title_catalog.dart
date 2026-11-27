@@ -7,6 +7,8 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import '../endpoints.dart';
@@ -20,6 +22,57 @@ import '../transport/webapi_transport.dart';
 import 'interfaces.dart';
 import 'paged_list.dart';
 
+const int _isolateXmlParseThreshold = 16384;
+
+List<RecordedTitle> _parseRecordedTitlesPage(String xmlText) => [
+  for (final item in parseXsrsItems(xmlText, 'soap:X_GetTitleList'))
+    recordedTitleFromXsrs(item, source: 'soap:X_GetTitleList'),
+];
+
+Future<List<RecordedTitle>> _parseRecordedTitlesPageInIsolate(
+  String xmlText,
+) => Isolate.run(() => _parseRecordedTitlesPage(xmlText));
+
+Future<Uint8List?> _decodeThumbnailInIsolate(Uint8List rawBytes) =>
+    Isolate.run(() => decodeThumbnailPayload(rawBytes));
+
+class _AsyncSemaphore {
+  _AsyncSemaphore(this._maxConcurrent) : assert(_maxConcurrent > 0);
+
+  final int _maxConcurrent;
+  int _active = 0;
+  final Queue<Completer<void>> _waiters = Queue<Completer<void>>();
+
+  Future<void> _acquire() {
+    if (_active < _maxConcurrent) {
+      _active++;
+      return Future<void>.value();
+    }
+    final gate = Completer<void>();
+    _waiters.addLast(gate);
+    return gate.future;
+  }
+
+  void _release() {
+    if (_waiters.isNotEmpty) {
+      // Transfer the held slot directly to the next waiter so _active never
+      // dips and allows a newcomer to overshoot _maxConcurrent.
+      _waiters.removeFirst().complete();
+    } else {
+      _active--;
+    }
+  }
+
+  Future<T> run<T>(Future<T> Function() action) async {
+    await _acquire();
+    try {
+      return await action();
+    } finally {
+      _release();
+    }
+  }
+}
+
 class SoapTitleCatalogService implements TitleCatalogService {
   SoapTitleCatalogService({
     required this._soap,
@@ -27,12 +80,17 @@ class SoapTitleCatalogService implements TitleCatalogService {
     required this._webApi,
     required this._metadata,
     this._pvrControlUrl,
-  }) : _controlUrl = xsrsControlUrl;
+    int maxConcurrentThumbnails = 3,
+  }) : _controlUrl = xsrsControlUrl,
+       _thumbnailSemaphore = _AsyncSemaphore(
+         maxConcurrentThumbnails < 1 ? 1 : maxConcurrentThumbnails,
+       );
 
   final SoapTransport _soap;
   final Uri _controlUrl;
   final WebApiTransport _webApi;
   final MetadataService _metadata;
+  final _AsyncSemaphore _thumbnailSemaphore;
 
   /// The X_PvrControl control URL (X_GetTitleInfo's
   /// service), or null when the device description
@@ -64,10 +122,17 @@ class SoapTitleCatalogService implements TitleCatalogService {
   Stream<TitleListProgress> listTitlesProgressively({
     bool withMetadata = true,
   }) {
+    var cancelled = false;
     late StreamController<TitleListProgress> controller;
     controller = StreamController<TitleListProgress>(
-      onListen: () =>
-          _emitTitleProgress(controller, withMetadata: withMetadata),
+      onListen: () => _emitTitleProgress(
+        controller,
+        withMetadata: withMetadata,
+        isCancelled: () => cancelled || controller.isClosed,
+      ),
+      onCancel: () {
+        cancelled = true;
+      },
     );
     return controller.stream;
   }
@@ -79,6 +144,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
   Future<void> _emitTitleProgress(
     StreamController<TitleListProgress> sink, {
     required bool withMetadata,
+    required bool Function() isCancelled,
   }) async {
     try {
       // The DIDL Browse runs alongside the XSRS paging, not
@@ -103,6 +169,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
       // request asks for [firstChunkSize] explicitly — the one
       // change that makes the first stage arrive quickly.
       await fetchAllListPages(
+        shouldCancel: isCancelled,
         requestPage: (startingIndex) {
           final count = firstRequest ? '$firstChunkSize' : '0';
           firstRequest = false;
@@ -119,7 +186,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
             },
           );
         },
-        consumePage: (resp) {
+        consumePage: (resp) async {
           final result = resp.result;
           if (result == null) {
             throw NasneError.parse(
@@ -127,22 +194,27 @@ class SoapTitleCatalogService implements TitleCatalogService {
               cause: 'missing Result',
             );
           }
-          final page = [
-            for (final item in parseXsrsItems(result, 'soap:X_GetTitleList'))
-              recordedTitleFromXsrs(item, source: 'soap:X_GetTitleList'),
-          ];
+          final page = result.length >= _isolateXmlParseThreshold
+              ? await _parseRecordedTitlesPageInIsolate(result)
+              : _parseRecordedTitlesPage(result);
           titles.addAll(page);
           return page.length;
         },
-        onPage: () => sink.add(
-          TitleListProgress(List.unmodifiable(titles), complete: false),
-        ),
+        onPage: () {
+          if (!isCancelled()) {
+            sink.add(
+              TitleListProgress(List.unmodifiable(titles), complete: false),
+            );
+          }
+        },
       );
+      if (isCancelled()) return;
       if (!withMetadata || titles.isEmpty) {
         sink.add(TitleListProgress(List.unmodifiable(titles), complete: true));
         return;
       }
       final didl = await didlFuture!;
+      if (isCancelled()) return;
       final byTitleId = {
         for (final item in didl.items)
           if (item.titleId != null) item.titleId!: item,
@@ -164,9 +236,13 @@ class SoapTitleCatalogService implements TitleCatalogService {
         ], complete: true),
       );
     } catch (e, s) {
-      sink.addError(e, s);
+      if (!isCancelled()) {
+        sink.addError(e, s);
+      }
     } finally {
-      await sink.close();
+      if (!sink.isClosed) {
+        await sink.close();
+      }
     }
   }
 
@@ -214,7 +290,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
   }
 
   @override
-  Future<Uint8List?> fetchThumbnail(String id) async {
+  Future<Uint8List?> fetchThumbnail(String id) {
     // Measured on a real unit (plan 97 / 99): thumbnailMapGet
     // returns a position map with no image in it; the frames
     // live behind recordedContentThumbnailGet as AES-128-CBC
@@ -225,23 +301,29 @@ class SoapTitleCatalogService implements TitleCatalogService {
     // Every failure — transport, status, an unrecognised
     // payload — is simply "no thumbnail"; a missing picture
     // must never break the list.
-    try {
-      final mapRaw = await _webApi.getBytes(
-        WebApiEndpoints.thumbnailMapGet,
-        params: {'id': id},
-      );
-      final embedded = extractThumbnailImage(mapRaw);
-      if (embedded != null) return embedded;
-      final count = thumbnailEntryCount(mapRaw);
-      if (count == null || count == 0) return null;
-      final raw = await _webApi.getBytes(
-        WebApiEndpoints.recordedContentThumbnailGet,
-        params: {'id': id, 'thumbnailEntryId': '0'},
-      );
-      return extractThumbnailImage(raw) ?? decodeThumbnailPayload(raw);
-    } catch (_) {
-      return null;
-    }
+    return _thumbnailSemaphore.run(() async {
+      try {
+        final mapRaw = await _webApi.getBytes(
+          WebApiEndpoints.thumbnailMapGet,
+          params: {'id': id},
+        );
+        final embedded = extractThumbnailImage(mapRaw);
+        if (embedded != null) return embedded;
+        final count = thumbnailEntryCount(mapRaw);
+        if (count == null || count == 0) return null;
+        final raw = await _webApi.getBytes(
+          WebApiEndpoints.recordedContentThumbnailGet,
+          params: {'id': id, 'thumbnailEntryId': '0'},
+        );
+        final plain = extractThumbnailImage(raw);
+        if (plain != null) return plain;
+        final rawBytes = raw is Uint8List ? raw : Uint8List.fromList(raw);
+        if (rawBytes.length != thumbnailPayloadSize) return null;
+        return await _decodeThumbnailInIsolate(rawBytes);
+      } catch (_) {
+        return null;
+      }
+    });
   }
 
   @override

@@ -15,10 +15,12 @@ class JikkyoPlaybackController {
   JikkyoPlaybackController({
     required this._client,
     this.onStateChanged,
+    this.retryBackoff = const Duration(seconds: 15),
   });
 
   final JikkyoClient _client;
   final void Function()? onStateChanged;
+  final Duration retryBackoff;
 
   static const int recordedChunkSeconds = 1200; // 20-minute chunk
   static const int maxCachedBodyChunks = 3;
@@ -27,6 +29,7 @@ class JikkyoPlaybackController {
 
   bool _disposed = false;
   bool _isLive = false;
+  int _sessionGen = 0;
   String? _jkId;
 
   // Live state
@@ -49,6 +52,8 @@ class JikkyoPlaybackController {
   final LinkedHashMap<int, List<JikkyoComment>> _chunkBodyCache =
       LinkedHashMap<int, List<JikkyoComment>>();
   final Set<int> _loadingChunks = <int>{};
+  final Set<int> _keepBodyRequestedChunks = <int>{};
+  final Map<int, DateTime> _chunkRetryAfter = <int, DateTime>{};
   bool _momentumLoading = false;
   bool _recordedLoadedAny = false;
   int _totalCommentCount = 0;
@@ -122,9 +127,12 @@ class JikkyoPlaybackController {
 
   Future<void> _refreshLiveChannelInfo({bool forceRefresh = false}) async {
     final jkId = _jkId;
+    final sessionGen = _sessionGen;
     if (_disposed || !_isLive || jkId == null) return;
     final map = await _client.fetchChannelsInfo(forceRefresh: forceRefresh);
-    if (_disposed || !_isLive || _jkId != jkId) return;
+    if (_disposed || !_isLive || sessionGen != _sessionGen || _jkId != jkId) {
+      return;
+    }
     final info = map[jkId];
     if (info != null) {
       _liveChannelInfo = info;
@@ -230,6 +238,7 @@ class JikkyoPlaybackController {
   }) async {
     final jkId = _jkId;
     final start = _recordedStart;
+    final sessionGen = _sessionGen;
     if (_disposed || _isLive || jkId == null || start == null) return;
     final totalChunks = _totalChunkCount();
     if (chunkIndex < 0 || chunkIndex >= totalChunks) return;
@@ -240,6 +249,11 @@ class JikkyoPlaybackController {
       return;
     }
     if (!keepBody && _countedChunkIndices.contains(chunkIndex)) return;
+    final retryAfter = _chunkRetryAfter[chunkIndex];
+    if (retryAfter != null && DateTime.now().isBefore(retryAfter)) return;
+    if (keepBody) {
+      _keepBodyRequestedChunks.add(chunkIndex);
+    }
     if (!_loadingChunks.add(chunkIndex)) return;
 
     try {
@@ -250,17 +264,45 @@ class JikkyoPlaybackController {
       final chunkEndSec = math.min(maxSec, chunkStartSec + recordedChunkSeconds);
       if (chunkEndSec <= chunkStartSec) return;
 
-      final comments = await _client.fetchKakolog(
-        jkId: jkId,
-        startTime: start.add(Duration(seconds: chunkStartSec)),
-        endTime: start.add(Duration(seconds: chunkEndSec)),
-      );
-      if (_disposed || _isLive || _jkId != jkId) return;
+      final List<JikkyoComment> rawComments;
+      try {
+        rawComments = await _client.fetchKakolog(
+          jkId: jkId,
+          startTime: start.add(Duration(seconds: chunkStartSec)),
+          endTime: start.add(Duration(seconds: chunkEndSec)),
+        );
+      } catch (_) {
+        if (!_disposed && sessionGen == _sessionGen) {
+          _chunkRetryAfter[chunkIndex] = DateTime.now().add(retryBackoff);
+        }
+        return;
+      }
+      if (_disposed || _isLive || sessionGen != _sessionGen || _jkId != jkId) {
+        return;
+      }
+      _chunkRetryAfter.remove(chunkIndex);
+
+      final startMs = start.millisecondsSinceEpoch;
+      final chunkStartMs = startMs + chunkStartSec * 1000;
+      final chunkEndMs = startMs + chunkEndSec * 1000;
+      final isLastChunk = chunkIndex == totalChunks - 1;
+      final seenKeys = <String>{};
+      final comments = <JikkyoComment>[];
+      for (final c in rawComments) {
+        final inRange = c.timestampMs >= chunkStartMs &&
+            (isLastChunk
+                ? c.timestampMs <= chunkEndMs
+                : c.timestampMs < chunkEndMs);
+        if (!inRange) continue;
+        final key = '${c.no ?? -1}:${c.timestampMs}:${c.text}';
+        if (seenKeys.add(key)) {
+          comments.add(c);
+        }
+      }
 
       _recordedLoadedAny = true;
       if (_countedChunkIndices.add(chunkIndex) && _momentumBuckets.isNotEmpty) {
         final nextBuckets = List<int>.of(_momentumBuckets);
-        final startMs = start.millisecondsSinceEpoch;
         final bucketMs = _bucketSeconds * 1000;
         for (final c in comments) {
           final relMs = c.timestampMs - startMs;
@@ -272,7 +314,9 @@ class JikkyoPlaybackController {
         _totalCommentCount += comments.length;
       }
 
-      if (keepBody) {
+      final shouldKeepBody =
+          keepBody || _keepBodyRequestedChunks.remove(chunkIndex);
+      if (shouldKeepBody) {
         _chunkBodyCache.remove(chunkIndex);
         _chunkBodyCache[chunkIndex] = comments;
         while (_chunkBodyCache.length > maxCachedBodyChunks) {
@@ -281,26 +325,30 @@ class JikkyoPlaybackController {
       }
       _notify();
     } finally {
-      _loadingChunks.remove(chunkIndex);
+      if (sessionGen == _sessionGen) {
+        _loadingChunks.remove(chunkIndex);
+        _keepBodyRequestedChunks.remove(chunkIndex);
+      }
     }
   }
 
   Future<void> _prefetchMomentumRemainingChunks() async {
+    final sessionGen = _sessionGen;
     final totalChunks = _totalChunkCount();
     if (totalChunks <= 1) return;
     _momentumLoading = true;
     _notify();
     try {
       for (var i = 1; i < totalChunks; i++) {
-        if (_disposed || _isLive) break;
+        if (_disposed || _isLive || sessionGen != _sessionGen) break;
         if (!_countedChunkIndices.contains(i)) {
           await _loadRecordedChunk(i, keepBody: false);
-          if (_disposed || _isLive) break;
+          if (_disposed || _isLive || sessionGen != _sessionGen) break;
           await Future<void>.delayed(const Duration(milliseconds: 220));
         }
       }
     } finally {
-      if (!_disposed && !_isLive) {
+      if (!_disposed && !_isLive && sessionGen == _sessionGen) {
         _momentumLoading = false;
         _notify();
       }
@@ -326,6 +374,12 @@ class JikkyoPlaybackController {
 
     final targetMs = startMs + relMs;
     final prev = _lastCursorMs;
+    if (!_chunkBodyCache.containsKey(chunkIdx)) {
+      if (prev == null || targetMs < prev || (targetMs - prev) > 4000) {
+        _lastCursorMs = targetMs;
+      }
+      return const [];
+    }
     if (prev == null || targetMs < prev || (targetMs - prev) > 4000) {
       // First tick or seek jump: advance cursor without dumping stale comments.
       _lastCursorMs = targetMs;
@@ -336,11 +390,15 @@ class JikkyoPlaybackController {
     }
     _lastCursorMs = targetMs;
 
+    final seen = <String>{};
     final out = <JikkyoComment>[];
     for (final list in _chunkBodyCache.values) {
       for (final c in list) {
         if (c.timestampMs > prev && c.timestampMs <= targetMs) {
-          out.add(c);
+          final key = '${c.no ?? -1}:${c.timestampMs}:${c.text}';
+          if (seen.add(key)) {
+            out.add(c);
+          }
         }
       }
     }
@@ -351,6 +409,7 @@ class JikkyoPlaybackController {
   }
 
   void _resetSessionState() {
+    _sessionGen++;
     _liveMetaRefreshTimer?.cancel();
     _liveMetaRefreshTimer = null;
     final conn = _liveConn;
@@ -372,6 +431,8 @@ class JikkyoPlaybackController {
     _countedChunkIndices.clear();
     _chunkBodyCache.clear();
     _loadingChunks.clear();
+    _keepBodyRequestedChunks.clear();
+    _chunkRetryAfter.clear();
     _momentumLoading = false;
     _recordedLoadedAny = false;
     _totalCommentCount = 0;

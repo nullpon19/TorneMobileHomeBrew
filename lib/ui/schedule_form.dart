@@ -219,9 +219,14 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
     final targetReg = activeHost != null
         ? regs.firstWhere((r) => r.host == activeHost, orElse: () => widget.reg)
         : widget.reg;
-    final channels = _selectedBand == bsBroadcastingType
-        ? ref.watch(bsChannelsProvider(targetReg))
-        : ref.watch(channelsProvider(targetReg));
+    final hasCsChannels =
+        _selectedBand == csBroadcastingType ||
+        (ref.watch(csChannelsProvider(targetReg)).value?.isNotEmpty ?? false);
+    final channels = switch (_selectedBand) {
+      bsBroadcastingType => ref.watch(bsChannelsProvider(targetReg)),
+      csBroadcastingType => ref.watch(csChannelsProvider(targetReg)),
+      _ => ref.watch(channelsProvider(targetReg)),
+    };
     final hddDetails = ref.watch(hddDetailsProvider(targetReg)).value;
     final externalAvailable =
         hddDetails != null &&
@@ -276,12 +281,17 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           const SizedBox(height: 12),
         ],
         SegmentedButton<int>(
-          segments: const [
-            ButtonSegment<int>(
+          segments: [
+            const ButtonSegment<int>(
               value: terrestrialBroadcastingType,
               label: Text('地デジ'),
             ),
-            ButtonSegment<int>(value: bsBroadcastingType, label: Text('BS')),
+            const ButtonSegment<int>(value: bsBroadcastingType, label: Text('BS')),
+            if (hasCsChannels)
+              const ButtonSegment<int>(
+                value: csBroadcastingType,
+                label: Text('CS'),
+              ),
           ],
           selected: {_selectedBand},
           onSelectionChanged: (values) => setState(() {
@@ -330,6 +340,8 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           onRetry: () {
             if (_selectedBand == bsBroadcastingType) {
               ref.invalidate(bsChannelsProvider(targetReg));
+            } else if (_selectedBand == csBroadcastingType) {
+              ref.invalidate(csChannelsProvider(targetReg));
             } else {
               ref.invalidate(channelsProvider(targetReg));
             }
@@ -388,7 +400,7 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       firstDate: DateTime(_date.year - 1),
       lastDate: DateTime(_date.year + 2),
     );
-    if (picked != null) {
+    if (picked != null && mounted) {
       setState(() => _date = DateTime(picked.year, picked.month, picked.day));
     }
   }
@@ -398,7 +410,7 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
       context: context,
       builder: (_) => FireTvTimePickerDialog(initialTime: _time),
     );
-    if (picked != null) setState(() => _time = picked);
+    if (picked != null && mounted) setState(() => _time = picked);
   }
 
   Widget _qualityField() {
@@ -470,11 +482,11 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           )
         : widget.reg;
 
-    final channels =
-        (_selectedBand == bsBroadcastingType
-                ? ref.read(bsChannelsProvider(explicitTargetReg))
-                : ref.read(channelsProvider(explicitTargetReg)))
-            .value;
+    final channels = switch (_selectedBand) {
+      bsBroadcastingType => ref.read(bsChannelsProvider(explicitTargetReg)),
+      csBroadcastingType => ref.read(csChannelsProvider(explicitTargetReg)),
+      _ => ref.read(channelsProvider(explicitTargetReg)),
+    }.value;
     final choices = <Channel>[
       for (final c in channels ?? const <Channel>[])
         if (c.broadcastingType == _selectedBand && c.serviceType == 1) c,
@@ -526,161 +538,176 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
         );
 
     setState(() => _saving = true);
+    try {
+      if (isMultiAuto) {
+        final reachableRegs = <RegisteredNasne>[];
+        final hasConflictByHost = <String, bool>{};
+        final freeBytesByHost = <String, int>{};
+        final allConflicts = <RecordSchedule>[];
+        Object? firstError;
 
-    if (isMultiAuto) {
-      final candidate = buildCandidate(widget.reg);
-      final reachableRegs = <RegisteredNasne>[];
-      final hasConflictByHost = <String, bool>{};
-      final freeBytesByHost = <String, int>{};
-      final allConflicts = <RecordSchedule>[];
-      Object? firstError;
-
-      final results = await Future.wait([
-        for (final r in regs)
-          () async {
-            try {
-              final svc = ref.read(deviceServicesProvider(r));
-              final conflicts = await svc.schedules.checkConflicts(candidate);
-              var hdds = ref.read(hddDetailsProvider(r)).value;
-              if (hdds == null) {
-                try {
-                  hdds = await ref
-                      .read(hddDetailsProvider(r).future)
-                      .timeout(const Duration(seconds: 3));
-                } catch (_) {
-                  hdds = null;
+        final results = await Future.wait([
+          for (final r in regs)
+            () async {
+              try {
+                final svc = ref.read(deviceServicesProvider(r));
+                final candidateForR = buildCandidate(r);
+                final conflicts = await svc.schedules.checkConflicts(
+                  candidateForR,
+                );
+                var hdds = ref.read(hddDetailsProvider(r)).value;
+                if (hdds == null) {
+                  try {
+                    hdds = await ref
+                        .read(hddDetailsProvider(r).future)
+                        .timeout(const Duration(seconds: 3));
+                  } catch (_) {
+                    hdds = null;
+                  }
                 }
+                return (
+                  reg: r,
+                  conflicts: conflicts,
+                  freeBytes: totalFreeBytesForHdds(hdds),
+                  error: null as Object?,
+                );
+              } catch (e) {
+                return (
+                  reg: r,
+                  conflicts: const <RecordSchedule>[],
+                  freeBytes: -1,
+                  error: e,
+                );
               }
-              return (
-                reg: r,
-                conflicts: conflicts,
-                freeBytes: totalFreeBytesForHdds(hdds),
-                error: null as Object?,
-              );
-            } catch (e) {
-              return (
-                reg: r,
-                conflicts: const <RecordSchedule>[],
-                freeBytes: -1,
-                error: e,
-              );
-            }
-          }(),
-      ]);
+            }(),
+        ]);
 
-      for (final res in results) {
-        if (res.error != null) {
-          firstError ??= res.error;
-          continue;
+        for (final res in results) {
+          if (res.error != null) {
+            firstError ??= res.error;
+            continue;
+          }
+          reachableRegs.add(res.reg);
+          hasConflictByHost[res.reg.host] = res.conflicts.isNotEmpty;
+          freeBytesByHost[res.reg.host] = res.freeBytes;
+          allConflicts.addAll(res.conflicts);
         }
-        reachableRegs.add(res.reg);
-        hasConflictByHost[res.reg.host] = res.conflicts.isNotEmpty;
-        freeBytesByHost[res.reg.host] = res.freeBytes;
-        allConflicts.addAll(res.conflicts);
-      }
 
-      if (!mounted) return;
-      if (reachableRegs.isEmpty) {
-        setState(() => _saving = false);
-        showSnack(
-          context,
-          firstError != null ? userMessageForError(firstError) : '予約を作成できませんでした',
+        if (!mounted) return;
+        if (reachableRegs.isEmpty) {
+          showSnack(
+            context,
+            firstError != null
+                ? userMessageForError(firstError)
+                : '予約を作成できませんでした',
+          );
+          return;
+        }
+
+        var target = selectAutoScheduleNasne(
+          candidates: reachableRegs,
+          hasConflictByHost: hasConflictByHost,
+          freeBytesByHost: freeBytesByHost,
+          preferredReg: widget.reg,
         );
+
+        if (target == null) {
+          final otherChannels = <Channel>[
+            if (_selectedBand != terrestrialBroadcastingType)
+              ...(ref.read(channelsProvider(widget.reg)).value ??
+                  const <Channel>[]),
+            if (_selectedBand != bsBroadcastingType)
+              ...(ref.read(bsChannelsProvider(widget.reg)).value ??
+                  const <Channel>[]),
+            if (_selectedBand != csBroadcastingType)
+              ...(ref.read(csChannelsProvider(widget.reg)).value ??
+                  const <Channel>[]),
+          ];
+          final proceed = await _showConflictWarning(allConflicts, [
+            ...choices,
+            ...otherChannels,
+          ]);
+          if (proceed != true || !mounted) return;
+          target = reachableRegs.any((r) => r.host == widget.reg.host)
+              ? widget.reg
+              : reachableRegs.first;
+        }
+
+        try {
+          await ref
+              .read(deviceServicesProvider(target))
+              .schedules
+              .createSchedule(buildCandidate(target));
+        } catch (e) {
+          if (!mounted) return;
+          showSnack(context, userMessageForError(e));
+          return;
+        }
+        ref.invalidate(schedulesProvider(target));
+        if (!mounted) return;
+        Navigator.of(context).pop();
+        showSnack(context, '予約を作成しました（${nasneDisplayLabel(target)}）');
         return;
       }
 
-      var target = selectAutoScheduleNasne(
-        candidates: reachableRegs,
-        hasConflictByHost: hasConflictByHost,
-        freeBytesByHost: freeBytesByHost,
-        preferredReg: widget.reg,
-      );
-
-      if (target == null) {
-        final otherChannels = _selectedBand == bsBroadcastingType
-            ? (ref.read(channelsProvider(widget.reg)).value ??
-                  const <Channel>[])
-            : (ref.read(bsChannelsProvider(widget.reg)).value ??
-                  const <Channel>[]);
-        final proceed = await _showConflictWarning(allConflicts, [
-          ...choices,
-          ...otherChannels,
-        ]);
-        if (proceed != true) {
-          if (mounted) setState(() => _saving = false);
-          return;
-        }
-        target = reachableRegs.any((r) => r.host == widget.reg.host)
-            ? widget.reg
-            : reachableRegs.first;
-      }
-
+      final candidate = buildCandidate(explicitTargetReg);
+      final services = ref.read(deviceServicesProvider(explicitTargetReg));
+      var created = false;
       try {
-        await ref
-            .read(deviceServicesProvider(target))
-            .schedules
-            .createSchedule(buildCandidate(target));
-      } on NasneError catch (e) {
+        var conflicts = await services.schedules.checkConflicts(candidate);
+        final original = widget.original;
+        if (widget.mode == ScheduleFormMode.timeChange && original != null) {
+          // The reservation being replaced always overlaps itself; it is
+          // not a conflict for this flow (plan 12.7 time-change model).
+          conflicts = [
+            for (final c in conflicts)
+              if (c.id != original.id) c,
+          ];
+        }
+        if (conflicts.isNotEmpty) {
+          if (!mounted) return;
+          final otherChannels = <Channel>[
+            if (_selectedBand != terrestrialBroadcastingType)
+              ...(ref.read(channelsProvider(explicitTargetReg)).value ??
+                  const <Channel>[]),
+            if (_selectedBand != bsBroadcastingType)
+              ...(ref.read(bsChannelsProvider(explicitTargetReg)).value ??
+                  const <Channel>[]),
+            if (_selectedBand != csBroadcastingType)
+              ...(ref.read(csChannelsProvider(explicitTargetReg)).value ??
+                  const <Channel>[]),
+          ];
+          final proceed = await _showConflictWarning(conflicts, [
+            ...choices,
+            ...otherChannels,
+          ]);
+          if (proceed != true || !mounted) return;
+        }
+        await services.schedules.createSchedule(candidate);
+        created = true;
+        if (widget.mode == ScheduleFormMode.timeChange && original != null) {
+          await services.schedules.deleteSchedule(original.id);
+        }
+      } catch (e) {
+        if (created) {
+          ref.invalidate(schedulesProvider(explicitTargetReg));
+        }
         if (!mounted) return;
-        setState(() => _saving = false);
         showSnack(context, userMessageForError(e));
         return;
       }
-      ref.invalidate(schedulesProvider(target));
+      ref.invalidate(schedulesProvider(explicitTargetReg));
       if (!mounted) return;
       Navigator.of(context).pop();
-      showSnack(context, '予約を作成しました（${nasneDisplayLabel(target)}）');
-      return;
+      showSnack(
+        context,
+        regs.length > 1
+            ? '予約を作成しました（${nasneDisplayLabel(explicitTargetReg)}）'
+            : '予約を作成しました',
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
-
-    final candidate = buildCandidate(explicitTargetReg);
-    final services = ref.read(deviceServicesProvider(explicitTargetReg));
-    try {
-      var conflicts = await services.schedules.checkConflicts(candidate);
-      final original = widget.original;
-      if (widget.mode == ScheduleFormMode.timeChange && original != null) {
-        // The reservation being replaced always overlaps itself; it is
-        // not a conflict for this flow (plan 12.7 time-change model).
-        conflicts = [
-          for (final c in conflicts)
-            if (c.id != original.id) c,
-        ];
-      }
-      if (conflicts.isNotEmpty) {
-        if (!mounted) return;
-        final otherChannels = _selectedBand == bsBroadcastingType
-            ? (ref.read(channelsProvider(explicitTargetReg)).value ??
-                  const <Channel>[])
-            : (ref.read(bsChannelsProvider(explicitTargetReg)).value ??
-                  const <Channel>[]);
-        final proceed = await _showConflictWarning(conflicts, [
-          ...choices,
-          ...otherChannels,
-        ]);
-        if (proceed != true) {
-          setState(() => _saving = false);
-          return;
-        }
-      }
-      await services.schedules.createSchedule(candidate);
-      if (widget.mode == ScheduleFormMode.timeChange && original != null) {
-        await services.schedules.deleteSchedule(original.id);
-      }
-    } on NasneError catch (e) {
-      if (!mounted) return;
-      setState(() => _saving = false);
-      showSnack(context, userMessageForError(e));
-      return;
-    }
-    ref.invalidate(schedulesProvider(explicitTargetReg));
-    if (!mounted) return;
-    Navigator.of(context).pop();
-    showSnack(
-      context,
-      regs.length > 1
-          ? '予約を作成しました（${nasneDisplayLabel(explicitTargetReg)}）'
-          : '予約を作成しました',
-    );
   }
 
   Future<bool?> _showConflictWarning(
@@ -803,17 +830,17 @@ class _ScheduleFormPageState extends ConsumerState<ScheduleFormPage> {
           .read(deviceServicesProvider(widget.reg))
           .schedules
           .updateSchedule(update);
-    } on NasneError catch (e) {
+      // After an update the re-read value is the truth (plan 12.5).
+      ref.invalidate(schedulesProvider(widget.reg));
       if (!mounted) return;
-      setState(() => _saving = false);
+      Navigator.of(context).pop();
+      showSnack(context, '更新しました');
+    } catch (e) {
+      if (!mounted) return;
       showSnack(context, userMessageForError(e));
-      return;
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
-    // After an update the re-read value is the truth (plan 12.5).
-    ref.invalidate(schedulesProvider(widget.reg));
-    if (!mounted) return;
-    Navigator.of(context).pop();
-    showSnack(context, '更新しました');
   }
 }
 
