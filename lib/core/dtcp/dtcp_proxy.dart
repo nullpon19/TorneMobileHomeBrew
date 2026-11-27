@@ -1220,17 +1220,27 @@ class DtcpProxy {
     final producer = _producer;
     _cancelProducer();
     _window.close();
-    await _iterator?.cancel();
-    await _server.close(force: true);
+    // Force-close the upstream HTTP client immediately so nasne:58890 does
+    // not keep the live tuner occupied while downstream teardown finishes.
+    _fetcher.resetClient();
+    try {
+      await _iterator?.cancel().timeout(
+        const Duration(seconds: 1),
+        onTimeout: () {},
+      );
+    } catch (_) {}
+    try {
+      await _server.close(force: true);
+    } catch (_) {}
     final pump = _pumpFuture;
     if (pump != null) {
       // The pump observes the stop through the flags above; do
       // not let teardown hang on it.
-      await pump.timeout(const Duration(seconds: 5), onTimeout: () {});
+      await pump.timeout(const Duration(seconds: 2), onTimeout: () {});
     }
     if (producer != null) {
       await producer.runFuture?.timeout(
-        const Duration(seconds: 5),
+        const Duration(seconds: 2),
         onTimeout: () {},
       );
     }

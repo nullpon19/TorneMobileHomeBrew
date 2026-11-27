@@ -4491,6 +4491,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (!mounted) return;
     if (confirmed) {
+      await _stopSession().timeout(
+        const Duration(milliseconds: 1500),
+        onTimeout: () {},
+      );
+      if (!mounted) return;
       final nav = Navigator.of(context);
       if (nav.canPop()) nav.pop();
       return;
@@ -6917,11 +6922,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
   }
 
+  Future<void>? _sessionStopFuture;
+
   /// Stops the playback session (plan 104): closes the
-  /// loopback proxy and the DTCP session behind it. A
-  /// failure is logged inside and dropped; the session's
-  /// stop can never hold up the rest of the teardown.
-  Future<void> _stopSession() async {
+  /// loopback proxy and the DTCP session behind it. Idempotent
+  /// across confirm-exit and [dispose] so callers can await it
+  /// before leaving without double-stopping. A failure is logged
+  /// inside and dropped; the session's stop can never hold up
+  /// the rest of the teardown.
+  Future<void> _stopSession() {
+    return _sessionStopFuture ??= _runStopSession();
+  }
+
+  Future<void> _runStopSession() async {
+    final sw = Stopwatch()..start();
     try {
       await widget.session.stop();
     } catch (e) {
@@ -6929,6 +6943,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         DiagCategory.playback,
         'player: session stop on leaving failed: $e',
       );
+    } finally {
+      sw.stop();
+      _logPlaybackTrace('session stopped in ${sw.elapsedMilliseconds}ms');
     }
   }
 

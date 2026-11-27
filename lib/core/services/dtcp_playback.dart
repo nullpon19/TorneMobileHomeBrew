@@ -389,9 +389,15 @@ class _DtcpPlaybackSession
   Future<void> stop() async {
     if (_stopped) return;
     _stopped = true;
-    await _proxy.stop();
-    await _keySource?.currentSession.close();
+    // Close the HTTP client synchronously before waiting on proxy/AKE teardown
+    // so the upstream TCP socket drops immediately on user exit.
     _fetcher.close();
+    try {
+      await _proxy.stop();
+      await _keySource?.currentSession.close();
+    } finally {
+      _fetcher.close();
+    }
   }
 }
 

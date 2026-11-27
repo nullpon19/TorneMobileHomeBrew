@@ -13,8 +13,18 @@ library;
 
 import '../core/core.dart';
 
+/// True when [error] indicates nasne's live tuner is currently busy
+/// (HTTP 511 from the DTCP live stream endpoint).
+bool isTunerBusyError(Object error) =>
+    error is NasneError &&
+    error.messageKey == 'error.http' &&
+    error.code == '511';
+
 /// A user-facing explanation for [error] (usually a [NasneError]).
 String userMessageForError(Object error) {
+  if (isTunerBusyError(error)) {
+    return 'nasne のチューナーが現在使用中です。';
+  }
   if (error is NasneError) {
     return switch (error.messageKey) {
       'error.unreachable' => 'nasne に接続できませんでした。電源とネットワークを確認してください。',
@@ -40,6 +50,9 @@ String userMessageForError(Object error) {
 /// useful can be added — the explanation already says what to
 /// check, or the failure is not one a viewer can act on.
 String? errorNextStepForError(Object error) {
+  if (isTunerBusyError(error)) {
+    return '他の視聴や録画が終わると再生できます。少し待ってから再試行するか、「空きを待って自動再生」をお使いください。';
+  }
   if (error is NasneError) {
     return switch (error.messageKey) {
       'error.unreachable' =>

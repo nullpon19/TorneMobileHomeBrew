@@ -6,6 +6,9 @@
 /// with the classification collapsed away.
 library;
 
+import 'dart:async';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/core/core.dart';
@@ -196,4 +199,158 @@ void main() {
       expect(formatThroughputMbps(-1.0), isNull);
     });
   });
+
+  group('HTTP 511 Tuner Busy wording & auto-wait', () {
+    test('identifies HTTP 511 as Tuner Busy with dedicated guidance', () {
+      final busy = NasneError.http(511, 'dtcp:http');
+      final other = NasneError.http(500, 'dtcp:http');
+      expect(isTunerBusyError(busy), isTrue);
+      expect(isTunerBusyError(other), isFalse);
+      expect(isTunerBusyError(NasneError.unreachable('dtcp:http')), isFalse);
+
+      expect(userMessageForError(busy), 'nasne のチューナーが現在使用中です。');
+      expect(errorNextStepForError(busy), contains('空きを待って自動再生'));
+    });
+
+    testWidgets('waits and auto-starts playback once HTTP 511 clears', (
+      tester,
+    ) async {
+      var attempts = 0;
+      final session = _FakePlaybackSession();
+
+      await tester.pumpWidget(
+        ProviderScope(
+          child: MaterialApp(
+            home: Consumer(
+              builder: (context, ref, _) => Scaffold(
+                body: Center(
+                  child: ElevatedButton(
+                    onPressed: () {
+                      unawaited(
+                        startPlaybackAndShowPlayer(
+                          context: context,
+                          ref: ref,
+                          unsupportedSubject: 'TV視聴',
+                          tunerWaitInterval: const Duration(milliseconds: 20),
+                          tunerWaitMaxDuration: const Duration(seconds: 5),
+                          start: () async {
+                            attempts++;
+                            if (attempts <= 2) {
+                              throw NasneError.http(511, 'dtcp:http');
+                            }
+                            return session;
+                          },
+                          buildPlayer: (_) =>
+                              const Scaffold(body: Text('player-opened')),
+                        ),
+                      );
+                    },
+                    child: const Text('開始'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('開始'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('nasne のチューナーが現在使用中です。'), findsOneWidget);
+      expect(find.text('空きを待って自動再生'), findsOneWidget);
+      expect(find.text('再試行'), findsOneWidget);
+
+      await tester.tap(find.text('空きを待って自動再生'));
+      await tester.pump();
+      expect(find.text('チューナーの空きを待機中'), findsOneWidget);
+
+      // Two 20ms polls: attempt 2 still 511, attempt 3 succeeds and opens player.
+      await tester.pump(const Duration(milliseconds: 30));
+      await tester.pump(const Duration(milliseconds: 30));
+      await tester.pumpAndSettle();
+
+      expect(attempts, 3);
+      expect(find.text('player-opened'), findsOneWidget);
+      expect(session.stopped, isFalse);
+    });
+
+    testWidgets('cancelling auto-wait stops cleanly and drops late session', (
+      tester,
+    ) async {
+      var attempts = 0;
+      final pendingStart = Completer<PlaybackSession>();
+      final lateSession = _FakePlaybackSession();
+
+      await tester.pumpWidget(
+        ProviderScope(
+          child: MaterialApp(
+            home: Consumer(
+              builder: (context, ref, _) => Scaffold(
+                body: Center(
+                  child: ElevatedButton(
+                    onPressed: () {
+                      unawaited(
+                        startPlaybackAndShowPlayer(
+                          context: context,
+                          ref: ref,
+                          unsupportedSubject: 'TV視聴',
+                          tunerWaitInterval: const Duration(milliseconds: 20),
+                          tunerWaitMaxDuration: const Duration(seconds: 5),
+                          start: () {
+                            attempts++;
+                            if (attempts == 1) {
+                              return Future.error(
+                                NasneError.http(511, 'dtcp:http'),
+                              );
+                            }
+                            return pendingStart.future;
+                          },
+                          buildPlayer: (_) =>
+                              const Scaffold(body: Text('player-opened')),
+                        ),
+                      );
+                    },
+                    child: const Text('開始'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('開始'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('空きを待って自動再生'));
+      await tester.pump();
+      // Let the first scheduled poll fire so start() is in-flight.
+      await tester.pump(const Duration(milliseconds: 30));
+      expect(attempts, 2);
+
+      await tester.tap(find.text('キャンセル'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('チューナーの空きを待機中'), findsNothing);
+      expect(find.text('player-opened'), findsNothing);
+
+      // Even if the in-flight start() later resolves, it is stopped immediately.
+      pendingStart.complete(lateSession);
+      await tester.pump();
+      expect(lateSession.stopped, isTrue);
+    });
+  });
+}
+
+class _FakePlaybackSession implements PlaybackSession {
+  bool stopped = false;
+
+  @override
+  Uri get mediaUri => Uri.parse('http://127.0.0.1:0/live');
+
+  @override
+  Future<void> stop() async {
+    stopped = true;
+  }
 }

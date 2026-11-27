@@ -752,5 +752,92 @@ void main() {
         expect(requestedNpts[1], lessThan(7.0));
       },
     );
+
+    test(
+      'DtcpProxy.stop() force-closes an active endless upstream stream immediately',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final plaintext = Uint8List.fromList(
+          List.generate(12288, (i) => (i * 13 + 7) & 0xFF),
+        );
+        final packet = _buildTestPcpPacket(exchangeKey, plaintext);
+        final upstreamConnected = Completer<void>();
+        final upstreamSocketClosed = Completer<void>();
+
+        final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(server.close);
+        server.listen((socket) async {
+          if (!upstreamConnected.isCompleted) upstreamConnected.complete();
+          final headerBuf = <int>[];
+          await for (final chunk in socket) {
+            headerBuf.addAll(chunk);
+            if (String.fromCharCodes(headerBuf).contains('\r\n\r\n')) {
+              break;
+            }
+          }
+          socket.write(
+            'HTTP/1.1 200 OK\r\n'
+            'Content-Type: application/x-dtcp1\r\n\r\n',
+          );
+          socket.add(packet);
+          await socket.flush();
+          // Keep the connection open endlessly like a live stream;
+          // wait until the client side resets/closes the TCP socket.
+          try {
+            await socket.drain<void>();
+          } catch (_) {
+            // Connection reset by peer is expected when force-closed.
+          } finally {
+            await socket.close();
+            if (!upstreamSocketClosed.isCompleted) {
+              upstreamSocketClosed.complete();
+            }
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/live'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+        );
+        addTearDown(proxy.stop);
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final req = await client.getUrl(proxy.uri);
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+
+        final firstChunk = Completer<void>();
+        final sub = resp.listen(
+          (chunk) {
+            if (chunk.isNotEmpty && !firstChunk.isCompleted) {
+              firstChunk.complete();
+            }
+          },
+          onError: (_) {},
+          cancelOnError: false,
+        );
+        addTearDown(sub.cancel);
+
+        await upstreamConnected.future.timeout(const Duration(seconds: 2));
+        await firstChunk.future.timeout(const Duration(seconds: 2));
+
+        final sw = Stopwatch()..start();
+        await proxy.stop();
+        sw.stop();
+
+        expect(sw.elapsedMilliseconds, lessThan(1500));
+        await upstreamSocketClosed.future.timeout(const Duration(seconds: 2));
+      },
+    );
   });
 }
