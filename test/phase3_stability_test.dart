@@ -308,6 +308,38 @@ void main() {
       // Comment finishes scrolling within ~5s and stops ticker again.
       await tester.pumpAndSettle();
     });
+
+    testWidgets('JikkyoDanmakuOverlay updates opacity and DPR cleanly with pre-rendered sprites', (tester) async {
+      final controller = JikkyoDanmakuController();
+      addTearDown(controller.dispose);
+
+      Widget buildFor(int opacityPercent, double dpr) => MaterialApp(
+        home: MediaQuery(
+          data: MediaQueryData(size: const Size(800, 450), devicePixelRatio: dpr),
+          child: SizedBox(
+            width: 800,
+            height: 450,
+            child: JikkyoDanmakuOverlay(
+              settings: JikkyoSettings(opacityPercent: opacityPercent),
+              controller: controller,
+              isPlaying: true,
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpWidget(buildFor(30, 1.0));
+      controller.enqueue([
+        const JikkyoComment(no: 1, timestampMs: 1000, text: '半透明テスト'),
+      ]);
+      await tester.pump(const Duration(milliseconds: 250));
+
+      await tester.pumpWidget(buildFor(50, 1.0));
+      await tester.pump(const Duration(milliseconds: 250));
+
+      await tester.pumpWidget(buildFor(100, 2.0));
+      await tester.pumpAndSettle();
+    });
   });
 
   group('Phase 3 PiP shared broadcast stream', () {

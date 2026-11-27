@@ -6,6 +6,7 @@ library;
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/scheduler.dart';
 import 'package:material_ui/material_ui.dart';
@@ -86,18 +87,22 @@ class _ActiveDanmakuItem {
       durationSeconds <= 0 ? 1.0 : (elapsedSeconds / durationSeconds);
 }
 
-class _CachedTextPair {
-  const _CachedTextPair({
-    required this.fill,
-    required this.stroke,
-    required this.width,
-    required this.height,
+class _CachedCommentSprite {
+  const _CachedCommentSprite({
+    required this.image,
+    required this.textWidth,
+    required this.textHeight,
+    required this.padding,
+    required this.logicalWidth,
+    required this.logicalHeight,
   });
 
-  final TextPainter fill;
-  final TextPainter stroke;
-  final double width;
-  final double height;
+  final ui.Image image;
+  final double textWidth;
+  final double textHeight;
+  final double padding;
+  final double logicalWidth;
+  final double logicalHeight;
 }
 
 class JikkyoDanmakuOverlay extends StatefulWidget {
@@ -124,16 +129,17 @@ class JikkyoDanmakuOverlay extends StatefulWidget {
 
 class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     with SingleTickerProviderStateMixin {
-  static const int _maxPainterCacheEntries = 128;
+  static const int _maxSpriteCacheEntries = 96;
 
   late final Ticker _ticker;
   final ValueNotifier<int> _repaintTick = ValueNotifier<int>(0);
   final List<_ActiveDanmakuItem> _active = [];
-  final LinkedHashMap<String, _CachedTextPair> _painterCache =
-      LinkedHashMap<String, _CachedTextPair>();
+  final LinkedHashMap<String, _CachedCommentSprite> _spriteCache =
+      LinkedHashMap<String, _CachedCommentSprite>();
 
   Duration? _lastTickElapsed;
   Size _viewportSize = const Size(1280, 720);
+  double _devicePixelRatio = 1.0;
   Timer? _previewTimer;
   int _previewCursor = 0;
 
@@ -146,12 +152,11 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     _syncTicker();
   }
 
-  void _clearPainterCache() {
-    for (final pair in _painterCache.values) {
-      pair.fill.dispose();
-      pair.stroke.dispose();
+  void _clearSpriteCache() {
+    for (final entry in _spriteCache.values) {
+      entry.image.dispose();
     }
-    _painterCache.clear();
+    _spriteCache.clear();
   }
 
   void _syncTicker() {
@@ -175,10 +180,12 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
       );
       widget.controller?._addListeners(_handleIncomingComments, _handleClear);
     }
-    if (oldWidget.settings.opacityPercent != widget.settings.opacityPercent ||
-        oldWidget.settings.textSize != widget.settings.textSize ||
+    if (oldWidget.settings.textSize != widget.settings.textSize ||
         oldWidget.settings.forceWhiteText != widget.settings.forceWhiteText) {
-      _clearPainterCache();
+      _clearSpriteCache();
+      _repaintTick.value++;
+    } else if (oldWidget.settings.opacityPercent !=
+        widget.settings.opacityPercent) {
       _repaintTick.value++;
     }
     if (oldWidget.settings.hideFixedComments !=
@@ -230,23 +237,20 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     }
   }
 
-  _CachedTextPair _painterFor(JikkyoComment comment, double baseFontSize) {
+  _CachedCommentSprite _spriteFor(JikkyoComment comment, double baseFontSize) {
     final fontSize = _commentFontSize(comment, baseFontSize);
-    final opacity = (widget.settings.opacityPercent / 100.0).clamp(0.1, 1.0);
     final effectiveColorValue =
         widget.settings.forceWhiteText ? 0xFFFFFFFF : comment.colorValue;
+    final baseDpr = _devicePixelRatio.clamp(1.0, 3.0);
     final key =
-        '${comment.text}|$effectiveColorValue|${fontSize.toStringAsFixed(1)}|${widget.settings.opacityPercent}';
-    final cached = _painterCache.remove(key);
+        '${comment.text}|$effectiveColorValue|${fontSize.toStringAsFixed(1)}|${baseDpr.toStringAsFixed(2)}';
+    final cached = _spriteCache.remove(key);
     if (cached != null) {
-      _painterCache[key] = cached;
+      _spriteCache[key] = cached;
       return cached;
     }
 
-    final fillColor = Color(effectiveColorValue).withValues(alpha: opacity);
-    final strokeAlpha = (opacity * 0.92).clamp(0.1, 1.0);
     final strokeWidth = (fontSize * 0.14).clamp(1.8, 6.8);
-
     final strokePainter = TextPainter(
       text: TextSpan(
         text: comment.text,
@@ -261,13 +265,12 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
             ..style = PaintingStyle.stroke
             ..strokeWidth = strokeWidth
             ..strokeJoin = StrokeJoin.round
-            ..color = Colors.black.withValues(alpha: strokeAlpha),
+            ..color = Colors.black,
         ),
       ),
       textDirection: TextDirection.ltr,
       maxLines: 1,
-    )..layout();
-
+    );
     final fillPainter = TextPainter(
       text: TextSpan(
         text: comment.text,
@@ -278,26 +281,63 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
           fontSize: fontSize,
           height: 1.15,
           locale: const Locale('ja', 'JP'),
-          color: fillColor,
+          color: Color(effectiveColorValue).withValues(alpha: 1.0),
         ),
       ),
       textDirection: TextDirection.ltr,
       maxLines: 1,
-    )..layout();
-
-    final entry = _CachedTextPair(
-      fill: fillPainter,
-      stroke: strokePainter,
-      width: fillPainter.width,
-      height: fillPainter.height,
     );
-    _painterCache[key] = entry;
-    while (_painterCache.length > _maxPainterCacheEntries) {
-      final evicted = _painterCache.remove(_painterCache.keys.first);
-      if (evicted != null) {
-        evicted.fill.dispose();
-        evicted.stroke.dispose();
+
+    final double textWidth;
+    final double textHeight;
+    final double padding;
+    final double logicalWidth;
+    final double logicalHeight;
+    final ui.Image image;
+    try {
+      strokePainter.layout();
+      fillPainter.layout();
+      textWidth = math.max(1.0, fillPainter.width);
+      textHeight = math.max(1.0, fillPainter.height);
+      padding = (strokeWidth / 2.0).ceilToDouble() + 2.0;
+      logicalWidth = textWidth + padding * 2.0;
+      logicalHeight = textHeight + padding * 2.0;
+      final maxDim = math.max(logicalWidth, logicalHeight);
+      final effectiveDpr = maxDim * baseDpr > 4096.0
+          ? (4096.0 / maxDim).clamp(0.5, baseDpr)
+          : baseDpr;
+      final pixelWidth = math.max(1, (logicalWidth * effectiveDpr).ceil());
+      final pixelHeight = math.max(1, (logicalHeight * effectiveDpr).ceil());
+
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.scale(effectiveDpr, effectiveDpr);
+      final offset = Offset(padding, padding);
+      strokePainter.paint(canvas, offset);
+      fillPainter.paint(canvas, offset);
+      final picture = recorder.endRecording();
+      try {
+        image = picture.toImageSync(pixelWidth, pixelHeight);
+      } finally {
+        picture.dispose();
       }
+    } finally {
+      strokePainter.dispose();
+      fillPainter.dispose();
+    }
+
+    final entry = _CachedCommentSprite(
+      image: image,
+      textWidth: textWidth,
+      textHeight: textHeight,
+      padding: padding,
+      logicalWidth: logicalWidth,
+      logicalHeight: logicalHeight,
+    );
+    _spriteCache[key] = entry;
+    while (_spriteCache.length > _maxSpriteCacheEntries) {
+      final evicted = _spriteCache.remove(_spriteCache.keys.first);
+      evicted?.image.dispose();
     }
     return entry;
   }
@@ -394,14 +434,14 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
       while (_active.length >= maxCap && _active.isNotEmpty) {
         _active.removeAt(0);
       }
-      final pair = _painterFor(comment, baseFont);
+      final sprite = _spriteFor(comment, baseFont);
       final duration = comment.position == JikkyoCommentPosition.naka
           ? widget.settings.speed.durationSeconds
           : 3.5;
       final lane = _pickLane(
         position: comment.position,
         laneCount: laneCount,
-        textWidth: pair.width,
+        textWidth: sprite.textWidth,
         viewWidth: viewW,
         durationSeconds: duration,
       );
@@ -411,7 +451,7 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
           laneIndex: lane,
           elapsedSeconds: 0.0,
           durationSeconds: duration,
-          textWidth: pair.width,
+          textWidth: sprite.textWidth,
         ),
       );
     }
@@ -454,13 +494,19 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
     widget.controller?._removeListeners(_handleIncomingComments, _handleClear);
     _ticker.dispose();
     _repaintTick.dispose();
-    _clearPainterCache();
+    _clearSpriteCache();
     _active.clear();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final dpr = MediaQuery.maybeDevicePixelRatioOf(context) ?? 1.0;
+    if ((dpr - _devicePixelRatio).abs() > 0.01) {
+      _devicePixelRatio = dpr;
+      _clearSpriteCache();
+    }
+    final opacity = (widget.settings.opacityPercent / 100.0).clamp(0.1, 1.0);
     return IgnorePointer(
       child: RepaintBoundary(
         child: LayoutBuilder(
@@ -480,8 +526,9 @@ class _JikkyoDanmakuOverlayState extends State<JikkyoDanmakuOverlay>
               painter: _JikkyoDanmakuPainter(
                 repaint: _repaintTick,
                 activeItems: _active,
-                painterLookup: (comment) => _painterFor(comment, baseFont),
+                spriteLookup: (comment) => _spriteFor(comment, baseFont),
                 baseFontSize: baseFont,
+                opacity: opacity,
                 avoidSubtitleArea:
                     widget.avoidBottomSubtitles &&
                     widget.settings.avoidSubtitleArea,
@@ -498,14 +545,16 @@ class _JikkyoDanmakuPainter extends CustomPainter {
   _JikkyoDanmakuPainter({
     required Listenable repaint,
     required this.activeItems,
-    required this.painterLookup,
+    required this.spriteLookup,
     required this.baseFontSize,
+    required this.opacity,
     required this.avoidSubtitleArea,
   }) : super(repaint: repaint);
 
   final List<_ActiveDanmakuItem> activeItems;
-  final _CachedTextPair Function(JikkyoComment comment) painterLookup;
+  final _CachedCommentSprite Function(JikkyoComment comment) spriteLookup;
   final double baseFontSize;
+  final double opacity;
   final bool avoidSubtitleArea;
 
   @override
@@ -516,32 +565,47 @@ class _JikkyoDanmakuPainter extends CustomPainter {
     final usableRatio = avoidSubtitleArea ? 0.72 : 0.94;
     final usableHeight = math.max(laneHeight, (size.height - 16.0) * usableRatio);
     final laneCount = math.max(2, (usableHeight / laneHeight).floor());
+    final imagePaint = Paint()
+      ..color = Colors.white.withValues(alpha: opacity)
+      ..filterQuality = FilterQuality.low
+      ..isAntiAlias = true;
 
     for (final item in activeItems) {
-      final pair = painterLookup(item.comment);
+      final sprite = spriteLookup(item.comment);
       final lane = item.laneIndex % laneCount;
       final double x;
       final double y;
       switch (item.comment.position) {
         case JikkyoCommentPosition.ue:
-          x = (size.width - pair.width) / 2.0;
+          x = (size.width - sprite.textWidth) / 2.0;
           y = 8.0 + lane * laneHeight;
         case JikkyoCommentPosition.shita:
-          x = (size.width - pair.width) / 2.0;
+          x = (size.width - sprite.textWidth) / 2.0;
           y = math.max(8.0, usableHeight - (lane + 1) * laneHeight + 8.0);
         case JikkyoCommentPosition.naka:
-          x = size.width - (size.width + pair.width) * item.progress;
+          x = size.width - (size.width + sprite.textWidth) * item.progress;
           y = 8.0 + lane * laneHeight;
       }
-      final offset = Offset(x, y);
-      pair.stroke.paint(canvas, offset);
-      pair.fill.paint(canvas, offset);
+      final src = Rect.fromLTWH(
+        0,
+        0,
+        sprite.image.width.toDouble(),
+        sprite.image.height.toDouble(),
+      );
+      final dst = Rect.fromLTWH(
+        x - sprite.padding,
+        y - sprite.padding,
+        sprite.logicalWidth,
+        sprite.logicalHeight,
+      );
+      canvas.drawImageRect(sprite.image, src, dst, imagePaint);
     }
   }
 
   @override
   bool shouldRepaint(covariant _JikkyoDanmakuPainter oldDelegate) {
     return oldDelegate.baseFontSize != baseFontSize ||
+        oldDelegate.opacity != opacity ||
         oldDelegate.avoidSubtitleArea != avoidSubtitleArea;
   }
 }
