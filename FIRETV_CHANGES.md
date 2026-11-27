@@ -1,6 +1,6 @@
-# torne HB FireTV — 公式 v1.5.0 からの変更点まとめ（現状仕様）
+# torne mobile HB（4 OS 統合非公式フォーク）— 公式 v1.5.0 からの変更点まとめ（現状仕様）
 
-> 本ドキュメントは、[mar1mo-41414/TorneMobileHomeBrew](https://github.com/mar1mo-41414/TorneMobileHomeBrew) v1.5.0（MIT License）をベースとした **Fire TV / Android TV 版（`torne HB FireTV`）の現在の全変更仕様** をまとめたドキュメントです。過去の変更経緯は省き、**現在動作している最終仕様のみ** を記載しています。
+> 本ドキュメントは、[mar1mo-41414/TorneMobileHomeBrew](https://github.com/mar1mo-41414/TorneMobileHomeBrew) v1.5.0（MIT License）をベースとした **マルチプラットフォーム統合非公式フォーク（`torne mobile HB`：Fire TV / Android TV / Android スマホ・タブレット / iOS・iPadOS / macOS / Windows）の現在の全変更仕様** をまとめたドキュメントです（`v1.5.0-firetv.1`〜`.7` の継続ラインとして `v1.5.0-mod.8` より 4 OS 統合リリースへ拡張）。過去の細かな試行経緯は省き、**現在動作している最終仕様のみ** を記載しています。
 
 ---
 
@@ -24,6 +24,23 @@
 ---
 
 ## 今回追加・改善した機能
+
+### v1.5.0-mod.8 での新機能・改善点（4 OS マルチプラットフォーム統合＆大幅強化）
+1. **4 OS マルチプラットフォーム統合対応（Fire TV / Android / iOS・iPadOS / macOS / Windows）**
+   - 端末種別に応じた操作モード自動判定（`UiControlMode`：TV リモコン／タッチ／デスクトップ）を導入し、アプリ表記を `torne mobile HB` へ統一しました（Android パッケージ `com.markun.tmhb.firetv` は `v1.5.0-firetv.1`〜`.7` からの上書き更新互換のため維持、Apple 側は `com.markun.tmhb.plus` として公式版と共存分離）。
+   - **タッチ端末（Android スマホ・タブレット / iOS・iPadOS）**: 縦横レスポンシブ再生 OSD、ノッチ／セーフエリア対応、2 段階スワイプ操作、スクラブシークバー、iPad フルスクリーン分割対応、PiP（ピクチャ・イン・ピクチャ）対応、ポートレート時の不要ボタン整理。
+   - **デスクトップ（macOS / Windows）**: マウスホバー＆画面端エッジピークによる全カードチャンネル切替、キーボードショートカット、戻るボタン、チャンネル／録画切替跨ぎでのフルスクリーン維持、ネイティブ ARIB チャイム音再生・スリープ抑止（wakelock）対応。
+   - テーマ設定を「自動（端末設定に追従）／ダーク」へ拡張し、環境ごとの案内文言を最適化しました。
+2. **再生安定性・モバイル回線（LTE）・Tailscale 接続の抜本強化＆汎用 DLNA/DTCP-IP 対応**
+   - 移動体通信（LTE）の一時断線時にも Live・録画バッファを保持したまま高速リカバリする耐障害強化、TS アライナー最適化、OSD ビットレート表示＆リトライ UX 改善を実施しました。
+   - Tailscale 高速起動ゲート＆フォアグラウンド自動接続、HTTP 511 自動リトライ＆診断ログ強化、視聴終了時の上流ストリーム強制クローズ、チューナービジー時の自動待機リトライを実装しました。
+   - バッファリングデッドロック・セッション／キャッシュリーク・チューナー待機競合・文字スーパー同期ズレ・Live 追いつき判定（キャッシュ先端鮮度基準化＆先読み上限引き上げ）・現在位置ジャンプ時の Live バッファ保持・実況 Live 遅延同期を修正し、汎用 DLNA / DTCP-IP サーバーにも対応しました。
+3. **起動高速化＆「起動時に開く画面」設定の追加**
+   - 各画面タブの遅延マウント（起動時は初期表示タブのみ即時生成し他タブは裏で順次プリフェッチ）、デバイス情報の並列取得、重い XML・サムネイル解析の Isolate 並列オフロードにより起動速度を大幅改善しました。
+   - 設定画面に **`起動時に開く画面`**（ホーム／TV 視聴／予約／録画済み／番組表）を追加しました。
+4. **ニコニコ実況描画品質向上＆アプリ全体ハードニング**
+   - 半透明ニコニコ実況コメントをオフスクリーンで不透明事前描画してから合成する方式へ刷新し、文字本体と縁取りの重なりによる透け・にじみを解消しました。
+   - EPG・予約・ディスカバリ・パーサ・TailscaleGuard・HTTP タイムアウト・Riverpod 状態管理・永続化・PiP・タッチ／TV UI 全体の堅牢化およびマルチプラットフォームテストを拡充しました。
 
 ### v1.5.0-firetv.7 での新機能・改善点
 1. **放送マーク（`[字]` `[二]` `[デ]` `[再]` `[生]` 等／`[新]` `[終]` `[初]`）のミニバッジ化と全画面展開**
@@ -116,8 +133,8 @@
 
 ## 公式 v1.5.0 から変更・追加されている全機能（現状仕様）
 
-### 1. アプリ基本構成・Fire TV / Android TV 対応
-- **アプリ識別子・表記・対応 OS**: `applicationId` を `com.markun.tmhb.firetv`（バージョン名 `1.5.0-firetv`）へ分離し、公式版（`com.markun.tmhb`）と同一端末上で共存インストール可能。`minSdk = 24`（Android 7.0+ / Fire OS 6・7・8）に対応し、アプリ名・ホーム画面・設定フッターを `torne HB FireTV` へ変更。
+### 1. アプリ基本構成・マルチプラットフォーム / Fire TV 対応
+- **アプリ識別子・表記・対応 OS**: Android / Fire TV 版は既存の `v1.5.0-firetv.1`〜`.7` からの上書き更新互換を保つため `applicationId` を `com.markun.tmhb.firetv` のまま維持し（バージョン名 `1.5.0-mod.8`）、公式版（`com.markun.tmhb`）と共存インストール可能です。Apple（iOS / iPadOS / macOS）版は `com.markun.tmhb.plus` へ分離しています。`minSdk = 24`（Android 7.0+ / Fire OS 6・7・8）に対応し、アプリ表記を `torne mobile HB` へ統一しました（4 OS 共通の操作モード自動判定 `UiControlMode` 搭載）。
 - **Android TV / Fire OS マニフェスト対応**: `LEANBACK_LAUNCHER` カテゴリ、ホーム画面用横長 TV バナー（`drawable-xhdpi/tv_banner.png` / `drawable/tv_banner.png`）、および Tailscale パッケージ検出（`<queries> com.tailscale.ipn`）を追加。
 - **起動・再生時の音量最大＆Tailscale 起動補助**: アプリ起動時・バックグラウンド復帰時・再生開始時に Android メディア音量を最大化し、登録済み nasne へ到達不能で Tailscale 未接続の場合は起動／接続誘導ダイアログを表示（`firetv_helper.dart` / `tailscale_guard.dart`）。
 - **DTCP-IP 資格情報の導入強化**: `/sdcard/Download`・`Downloads`・`Documents` 読み取りのため API バージョン別（API 30+ は `MANAGE_EXTERNAL_STORAGE` 設定誘導、API 24〜29 は `READ_EXTERNAL_STORAGE` 権限ダイアログ）で対応し、TV でも使えるアプリ内ファイル一覧選択ダイアログ・2 カラム設定画面を実装（認証鍵等は同梱なし）。
