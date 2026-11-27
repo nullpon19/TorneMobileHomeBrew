@@ -507,6 +507,32 @@ void main() {
       );
       await fake;
     });
+
+    test('ControlFrame.tryParse rejects totalLength < 8 instead of hanging', () {
+      final bogus = Uint8List.fromList([
+        0x01,
+        0x00,
+        0x04, // totalLength = 4 (< 8)
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+      ]);
+      expect(
+        () => ControlFrame.tryParse(bogus),
+        throwsA(
+          isA<NasneError>().having(
+            (e) => e.category,
+            'category',
+            NasneErrorCategory.parse,
+          ),
+        ),
+      );
+    });
   });
 
   group('playback engine gating', () {

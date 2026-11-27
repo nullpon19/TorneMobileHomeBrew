@@ -839,5 +839,93 @@ void main() {
         await upstreamSocketClosed.future.timeout(const Duration(seconds: 2));
       },
     );
+
+    test(
+      'seekable proxy cancels superseded producer before stale plaintext hits re-anchored window',
+      () async {
+        final exchangeKey = hexToBytes(katPcpExchangeKey);
+        final firstRegion = Uint8List.fromList(List.filled(12288, 0x11));
+        final secondRegion = Uint8List.fromList(List.filled(12288, 0x22));
+        final firstPacket = _buildTestPcpPacket(exchangeKey, firstRegion);
+        final secondPacket = _buildTestPcpPacket(exchangeKey, secondRegion);
+        final firstStarted = Completer<void>();
+        final releaseFirstStale = Completer<void>();
+
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        server.listen((request) async {
+          final tsr = request.headers.value('timeseekrange.dlna.org') ?? 'npt=0.000-';
+          final nptStr = tsr.split('=').last.split('-').first;
+          final npt = double.tryParse(nptStr) ?? 0.0;
+          if (npt < 5.0) {
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.set(
+              'TimeSeekRange.dlna.org',
+              'npt=0.000-20.000/20.000 bytes=0-49151/49152',
+            );
+            // Send first half of PCP header + stall so first request stays waiting
+            // across moveNext() while second range seek arrives and re-anchors window.
+            request.response.add(firstPacket.sublist(0, 64));
+            await request.response.flush();
+            if (!firstStarted.isCompleted) firstStarted.complete();
+            await releaseFirstStale.future.timeout(
+              const Duration(seconds: 3),
+              onTimeout: () {},
+            );
+            request.response.add(firstPacket.sublist(64));
+            await request.response.close();
+          } else {
+            request.response.statusCode = HttpStatus.ok;
+            request.response.headers.set(
+              'TimeSeekRange.dlna.org',
+              'npt=10.000-20.000/20.000 bytes=24576-49151/49152',
+            );
+            request.response.add(secondPacket);
+            await request.response.close();
+          }
+        });
+
+        final diag = DiagLog(
+          (cat, msg) => printOnFailure('[$cat] $msg'),
+          (_) => true,
+        );
+        final fetcher = DtcpMediaFetcher(diag: diag);
+        addTearDown(fetcher.close);
+        final proxy = await DtcpProxy.start(
+          contentUrl: Uri.parse('http://127.0.0.1:${server.port}/seek_race'),
+          keyForLabel: (_) async => exchangeKey,
+          fetcher: fetcher,
+          diag: diag,
+          totalBytes: 49152,
+          totalDuration: const Duration(seconds: 20),
+          windowCapBytesOverride: 8192,
+        );
+        addTearDown(proxy.stop);
+
+        // Request 1 starts producer at byte 0 and stalls mid-packet.
+        final client1 = HttpClient();
+        addTearDown(() => client1.close(force: true));
+        final req1 = await client1.getUrl(proxy.uri);
+        req1.headers.set('Range', 'bytes=0-12287');
+        unawaited(req1.close().then((r) => r.drain<void>()).catchError((_) {}));
+        await firstStarted.future.timeout(const Duration(seconds: 2));
+
+        // Request 2 seeks to 24576 (npt >= 5) while stale producer is in flight.
+        final client2 = HttpClient();
+        addTearDown(() => client2.close(force: true));
+        final req2 = await client2.getUrl(proxy.uri);
+        req2.headers.set('Range', 'bytes=24576-36863');
+        final resp2 = await req2.close();
+        expect(resp2.statusCode, HttpStatus.partialContent);
+        if (!releaseFirstStale.isCompleted) releaseFirstStale.complete();
+        final out = BytesBuilder(copy: false);
+        await for (final c in resp2.timeout(const Duration(seconds: 3))) {
+          out.add(c);
+        }
+        final bytes = out.toBytes();
+        expect(bytes, isNotEmpty);
+        expect(bytes.every((b) => b == 0x22), isTrue);
+      },
+    );
   });
 }

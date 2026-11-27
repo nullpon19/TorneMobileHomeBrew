@@ -54,6 +54,38 @@ class WebApiTransport {
     }
   }
 
+  Future<http.Response> _sendWithAbort(
+    String method,
+    Uri uri, {
+    Map<String, String>? headers,
+    Object? body,
+  }) async {
+    final abortTrigger = Completer<void>();
+    final timer = Timer(timeout, () {
+      if (!abortTrigger.isCompleted) abortTrigger.complete();
+    });
+    final request = http.AbortableRequest(
+      method,
+      uri,
+      abortTrigger: abortTrigger.future,
+    );
+    if (headers != null) request.headers.addAll(headers);
+    if (body is String) {
+      request.body = body;
+    } else if (body is List<int>) {
+      request.bodyBytes = body;
+    }
+    try {
+      final streamed = await _client.send(request).timeout(timeout);
+      return await http.Response.fromStream(streamed).timeout(timeout);
+    } on TimeoutException {
+      if (!abortTrigger.isCompleted) abortTrigger.complete();
+      rethrow;
+    } finally {
+      timer.cancel();
+    }
+  }
+
   /// GET returning a decoded JSON object. Idempotent reads are
   /// retried a small number of times on reachability failures only.
   Future<Map<String, dynamic>> getJson(
@@ -65,9 +97,7 @@ class WebApiTransport {
     http.Response? lastError;
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
-        final resp = await _client
-            .get(_uri(endpoint, params))
-            .timeout(timeout);
+        final resp = await _sendWithAbort('GET', _uri(endpoint, params));
         return _decodeJson(endpoint, resp);
       } on NasneError {
         rethrow;
@@ -91,8 +121,7 @@ class WebApiTransport {
   }) async {
     _checkParams(endpoint, params);
     try {
-      final resp =
-          await _client.get(_uri(endpoint, params)).timeout(timeout);
+      final resp = await _sendWithAbort('GET', _uri(endpoint, params));
       if (resp.statusCode != 200) {
         throw _statusError(endpoint, resp);
       }
@@ -127,9 +156,12 @@ class WebApiTransport {
       headers['X-DTVToken'] = tokens.tokenFor(endpoint.path, body);
     }
     try {
-      final resp = await _client
-          .post(_uri(endpoint, const {}), headers: headers, body: body)
-          .timeout(timeout);
+      final resp = await _sendWithAbort(
+        'POST',
+        _uri(endpoint, const {}),
+        headers: headers,
+        body: body,
+      );
       return _decodeJson(endpoint, resp);
     } on NasneError {
       rethrow;
@@ -162,9 +194,12 @@ class WebApiTransport {
       headers['X-DTVToken'] = tokens.tokenForBytes(endpoint.path, body);
     }
     try {
-      final resp = await _client
-          .post(_uri(endpoint, params), headers: headers, body: body)
-          .timeout(timeout);
+      final resp = await _sendWithAbort(
+        'POST',
+        _uri(endpoint, params),
+        headers: headers,
+        body: body,
+      );
       if (resp.statusCode != 200) {
         throw _statusError(endpoint, resp);
       }

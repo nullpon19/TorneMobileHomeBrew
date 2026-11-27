@@ -28,7 +28,8 @@ class LiveTsContinuityAligner {
   static const int _ptsMod33 = 0x200000000;
   static const int _ttsMask30 = 0x3FFFFFFF;
   static const int _probeLimitBytes = 1024;
-  static const int _maxRebaseBufferPackets = 128;
+  static const int _maxRebaseBufferPackets = 2048;
+  static const int _maxResyncCarryBytes = 4096;
 
   /// +100 ms in 90 kHz clock ticks added when stitching a reconnect segment.
   static const int _reconnectGap90k = 9000;
@@ -43,7 +44,9 @@ class LiveTsContinuityAligner {
   bool _needsRebase = false;
   bool _rebaseSawPcr = false;
   bool _rebaseSawAnyTs = false;
+  bool _streamHasPcr = false;
   bool _markDiscontinuityAfterReconnect = false;
+  int _packetsSinceReconnect = 0;
   final Set<int> _discontinuityEmittedPids = <int>{};
 
   int _ptsOffset90k = 0;
@@ -71,7 +74,9 @@ class LiveTsContinuityAligner {
     _needsRebase = false;
     _rebaseSawPcr = false;
     _rebaseSawAnyTs = false;
+    _streamHasPcr = false;
     _markDiscontinuityAfterReconnect = false;
+    _packetsSinceReconnect = 0;
     _discontinuityEmittedPids.clear();
     _ptsOffset90k = 0;
     _maxEmittedPts90k = null;
@@ -90,6 +95,7 @@ class LiveTsContinuityAligner {
     _pendingRebasePackets.clear();
     _rebaseSawPcr = false;
     _rebaseSawAnyTs = false;
+    _packetsSinceReconnect = 0;
     if (_passthrough) return;
     _resyncNeeded = true;
     if (_maxEmittedPts90k != null) {
@@ -127,7 +133,7 @@ class LiveTsContinuityAligner {
           _passthrough = true;
           return combined;
         }
-        _carry = Uint8List.fromList(combined);
+        _carry = _capCarry(combined);
         return Uint8List(0);
       }
       _packetSize = detected.$1;
@@ -233,7 +239,10 @@ class LiveTsContinuityAligner {
       emitRun(runStart, offset);
     }
 
-    if (_needsRebase && _rebaseSawAnyTs && _pendingRebasePackets.isNotEmpty) {
+    if (_needsRebase &&
+        !_streamHasPcr &&
+        _rebaseSawAnyTs &&
+        _pendingRebasePackets.isNotEmpty) {
       _flushPendingRebase(tsOffsetInPacket, pktSize, (flushed) {
         if (out.isEmpty && singleChunkResult == null) {
           singleChunkResult = flushed;
@@ -248,10 +257,19 @@ class LiveTsContinuityAligner {
     }
 
     if (offset < combined.length) {
-      _carry = Uint8List.fromList(Uint8List.sublistView(combined, offset));
+      _carry = _capCarry(Uint8List.sublistView(combined, offset));
     }
     if (singleChunkResult != null) return singleChunkResult!;
     return out.isEmpty ? Uint8List(0) : out.takeBytes();
+  }
+
+  static Uint8List _capCarry(Uint8List tail) {
+    if (tail.length <= _maxResyncCarryBytes) {
+      return Uint8List.fromList(tail);
+    }
+    return Uint8List.fromList(
+      Uint8List.sublistView(tail, tail.length - _maxResyncCarryBytes),
+    );
   }
 
   void _flushPendingRebase(
@@ -280,7 +298,25 @@ class LiveTsContinuityAligner {
         }
       }
     }
-    if (earliestTs != null && _maxEmittedPts90k != null) {
+    if (earliestTs == null) {
+      // No timestamp arrived within this buffer window yet; emit the buffered
+      // packets cleanly but keep rebase armed for the first timestamped packet.
+      final out = Uint8List(_pendingRebasePackets.length * pktSize);
+      var writePos = 0;
+      for (final buffered in _pendingRebasePackets) {
+        out.setRange(writePos, writePos + pktSize, buffered);
+        if (tsOffsetInPacket == 4) {
+          _lastEmittedTts30 = _readTts30At(out, writePos);
+        }
+        writePos += pktSize;
+      }
+      _pendingRebasePackets.clear();
+      _rebaseSawPcr = false;
+      _rebaseSawAnyTs = false;
+      emit(out);
+      return;
+    }
+    if (_maxEmittedPts90k != null) {
       final targetPts = (_maxEmittedPts90k! + _reconnectGap90k) & _ptsMask33;
       _ptsOffset90k = (targetPts - earliestTs) & _ptsMask33;
     }
@@ -408,7 +444,10 @@ class LiveTsContinuityAligner {
       _lastEmittedTts30 = _readTts30At(buf, pktOffset);
     }
     final ts = _extractPacketTimestamps90k(buf, pktOffset, tsOff);
-    if (ts.pcr != null) _observeEmittedPts90k(ts.pcr!);
+    if (ts.pcr != null) {
+      _streamHasPcr = true;
+      _observeEmittedPts90k(ts.pcr!);
+    }
     if (ts.pts != null) _observeEmittedPts90k(ts.pts!);
   }
 
@@ -420,6 +459,10 @@ class LiveTsContinuityAligner {
         _writeTts30At(buf, pktOffset, shiftedTts);
       }
       _lastEmittedTts30 = shiftedTts;
+    }
+
+    if (_markDiscontinuityAfterReconnect) {
+      _packetsSinceReconnect++;
     }
 
     final tsStart = pktOffset + tsOff;
@@ -434,13 +477,11 @@ class LiveTsContinuityAligner {
         if (_markDiscontinuityAfterReconnect &&
             _discontinuityEmittedPids.add(pid)) {
           buf[tsStart + 5] |= 0x80; // discontinuity_indicator
-          if (_discontinuityEmittedPids.length > 64) {
-            _markDiscontinuityAfterReconnect = false;
-          }
         }
         final flags = buf[tsStart + 5];
         var cursor = tsStart + 6;
         if ((flags & 0x10) != 0 && cursor + 6 <= afEnd) {
+          _streamHasPcr = true;
           final pcrBase = _readPcrBase33(buf, cursor);
           final nextPcr = (pcrBase + _ptsOffset90k) & _ptsMask33;
           if (_ptsOffset90k != 0) {
@@ -495,6 +536,11 @@ class LiveTsContinuityAligner {
           }
         }
       }
+    }
+    if (_markDiscontinuityAfterReconnect &&
+        (_packetsSinceReconnect >= 256 ||
+            _discontinuityEmittedPids.length > 64)) {
+      _markDiscontinuityAfterReconnect = false;
     }
   }
 

@@ -63,19 +63,30 @@ class SoapTransport {
         '</soapenv:Body></soapenv:Envelope>';
 
     final http.Response resp;
+    final abortTrigger = Completer<void>();
+    final timer = Timer(timeout, () {
+      if (!abortTrigger.isCompleted) abortTrigger.complete();
+    });
+    final request = http.AbortableRequest(
+      'POST',
+      controlUrl,
+      abortTrigger: abortTrigger.future,
+    );
+    request.headers.addAll({
+      'Content-Type': 'text/xml; charset="utf-8"',
+      'SOAPAction': '"$serviceType#$action"',
+    });
+    request.bodyBytes = utf8.encode(body);
     try {
-      resp = await _client
-          .post(
-            controlUrl,
-            headers: {
-              'Content-Type': 'text/xml; charset="utf-8"',
-              'SOAPAction': '"$serviceType#$action"',
-            },
-            body: utf8.encode(body),
-          )
-          .timeout(timeout);
+      final streamed = await _client.send(request).timeout(timeout);
+      resp = await http.Response.fromStream(streamed).timeout(timeout);
+    } on TimeoutException catch (e) {
+      if (!abortTrigger.isCompleted) abortTrigger.complete();
+      throw NasneError.unreachable(source, cause: e);
     } catch (e) {
       throw NasneError.unreachable(source, cause: e);
+    } finally {
+      timer.cancel();
     }
 
     final text = utf8.decode(resp.bodyBytes, allowMalformed: true);

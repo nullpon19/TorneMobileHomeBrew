@@ -345,7 +345,10 @@ class DtcpMediaFetcher {
         '${response.statusCode} in ${stopwatch.elapsedMilliseconds} ms',
       );
       if (response.statusCode != HttpStatus.ok) {
-        await response.drain<void>();
+        await DtcpProxy._discardResponse(response).timeout(
+          const Duration(seconds: 1),
+          onTimeout: () {},
+        );
         throw NasneError.http(response.statusCode, 'dtcp:http');
       }
       final header = response.headers.value('timeseekrange.dlna.org');
@@ -822,6 +825,10 @@ class DtcpProxy {
             },
           );
           final iterator = StreamIterator<List<int>>(timed);
+          if (pumpGen != _pumpGeneration || _stopRequested || _downstreamGone) {
+            await iterator.cancel();
+            break;
+          }
           _iterator = iterator;
           final yieldWatch = Stopwatch()..start();
           try {
@@ -906,7 +913,7 @@ class DtcpProxy {
           return;
         }
 
-        if (!_autoReconnect) {
+        if (!_autoReconnect || !_isLive) {
           if (attemptError != null) {
             queue.close(attemptError);
             _diag(
@@ -1018,17 +1025,18 @@ class DtcpProxy {
     if (_seekable || !_isLive || _stopRequested) return;
     _diag(DiagCategory.playback, 'proxy: resetting stream to latest live edge');
     ++_legacyGeneration;
-    ++_pumpGeneration;
+    final resetGen = ++_pumpGeneration;
     _queue.close();
     final oldIter = _iterator;
     _iterator = null;
+    _fetcher.resetClient();
     if (oldIter != null) {
       await oldIter.cancel().timeout(
         const Duration(seconds: 2),
         onTimeout: () {},
       );
     }
-    _fetcher.resetClient();
+    if (_stopRequested || resetGen != _pumpGeneration) return;
     _queue = _PlaintextQueue();
     _liveTsAligner.reset();
     _isReconnectingUpstream = false;
@@ -1052,17 +1060,18 @@ class DtcpProxy {
       '${_streamingTimeSeekStartSeconds!.toStringAsFixed(3)}s',
     );
     ++_legacyGeneration;
-    ++_pumpGeneration;
+    final resetGen = ++_pumpGeneration;
     _queue.close();
     final oldIter = _iterator;
     _iterator = null;
+    _fetcher.resetClient();
     if (oldIter != null) {
       await oldIter.cancel().timeout(
         const Duration(seconds: 2),
         onTimeout: () {},
       );
     }
-    _fetcher.resetClient();
+    if (_stopRequested || resetGen != _pumpGeneration) return;
     _queue = _PlaintextQueue();
     _isReconnectingUpstream = false;
     _aribCaptionTap.resetAll();
@@ -1142,8 +1151,19 @@ class DtcpProxy {
         !initialStartFailed &&
         (_queue.isClosed || !_legacyPumpActive)) {
       ++_pumpGeneration;
-      await _iterator?.cancel();
+      _fetcher.resetClient();
+      final oldIter = _iterator;
       _iterator = null;
+      await oldIter?.cancel().timeout(
+        const Duration(seconds: 1),
+        onTimeout: () {},
+      );
+      if (gen != _legacyGeneration || _stopRequested) {
+        try {
+          await request.response.close();
+        } catch (_) {}
+        return;
+      }
       _queue = _PlaintextQueue();
       _pumpFuture = _pump();
     }
@@ -1417,7 +1437,10 @@ class DtcpProxy {
           );
           if (startByte > target && attempts < maxSeekAttempts) {
             overshootCount++;
-            unawaited(_discardResponse(tsr.response));
+            await _discardResponse(tsr.response).timeout(
+              const Duration(seconds: 1),
+              onTimeout: () {},
+            );
             continue;
           }
           if (startByte <= target &&
@@ -1433,7 +1456,10 @@ class DtcpProxy {
                 '(> ${maxSkipPlaintextBytes ~/ (1024 * 1024)} MiB); refining '
                 'to npt ${refined.toStringAsFixed(3)} s',
               );
-              unawaited(_discardResponse(tsr.response));
+              await _discardResponse(tsr.response).timeout(
+                const Duration(seconds: 1),
+                onTimeout: () {},
+              );
               continue;
             }
           }
@@ -1527,6 +1553,11 @@ class DtcpProxy {
           continue;
         }
         if (!await iterator.moveNext()) break;
+        if (producer.cancelled ||
+            _stopRequested ||
+            !identical(_producer, producer)) {
+          break;
+        }
         final chunk = iterator.current;
         _cipherBytes += chunk.length;
         final List<Uint8List> pieces;
@@ -1537,6 +1568,11 @@ class DtcpProxy {
           pieces = u8.isEmpty ? const <Uint8List>[] : [u8];
         }
         for (var piece in pieces) {
+          if (producer.cancelled ||
+              _stopRequested ||
+              !identical(_producer, producer)) {
+            break;
+          }
           _consecutiveReconnectErrors = 0;
           _lastUpstreamError = null;
           _isReconnectingUpstream = false;
@@ -1688,6 +1724,7 @@ class DtcpProxy {
           _isReconnectingUpstream = false;
           break;
         } catch (e) {
+          if (identical(_producer, producer)) _cancelProducer();
           if (generation != _serveGeneration || _stopRequested) {
             try {
               await response.close();
@@ -1744,6 +1781,13 @@ class DtcpProxy {
                 'proxy: seek establish reauth failed: $reauthErr',
               );
             }
+          }
+          if (generation != _serveGeneration || _stopRequested) {
+            _isReconnectingUpstream = false;
+            try {
+              await response.close();
+            } catch (_) {}
+            return;
           }
         }
       }
@@ -1886,10 +1930,14 @@ class DtcpProxy {
                 consecutiveOvershoots++;
                 lastError = StateError('overshoot past $pos ($actual)');
                 _lastUpstreamError = lastError;
-                if (consecutiveOvershoots >= 5) break;
+                if (consecutiveOvershoots >= 5) {
+                  if (identical(_producer, retry)) _cancelProducer();
+                  break;
+                }
               } catch (e) {
                 lastError = e;
                 _lastUpstreamError = e;
+                if (identical(_producer, retry)) _cancelProducer();
               }
             }
             _isReconnectingUpstream = false;
@@ -1914,13 +1962,17 @@ class DtcpProxy {
                 seekEstablishTimeout,
               );
             } catch (e) {
+              if (identical(_producer, retry)) _cancelProducer();
               _diag(
                 DiagCategory.playback,
                 'proxy: request #$requestNo: the retry failed: $e',
               );
               break;
             }
-            if (actual != pos) break;
+            if (actual != pos) {
+              if (identical(_producer, retry)) _cancelProducer();
+              break;
+            }
             continue;
           }
           _diag(
@@ -1986,11 +2038,16 @@ class DtcpProxy {
                 );
               }
             }
+            if (_stopRequested || generation != _serveGeneration) {
+              _isReconnectingUpstream = false;
+              break;
+            }
           }
         } else {
           stalledRestarts = 0;
           lastEnd = _window.end;
         }
+        _cancelProducer();
         _startProducer(_window.end);
       }
       if (pos > reqEnd || (_eofByte != null && pos >= _eofByte!)) {

@@ -51,6 +51,7 @@ class MainActivity : FlutterActivity() {
     private var akeEventSink: EventChannel.EventSink? = null
     private val akeConnections = mutableMapOf<Int, AkeSocketConnection>()
     private val akeExecutor = Executors.newCachedThreadPool()
+    private val akeSendExecutor = Executors.newSingleThreadExecutor()
     private val soundExecutor = Executors.newSingleThreadExecutor()
     private val soundGeneration = AtomicInteger(0)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -123,7 +124,7 @@ class MainActivity : FlutterActivity() {
                         val data = call.argument<ByteArray>("data")!!
                         val connection = synchronized(akeConnections) { akeConnections[id] }
                         if (connection != null) {
-                            akeExecutor.execute { connection.send(data) }
+                            akeSendExecutor.execute { connection.send(data) }
                         }
                         result.success(null)
                     }
@@ -259,6 +260,7 @@ class MainActivity : FlutterActivity() {
             connection.close()
         }
         akeExecutor.shutdownNow()
+        akeSendExecutor.shutdownNow()
         soundGeneration.incrementAndGet()
         soundExecutor.shutdownNow()
         super.onDestroy()
@@ -913,8 +915,10 @@ private class AkeSocketConnection(
     }
 
     fun send(data: ByteArray) {
+        if (closed) return
         val out = output ?: return
         synchronized(out) {
+            if (closed) return
             try {
                 out.write(data)
                 out.flush()
@@ -956,6 +960,10 @@ private class AkeSocketConnection(
         } catch (_: Exception) {
         }
         if (descriptor != null) {
+            try {
+                Os.shutdown(descriptor, OsConstants.SHUT_RDWR)
+            } catch (_: Exception) {
+            }
             try {
                 Os.close(descriptor)
             } catch (_: Exception) {

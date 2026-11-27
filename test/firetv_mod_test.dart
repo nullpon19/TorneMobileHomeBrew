@@ -463,6 +463,159 @@ void main() {
         expect(find.text('Tailscale が起動していません'), findsNothing);
       },
     );
+
+    testWidgets(
+      'tapping 再確認 re-probes reachability and releases gate without soft-lock',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: Duration(milliseconds: 20),
+                pollInterval: Duration(milliseconds: 20),
+                autoConnectMaxWait: Duration(milliseconds: 60),
+                postVpnReachableMaxWait: Duration(milliseconds: 100),
+                child: Scaffold(body: Text('home-mounted')),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        expect(find.text('home-mounted'), findsNothing);
+
+        helper.reachable = true;
+        await tester.tap(find.text('再確認'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+        expect(find.text('home-mounted'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'dismissing Tailscale dialog via barrier tap releases gate cleanly',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: Duration(milliseconds: 20),
+                pollInterval: Duration(milliseconds: 20),
+                autoConnectMaxWait: Duration(milliseconds: 60),
+                postVpnReachableMaxWait: Duration(milliseconds: 100),
+                child: Scaffold(body: Text('home-mounted')),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        await tester.tapAt(const Offset(10, 10));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+        expect(find.text('home-mounted'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'manual return via AppLifecycleState.resumed after このまま使う clears dismissed state and reconnects',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+        late WidgetRef capturedRef;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: const Duration(milliseconds: 20),
+                pollInterval: const Duration(milliseconds: 20),
+                autoConnectMaxWait: const Duration(milliseconds: 60),
+                postVpnReachableMaxWait: const Duration(milliseconds: 100),
+                child: Consumer(
+                  builder: (context, ref, _) {
+                    capturedRef = ref;
+                    return const Scaffold(body: Text('home-mounted'));
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+
+        expect(find.text('Tailscale が起動していません'), findsOneWidget);
+        await tester.tap(find.text('このまま使う'));
+        await tester.pumpAndSettle();
+        expect(find.text('home-mounted'), findsOneWidget);
+
+        // User later launches Tailscale manually from rail, enables VPN, and returns.
+        capturedRef
+            .read(tailscaleManualLaunchSignalProvider.notifier)
+            .notifyLaunched();
+        await tester.pump();
+        helper.vpnActive = true;
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        await tester.pump();
+
+        // While nasne is still settling after return, guard polls post-VPN instead
+        // of aborting on stale _dismissedForSession.
+        helper.reachable = true;
+        await tester.pump(const Duration(milliseconds: 25));
+        await tester.pumpAndSettle();
+
+        expect(find.text('nasne に接続しました'), findsOneWidget);
+      },
+    );
   });
 
   group('PlayerScreen loading indicator & Android cache sizing', () {
@@ -12338,6 +12491,43 @@ void main() {
         tap.feed(wrapTs(0x0138, realMgmtPes));
         tap.feed(wrapTs(0x0138, realMgmtPes));
         tap.feed(wrapTs(0x0138, realMgmtPes));
+        expect(tap.superimposeEvents, hasLength(1));
+      },
+    );
+
+    test(
+      'AribTsCaptionTap does not double-process trailing packet on 192B MPEG-TTS chunk boundary',
+      () {
+        final tap = AribTsCaptionTap();
+        final rawTs = AribTsCaptionTap.buildSyntheticSuperimposeTsPacket(
+          text: '速報テスト',
+          bgColorIndex: 1,
+          fgColorIndex: 7,
+          builtinSoundId: 2,
+          clearAfterSeconds: 5.0,
+        );
+        expect(rawTs.length % 188, 0);
+        final ttsBuilder = BytesBuilder(copy: false);
+        for (var i = 0; i < rawTs.length; i += 188) {
+          ttsBuilder.add([0x00, 0x00, 0x00, (i ~/ 188) & 0xFF]);
+          ttsBuilder.add(Uint8List.sublistView(rawTs, i, i + 188));
+        }
+        final ttsChunk = ttsBuilder.toBytes();
+        expect(ttsChunk.length % 192, 0);
+
+        // Feed exact multiple of 192B MPEG-TTS packets, then a null filler TTS packet.
+        tap.feed(ttsChunk);
+        final nullTts = Uint8List(192)..fillRange(0, 192, 0xFF);
+        nullTts[0] = 0x00;
+        nullTts[1] = 0x00;
+        nullTts[2] = 0x00;
+        nullTts[3] = 0x01;
+        nullTts[4] = 0x47;
+        nullTts[5] = 0x1F;
+        nullTts[6] = 0xFF;
+        nullTts[7] = 0x10;
+        tap.feed(nullTts);
+
         expect(tap.superimposeEvents, hasLength(1));
       },
     );

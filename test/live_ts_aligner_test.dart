@@ -209,5 +209,63 @@ void main() {
       final c2 = aligner.process(Uint8List.sublistView(full, 250, 564));
       expect([...c1, ...c2], full);
     });
+
+    test('caps _carry under prolonged sync loss and still resyncs cleanly', () {
+      final aligner = LiveTsContinuityAligner();
+      final p0 = _makeTsPacket(pid: 0x0100, pcrBase90k: 10000, pts90k: 12000);
+      final p1 = _makeTsPacket(pid: 0x0100, pcrBase90k: 19000, pts90k: 21000);
+      expect(aligner.process(Uint8List.fromList([...p0, ...p1])).length, 376);
+
+      // Simulate reconnect followed by 32 KiB of non-sync garbage bytes.
+      aligner.beginNewSegment();
+      final garbage = Uint8List.fromList(List.filled(32768, 0xAA));
+      expect(aligner.process(garbage), isEmpty);
+
+      // Valid TS packets after sync loss should resync and rebase without OOM.
+      final p2 = _makeTsPacket(pid: 0x0100, pcrBase90k: 500, pts90k: 1500);
+      final p3 = _makeTsPacket(pid: 0x0100, pcrBase90k: 9500, pts90k: 10500);
+      final resynced = aligner.process(Uint8List.fromList([...p2, ...p3]));
+      expect(resynced.length, 376);
+      final rebasedPcr = _readPcr(Uint8List.sublistView(resynced, 0, 188), 6);
+      expect(rebasedPcr, 21000 + 9000);
+    });
+
+    test('waits beyond 128 packets for PCR anchor on PCR-bearing streams', () {
+      final aligner = LiveTsContinuityAligner();
+      final initialPcr = _makeTsPacket(
+        pid: 0x0100,
+        pcrBase90k: 900000,
+        pts90k: 909000,
+      );
+      final initialP2 = _makeTsPacket(pid: 0x0100, pcrBase90k: 909000);
+      expect(
+        aligner.process(Uint8List.fromList([...initialPcr, ...initialP2])).length,
+        376,
+      );
+
+      aligner.beginNewSegment();
+      // Feed 200 packets without PCR (video PTS earlier in segment would skew offset),
+      // then deliver the true PCR packet at index 200.
+      final noPcrPackets = <int>[];
+      for (var i = 0; i < 200; i++) {
+        noPcrPackets.addAll(_makeTsPacket(pid: 0x0101, pts90k: 8000 + i * 100));
+      }
+      final midOut = aligner.process(Uint8List.fromList(noPcrPackets));
+      expect(midOut, isEmpty);
+
+      final pcrPacket = _makeTsPacket(
+        pid: 0x0100,
+        pcrBase90k: 1000,
+        pts90k: 4000,
+        dts90k: 1000,
+      );
+      final flushed = aligner.process(pcrPacket);
+      expect(flushed.length, 201 * 188);
+      final anchoredPcr = _readPcr(
+        Uint8List.sublistView(flushed, 200 * 188, 201 * 188),
+        6,
+      );
+      expect(anchoredPcr, 909000 + 9000);
+    });
   });
 }

@@ -20,6 +20,8 @@ import '../app/providers.dart';
 import '../app/state.dart';
 import '../core/core.dart';
 
+enum _TailscaleDialogAction { dismiss, retry, openTailscale }
+
 class TailscaleGuard extends ConsumerStatefulWidget {
   const TailscaleGuard({
     super.key,
@@ -140,19 +142,30 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
     FireTvHelper helper,
     List<String> hosts, {
     required Duration maxWait,
+    bool ignoreDismissed = false,
   }) async {
+    final wallClock = Stopwatch()..start();
     final steps = widget.pollInterval > Duration.zero
         ? (maxWait.inMilliseconds / widget.pollInterval.inMilliseconds)
             .ceil()
             .clamp(1, 100)
         : 1;
     for (var i = 0; i < steps; i++) {
-      if (!mounted || _dismissedForSession) return false;
-      if (await helper.isAnyNasneReachable(hosts, timeout: widget.probeTimeout)) {
+      if (!mounted || (!ignoreDismissed && _dismissedForSession)) return false;
+      final remaining = maxWait - wallClock.elapsed;
+      if (remaining <= Duration.zero) return false;
+      final stepTimeout =
+          remaining < widget.probeTimeout ? remaining : widget.probeTimeout;
+      if (await helper.isAnyNasneReachable(hosts, timeout: stepTimeout)) {
         return true;
       }
-      if (!mounted || _dismissedForSession) return false;
-      await Future<void>.delayed(widget.pollInterval);
+      if (!mounted || (!ignoreDismissed && _dismissedForSession)) return false;
+      final afterRemaining = maxWait - wallClock.elapsed;
+      if (afterRemaining <= Duration.zero) return false;
+      final delay = afterRemaining < widget.pollInterval
+          ? afterRemaining
+          : widget.pollInterval;
+      await Future<void>.delayed(delay);
     }
     return false;
   }
@@ -172,7 +185,9 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
       return;
     }
     if (_checking || _dialogOpen) return;
-    if (!force && _dismissedForSession) {
+    if (force) {
+      _dismissedForSession = false;
+    } else if (_dismissedForSession) {
       _releaseGate();
       return;
     }
@@ -181,6 +196,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
     final hosts = [for (final r in regs) r.host];
     final wasReachable = _lastReachable;
     final wasWaitingReturn = _waitingForTailscaleReturn;
+    var shouldShowDialog = false;
 
     try {
       bool installed;
@@ -202,7 +218,8 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
         if (!mounted) return;
         _waitingForTailscaleReturn = false;
         _lastReachable = true;
-        final shouldReset = fromReturn || wasWaitingReturn || !wasReachable && _startupChecked;
+        final shouldReset =
+            fromReturn || wasWaitingReturn || !wasReachable && _startupChecked;
         _releaseGate(markReachable: true);
         if (shouldReset) {
           resetNetworkAndInvalidateDevices(ref, regs);
@@ -210,7 +227,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
         }
         return;
       }
-      if (!mounted || _dismissedForSession) {
+      if (!mounted || (!force && _dismissedForSession)) {
         _releaseGate();
         return;
       }
@@ -222,6 +239,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
           helper,
           hosts,
           maxWait: widget.postVpnReachableMaxWait,
+          ignoreDismissed: force,
         );
         if (!mounted) return;
         _waitingForTailscaleReturn = false;
@@ -243,12 +261,13 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
       // first before showing the D-pad Tailscale prompt.
       _updateGateStatus('Tailscale に自動接続しています…');
       final sent = await helper.tryConnectTailscale();
-      if (!mounted || _dismissedForSession) {
+      if (!mounted || (!force && _dismissedForSession)) {
         _releaseGate();
         return;
       }
 
       if (sent) {
+        final connectClock = Stopwatch()..start();
         final steps = widget.pollInterval > Duration.zero
             ? (widget.autoConnectMaxWait.inMilliseconds /
                     widget.pollInterval.inMilliseconds)
@@ -256,14 +275,24 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
                 .clamp(1, 40)
             : 1;
         for (var i = 0; i < steps; i++) {
-          await Future<void>.delayed(widget.pollInterval);
-          if (!mounted || _dismissedForSession) {
+          final remainingDelay = widget.autoConnectMaxWait - connectClock.elapsed;
+          if (remainingDelay <= Duration.zero) break;
+          final delay = remainingDelay < widget.pollInterval
+              ? remainingDelay
+              : widget.pollInterval;
+          await Future<void>.delayed(delay);
+          if (!mounted || (!force && _dismissedForSession)) {
             _releaseGate();
             return;
           }
+          final probeBudget = widget.autoConnectMaxWait - connectClock.elapsed;
+          final stepTimeout = probeBudget > Duration.zero &&
+                  probeBudget < widget.probeTimeout
+              ? probeBudget
+              : widget.probeTimeout;
           if (await helper.isAnyNasneReachable(
             hosts,
-            timeout: widget.probeTimeout,
+            timeout: stepTimeout,
           )) {
             _waitingForTailscaleReturn = false;
             _lastReachable = true;
@@ -278,6 +307,7 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
               helper,
               hosts,
               maxWait: widget.postVpnReachableMaxWait,
+              ignoreDismissed: force,
             );
             if (!mounted) return;
             _waitingForTailscaleReturn = false;
@@ -294,14 +324,18 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
         }
       }
 
-      if (!mounted || _dismissedForSession) {
+      if (!mounted || (!force && _dismissedForSession)) {
         _releaseGate();
         return;
       }
       _startupChecked = true;
-      await _showTailscaleDialog(regs, helper);
+      shouldShowDialog = true;
     } finally {
       _checking = false;
+    }
+
+    if (shouldShowDialog && mounted && !_dismissedForSession) {
+      await _showTailscaleDialog(regs, helper);
     }
   }
 
@@ -315,8 +349,9 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
       setState(() => _showGateActions = false);
     }
     final primaryReg = regs.first;
+    _TailscaleDialogAction? action;
     try {
-      await showDialog<void>(
+      action = await showDialog<_TailscaleDialogAction>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           title: const Text('Tailscale が起動していません'),
@@ -327,28 +362,20 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                _dismissedForSession = true;
-                _waitingForTailscaleReturn = false;
-                Navigator.of(dialogContext).pop();
-                _releaseGate();
-              },
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(_TailscaleDialogAction.dismiss),
               child: const Text('このまま使う'),
             ),
             OutlinedButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop();
-                unawaited(_checkReachability(regs, force: true));
-              },
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(_TailscaleDialogAction.retry),
               child: const Text('再確認'),
             ),
             FilledButton(
               autofocus: true,
-              onPressed: () {
-                _waitingForTailscaleReturn = true;
-                Navigator.of(dialogContext).pop();
-                unawaited(_openTailscale(helper));
-              },
+              onPressed: () => Navigator.of(dialogContext).pop(
+                _TailscaleDialogAction.openTailscale,
+              ),
               child: const Text('Tailscale を開く'),
             ),
           ],
@@ -356,12 +383,21 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
       );
     } finally {
       _dialogOpen = false;
-      if (mounted &&
-          _gateActive &&
-          !_waitingForTailscaleReturn &&
-          !_checking) {
+    }
+    if (!mounted) return;
+    switch (action) {
+      case _TailscaleDialogAction.retry:
+        _dismissedForSession = false;
+        unawaited(_checkReachability(regs, force: true));
+      case _TailscaleDialogAction.openTailscale:
+        _waitingForTailscaleReturn = true;
+        _updateGateStatus('Tailscale の接続を待機しています…', showActions: true);
+        unawaited(_openTailscale(helper));
+      case _TailscaleDialogAction.dismiss:
+      case null:
+        _dismissedForSession = true;
+        _waitingForTailscaleReturn = false;
         _releaseGate();
-      }
     }
   }
 
@@ -398,7 +434,10 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const CircularProgressIndicator(),
+                    if (_checking)
+                      const CircularProgressIndicator()
+                    else
+                      const Icon(Icons.vpn_lock, size: 40),
                     const SizedBox(height: 18),
                     Text(
                       _statusMessage,
@@ -462,15 +501,17 @@ class _TailscaleGuardState extends ConsumerState<TailscaleGuard>
     });
     ref.listen<RegisteredNasne?>(selectedRegistrationProvider, (prev, next) {
       if (next == null || !_isAndroidTv) return;
-      if (!_startupChecked || prev?.host != next.host) {
+      if (!_startupChecked) {
         final regs =
             ref.read(registrationsProvider).value ?? <RegisteredNasne>[next];
-        _startupChecked = false;
         _maybeScheduleStartupCheck(regs);
       }
     });
 
-    if (!_isAndroidTv) {
+    final isAndroidTv =
+        ref.read(fireTvHelperProvider).isAndroid &&
+        ref.watch(uiControlModeProvider).isTv;
+    if (!isAndroidTv) {
       return widget.child;
     }
 

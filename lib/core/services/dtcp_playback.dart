@@ -46,15 +46,24 @@ class PlaybackKeySource {
   /// Diagnostics sink, category playback.
   final DiagLog diag;
   Future<ExchangeKeySession>? _reauthInFlight;
+  bool _closed = false;
 
   /// The session currently supplying keys (the latest after any
   /// re-authentication); the playback session stops this one.
   ExchangeKeySession get currentSession => _session;
 
+  /// Permanently closes this key source and aborts any late re-authentication
+  /// result so orphaned AKE sockets cannot survive session stop.
+  Future<void> close() async {
+    _closed = true;
+    await _session.close();
+  }
+
   /// The key for [label]: immediate when already delivered, a
   /// bounded wait while the session is alive, and a
   /// re-authentication when the session has ended without it.
   Future<Uint8List> keyForLabel(int label) async {
+    if (_closed) throw AkeConnectionClosed();
     final known = _session.keyOrNull(label);
     if (known != null) return known;
     diag(DiagCategory.playback, 'waiting for exchange key, label $label');
@@ -63,31 +72,41 @@ class PlaybackKeySource {
         label,
         timeout: const Duration(seconds: 15),
       );
-    } on AkeConnectionClosed {
+    } on AkeConnectionClosed catch (_) {
+      return _reauthForLabel(label);
+    } on TimeoutException catch (_) {
       diag(
         DiagCategory.playback,
-        'the AKE session ended without label $label; '
-        're-authenticating',
+        'waiting for exchange key label $label timed out; re-authenticating',
       );
-      final fresh = await _reauthenticateOnce();
-      final firstLabel = await fresh.waitFirstExchangeKey(
-        timeout: const Duration(seconds: 20),
-      );
-      final key = fresh.keyOrNull(label);
-      if (key == null) {
-        throw NasneError.parse(
-          'dtcp:ake',
-          cause:
-              'the exchange key label still does not match after '
-              're-authentication (wanted $label, got $firstLabel)',
-        );
-      }
-      diag(
-        DiagCategory.playback,
-        're-authenticated; exchange key label $firstLabel in hand',
-      );
-      return key;
+      unawaited(_session.close());
+      return _reauthForLabel(label);
     }
+  }
+
+  Future<Uint8List> _reauthForLabel(int label) async {
+    diag(
+      DiagCategory.playback,
+      'the AKE session ended without label $label; re-authenticating',
+    );
+    final fresh = await _reauthenticateOnce();
+    final firstLabel = await fresh.waitFirstExchangeKey(
+      timeout: const Duration(seconds: 20),
+    );
+    final key = fresh.keyOrNull(label);
+    if (key == null) {
+      throw NasneError.parse(
+        'dtcp:ake',
+        cause:
+            'the exchange key label still does not match after '
+            're-authentication (wanted $label, got $firstLabel)',
+      );
+    }
+    diag(
+      DiagCategory.playback,
+      're-authenticated; exchange key label $firstLabel in hand',
+    );
+    return key;
   }
 
   /// Forces a fresh AKE authentication even when the local key cache is
@@ -95,7 +114,12 @@ class PlaybackKeySource {
   Future<void> forceReauthenticate() async {
     final future = () async {
       final fresh = await _reauthenticateOnce();
-      await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 10));
+      try {
+        await fresh.waitFirstExchangeKey(timeout: const Duration(seconds: 10));
+      } catch (_) {
+        unawaited(fresh.close());
+        rethrow;
+      }
     }();
     unawaited(future.then((_) {}, onError: (_) {}));
     await future.timeout(
@@ -108,12 +132,17 @@ class PlaybackKeySource {
   }
 
   Future<ExchangeKeySession> _reauthenticateOnce() async {
+    if (_closed) throw AkeConnectionClosed();
     final inFlight = _reauthInFlight;
     if (inFlight != null) return inFlight;
     final future = _reauthenticate();
     _reauthInFlight = future;
     try {
       final fresh = await future;
+      if (_closed) {
+        unawaited(fresh.close());
+        throw AkeConnectionClosed();
+      }
       final old = _session;
       _session = fresh;
       if (!identical(old, fresh)) unawaited(old.close());
@@ -394,7 +423,7 @@ class _DtcpPlaybackSession
     _fetcher.close();
     try {
       await _proxy.stop();
-      await _keySource?.currentSession.close();
+      await _keySource?.close();
     } finally {
       _fetcher.close();
     }
