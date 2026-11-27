@@ -11606,8 +11606,8 @@ void main() {
               bandId: '0/video/LiveTuner/DTTB',
               channelName: 'テスト局',
               programTitle: '[字][二]あいうえお番組タイトルテスト',
-              programStart: DateTime(2026, 11, 27, 10, 0),
-              programEnd: DateTime(2026, 11, 27, 11, 0),
+              programStart: DateTime.utc(2026, 11, 27, 1, 0),
+              programEnd: DateTime.utc(2026, 11, 27, 2, 0),
             ),
             primaryReg: reg,
           );
@@ -11736,6 +11736,7 @@ void main() {
         final pip = PipController(
           channel: methodChannel,
           eventStreamOverride: events.stream,
+          hasPlatformImplementationOverride: true,
         );
         expect(await pip.isSupported(), isTrue);
         expect(await pip.enterPip(aspectWidth: 16, aspectHeight: 9), isTrue);

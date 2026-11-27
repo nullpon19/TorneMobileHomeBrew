@@ -18,10 +18,13 @@ class PipController {
     EventChannel? eventChannel,
     Stream<bool>? eventStreamOverride,
     bool? isSupportedOverride,
+    bool? hasPlatformImplementationOverride,
   }) : _channel = channel ?? const MethodChannel(_channelName),
        _eventChannel = eventChannel ?? const EventChannel(_eventChannelName),
        _eventStreamOverride = eventStreamOverride, // ignore: prefer_initializing_formals
-       _isSupportedOverride = isSupportedOverride; // ignore: prefer_initializing_formals
+       _isSupportedOverride = isSupportedOverride, // ignore: prefer_initializing_formals
+       // ignore: prefer_initializing_formals
+       _hasPlatformImplementationOverride = hasPlatformImplementationOverride;
 
   static const String _channelName = 'com.markun.tmhb/pip';
   static const String _eventChannelName = 'com.markun.tmhb/pip_events';
@@ -30,11 +33,13 @@ class PipController {
   final EventChannel _eventChannel;
   final Stream<bool>? _eventStreamOverride;
   final bool? _isSupportedOverride;
+  final bool? _hasPlatformImplementationOverride;
   StreamController<bool>? _sharedModeController;
   StreamSubscription<dynamic>? _nativeSub;
 
   bool get _hasPlatformImplementation =>
-      !kIsWeb && (Platform.isAndroid || Platform.isMacOS || Platform.isWindows);
+      _hasPlatformImplementationOverride ??
+      (!kIsWeb && (Platform.isAndroid || Platform.isMacOS || Platform.isWindows));
 
   Future<bool> isSupported() async {
     if (_isSupportedOverride != null) return _isSupportedOverride;
