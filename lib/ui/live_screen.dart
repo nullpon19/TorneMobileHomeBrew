@@ -2325,14 +2325,28 @@ Widget _buildLivePlayerScreen({
               await nextSession.stop();
               return null;
             }
-            final freshSchedules = await _fetchFreshSchedules(container, reg);
-            final switchCtx = await _resolveLiveSwitchContext(
-              container: container,
-              currentReg: reg,
-              currentChannel: channel,
-              multiNasneRegs: multiNasneRegs,
-              refreshIfStale: true,
-            );
+            late final List<RecordSchedule> freshSchedules;
+            late final ({
+              List<LiveChannelSwitchEntry> entries,
+              int currentIndex,
+            }) switchCtx;
+            try {
+              freshSchedules = await _fetchFreshSchedules(container, reg);
+              switchCtx = await _resolveLiveSwitchContext(
+                container: container,
+                currentReg: reg,
+                currentChannel: channel,
+                multiNasneRegs: multiNasneRegs,
+                refreshIfStale: true,
+              );
+            } catch (_) {
+              await nextSession.stop();
+              rethrow;
+            }
+            if (!playerContext.mounted) {
+              await nextSession.stop();
+              return null;
+            }
             final effectiveChannel = _resolveChannelFromSwitchContext(
               switchCtx,
               ownerReg: reg,
@@ -2576,13 +2590,30 @@ Future<Widget?> _switchLivePlayerToChannel({
     useMobile: useMobile,
     allowQualityFallback: allowQualityFallback || sameChannelRecording,
   );
-  final switchCtx = await _resolveLiveSwitchContext(
-    container: container,
-    currentReg: chosenReg,
-    currentChannel: chosenChannel,
-    multiNasneRegs: multiNasneRegs,
-    refreshIfStale: true,
-  );
+  if (!playerContext.mounted) {
+    await targetSession.stop();
+    return null;
+  }
+  late final ({
+    List<LiveChannelSwitchEntry> entries,
+    int currentIndex,
+  }) switchCtx;
+  try {
+    switchCtx = await _resolveLiveSwitchContext(
+      container: container,
+      currentReg: chosenReg,
+      currentChannel: chosenChannel,
+      multiNasneRegs: multiNasneRegs,
+      refreshIfStale: true,
+    );
+  } catch (_) {
+    await targetSession.stop();
+    rethrow;
+  }
+  if (!playerContext.mounted) {
+    await targetSession.stop();
+    return null;
+  }
   final effectiveChannel = _resolveChannelFromSwitchContext(
     switchCtx,
     ownerReg: chosenReg,

@@ -680,6 +680,28 @@ void main() {
         ),
         isNull,
       );
+      expect(
+        playerLoadingLabel(
+          interrupted: false,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+          resuming: true,
+        ),
+        '再接続中…',
+      );
+      expect(
+        playerLoadingLabel(
+          interrupted: true,
+          hasVideoFrame: true,
+          playingStarted: true,
+          playingNow: false,
+          buffering: true,
+          resuming: true,
+        ),
+        isNull,
+      );
     });
 
     test('effectiveRecordingDemuxerMaxBytes uses compact Android limits', () {
@@ -12608,6 +12630,34 @@ void main() {
             events: [noClearEvent],
             isLive: true,
             now: t0.add(superimposeStaleTimeout),
+          ).cues,
+          isEmpty,
+        );
+
+        // Live with 15s buffer delay: holds alert/chime until buffered video reaches t0 + 15s.
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: true,
+            now: t0.add(const Duration(seconds: 2)),
+            liveBufferDelaySeconds: 15.0,
+          ).cues,
+          isEmpty,
+        );
+        final delayedActive = resolveActiveSuperimposeCues(
+          events: [fixedEvent],
+          isLive: true,
+          now: t0.add(const Duration(seconds: 16)),
+          liveBufferDelaySeconds: 15.0,
+        );
+        expect(delayedActive.cues, hasLength(1));
+        expect(delayedActive.soundSequence, 7);
+        expect(
+          resolveActiveSuperimposeCues(
+            events: [fixedEvent],
+            isLive: true,
+            now: t0.add(const Duration(seconds: 21)),
+            liveBufferDelaySeconds: 15.0,
           ).cues,
           isEmpty,
         );

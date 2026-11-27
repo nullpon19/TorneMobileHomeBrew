@@ -340,6 +340,87 @@ void main() {
       await tester.pump();
       expect(lateSession.stopped, isTrue);
     });
+
+    testWidgets('cancelling just after start resolves never double-pops parent route', (
+      tester,
+    ) async {
+      final session = _FakePlaybackSession();
+      var attempts = 0;
+
+      await tester.pumpWidget(
+        ProviderScope(
+          child: MaterialApp(
+            home: Builder(
+              builder: (rootContext) => Scaffold(
+                body: ElevatedButton(
+                  onPressed: () {
+                    unawaited(
+                      Navigator.of(rootContext).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => Consumer(
+                            builder: (context, ref, _) => Scaffold(
+                              body: Center(
+                                child: ElevatedButton(
+                                  onPressed: () {
+                                    unawaited(
+                                      startPlaybackAndShowPlayer(
+                                        context: context,
+                                        ref: ref,
+                                        unsupportedSubject: 'TV視聴',
+                                        tunerWaitInterval:
+                                            const Duration(milliseconds: 20),
+                                        tunerWaitMaxDuration:
+                                            const Duration(seconds: 5),
+                                        start: () async {
+                                          attempts++;
+                                          if (attempts == 1) {
+                                            throw NasneError.http(
+                                              511,
+                                              'dtcp:http',
+                                            );
+                                          }
+                                          return session;
+                                        },
+                                        buildPlayer: (_) => const Scaffold(
+                                          body: Text('player-opened'),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                  child: const Text('開始'),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text('親画面へ'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('親画面へ'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('開始'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('空きを待って自動再生'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 25));
+
+      // Dialog is in dismiss transition while pushing player; tapping キャンセル
+      // or back during transition must not pop the pushed player or parent route.
+      final cancelBtn = find.text('キャンセル');
+      if (cancelBtn.evaluate().isNotEmpty) {
+        await tester.tap(cancelBtn, warnIfMissed: false);
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('player-opened'), findsOneWidget);
+    });
   });
 }
 

@@ -219,8 +219,10 @@ String? playerLoadingLabel({
   required bool playingStarted,
   required bool playingNow,
   required bool buffering,
+  bool resuming = false,
 }) {
   if (interrupted) return null;
+  if (resuming) return '再接続中…';
   if (!hasVideoFrame || !playingStarted) return '読み込み中…';
   if (buffering && playingNow) return 'バッファリング中…';
   return null;
@@ -3273,6 +3275,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _checkingConflict = false;
   bool _conflictHandled = false;
   bool _switchingChannel = false;
+  bool _switchInFlight = false;
+  bool _sessionPermanentlyStopped = false;
+  bool _exitingPlayback = false;
+  bool _resuming = false;
+  bool _userPaused = false;
+  bool _reanchorLiveEpochAfterReconnect = false;
   String? _switchingChannelLabel;
   Timer? _liveConflictPollTimer;
   DateTime? _livePausedAt;
@@ -4006,11 +4014,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       (_) {
         if (!mounted || _conflictHandled || _switchingChannel) return;
         _sampleThroughputTick();
+        final wasReconnecting = _proxyReconnecting;
         final next = _readProxyReconnecting();
         if (next != _proxyReconnecting) {
           setState(() => _proxyReconnecting = next);
         }
-        if (next && _initialPlaybackStarted && !_interrupted) {
+        if (wasReconnecting && !next && widget.live) {
+          _reanchorLiveEpochAfterReconnect = true;
+          unawaited(_pollMpvBufferProperties());
+        } else if (next && _initialPlaybackStarted && !_interrupted) {
           unawaited(_pollMpvBufferProperties());
         }
       },
@@ -4037,15 +4049,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           if (!playing) {
             if (!_buffering && !_interrupted && _initialPlaybackStarted) {
               _markLivePaused(notify: false);
-            } else {
+            } else if (_liveDelayedByPause) {
               _livePausedAt ??= _now();
             }
           } else {
             if (_livePausedAt != null) {
-              final pauseDelta =
-                  _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
-              if (pauseDelta > 0) {
-                _liveEstimatedLagSeconds += pauseDelta;
+              if (_liveDelayedByPause) {
+                final pauseDelta =
+                    _now().difference(_livePausedAt!).inMilliseconds / 1000.0;
+                if (pauseDelta > 0) {
+                  _liveEstimatedLagSeconds += pauseDelta;
+                }
               }
               _livePausedAt = null;
             }
@@ -4056,25 +4070,31 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _playingNow = playing;
             if (playing) {
               _playing = true;
+              _userPaused = false;
               _interrupted = false;
               _interruptDetail = null;
+              if (!_buffering) _resuming = false;
             }
             _maybeLatchInitialPlaybackStarted();
           });
         } else {
           _playingNow = playing;
-          if (playing) _playing = true;
+          if (playing) {
+            _playing = true;
+            _userPaused = false;
+            if (!_buffering) _resuming = false;
+          }
           _maybeLatchInitialPlaybackStarted();
         }
         if (playing) {
           _maybeCancelStartWatchdog();
-          _resumeWatchdogTimer?.cancel();
+          if (!_buffering) {
+            _resumeWatchdogTimer?.cancel();
+            _autoResumeAttempts = 0;
+          }
           _autoResumeTimer?.cancel();
           _autoResumeCountdown = 0;
           _autoResumeDisabled = false;
-          if (!_buffering) {
-            _autoResumeAttempts = 0;
-          }
           // A (re)start clears any interruption state
           // (plan 80): playback is running again, whether it
           // recovered on its own or the user resumed it.
@@ -4105,11 +4125,29 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // while playing is a recovery and clears it.
           _bufferingSincePlaying = buffering;
         }
-        if (!buffering && _playingNow) {
-          _autoResumeAttempts = 0;
-          if (!_decodeStatusLogged) {
-            _decodeStatusLogged = true;
-            unawaited(_logDecodeStatus());
+        if (!buffering) {
+          _stallTimer?.cancel();
+          _stallDeferCount = 0;
+          if (_playingNow) {
+            _resumeWatchdogTimer?.cancel();
+            _resuming = false;
+            _autoResumeAttempts = 0;
+            if (!_decodeStatusLogged) {
+              _decodeStatusLogged = true;
+              unawaited(_logDecodeStatus());
+            }
+          }
+        } else if (_playingNow &&
+            _initialPlaybackStarted &&
+            !_interrupted &&
+            !_userPaused) {
+          if (_stallTimer == null || !_stallTimer!.isActive) {
+            final waitSec = _bufferPlan?.rebufferWaitSeconds ?? 0;
+            final timeout = computeEffectiveStallTimeout(
+              live: widget.live,
+              rebufferWaitSeconds: waitSec,
+            );
+            _stallTimer = Timer(timeout, _onStallTimeout);
           }
         }
         if (widget.live &&
@@ -4339,7 +4377,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           );
           return;
         }
-        _wakelockSession.setPlaying(false);
         _watchdog?.cancel();
         _stopStartupTraceTimer();
         if (!mounted) return;
@@ -4349,6 +4386,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         );
         if (hasStartedFrames && _playing) {
           if (!widget.live && _isEffectivelyCompleted) {
+            _wakelockSession.setPlaying(false);
             _handleRecordedCompletion('trailing error near end: $error');
             return;
           }
@@ -4374,8 +4412,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           // Keep the frozen frame and offer the in-place
           // resume instead of replacing the screen with the
           // start-failure message.
+          _wakelockSession.setPlaying(false);
           _enterInterruptedState(error);
         } else if (_error == null) {
+          _wakelockSession.setPlaying(false);
           _setStartError('$error\n\n${_buildCompactDiagnosticsSummary()}');
         }
       }),
@@ -4446,7 +4486,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      if (!mounted || _exitingPlayback) return;
       final nav = Navigator.of(context);
       if (_exitConfirmOpen) {
         if (nav.canPop()) nav.pop(true);
@@ -4492,19 +4532,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     try {
       final nextPlayer = await launcher(context, stopCurrentSession);
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer != null) {
-        await _pushReplacementPlayer(nextPlayer);
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
         return;
       }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: next episode launch failed: $e');
     }
     if (mounted) {
-      final nav = Navigator.of(context);
-      if (nav.canPop()) {
-        nav.pop();
-      }
+      await _exitPlaybackCleanly();
     }
   }
 
@@ -4519,13 +4564,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     }
     if (!mounted) return;
     if (confirmed) {
-      await _stopSession().timeout(
-        const Duration(milliseconds: 1500),
-        onTimeout: () {},
-      );
-      if (!mounted) return;
-      final nav = Navigator.of(context);
-      if (nav.canPop()) nav.pop();
+      await _exitPlaybackCleanly();
       return;
     }
     _suppressBackPopUntil = DateTime.now().add(
@@ -4541,6 +4580,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _setStartError(String error, {bool allowAfterConflict = false}) {
+    _resuming = false;
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
     _logPlaybackTrace('start error: $error');
@@ -4562,10 +4602,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   Future<void> _retryFromStartError() async {
-    if (!mounted || _conflictHandled || _switchingChannel) return;
+    if (!mounted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _sessionPermanentlyStopped) {
+      return;
+    }
     _watchdog?.cancel();
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
+    try {
+      await _player.stop().catchError((_) {});
+    } catch (_) {}
+    await _deleteUsedDiskCacheDir();
     if (widget.live) {
       if (widget.session case final LiveEdgeResettable resettable) {
         try {
@@ -4578,9 +4627,15 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
       }
     }
-    if (!mounted || _conflictHandled || _switchingChannel) return;
+    if (!mounted ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _sessionPermanentlyStopped) {
+      return;
+    }
     setState(() {
       _error = null;
+      _resuming = false;
       _playing = false;
       _playingNow = false;
       _completed = false;
@@ -4603,6 +4658,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _enterInterruptedState(String? detail) {
+    _resuming = false;
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
     _logPlaybackTrace(
@@ -5015,21 +5071,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles(stopTimer: true);
     _resetSubtitleTrackTracking();
     _resetLiveCatchUpState(resetPlayerRate: false);
-    _recordingStatusTimer?.cancel();
-    _cornerNoticeTimer?.cancel();
-    _customCornerNoticeTimer?.cancel();
-    _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
-    _hudTimer?.cancel();
-    _seekHudTimer?.cancel();
-    _seekDebounceTimer?.cancel();
-    _committedSeekHoldTimer?.cancel();
-    _liveSeekDebounceTimer?.cancel();
-    _liveCommittedSeekHoldTimer?.cancel();
-    _livePendingSeekBaseSec = null;
-    _livePendingSeekDeltaSec = 0.0;
-    _liveCommittedSeekSec = null;
+    _stopJikkyo(clearOverlay: true);
+    _cancelAuxTimersForTeardown();
 
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
@@ -5037,6 +5080,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _subscriptions.clear();
 
     setState(() {
+      _resuming = false;
       _interrupted = false;
       _interruptDetail = null;
       _autoResumeCountdown = 0;
@@ -5051,6 +5095,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _customCornerNoticeText = null;
     });
 
+    _sessionPermanentlyStopped = true;
     await _player.stop().timeout(
       const Duration(seconds: 2),
       onTimeout: () {},
@@ -5059,6 +5104,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(seconds: 3),
       onTimeout: () {},
     ).catchError((_) {});
+    await _deleteUsedDiskCacheDir();
     if (!mounted) return;
 
     final failoverReg = conflict.failoverRegistration;
@@ -5075,8 +5121,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
       try {
         final nextPlayer = await buildFailover(failoverReg, failoverCh, notice);
-        if (!mounted) return;
-        await _pushReplacementPlayer(nextPlayer);
+        if (!mounted) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          return;
+        }
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
         return;
       } catch (e) {
         _diag(
@@ -5105,8 +5159,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
       try {
         final nextPlayer = await buildNext(target);
-        if (!mounted) return;
-        await _pushReplacementPlayer(nextPlayer);
+        if (!mounted) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          return;
+        }
+        try {
+          await _pushReplacementPlayer(nextPlayer);
+        } catch (_) {
+          _stopOrphanedReplacementPlayer(nextPlayer);
+          rethrow;
+        }
       } catch (e) {
         _diag(
           DiagCategory.playback,
@@ -5122,8 +5184,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
 
-    final nav = Navigator.of(context);
-    if (nav.canPop()) nav.pop();
+    await _exitPlaybackCleanly();
   }
 
   /// A playing→stopped transition (plan 80): when the
@@ -5131,7 +5192,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// grace period to recover on its own before surfacing
   /// anything.
   void _onPlaybackStopped() {
-    if (_conflictHandled || _switchingChannel) return;
+    if (_conflictHandled || _switchingChannel || _userPaused) return;
     if (!shouldSurfacePreFrameStopAsInterruption(
       hasVideoFrame: _hasVideoFrame,
       initialPlaybackStarted: _initialPlaybackStarted,
@@ -5188,7 +5249,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _onStallTimeout() {
     if (!mounted ||
-        _playingNow ||
+        (_playingNow && !_buffering) ||
+        _userPaused ||
         _completed ||
         _error != null ||
         _conflictHandled ||
@@ -5246,6 +5308,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _resetLiveCatchUpState(resetPlayerRate: true);
     }
     setState(() {
+      _resuming = true;
+      _userPaused = false;
       _autoResumeDisabled = false;
       _autoResumeCountdown = 0;
       _interrupted = false;
@@ -5288,7 +5352,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
     _resumeWatchdogTimer = Timer(resumeTimeout, () {
       if (!mounted ||
-          _playingNow ||
+          (_playingNow && !_buffering) ||
           _completed ||
           _interrupted ||
           _error != null ||
@@ -5332,6 +5396,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
       if (!mounted || _conflictHandled || _switchingChannel) return;
       await _applyPlayerVolume();
+      await _applySubtitleSelection();
       _diag(DiagCategory.playback, 'player: resume open completed');
     } catch (e) {
       if (!mounted || _conflictHandled || _switchingChannel) return;
@@ -5379,6 +5444,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _usingDirectAribCaptions = false;
     _suppressedCaptionSignature = null;
     _lastSeenSubStartSeconds = null;
+    _lastPlaybackTimeSeconds = null;
   }
 
   void _clearDisplayedSubtitles({bool notify = true, bool stopTimer = false}) {
@@ -5504,7 +5570,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _syncSuperimposeTick() {
-    if (!mounted || _switchingChannel || _error != null) return;
+    if (!mounted || _conflictHandled || _switchingChannel || _error != null) {
+      return;
+    }
     final enabled = ref.read(superimposeEnabledProvider);
     if (!enabled) {
       if (_visibleSuperimposeCues.isNotEmpty) {
@@ -5529,13 +5597,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     ? -source.firstStreamPtsSeconds!
                     : 0.0));
       final playbackTime =
-          _lastPlaybackTimeSeconds ?? (_lastPosition.inMilliseconds / 1000.0);
+          _lastPlaybackTimeSeconds ??
+          (_effectiveRecordedPosition.inMilliseconds / 1000.0);
+      final now = _now();
+      var liveBufferDelaySeconds = 0.0;
+      if (widget.live) {
+        final inputs = _currentLiveSeekInputs(now);
+        final lag = resolveLivePlaybackLagSeconds(
+          liveDelayedByPause: _liveDelayedByPause,
+          cacheStartSeconds: _liveCacheStartSec,
+          cacheEndSeconds: _liveCacheEndSec,
+          liveEdgeSeconds: _liveCacheLiveEdgeSec,
+          effectivePosSeconds: inputs.effectivePos,
+          fallbackLagSeconds: inputs.fallbackLag,
+          streamEpoch: _liveStreamEpoch,
+          now: now,
+          bufferedAheadSeconds: _bufferedAheadSeconds,
+          isScrubbing: _livePendingSeekBaseSec != null,
+        );
+        final configured = (_bufferPlan?.configuredSeconds ?? 0).toDouble();
+        liveBufferDelaySeconds = lag > configured ? lag : configured;
+      }
       final resolved = resolveActiveSuperimposeCues(
         events: events,
         isLive: widget.live,
-        now: _now(),
+        now: now,
         currentPlaybackMpvPts: playbackTime,
         ptsOffset: ptsOffset,
+        liveBufferDelaySeconds: liveBufferDelaySeconds,
       );
       if (!_cuesEqual(_visibleSuperimposeCues, resolved.cues)) {
         setState(() => _visibleSuperimposeCues = resolved.cues);
@@ -5646,7 +5735,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   void _syncJikkyoTick() {
-    if (!mounted || !_jikkyoOn || _switchingChannel || _error != null) return;
+    if (!mounted ||
+        !_jikkyoOn ||
+        _conflictHandled ||
+        _switchingChannel ||
+        _error != null) {
+      return;
+    }
     final controller = _jikkyoController;
     if (controller == null) return;
     final settings = ref.read(jikkyoSettingsProvider);
@@ -6629,6 +6724,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   Future<void> _open() async {
+    _userPaused = false;
     _openStartedAt = Stopwatch()..start();
     _diag(DiagCategory.playback, 'player: opening ${widget.session.mediaUri}');
     try {
@@ -6640,6 +6736,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           ((widget.live || bufferSeconds >= 60) && Platform.isAndroid)
           ? await _fireTvHelper.getCacheAvailableBytes()
           : null;
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        return;
+      }
       final plan = computeMpvBufferPlan(
         live: widget.live,
         bufferSeconds: bufferSeconds,
@@ -6688,7 +6787,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           sessionCacheDir = cacheDir;
         }
       }
-      if (!mounted) return;
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        if (sessionCacheDir != null &&
+            sessionCacheDir.parent.path.endsWith('mpv_cache')) {
+          try {
+            if (await sessionCacheDir.exists()) {
+              await sessionCacheDir.delete(recursive: true);
+            }
+          } catch (_) {}
+        }
+        return;
+      }
       _usedDiskCacheDir = sessionCacheDir;
       _watchdog?.cancel();
       _watchdog = Timer(
@@ -6840,6 +6949,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         );
       }
       await _applyPlayerVolume();
+      if (!mounted || _conflictHandled || _switchingChannel || _exitingPlayback) {
+        return;
+      }
       await _player.open(
         Media(widget.session.mediaUri.toString(), start: openMediaStart),
       );
@@ -6923,6 +7035,71 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// even when the stop fails — media_kit's own dispose also
   /// stops internally, but leaving must not depend on a
   /// single call landing.
+  Future<void> _deleteUsedDiskCacheDir() async {
+    final cacheDir = _usedDiskCacheDir;
+    _usedDiskCacheDir = null;
+    if (cacheDir == null) return;
+    try {
+      if (await cacheDir.exists()) {
+        if (cacheDir.parent.path.endsWith('mpv_cache')) {
+          await cacheDir.delete(recursive: true);
+        } else {
+          await for (final entry in cacheDir.list()) {
+            await entry.delete(recursive: true);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _cancelAuxTimersForTeardown() {
+    _superimposeSyncTimer?.cancel();
+    _proxyReconnectTimer?.cancel();
+    _recordingStatusTimer?.cancel();
+    _cornerNoticeTimer?.cancel();
+    _customCornerNoticeTimer?.cancel();
+    _channelPreviewTimer?.cancel();
+    _osdTimer?.cancel();
+    _osdClockTimer?.cancel();
+    _osdClockTimer = null;
+    _touchPortraitOverlayTimer?.cancel();
+    _orientationResetTimer?.cancel();
+    _desktopEdgeHideTimer?.cancel();
+    _hudTimer?.cancel();
+    _seekHudTimer?.cancel();
+    _seekDebounceTimer?.cancel();
+    _committedSeekHoldTimer?.cancel();
+    _liveSeekDebounceTimer?.cancel();
+    _liveCommittedSeekHoldTimer?.cancel();
+    _livePendingSeekBaseSec = null;
+    _livePendingSeekDeltaSec = 0.0;
+    _liveCommittedSeekSec = null;
+  }
+
+  void _stopOrphanedReplacementPlayer(Widget? candidate) {
+    if (candidate is PlayerScreen) {
+      unawaited(candidate.session.stop().catchError((_) {}));
+    }
+  }
+
+  Future<void> _exitPlaybackCleanly() async {
+    if (_exitingPlayback || !mounted) return;
+    _exitingPlayback = true;
+    _exitConfirmOpen = false;
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel().catchError((_) {}));
+    }
+    _subscriptions.clear();
+    unawaited(_player.stop().catchError((_) {}));
+    await _stopSession().timeout(
+      const Duration(milliseconds: 1500),
+      onTimeout: () {},
+    );
+    if (!mounted) return;
+    final nav = Navigator.of(context);
+    if (nav.canPop()) nav.pop();
+  }
+
   Future<void> _stopAndDisposePlayer() async {
     try {
       await _player.stop();
@@ -6934,20 +7111,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     } catch (e) {
       _diag(DiagCategory.playback, 'player: dispose on leaving failed: $e');
     }
-    final cacheDir = _usedDiskCacheDir;
-    if (cacheDir != null) {
-      try {
-        if (await cacheDir.exists()) {
-          if (cacheDir.parent.path.endsWith('mpv_cache')) {
-            await cacheDir.delete(recursive: true);
-          } else {
-            await for (final entry in cacheDir.list()) {
-              await entry.delete(recursive: true);
-            }
-          }
-        }
-      } catch (_) {}
-    }
+    await _deleteUsedDiskCacheDir();
   }
 
   Future<void>? _sessionStopFuture;
@@ -7080,6 +7244,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             _errorBackFocusNode.dispose();
             _nextPlayNowFocusNode.dispose();
             _nextCancelFocusNode.dispose();
+            _seekable.dispose();
             _osdFadeController.dispose();
           },
         ),
@@ -7968,12 +8133,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   void _setLivePlaybackPaused(bool paused) {
     if (!widget.live) return;
     if (paused) {
+      _userPaused = true;
+      _bufferingSincePlaying = false;
+      _stallTimer?.cancel();
       unawaited(_player.pause());
       _markLivePaused();
       unawaited(_pollMpvBufferProperties());
       _showSeekHud(Icons.pause, '一時停止');
       return;
     }
+    _userPaused = false;
     unawaited(_resumeLivePlayback());
   }
 
@@ -7981,6 +8150,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!mounted || !widget.live || _switchingChannel || _conflictHandled) {
       return;
     }
+    _userPaused = false;
     if (_liveSeekDebounceTimer?.isActive == true ||
         _livePendingSeekDeltaSec != 0.0) {
       _liveSeekDebounceTimer?.cancel();
@@ -7988,10 +8158,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       if (!mounted || _switchingChannel || _conflictHandled) return;
     }
     final effectivePos = _liveCommittedSeekSec ?? _liveTimePosSec;
+    final liveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final atLiveEdge =
-        _liveCacheEndSec != null &&
+        liveEdge != null &&
         effectivePos != null &&
-        (_liveCacheEndSec! - effectivePos) <= 1.5;
+        (liveEdge - effectivePos) <= 1.5;
     await _player.play();
     if (!mounted) return;
     if (_liveDelayedByPause && atLiveEdge) {
@@ -8013,6 +8184,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (widget.live) {
       _setLivePlaybackPaused(!willPlay);
     } else {
+      _userPaused = !willPlay;
+      if (!willPlay) {
+        _bufferingSincePlaying = false;
+        _stallTimer?.cancel();
+      }
       unawaited(_player.playOrPause());
       _showSeekHud(
         willPlay ? Icons.play_arrow : Icons.pause,
@@ -8025,8 +8201,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (!widget.live || _switchingChannel || _conflictHandled || _catchingUpLive) {
       return;
     }
-    _liveDelayedByPause = true;
-    _startLiveCatchUpMonitor();
     final effectiveLiveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
     final base =
         _livePendingSeekBaseSec ??
@@ -8048,6 +8222,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _showSeekHud(Icons.info_outline, '戻れるキャッシュ蓄積中');
       return;
     }
+    _liveDelayedByPause = true;
+    _startLiveCatchUpMonitor();
     if (deltaSec < 0) {
       _liveRewoundByUser = true;
       _liveAutoCatchUpEnabled = false;
@@ -8076,7 +8252,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
     } else if (deltaSec > 0 && clamped.hitEnd) {
       _liveRewoundByUser = false;
-      _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
+      _liveAutoCatchUpEnabled = true;
+      if (clamped.clampedDelta == 0.0 && _playingNow) {
+        unawaited(_finishLiveCatchUp(showHud: true));
+      } else {
+        _showSeekHud(Icons.live_tv, '現在位置 (LIVE)');
+      }
     } else {
       _showSeekHud(
         _livePendingSeekDeltaSec < 0 ? Icons.replay_10 : Icons.forward_10,
@@ -8360,30 +8541,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _stopLiveConflictPoller();
     _stopPreBufferPoller();
     _stopStartupTraceTimer();
-    _proxyReconnectTimer?.cancel();
-    _watchdog?.cancel();
     _stallTimer?.cancel();
     _autoResumeTimer?.cancel();
     _resumeWatchdogTimer?.cancel();
     _clearDisplayedSubtitles(notify: false, stopTimer: true);
     _resetSubtitleTrackTracking();
     _stopJikkyo(clearOverlay: true);
-    _recordingStatusTimer?.cancel();
-    _cornerNoticeTimer?.cancel();
-    _customCornerNoticeTimer?.cancel();
-    _channelPreviewTimer?.cancel();
-    _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
-    _hudTimer?.cancel();
-    _seekHudTimer?.cancel();
-    _seekDebounceTimer?.cancel();
-    _committedSeekHoldTimer?.cancel();
-    _liveSeekDebounceTimer?.cancel();
-    _liveCommittedSeekHoldTimer?.cancel();
-    _livePendingSeekBaseSec = null;
-    _livePendingSeekDeltaSec = 0.0;
-    _liveCommittedSeekSec = null;
+    _cancelAuxTimersForTeardown();
 
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
@@ -8393,6 +8557,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     if (mounted) {
       setState(() {
         _switchingChannel = true;
+        _resuming = false;
         _error = null;
         _interrupted = false;
         _interruptDetail = null;
@@ -8409,6 +8574,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       });
     }
 
+    _sessionPermanentlyStopped = true;
     await _player.stop().timeout(
       const Duration(seconds: 2),
       onTimeout: () {},
@@ -8417,6 +8583,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       const Duration(seconds: 3),
       onTimeout: () {},
     ).catchError((_) {});
+    await _deleteUsedDiskCacheDir();
   }
 
   Future<void> _pushReplacementPlayer(Widget nextPlayer) async {
@@ -8433,9 +8600,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _executeLiveChannelSwitch(LiveChannelSwitchEntry target) async {
     final switcher = widget.onSwitchLiveChannel;
-    if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
+    if (switcher == null ||
+        !mounted ||
+        _switchInFlight ||
+        _switchingChannel ||
+        _conflictHandled) {
       return;
     }
+    _switchInFlight = true;
     _dismissChannelPreview();
     _switchingChannelLabel = target.displayChannelName;
 
@@ -8448,12 +8620,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     try {
       final nextPlayer = await switcher(context, target, stopCurrentSession);
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer == null) {
         _switchingChannelLabel = null;
         return;
       }
-      await _pushReplacementPlayer(nextPlayer);
+      try {
+        await _pushReplacementPlayer(nextPlayer);
+      } catch (_) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        rethrow;
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: live channel switch failed: $e');
       if (!mounted) return;
@@ -8467,14 +8647,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannelLabel = null;
         _showCustomCornerNotice('チャンネルを切り替えできませんでした');
       }
+    } finally {
+      _switchInFlight = false;
     }
   }
 
   Future<void> _executeQualitySwitch() async {
     final switcher = widget.onSwitchQuality;
-    if (switcher == null || !mounted || _switchingChannel || _conflictHandled) {
+    if (switcher == null ||
+        !mounted ||
+        _switchInFlight ||
+        _switchingChannel ||
+        _conflictHandled) {
       return;
     }
+    _switchInFlight = true;
     _closeOsd();
     final nextUseMobile = !widget.currentUseMobile;
     final resumeFrom = _effectiveRecordedPosition > Duration.zero
@@ -8497,7 +8684,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         resumeFrom,
         stopCurrentSession,
       );
-      if (!mounted) return;
+      if (!mounted) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        return;
+      }
       if (nextPlayer == null) {
         if (!sessionStopped) {
           _suppressResumeReportOnDispose = false;
@@ -8505,7 +8695,12 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         return;
       }
-      await _pushReplacementPlayer(nextPlayer);
+      try {
+        await _pushReplacementPlayer(nextPlayer);
+      } catch (_) {
+        _stopOrphanedReplacementPlayer(nextPlayer);
+        rethrow;
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: quality switch failed: $e');
       if (!mounted) return;
@@ -8520,6 +8715,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _switchingChannelLabel = null;
         _showCustomCornerNotice('画質を切り替えできませんでした');
       }
+    } finally {
+      _switchInFlight = false;
     }
   }
 
@@ -8545,7 +8742,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _updateLiveStreamEpochFromLiveEdge(double liveEdgeSec, DateTime now) {
     if (!widget.live || !liveEdgeSec.isFinite) return;
-    if (_liveStreamEpoch == null) {
+    if (_liveStreamEpoch == null || _reanchorLiveEpochAfterReconnect) {
+      _reanchorLiveEpochAfterReconnect = false;
       _liveMaxAdvancingCacheEndSec = liveEdgeSec;
       _liveStreamEpoch = now.subtract(
         Duration(milliseconds: (liveEdgeSec * 1000).round()),
@@ -8673,11 +8871,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       return;
     }
     final targetBufferFloor = (_bufferPlan?.configuredSeconds ?? 0).toDouble();
-    final measuredAhead =
-        (_liveCacheEndSec != null && _liveTimePosSec != null)
+    final liveEdge = _liveCacheLiveEdgeSec ?? _liveCacheEndSec;
+    final measuredAhead = (liveEdge != null && _liveTimePosSec != null)
         ? math.max(
             _bufferedAheadSeconds,
-            math.max(0.0, _liveCacheEndSec! - _liveTimePosSec!),
+            math.max(0.0, liveEdge - _liveTimePosSec!),
           )
         : _bufferedAheadSeconds;
     final excessBuffered = math.max(
@@ -8745,6 +8943,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   Future<void> _catchUpToLiveEdge() async {
     if (!widget.live || !mounted || _catchingUpLive || _switchingChannel) return;
+    _userPaused = false;
     _catchingUpLive = true;
     _clearDisplayedSubtitles();
     _closeOsd();
@@ -8917,7 +9116,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         _lastLiveTransferTickAt = null;
         _liveTransferAccumulatedSeconds = 0.0;
       });
-      if (_isPreBuffering) {
+      if (_shouldPollLiveBuffering) {
         _startPreBufferPoller();
       }
       final uri = widget.session.mediaUri.replace(
@@ -9069,7 +9268,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           return KeyEventResult.handled;
         }
         if (key == LogicalKeyboardKey.backspace) {
-          Navigator.of(context).pop();
+          unawaited(_exitPlaybackCleanly());
           return KeyEventResult.handled;
         }
         if (key == LogicalKeyboardKey.escape) {
@@ -9080,7 +9279,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           } else if (_channelPreviewDirection != null) {
             _dismissChannelPreview(fromBackKey: true);
           } else {
-            Navigator.of(context).pop();
+            unawaited(_exitPlaybackCleanly());
           }
           return KeyEventResult.handled;
         }
@@ -9313,6 +9512,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       playingStarted: _playing,
       playingNow: _playingNow,
       buffering: _buffering,
+      resuming: _resuming,
     );
     final canLiveSwitch =
         widget.live &&
@@ -9367,11 +9567,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             if (uiMode.isTv) {
               unawaited(_confirmExitPlayback());
             } else {
-              Navigator.of(context).pop();
+              unawaited(_exitPlaybackCleanly());
             }
             return;
           case PlayerBackOutcome.popPlayer:
-            Navigator.of(context).pop();
+            unawaited(_exitPlaybackCleanly());
             return;
         }
       },
@@ -9424,16 +9624,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           runSpacing: 8,
                           alignment: WrapAlignment.center,
                           children: [
-                            FilledButton.icon(
-                              focusNode: _errorRetryFocusNode,
-                              autofocus: true,
-                              onPressed: _retryFromStartError,
-                              icon: const Icon(Icons.refresh),
-                              label: const Text('再試行'),
-                            ),
+                            if (!_sessionPermanentlyStopped && !_conflictHandled)
+                              FilledButton.icon(
+                                focusNode: _errorRetryFocusNode,
+                                autofocus: true,
+                                onPressed: _retryFromStartError,
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('再試行'),
+                              ),
                             OutlinedButton.icon(
                               focusNode: _errorBackFocusNode,
-                              onPressed: () => Navigator.of(context).pop(),
+                              autofocus:
+                                  _sessionPermanentlyStopped ||
+                                  _conflictHandled,
+                              onPressed: () =>
+                                  unawaited(_exitPlaybackCleanly()),
                               icon: const Icon(Icons.arrow_back),
                               label: const Text('戻る'),
                             ),
@@ -9695,7 +9900,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                                       ),
                                     ),
                                     onPressed: () =>
-                                        Navigator.of(context).pop(),
+                                        unawaited(_exitPlaybackCleanly()),
                                     icon: const Icon(
                                       Icons.arrow_back,
                                       size: 18,
@@ -10044,7 +10249,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       key: const ValueKey('touch_portrait_back_button'),
                       icon: const Icon(Icons.arrow_back, color: Colors.white),
                       tooltip: '戻る',
-                      onPressed: () => Navigator.of(context).pop(),
+                      onPressed: () => unawaited(_exitPlaybackCleanly()),
                     ),
                   ),
                 ),
@@ -11504,7 +11709,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                       minimumSize: const Size(0, 34),
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: () => unawaited(_exitPlaybackCleanly()),
                     icon: const Icon(Icons.arrow_back, size: 16),
                     label: const Text('戻る', style: TextStyle(fontSize: 12)),
                   ),

@@ -308,6 +308,7 @@ class _TunerBusyWaitDialogState extends State<_TunerBusyWaitDialog> {
   Timer? _pollTimer;
   late NasneError _lastError = widget.initialError;
   bool _cancelled = false;
+  bool _popped = false;
   bool _checking = false;
   int _attempt = 0;
 
@@ -326,19 +327,20 @@ class _TunerBusyWaitDialogState extends State<_TunerBusyWaitDialog> {
     super.dispose();
   }
 
-  void _cancel() {
-    if (_cancelled) return;
+  void _popOnce(_TunerWaitResult result) {
+    if (_popped || !mounted) return;
+    _popped = true;
     _cancelled = true;
     _pollTimer?.cancel();
-    if (mounted) {
-      Navigator.of(context).pop(const _TunerWaitResult.cancelled());
-    }
+    Navigator.of(context).pop(result);
   }
+
+  void _cancel() => _popOnce(const _TunerWaitResult.cancelled());
 
   Future<void> _attemptStart() async {
     if (_cancelled || !mounted) return;
     if (_sw.elapsed >= widget.maxWait) {
-      Navigator.of(context).pop(_TunerWaitResult.nasneError(_lastError));
+      _popOnce(_TunerWaitResult.nasneError(_lastError));
       return;
     }
     setState(() {
@@ -351,7 +353,7 @@ class _TunerBusyWaitDialogState extends State<_TunerBusyWaitDialog> {
         await session.stop();
         return;
       }
-      Navigator.of(context).pop(_TunerWaitResult.success(session));
+      _popOnce(_TunerWaitResult.success(session));
     } on NasneError catch (e) {
       if (_cancelled || !mounted) return;
       if (isTunerBusyError(e) && _sw.elapsed < widget.maxWait) {
@@ -359,11 +361,11 @@ class _TunerBusyWaitDialogState extends State<_TunerBusyWaitDialog> {
         setState(() => _checking = false);
         _pollTimer = Timer(widget.pollInterval, _attemptStart);
       } else {
-        Navigator.of(context).pop(_TunerWaitResult.nasneError(e));
+        _popOnce(_TunerWaitResult.nasneError(e));
       }
     } catch (e) {
       if (_cancelled || !mounted) return;
-      Navigator.of(context).pop(_TunerWaitResult.unexpectedError(e));
+      _popOnce(_TunerWaitResult.unexpectedError(e));
     }
   }
 
