@@ -35,6 +35,7 @@ import 'dart:typed_data';
 
 import '../arib_b24.dart';
 import '../broadcast_text.dart';
+import '../errors.dart';
 import '../models/channel.dart';
 import '../models/epg.dart';
 
@@ -52,13 +53,20 @@ Uint8List deobfuscateEpgPayload(List<int> raw) {
 
 /// Inflates the (single) zlib stream of an EPG response body.
 Uint8List inflateEpgResponse(List<int> rawResponse) {
-  return Uint8List.fromList(
-      ZLibDecoder().convert(deobfuscateEpgPayload(rawResponse)));
+  try {
+    return Uint8List.fromList(
+      ZLibDecoder().convert(deobfuscateEpgPayload(rawResponse)),
+    );
+  } catch (e) {
+    throw NasneError.parse('epg:inflate', cause: e);
+  }
 }
 
 int _u16be(List<int> b, int off) => (b[off] << 8) | b[off + 1];
 
 int _bcd(int b) => ((b >> 4) * 10) + (b & 0x0f);
+
+bool _isValidBcd(int b) => (b >> 4) <= 9 && (b & 0x0f) <= 9;
 
 /// MJD (Modified Julian Date) epoch: 1858-11-17.
 final DateTime _mjdEpoch = DateTime.utc(1858, 11, 17);
@@ -261,21 +269,47 @@ List<EpgEvent> _parseSectionEvents(Uint8List plain, int start, int end) {
   while (p + 12 <= end) {
     final eventId = _u16be(plain, p);
     final mjd = _u16be(plain, p + 2);
-    final hh = _bcd(plain[p + 4]);
-    final mm = _bcd(plain[p + 5]);
-    final ss = _bcd(plain[p + 6]);
-    final dh = _bcd(plain[p + 7]);
-    final dm = _bcd(plain[p + 8]);
-    final ds = _bcd(plain[p + 9]);
+    final bHh = plain[p + 4];
+    final bMm = plain[p + 5];
+    final bSs = plain[p + 6];
+    final bDh = plain[p + 7];
+    final bDm = plain[p + 8];
+    final bDs = plain[p + 9];
     // The descriptors length is the low 12 bits; the high nibble
     // is running_status / free_CA_mode (zero in the measured data).
     final dlen = _u16be(plain, p + 10) & 0x0fff;
     if (p + 12 + dlen > end) break; // truncated tail: stop this section
+    if (mjd == 0 ||
+        mjd == 0xffff ||
+        !_isValidBcd(bHh) ||
+        !_isValidBcd(bMm) ||
+        !_isValidBcd(bSs)) {
+      p += 12 + dlen;
+      continue;
+    }
+    final hh = _bcd(bHh);
+    final mm = _bcd(bMm);
+    final ss = _bcd(bSs);
+    if (hh > 23 || mm > 59 || ss > 59) {
+      p += 12 + dlen;
+      continue;
+    }
+    final Duration duration;
+    if (_isValidBcd(bDh) && _isValidBcd(bDm) && _isValidBcd(bDs)) {
+      final dh = _bcd(bDh);
+      final dm = _bcd(bDm);
+      final ds = _bcd(bDs);
+      duration = (dm <= 59 && ds <= 59)
+          ? Duration(hours: dh, minutes: dm, seconds: ds)
+          : Duration.zero;
+    } else {
+      duration = Duration.zero;
+    }
     final fields = _parseDescriptors(plain, p + 12, p + 12 + dlen);
     events.add(EpgEvent(
       eventId: eventId,
       start: _eitStart(mjd, hh, mm, ss),
-      duration: Duration(hours: dh, minutes: dm, seconds: ds),
+      duration: duration,
       title: fields.title,
       shortText: fields.shortText,
       description: fields.description,
@@ -370,11 +404,12 @@ _EventFields _parseDescriptors(Uint8List plain, int start, int end) {
   for (final n in numbers) {
     final part = extParts[n]!;
     for (final item in part.items) {
-      if (fields.items.isNotEmpty && fields.items.last.label == item.label) {
+      if (fields.items.isNotEmpty &&
+          (item.label.isEmpty || fields.items.last.label == item.label)) {
         final last = fields.items.removeLast();
         fields.items.add(EpgExtendedItem(
             label: last.label, value: last.value + item.value));
-      } else {
+      } else if (item.label.isNotEmpty || item.value.isNotEmpty) {
         fields.items.add(item);
       }
     }
@@ -447,9 +482,13 @@ bool _listEquals(List<int> a, List<int> b) {
         bytes[end - 3] == trailer[1] &&
         bytes[end - 2] == trailer[2] &&
         bytes[end - 1] == trailer[3]) {
-      final check = decoder.convert(bytes.sublist(start, end));
-      if (_listEquals(check, full)) {
-        return (full, end - start);
+      try {
+        final check = decoder.convert(bytes.sublist(start, end));
+        if (_listEquals(check, full)) {
+          return (full, end - start);
+        }
+      } catch (_) {
+        continue;
       }
     }
   }

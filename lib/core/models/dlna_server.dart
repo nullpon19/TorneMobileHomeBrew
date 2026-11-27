@@ -3,6 +3,7 @@
 library;
 
 import '../json_util.dart';
+import '../time_util.dart';
 import 'device.dart';
 import 'didl.dart';
 import 'schedule.dart';
@@ -119,14 +120,9 @@ int? _inferBroadcastingTypeFromDidl(DidlItem item) {
   return null;
 }
 
-/// Parses an ISO-8601 `dc:date` string as JST / local DateTime when offset is
+/// Parses an ISO-8601 `dc:date` string as JST (`+09:00`) when offset is
 /// omitted or explicit.
-DateTime? parseDidlDate(String? raw) {
-  if (raw == null) return null;
-  final trimmed = raw.trim();
-  if (trimmed.isEmpty) return null;
-  return DateTime.tryParse(trimmed);
-}
+DateTime? parseDidlDate(String? raw) => parseJstDateTime(raw);
 
 /// Converts a generic DLNA [DidlItem] into a [RecordedTitle] so existing
 /// playback, subtitle, detail, and Jikkyo past-log flows can consume it.

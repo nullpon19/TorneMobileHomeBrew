@@ -14,6 +14,8 @@
 ///    (a desiredQualityMode change may be accepted yet not stored).
 library;
 
+import '../errors.dart';
+
 /// Channel reference as it appears in an xsrs `scheduledChannelID`.
 class ScheduleChannel {
   const ScheduleChannel({
@@ -32,10 +34,16 @@ class ScheduleChannel {
 
   static int parseServiceId(String text) {
     final t = text.trim();
-    if (t.startsWith('0x') || t.startsWith('0X')) {
-      return int.parse(t.substring(2), radix: 16);
+    final parsed = (t.startsWith('0x') || t.startsWith('0X'))
+        ? int.tryParse(t.substring(2), radix: 16)
+        : int.tryParse(t);
+    if (parsed == null) {
+      throw NasneError.parse(
+        'xsrs:scheduledChannelID',
+        cause: 'invalid serviceId: $text',
+      );
     }
-    return int.parse(t);
+    return parsed;
   }
 }
 

@@ -64,10 +64,17 @@ class SoapTitleCatalogService implements TitleCatalogService {
   Stream<TitleListProgress> listTitlesProgressively({
     bool withMetadata = true,
   }) {
+    var cancelled = false;
     late StreamController<TitleListProgress> controller;
     controller = StreamController<TitleListProgress>(
-      onListen: () =>
-          _emitTitleProgress(controller, withMetadata: withMetadata),
+      onListen: () => _emitTitleProgress(
+        controller,
+        withMetadata: withMetadata,
+        isCancelled: () => cancelled || controller.isClosed,
+      ),
+      onCancel: () {
+        cancelled = true;
+      },
     );
     return controller.stream;
   }
@@ -79,6 +86,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
   Future<void> _emitTitleProgress(
     StreamController<TitleListProgress> sink, {
     required bool withMetadata,
+    required bool Function() isCancelled,
   }) async {
     try {
       // The DIDL Browse runs alongside the XSRS paging, not
@@ -103,6 +111,7 @@ class SoapTitleCatalogService implements TitleCatalogService {
       // request asks for [firstChunkSize] explicitly — the one
       // change that makes the first stage arrive quickly.
       await fetchAllListPages(
+        shouldCancel: isCancelled,
         requestPage: (startingIndex) {
           final count = firstRequest ? '$firstChunkSize' : '0';
           firstRequest = false;
@@ -134,15 +143,21 @@ class SoapTitleCatalogService implements TitleCatalogService {
           titles.addAll(page);
           return page.length;
         },
-        onPage: () => sink.add(
-          TitleListProgress(List.unmodifiable(titles), complete: false),
-        ),
+        onPage: () {
+          if (!isCancelled()) {
+            sink.add(
+              TitleListProgress(List.unmodifiable(titles), complete: false),
+            );
+          }
+        },
       );
+      if (isCancelled()) return;
       if (!withMetadata || titles.isEmpty) {
         sink.add(TitleListProgress(List.unmodifiable(titles), complete: true));
         return;
       }
       final didl = await didlFuture!;
+      if (isCancelled()) return;
       final byTitleId = {
         for (final item in didl.items)
           if (item.titleId != null) item.titleId!: item,
@@ -164,9 +179,13 @@ class SoapTitleCatalogService implements TitleCatalogService {
         ], complete: true),
       );
     } catch (e, s) {
-      sink.addError(e, s);
+      if (!isCancelled()) {
+        sink.addError(e, s);
+      }
     } finally {
-      await sink.close();
+      if (!sink.isClosed) {
+        await sink.close();
+      }
     }
   }
 

@@ -3404,6 +3404,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   bool _liveDetailLoading = false;
   int _liveDetailRequestSeq = 0;
   bool _replacedByNextPlayer = false;
+  bool _isTouchSplitActive = false;
   Timer? _osdClockTimer;
 
   /// The playback rate (plan 86, plan 85 item 7): 1.0 is
@@ -4213,7 +4214,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         }
         final committed = _committedSeekTarget;
         if (committed != null &&
-            (position - committed).abs() <= const Duration(seconds: 2)) {
+            (_effectiveRecordedPosition - committed).abs() <=
+                const Duration(seconds: 2)) {
           _committedSeekTarget = null;
           _committedSeekHoldTimer?.cancel();
           if (_seekHudVisible) shouldRebuild = true;
@@ -4452,7 +4454,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       _completed ||
       isNearRecordedEnd(
         live: widget.live,
-        position: _lastPosition,
+        position: _effectiveRecordedPosition,
         duration: _effectiveDuration,
       );
 
@@ -4508,7 +4510,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         interrupted: _interrupted,
         hasError: _error != null,
         duration: _effectiveDuration,
-        position: _lastPosition,
+        position: _effectiveRecordedPosition,
       );
 
   Future<void> _executePlayNextEpisode() async {
@@ -6648,7 +6650,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   /// has points and follow the same seekable signal as
   /// the skip buttons; a side with no point is a no-op.
   Future<void> _seekToChapter({required bool forward}) async {
-    final position = _player.state.position;
+    final position = _effectiveRecordedPosition;
     final target = forward
         ? nextChapterTarget(chapters: _chapters, position: position)
         : previousChapterTarget(chapters: _chapters, position: position);
@@ -6678,7 +6680,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _clearDisplayedSubtitles();
     _resetSubtitleTrackTracking();
     try {
-      await _player.seek(target);
+      if (widget.session is TimeSeekableSession && !_seekable.value) {
+        await _performTimeSeek(target);
+      } else {
+        await _player.seek(target);
+      }
     } catch (e) {
       _diag(DiagCategory.playback, 'player: chapter seek failed: $e');
     }
@@ -7901,6 +7907,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       usesProgramTimeline: barState.usesProgramTimeline,
       programStart: info?.currentStart,
       programEnd: info?.currentEnd,
+      now: now,
       cacheStartSeconds: _liveCacheStartSec,
       cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
     );
@@ -7944,6 +7951,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       usesProgramTimeline: barState.usesProgramTimeline,
       programStart: info?.currentStart,
       programEnd: info?.currentEnd,
+      now: now,
       cacheStartSeconds: _liveCacheStartSec,
       cacheEndSeconds: _liveCacheLiveEdgeSec ?? _liveCacheEndSec,
     );
@@ -7983,13 +7991,27 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
     }
     _osdFadeController.forward();
+    _startOsdClockTimer();
+    unawaited(_pollMpvBufferProperties());
+    _resetOsdTimer();
+    if (requestFocus && _uiMode.isTv) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _osdFirstFocusNode.canRequestFocus) {
+          _osdFirstFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _startOsdClockTimer() {
     _osdClockTimer?.cancel();
     _osdClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted || !_osdOpen) return;
+      final active = _osdOpen || _isTouchSplitActive;
+      if (!mounted || !active) return;
       _syncDisplayedBufferBadge();
       if (shouldPollLiveCacheOnOsdTick(
         live: widget.live,
-        osdOpen: _osdOpen,
+        osdOpen: active,
         switchingChannel: _switchingChannel,
         conflictHandled: _conflictHandled,
         catchUpMonitorActive: _liveCatchUpTimer != null,
@@ -7998,7 +8020,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       )) {
         unawaited(_pollMpvBufferProperties());
       }
-      if (widget.live && _activeLiveChannel != null) {
+      if (_osdOpen && widget.live && _activeLiveChannel != null) {
         final cur = _activeLiveChannel!;
         final now = _now();
         final playbackNow = _effectiveLivePlaybackClock(now);
@@ -8025,15 +8047,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       }
       setState(() {});
     });
-    unawaited(_pollMpvBufferProperties());
-    _resetOsdTimer();
-    if (requestFocus && _uiMode.isTv) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _osdFirstFocusNode.canRequestFocus) {
-          _osdFirstFocusNode.requestFocus();
-        }
-      });
-    }
   }
 
   void _closeOsd({bool fromBackKey = false}) {
@@ -8043,8 +8056,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       );
     }
     _osdTimer?.cancel();
-    _osdClockTimer?.cancel();
-    _osdClockTimer = null;
+    if (!_isTouchSplitActive) {
+      _osdClockTimer?.cancel();
+      _osdClockTimer = null;
+    }
     if (!_osdOpen && !_detailOpen) return;
     _liveDetailRequestSeq++;
     setState(() {
@@ -9484,6 +9499,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final isTouchFullscreen =
         uiMode.isTouch && (_touchFullscreenOverride ?? isLandscape);
     final isTouchSplit = uiMode.isTouch && !isTouchFullscreen;
+    if (isTouchSplit != _isTouchSplitActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _isTouchSplitActive = isTouchSplit;
+        if (isTouchSplit) {
+          _startOsdClockTimer();
+          unawaited(_pollMpvBufferProperties());
+        } else if (!_osdOpen) {
+          _osdClockTimer?.cancel();
+          _osdClockTimer = null;
+        }
+      });
+    }
     if (uiMode.isTouch && isTouchFullscreen != _lastAppliedImmersive) {
       _lastAppliedImmersive = isTouchFullscreen;
       WidgetsBinding.instance.addPostFrameCallback((_) {

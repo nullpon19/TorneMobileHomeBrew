@@ -524,12 +524,14 @@ Widget _buildRecordedPlayerScreen({
     nextEpisodeTitle: nextTarget?.title.title,
     onPlayNextEpisode: nextTarget != null
         ? (playerContext, stopCurrentSession) async {
-            await _reportResumePositionWithContainer(
-              container: container,
-              reg: reg,
-              titleId: title.id,
-              position: Duration.zero,
-            );
+            try {
+              await _reportResumePositionWithContainer(
+                container: container,
+                reg: reg,
+                titleId: title.id,
+                position: Duration.zero,
+              );
+            } catch (_) {}
             await stopCurrentSession();
             final nextTitle = nextTarget.title;
             final nextReg = nextTarget.reg;
@@ -1570,12 +1572,14 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
   @override
   void didUpdateWidget(covariant TitleDetailView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.title.id != widget.title.id) {
+    if (oldWidget.title.id != widget.title.id ||
+        oldWidget.reg.host != widget.reg.host) {
       _useMobileChoice = null;
     }
   }
 
   Future<void> _toggleProtection(bool protect) async {
+    if (_protectBusy) return;
     setState(() => _protectBusy = true);
     try {
       await setRecordedTitleProtection(
@@ -1744,27 +1748,27 @@ class _TitleDetailViewState extends ConsumerState<TitleDetailView> {
     final res = useMobile
         ? (title.mobileRes ?? title.originalRes ?? title.res.first)
         : (title.originalRes ?? title.mobileRes ?? title.res.first);
-    // Resume (plan 86): a title the viewer stopped midway offers
-    // its recorded position. Ask before starting — beginning a
-    // session is the expensive step, and the choice belongs
-    // before it, not after.
-    var initialStart = resumeStartOf(title);
-    if (initialStart != null) {
-      final resume = await showResumeChoiceDialog(context, initialStart);
-      if (!context.mounted) return;
-      if (resume == null) return;
-      // Continuing opens a little before the recorded position:
-      // the context rewind of resumeRewind (plan 98 / 102).
-      initialStart = resume ? resumePlaybackStartOf(title) : null;
-    }
-    final detailMeta = _formatRecordedDetailMeta(title);
-    final detailBody = formatProgramDetailBody(
-      description: title.description,
-      longDescription: title.longDescription,
-    );
-    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _starting = true);
     try {
+      // Resume (plan 86): a title the viewer stopped midway offers
+      // its recorded position. Ask before starting — beginning a
+      // session is the expensive step, and the choice belongs
+      // before it, not after.
+      var initialStart = resumeStartOf(title);
+      if (initialStart != null) {
+        final resume = await showResumeChoiceDialog(context, initialStart);
+        if (!context.mounted) return;
+        if (resume == null) return;
+        // Continuing opens a little before the recorded position:
+        // the context rewind of resumeRewind (plan 98 / 102).
+        initialStart = resume ? resumePlaybackStartOf(title) : null;
+      }
+      final detailMeta = _formatRecordedDetailMeta(title);
+      final detailBody = formatProgramDetailBody(
+        description: title.description,
+        longDescription: title.longDescription,
+      );
+      final container = ProviderScope.containerOf(context, listen: false);
       await startPlaybackAndShowPlayer(
         context: context,
         ref: ref,

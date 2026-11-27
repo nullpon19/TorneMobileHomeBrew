@@ -234,7 +234,11 @@ class KeyValueSrmStore implements SrmStore {
   Future<Uint8List?> loadRaw() async {
     final hex = await _store.read(storageKey);
     if (hex == null || hex.isEmpty) return null;
-    return hexToBytes(hex);
+    try {
+      return hexToBytes(hex);
+    } on FormatException {
+      return null;
+    }
   }
 
   @override

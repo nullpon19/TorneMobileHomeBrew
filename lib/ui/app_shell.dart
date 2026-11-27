@@ -42,6 +42,24 @@ final tabBackHandlersProvider = Provider<Map<int, bool Function()>>(
   (ref) => <int, bool Function()>{},
 );
 
+/// Signals whether a nested UI flow inside the active touch tab (e.g. a DLNA
+/// subfolder stack) should intercept the Android system Back button before exit.
+class TouchBackInterceptNotifier extends Notifier<bool> {
+  @override
+  bool build() => false;
+
+  void setActive(bool active) {
+    if (ref.mounted && state != active) {
+      state = active;
+    }
+  }
+}
+
+final touchBackInterceptProvider =
+    NotifierProvider<TouchBackInterceptNotifier, bool>(
+      TouchBackInterceptNotifier.new,
+    );
+
 class AppShell extends ConsumerStatefulWidget {
   const AppShell({super.key});
 
@@ -315,13 +333,18 @@ class _AppShellState extends ConsumerState<AppShell> {
       }
     }
 
+    final touchTabInterceptsBack =
+        uiMode.isTouch &&
+        tab == AppTabs.titles &&
+        ref.watch(touchBackInterceptProvider);
     return PopScope(
-      canPop: !uiMode.isTv,
+      canPop: !uiMode.isTv && !touchTabInterceptsBack,
       onPopInvokedWithResult: (didPop, result) {
-        if (didPop || _exitDialogOpen || !uiMode.isTv) return;
+        if (didPop || _exitDialogOpen) return;
         final activeTab = ref.read(tabIndexProvider);
         final handler = ref.read(tabBackHandlersProvider)[activeTab];
         if (handler != null && handler()) return;
+        if (!uiMode.isTv) return;
         if (!_railFocusNode.hasFocus &&
             _focusSelectedRailDestination(activeTab)) {
           return;

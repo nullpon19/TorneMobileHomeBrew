@@ -178,7 +178,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                 target,
                 isMultiNasne: activeRegs.length > 1,
               ),
-              onSelect: (selectionKey, channel, candidates, twoPane) {
+              onSelect: (selectionKey, targetReg, channel, candidates, twoPane) {
                 if (twoPane) {
                   setState(() => _selectedId = selectionKey);
                   WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -190,7 +190,7 @@ class _LiveScreenState extends ConsumerState<LiveScreen>
                   Navigator.of(context).push(
                     MaterialPageRoute(
                       builder: (_) => LiveChannelDetailPage(
-                        reg: reg,
+                        reg: targetReg,
                         channelId: channel.id,
                         candidates: candidates,
                       ),
@@ -408,6 +408,7 @@ class _LiveList extends ConsumerStatefulWidget {
   final ValueChanged<LiveWatchedChannelTarget> onPlaybackReturned;
   final void Function(
     String selectionKey,
+    RegisteredNasne targetReg,
     LiveChannel channel,
     List<OwnedLiveChannel>? candidates,
     bool twoPane,
@@ -689,6 +690,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                       logoBytes: row.logoBytes,
                       onTap: () => widget.onSelect(
                         row.channel.id,
+                        widget.reg,
                         row.channel,
                         null,
                         twoPane,
@@ -869,6 +871,7 @@ class _LiveListState extends ConsumerState<_LiveList>
                 logoBytes: row.logoBytes,
                 onTap: () => widget.onSelect(
                   row.merged.serviceKey,
+                  row.merged.primaryReg,
                   row.merged.primary,
                   row.merged.candidates,
                   twoPane,

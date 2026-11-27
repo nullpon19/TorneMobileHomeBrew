@@ -288,16 +288,24 @@ class _ScheduleList extends ConsumerWidget {
   List<Channel> _channelsFor(WidgetRef ref, RegisteredNasne owner) {
     final terrestrial =
         ref.watch(channelsProvider(owner)).value ?? const <Channel>[];
+    final schedules = ref.watch(schedulesProvider(owner)).value;
     final needsBs =
-        ref
-            .watch(schedulesProvider(owner))
-            .value
-            ?.any((s) => s.channel.broadcastingType == bsBroadcastingType) ??
+        schedules?.any(
+          (s) => s.channel.broadcastingType == bsBroadcastingType,
+        ) ??
+        false;
+    final needsCs =
+        schedules?.any(
+          (s) => s.channel.broadcastingType == csBroadcastingType,
+        ) ??
         false;
     final bs = needsBs
         ? (ref.watch(bsChannelsProvider(owner)).value ?? const <Channel>[])
         : const <Channel>[];
-    return [...terrestrial, ...bs];
+    final cs = needsCs
+        ? (ref.watch(csChannelsProvider(owner)).value ?? const <Channel>[])
+        : const <Channel>[];
+    return [...terrestrial, ...bs, ...cs];
   }
 
   @override
@@ -554,9 +562,11 @@ class ScheduleDetailView extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final s = schedule;
-    final channels = s.channel.broadcastingType == bsBroadcastingType
-        ? ref.watch(bsChannelsProvider(reg)).value
-        : ref.watch(channelsProvider(reg)).value;
+    final channels = switch (s.channel.broadcastingType) {
+      bsBroadcastingType => ref.watch(bsChannelsProvider(reg)).value,
+      csBroadcastingType => ref.watch(csChannelsProvider(reg)).value,
+      _ => ref.watch(channelsProvider(reg)).value,
+    };
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [

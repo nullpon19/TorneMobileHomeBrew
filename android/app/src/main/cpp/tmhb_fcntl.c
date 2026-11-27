@@ -17,15 +17,38 @@
 // "descriptor" field is the one libcore itself maintains and it has
 // been stable across Android versions.
 static int descriptor_of(JNIEnv *env, jobject file_descriptor) {
+    if (file_descriptor == NULL) {
+        return -1;
+    }
     jclass cls = (*env)->GetObjectClass(env, file_descriptor);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        if (cls != NULL) {
+            (*env)->DeleteLocalRef(env, cls);
+        }
+        return -1;
+    }
     if (cls == NULL) {
         return -1;
     }
     jfieldID field = (*env)->GetFieldID(env, cls, "descriptor", "I");
-    if (field == NULL) {
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, cls);
         return -1;
     }
-    return (*env)->GetIntField(env, file_descriptor, field);
+    if (field == NULL) {
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
+    }
+    jint fd = (*env)->GetIntField(env, file_descriptor, field);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    return (int)fd;
 }
 
 JNIEXPORT jint JNICALL

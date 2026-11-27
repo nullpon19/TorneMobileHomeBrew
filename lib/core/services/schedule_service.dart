@@ -7,6 +7,7 @@ import '../models/schedule.dart';
 import '../parsing/xsrs.dart';
 import '../transport/soap_transport.dart';
 import 'interfaces.dart';
+import 'paged_list.dart';
 
 class SoapScheduleService implements ScheduleService {
   SoapScheduleService({
@@ -44,17 +45,34 @@ class SoapScheduleService implements ScheduleService {
     int startingIndex = 0,
     int requestedCount = 50,
   }) async {
-    final resp = await _call(
-        'X_GetRecordScheduleList', _listArgs(startingIndex, requestedCount));
-    final result = resp.result;
-    if (result == null) {
-      throw NasneError.parse('soap:X_GetRecordScheduleList',
-          cause: 'missing Result');
-    }
-    return [
-      for (final item in parseXsrsItems(result, 'soap:X_GetRecordScheduleList'))
-        recordScheduleFromXsrs(item, source: 'soap:X_GetRecordScheduleList'),
-    ];
+    final items = <RecordSchedule>[];
+    await fetchAllListPages(
+      initialStartingIndex: startingIndex,
+      requestPage: (index) =>
+          _call('X_GetRecordScheduleList', _listArgs(index, requestedCount)),
+      consumePage: (resp) {
+        final result = resp.result;
+        if (result == null) {
+          throw NasneError.parse(
+            'soap:X_GetRecordScheduleList',
+            cause: 'missing Result',
+          );
+        }
+        final page = [
+          for (final item in parseXsrsItems(
+            result,
+            'soap:X_GetRecordScheduleList',
+          ))
+            recordScheduleFromXsrs(
+              item,
+              source: 'soap:X_GetRecordScheduleList',
+            ),
+        ];
+        items.addAll(page);
+        return page.length;
+      },
+    );
+    return items;
   }
 
   @override

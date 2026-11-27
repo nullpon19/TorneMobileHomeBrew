@@ -34,13 +34,18 @@ Future<void> fetchAllListPages({
   required Future<SoapResponse> Function(int startingIndex) requestPage,
   required int Function(SoapResponse response) consumePage,
   void Function()? onPage,
+  int initialStartingIndex = 0,
+  bool Function()? shouldCancel,
 }) async {
   var accumulated = 0;
-  var startingIndex = 0;
+  var startingIndex = initialStartingIndex;
   for (var page = 0; page < maxListPages; page++) {
+    if (shouldCancel?.call() == true) break;
     final response = await requestPage(startingIndex);
+    if (shouldCancel?.call() == true) break;
     accumulated += consumePage(response);
     onPage?.call();
+    if (shouldCancel?.call() == true) break;
     final numberReturned = int.tryParse(
       response.values['NumberReturned'] ?? '',
     );
@@ -48,5 +53,6 @@ Future<void> fetchAllListPages({
     if (numberReturned == null || numberReturned <= 0) break;
     if (totalMatches == null || accumulated >= totalMatches) break;
     startingIndex += numberReturned;
+    if (startingIndex >= totalMatches) break;
   }
 }

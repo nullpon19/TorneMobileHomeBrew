@@ -19,6 +19,7 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 
 import '../endpoints.dart';
+import '../errors.dart';
 import '../models/device.dart';
 import 'discovery.dart';
 import 'interfaces.dart';
@@ -55,7 +56,18 @@ Future<List<String>> localSubnetBases() async {
       bases.add('${parts[0]}.${parts[1]}.${parts[2]}');
     }
   }
-  return bases.toList()..sort();
+  final sorted = bases.toList()
+    ..sort((a, b) {
+      int priority(String base) {
+        if (base.startsWith('192.168.')) return 0;
+        if (base.startsWith('172.')) return 1;
+        return 2;
+      }
+
+      final byPrio = priority(a).compareTo(priority(b));
+      return byPrio != 0 ? byPrio : a.compareTo(b);
+    });
+  return sorted;
 }
 
 /// Discovery by unicast subnet scan. See the library comment.
@@ -63,7 +75,7 @@ class SubnetScanDiscoveryService implements DiscoveryService {
   SubnetScanDiscoveryService({
     http.Client? client,
     this.probeTimeout = const Duration(milliseconds: 800),
-    this.concurrency = 64,
+    this.concurrency = 32,
     SubnetBaseProvider? subnetBases,
     this._describer,
   })  : _client = client ?? http.Client(),
@@ -133,22 +145,36 @@ class SubnetScanDiscoveryService implements DiscoveryService {
   /// Cheap filter: the nasne WebAPI answers `status/boxNameGet` with
   /// a JSON object carrying `errorcode: 0` and a `name`.
   Future<bool> _probe(String host) async {
+    final abort = Completer<void>();
+    final timer = Timer(probeTimeout, () {
+      if (!abort.isCompleted) abort.complete();
+    });
     try {
-      final resp = await _client
-          .get(Uri(
-            scheme: 'http',
-            host: host,
-            port: 64210,
-            path: WebApiEndpoints.boxNameGet.path,
-          ))
-          .timeout(probeTimeout);
-      if (resp.statusCode != 200) return false;
-      final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
+      final req = http.AbortableRequest(
+        'GET',
+        Uri(
+          scheme: 'http',
+          host: host,
+          port: 64210,
+          path: WebApiEndpoints.boxNameGet.path,
+        ),
+        abortTrigger: abort.future,
+      );
+      final streamed = await _client.send(req).timeout(probeTimeout);
+      if (streamed.statusCode != 200) {
+        await streamed.stream.drain<void>().catchError((_) {});
+        return false;
+      }
+      final bodyBytes = await streamed.stream.toBytes().timeout(probeTimeout);
+      final decoded = jsonDecode(utf8.decode(bodyBytes));
       return decoded is Map &&
           decoded['errorcode'] == 0 &&
           decoded.containsKey('name');
     } catch (_) {
+      if (!abort.isCompleted) abort.complete();
       return false;
+    } finally {
+      timer.cancel();
     }
   }
 
@@ -183,9 +209,22 @@ class CompositeDiscoveryService implements DiscoveryService {
   Future<List<NasneDevice>> discover({
     Duration timeout = const Duration(seconds: 3),
   }) async {
+    Object? lastError;
+    var anySucceeded = false;
     for (final service in _chain) {
-      final found = await service.discover(timeout: timeout);
-      if (found.isNotEmpty) return found;
+      try {
+        final found = await service.discover(timeout: timeout);
+        anySucceeded = true;
+        if (found.isNotEmpty) return found;
+      } on NasneError catch (e) {
+        lastError = e;
+      } on SocketException catch (e) {
+        lastError = e;
+      }
+    }
+    if (!anySucceeded && lastError != null) {
+      if (lastError is NasneError) throw lastError;
+      throw NasneError.unreachable('discovery', cause: lastError);
     }
     return const [];
   }

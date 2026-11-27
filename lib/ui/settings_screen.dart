@@ -697,15 +697,22 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       final found = await ref.read(discoveryServiceProvider).discover();
       if (!mounted) return;
       setState(() {
-        _searching = false;
         _found = found;
       });
     } on NasneError catch (e) {
       if (!mounted) return;
       setState(() {
-        _searching = false;
         _searchError = userMessageForError(e);
       });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _searchError = userMessageForError(e);
+      });
+    } finally {
+      if (mounted && _searching) {
+        setState(() => _searching = false);
+      }
     }
   }
 
@@ -729,21 +736,44 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   Future<void> _registerManual() async {
     FocusScope.of(context).unfocus();
-    final host = _manualHost.text.trim();
+    var host = _manualHost.text.trim();
+    if (host.contains('://')) {
+      final parsed = Uri.tryParse(host);
+      if (parsed != null && parsed.host.isNotEmpty) {
+        host = parsed.host;
+      }
+    }
+    host = host.replaceAll(RegExp(r'/+$'), '').trim();
     if (host.isEmpty) {
       showSnack(context, 'アドレスを入力してください');
       return;
     }
-    setState(() => _registering = true);
-    NasneDevice device;
+    final Uri describeUri;
     try {
-      device = await ref
-          .read(discoveryServiceProvider)
-          .describe(Uri(scheme: 'http', host: host, port: 58888, path: '/'));
+      describeUri = Uri(scheme: 'http', host: host, port: 58888, path: '/');
+      if (describeUri.host.isEmpty) {
+        throw const FormatException('empty host');
+      }
+    } catch (_) {
+      showSnack(context, 'アドレスの形式が正しくありません');
+      return;
+    }
+    setState(() => _registering = true);
+    NasneDevice? device;
+    try {
+      device = await ref.read(discoveryServiceProvider).describe(describeUri);
     } catch (_) {
       // The description may be unreachable while the device itself is
       // fine; registration re-verifies against the device directly.
-      device = NasneDevice.direct(host);
+      try {
+        device = NasneDevice.direct(host);
+      } catch (e) {
+        if (mounted) {
+          setState(() => _registering = false);
+          showSnack(context, userMessageForError(e));
+        }
+        return;
+      }
     }
     if (!mounted) return;
     await _registerDevice(device);
@@ -847,7 +877,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       ),
     );
-    if (chosen != null) {
+    if (chosen != null && mounted) {
       await onSelected(chosen);
     }
   }
@@ -876,7 +906,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       ),
     );
-    if (chosen != null) {
+    if (chosen != null && mounted) {
       await ref.read(videoHwdecModeProvider.notifier).set(chosen);
     }
   }
@@ -952,8 +982,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           message: '${reg.friendlyName} (${reg.host}) の登録を解除しますか？',
           confirmLabel: '解除',
         );
-        if (!ok) return;
+        if (!ok || !mounted) return;
         await ref.read(registrationsProvider.notifier).remove(reg.host);
+        if (!mounted) return;
         if (ref.read(selectedHostProvider) == reg.host) {
           await ref.read(selectedHostProvider.notifier).select(null);
         }

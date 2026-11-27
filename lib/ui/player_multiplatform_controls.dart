@@ -24,6 +24,7 @@ double? resolveLiveTimeshiftTargetSeconds({
   required bool usesProgramTimeline,
   DateTime? programStart,
   DateTime? programEnd,
+  DateTime? now,
   double? cacheStartSeconds,
   double? cacheEndSeconds,
 }) {
@@ -45,7 +46,13 @@ double? resolveLiveTimeshiftTargetSeconds({
       programEnd != null &&
       programEnd.isAfter(programStart)) {
     final totalSec = programEnd.difference(programStart).inMilliseconds / 1000.0;
-    final lagSec = math.max(0.0, (maxFrac - clampedFrac) * totalSec);
+    final overshootSec = (now != null && now.isAfter(programEnd))
+        ? now.difference(programEnd).inMilliseconds / 1000.0
+        : 0.0;
+    final lagSec = math.max(
+      0.0,
+      overshootSec + (maxFrac - clampedFrac) * totalSec,
+    );
     return math.max(cacheStartSeconds, cacheEndSeconds - lagSec);
   }
   final normalized = ((clampedFrac - minFrac) / (maxFrac - minFrac))

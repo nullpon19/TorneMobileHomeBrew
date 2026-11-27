@@ -57,8 +57,10 @@ class SsdpDiscoveryService implements DiscoveryService {
     }
     final devices = <NasneDevice>[];
     for (final loc in locations) {
+      final uri = Uri.tryParse(loc);
+      if (uri == null || !uri.hasScheme || uri.host.isEmpty) continue;
       try {
-        final device = await describe(Uri.parse(loc));
+        final device = await describe(uri);
         if (device.isNasne) devices.add(device);
       } on NasneError {
         // Not a nasne (or gone): discovery skips it by design.
@@ -100,8 +102,10 @@ class SsdpDiscoveryService implements DiscoveryService {
     final devices = <NasneDevice>[];
     final seenIds = <String>{};
     for (final loc in locations) {
+      final uri = Uri.tryParse(loc);
+      if (uri == null || !uri.hasScheme || uri.host.isEmpty) continue;
       try {
-        final device = await describe(Uri.parse(loc));
+        final device = await describe(uri);
         if (!isGenericDlnaMediaServer(device)) continue;
         final cds = device.controlUrl(
           'urn:schemas-upnp-org:service:ContentDirectory:1',

@@ -324,6 +324,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
   late List<_DlnaFolderCrumb> _stack;
   DidlItem? _selectedItem;
   late final Map<int, bool Function()> _tabBackHandlers;
+  late final TouchBackInterceptNotifier _touchBackIntercept;
 
   @override
   void initState() {
@@ -332,6 +333,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
       _DlnaFolderCrumb(id: '0', title: widget.server.friendlyName),
     ];
     _tabBackHandlers = ref.read(tabBackHandlersProvider);
+    _touchBackIntercept = ref.read(touchBackInterceptProvider.notifier);
     if (widget.enableTabBackHandler) {
       _tabBackHandlers[AppTabs.titles] = _handleBackKey;
     }
@@ -345,6 +347,9 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
         _DlnaFolderCrumb(id: '0', title: widget.server.friendlyName),
       ];
       _selectedItem = null;
+      if (widget.enableTabBackHandler) {
+        Future.microtask(() => _touchBackIntercept.setActive(false));
+      }
     }
   }
 
@@ -353,6 +358,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
     if (widget.enableTabBackHandler &&
         identical(_tabBackHandlers[AppTabs.titles], _handleBackKey)) {
       _tabBackHandlers.remove(AppTabs.titles);
+      Future.microtask(() => _touchBackIntercept.setActive(false));
     }
     super.dispose();
   }
@@ -361,6 +367,12 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
     if (_stack.length <= 1) return false;
     _popFolder();
     return true;
+  }
+
+  void _syncTouchBackIntercept() {
+    if (widget.enableTabBackHandler) {
+      _touchBackIntercept.setActive(_stack.length > 1);
+    }
   }
 
   void _enterFolder(DidlContainer folder) {
@@ -374,6 +386,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
       ];
       _selectedItem = null;
     });
+    _syncTouchBackIntercept();
   }
 
   void _popFolder() {
@@ -382,6 +395,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
       _stack = _stack.sublist(0, _stack.length - 1);
       _selectedItem = null;
     });
+    _syncTouchBackIntercept();
   }
 
   void _popToIndex(int index) {
@@ -390,6 +404,7 @@ class _DlnaBrowserViewState extends ConsumerState<DlnaBrowserView> {
       _stack = _stack.sublist(0, index + 1);
       _selectedItem = null;
     });
+    _syncTouchBackIntercept();
   }
 
   @override
