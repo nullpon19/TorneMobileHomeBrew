@@ -95,10 +95,14 @@ class AppShell extends ConsumerStatefulWidget {
 
 class _AppShellState extends ConsumerState<AppShell> {
   static const _destinations = AppShell._destinations;
+  static const int _assistantTapThreshold = 5;
+  static const Duration _assistantTapWindow = Duration(milliseconds: 2500);
   bool _exitDialogOpen = false;
   bool _userMovedIntoInitialPane = false;
   late final int _initialTab;
   final Set<int> _mountedTabs = <int>{};
+  int _homeTapCount = 0;
+  Timer? _homeTapResetTimer;
   final FocusNode _railFocusNode = FocusNode(debugLabel: 'appShellRail');
   final FocusNode _rightPaneFocusNode = FocusNode(
     debugLabel: 'appShellRightPane',
@@ -125,6 +129,7 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   @override
   void dispose() {
+    _homeTapResetTimer?.cancel();
     _railFocusNode.removeListener(_handleRailFocusChange);
     _railFocusNode.dispose();
     _rightPaneFocusNode.dispose();
@@ -303,6 +308,32 @@ class _AppShellState extends ConsumerState<AppShell> {
     }
   }
 
+  void _resetHomeTapCounter() {
+    _homeTapResetTimer?.cancel();
+    _homeTapResetTimer = null;
+    _homeTapCount = 0;
+  }
+
+  void _recordHomeReselectTap() {
+    _homeTapResetTimer?.cancel();
+    _homeTapCount++;
+    if (_homeTapCount >= _assistantTapThreshold) {
+      _homeTapCount = 0;
+      _homeTapResetTimer = null;
+      final isTv = ref.read(uiControlModeProvider).isTv;
+      unawaited(
+        ref.read(homeAssistantProvider.notifier).toggleFromEasterEgg(
+          autoDismissDialog: isTv,
+        ),
+      );
+      return;
+    }
+    _homeTapResetTimer = Timer(_assistantTapWindow, () {
+      _homeTapCount = 0;
+      _homeTapResetTimer = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
@@ -327,6 +358,14 @@ class _AppShellState extends ConsumerState<AppShell> {
       SettingsScreen(),
     ];
     void select(int index) {
+      final prevTab = ref.read(tabIndexProvider);
+      final isHomeReselect = prevTab == AppTabs.home && index == AppTabs.home;
+      if (isHomeReselect) {
+        _recordHomeReselectTap();
+        // Keep TV rail focus on Home during rapid taps; ArrowRight enters pane.
+        return;
+      }
+      _resetHomeTapCounter();
       if (index == _initialTab) {
         _userMovedIntoInitialPane = true;
       }

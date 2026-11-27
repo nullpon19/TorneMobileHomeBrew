@@ -5,6 +5,7 @@
 /// discovered path) is an override here, never a UI change.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -1112,6 +1113,135 @@ class StartupTabPreferenceNotifier extends Notifier<StartupTabPreference> {
 final startupTabPreferenceProvider =
     NotifierProvider<StartupTabPreferenceNotifier, StartupTabPreference>(
       StartupTabPreferenceNotifier.new,
+    );
+
+/// Lifecycle stage of the hidden Home 3D assistant ("ナスカ").
+enum HomeAssistantStage { hidden, entering, idle, dismissingAuto, exiting }
+
+/// State of the Home 3D assistant Easter egg.
+class HomeAssistantState {
+  const HomeAssistantState({
+    required this.enabled,
+    required this.stage,
+    required this.triggerSeq,
+  });
+
+  final bool enabled;
+  final HomeAssistantStage stage;
+  final int triggerSeq;
+
+  HomeAssistantState copyWith({
+    bool? enabled,
+    HomeAssistantStage? stage,
+    int? triggerSeq,
+  }) => HomeAssistantState(
+    enabled: enabled ?? this.enabled,
+    stage: stage ?? this.stage,
+    triggerSeq: triggerSeq ?? this.triggerSeq,
+  );
+}
+
+/// Persisted toggle & animation stage for the Home 3D assistant ("ナスカ").
+/// Shared across all platforms; unlocked and dismissed via 5 rapid Home taps
+/// or via the non-TV Office balloon ("お前を消す方法").
+class HomeAssistantNotifier extends Notifier<HomeAssistantState> {
+  static const storageKey = 'easter_egg_assistant_enabled';
+  bool _dirty = false;
+
+  @override
+  HomeAssistantState build() {
+    _dirty = false;
+    final store = ref.watch(keyValueStoreProvider);
+    Future.microtask(() async {
+      final raw = await store.read(storageKey);
+      if (!ref.mounted || _dirty) return;
+      if (raw == 'true' && state.stage == HomeAssistantStage.hidden) {
+        state = HomeAssistantState(
+          enabled: true,
+          stage: HomeAssistantStage.entering,
+          triggerSeq: state.triggerSeq + 1,
+        );
+      }
+    });
+    return const HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.hidden,
+      triggerSeq: 0,
+    );
+  }
+
+  Future<void> toggleFromEasterEgg({bool autoDismissDialog = false}) async {
+    switch (state.stage) {
+      case HomeAssistantStage.hidden:
+        await activate();
+      case HomeAssistantStage.entering:
+      case HomeAssistantStage.idle:
+        if (autoDismissDialog) {
+          startAutoDismiss();
+        } else {
+          startDismiss();
+        }
+      case HomeAssistantStage.dismissingAuto:
+      case HomeAssistantStage.exiting:
+        return;
+    }
+  }
+
+  Future<void> activate() async {
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: true,
+      stage: HomeAssistantStage.entering,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    await ref.read(keyValueStoreProvider).write(storageKey, 'true');
+  }
+
+  void markEntered() {
+    if (state.stage == HomeAssistantStage.entering) {
+      state = state.copyWith(stage: HomeAssistantStage.idle);
+    }
+  }
+
+  void startAutoDismiss() {
+    if (state.stage == HomeAssistantStage.hidden ||
+        state.stage == HomeAssistantStage.dismissingAuto ||
+        state.stage == HomeAssistantStage.exiting) {
+      return;
+    }
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.dismissingAuto,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    unawaited(ref.read(keyValueStoreProvider).write(storageKey, 'false'));
+  }
+
+  void startDismiss() {
+    if (state.stage == HomeAssistantStage.hidden ||
+        state.stage == HomeAssistantStage.exiting) {
+      return;
+    }
+    _dirty = true;
+    state = HomeAssistantState(
+      enabled: false,
+      stage: HomeAssistantStage.exiting,
+      triggerSeq: state.triggerSeq + 1,
+    );
+    unawaited(ref.read(keyValueStoreProvider).write(storageKey, 'false'));
+  }
+
+  void markExited() {
+    if (state.stage == HomeAssistantStage.exiting) {
+      state = state.copyWith(enabled: false, stage: HomeAssistantStage.hidden);
+    }
+  }
+}
+
+final homeAssistantProvider =
+    NotifierProvider<HomeAssistantNotifier, HomeAssistantState>(
+      HomeAssistantNotifier.new,
     );
 
 /// Persisted player volume (`0.0..100.0`, defaults to `100.0`).
