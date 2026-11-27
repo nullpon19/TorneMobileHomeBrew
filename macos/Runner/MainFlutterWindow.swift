@@ -29,6 +29,11 @@ class MainFlutterWindow: NSWindow {
     WindowControlHub.shared.register(
       messenger: windowRegistrar.messenger, window: self)
 
+    let pipRegistrar = flutterViewController.registrar(
+      forPlugin: "PipChannels")
+    PipHub.shared.register(
+      messenger: pipRegistrar.messenger, window: self)
+
     let wakelockRegistrar = flutterViewController.registrar(
       forPlugin: "WakelockChannels")
     WakelockHub.shared.register(messenger: wakelockRegistrar.messenger)
@@ -146,5 +151,114 @@ final class AribSoundHub {
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+}
+
+final class PipHub: NSObject, FlutterStreamHandler {
+  static let shared = PipHub()
+  private weak var window: NSWindow?
+  private var eventSink: FlutterEventSink?
+  private var inPip = false
+  private var savedFrame: NSRect?
+  private var savedLevel: NSWindow.Level = .normal
+  private var savedCollectionBehavior: NSWindow.CollectionBehavior = []
+  private var savedMovableByBackground = false
+
+  func register(messenger: FlutterBinaryMessenger, window: NSWindow) {
+    self.window = window
+    let methodChannel = FlutterMethodChannel(
+      name: "com.markun.tmhb/pip", binaryMessenger: messenger)
+    methodChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else {
+        result(false)
+        return
+      }
+      switch call.method {
+      case "isSupported":
+        result(true)
+      case "enterPip":
+        let args = call.arguments as? [String: Any] ?? [:]
+        let width = args["aspectWidth"] as? Int ?? 16
+        let height = args["aspectHeight"] as? Int ?? 9
+        result(self.enterPip(aspectWidth: width, aspectHeight: height))
+      case "exitPip":
+        result(self.exitPip())
+      case "setAutoPipEnabled":
+        result(true)
+      case "isInPipMode":
+        result(self.inPip)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+    let eventChannel = FlutterEventChannel(
+      name: "com.markun.tmhb/pip_events", binaryMessenger: messenger)
+    eventChannel.setStreamHandler(self)
+  }
+
+  func onListen(
+    withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    self.eventSink = events
+    if inPip {
+      events(true)
+    }
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    self.eventSink = nil
+    return nil
+  }
+
+  private func enterPip(aspectWidth: Int, aspectHeight: Int) -> Bool {
+    guard let window = self.window else { return false }
+    if inPip { return true }
+    if window.styleMask.contains(.fullScreen) {
+      window.toggleFullScreen(nil)
+    }
+    savedFrame = window.frame
+    savedLevel = window.level
+    savedCollectionBehavior = window.collectionBehavior
+    savedMovableByBackground = window.isMovableByWindowBackground
+
+    let wRatio = max(1, aspectWidth)
+    let hRatio = max(1, aspectHeight)
+    let targetWidth: CGFloat = 480
+    let targetHeight = round(targetWidth * CGFloat(hRatio) / CGFloat(wRatio))
+    let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+      ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+    let margin: CGFloat = 24
+    let targetFrame = NSRect(
+      x: visible.maxX - targetWidth - margin,
+      y: visible.minY + margin,
+      width: targetWidth,
+      height: targetHeight
+    )
+
+    window.level = .floating
+    window.collectionBehavior = savedCollectionBehavior.union(.canJoinAllSpaces)
+    window.aspectRatio = NSSize(width: wRatio, height: hRatio)
+    window.isMovableByWindowBackground = true
+    window.setFrame(targetFrame, display: true, animate: true)
+    inPip = true
+    eventSink?(true)
+    return true
+  }
+
+  private func exitPip() -> Bool {
+    guard let window = self.window else { return false }
+    if !inPip { return false }
+    window.level = savedLevel
+    window.collectionBehavior = savedCollectionBehavior
+    window.aspectRatio = NSSize.zero
+    window.isMovableByWindowBackground = savedMovableByBackground
+    if let frame = savedFrame {
+      window.setFrame(frame, display: true, animate: true)
+    }
+    savedFrame = nil
+    inPip = false
+    eventSink?(false)
+    return true
   }
 }

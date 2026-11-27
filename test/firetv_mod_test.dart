@@ -13,10 +13,12 @@ import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:material_ui/material_ui.dart';
 import 'package:tmhb/app/bs_epg_providers.dart';
 import 'package:tmhb/app/firetv_helper.dart';
 import 'package:tmhb/app/mpv_compat.dart';
+import 'package:tmhb/app/pip_controller.dart';
 import 'package:tmhb/app/providers.dart';
 import 'package:tmhb/app/state.dart';
 import 'package:tmhb/core/core.dart';
@@ -359,6 +361,108 @@ void main() {
       expect(helper.tryConnectCalls, 0);
       expect(find.text('Tailscale が起動していません'), findsNothing);
     });
+
+    testWidgets(
+      'gates child until Tailscale VPN + nasne reachability settle and resets httpClientProvider',
+      (tester) async {
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: true,
+          connectSucceeds: false,
+        );
+        var httpBuildCount = 0;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              httpClientProvider.overrideWith((ref) {
+                httpBuildCount++;
+                final client = _DummyHttpClient();
+                ref.onDispose(client.close);
+                return client;
+              }),
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const [reg]),
+              ),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: MaterialApp(
+              home: TailscaleGuard(
+                probeTimeout: const Duration(milliseconds: 50),
+                pollInterval: const Duration(milliseconds: 50),
+                autoConnectMaxWait: const Duration(milliseconds: 250),
+                postVpnReachableMaxWait: const Duration(milliseconds: 500),
+                child: Consumer(
+                  builder: (context, ref, _) {
+                    if (ref.watch(selectedRegistrationProvider) != null) {
+                      ref.watch(httpClientProvider);
+                    }
+                    return const Scaffold(body: Text('home-mounted'));
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 10));
+
+        // While waiting for Tailscale auto-connect, child must stay gated so
+        // pre-VPN requests cannot saturate sockets.
+        expect(find.text('home-mounted'), findsNothing);
+        expect(httpBuildCount, 0);
+        expect(find.text('Tailscale に自動接続しています…'), findsOneWidget);
+
+        // First VPN activates (tun interface), but nasne is not yet reachable:
+        // guard must keep waiting instead of tearing down early.
+        helper.vpnActive = true;
+        await tester.pump(const Duration(milliseconds: 60));
+        expect(find.text('home-mounted'), findsNothing);
+        expect(httpBuildCount, 0);
+        expect(find.text('Tailscale 接続済み — nasne の応答を待機中…'), findsOneWidget);
+
+        // Once nasne actually responds, guard releases child cleanly.
+        helper.reachable = true;
+        await tester.pump(const Duration(milliseconds: 60));
+        await tester.pumpAndSettle();
+        expect(find.text('home-mounted'), findsOneWidget);
+        expect(find.text('Tailscale に接続しました'), findsOneWidget);
+        expect(httpBuildCount, 1);
+      },
+    );
+
+    testWidgets(
+      'AppShell hides Tailscale rail button and bypasses gate when Tailscale is not installed',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 720);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        final helper = _FakeFireTvHelper(
+          reachable: false,
+          vpnActive: false,
+          tailscaleInstalled: false,
+        );
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              registrationStoreProvider.overrideWithValue(
+                InMemoryRegistrationStore(const []),
+              ),
+              keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+              fireTvHelperProvider.overrideWithValue(helper),
+            ],
+            child: const MaterialApp(home: AppShell()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.byIcon(Icons.vpn_lock), findsNothing);
+        expect(find.text('Tailscale が起動していません'), findsNothing);
+      },
+    );
   });
 
   group('PlayerScreen loading indicator & Android cache sizing', () {
@@ -11145,6 +11249,168 @@ void main() {
       );
 
       testWidgets(
+        'LiveChannelSwitchPreviewCard places attribute badges next to broadcast time below the title',
+        (tester) async {
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:preview-attr-pos',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          final entry = LiveChannelSwitchEntry(
+            channel: LiveChannel(
+              id: '0/video/LiveTuner/DTTB/ch?nid=7880&tsid=7880&svid=de00',
+              bandId: '0/video/LiveTuner/DTTB',
+              channelName: 'テスト局',
+              programTitle: '[字][二]あいうえお番組タイトルテスト',
+              programStart: DateTime(2026, 11, 27, 10, 0),
+              programEnd: DateTime(2026, 11, 27, 11, 0),
+            ),
+            primaryReg: reg,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData.dark(),
+              home: Scaffold(
+                body: Stack(
+                  children: [
+                    LiveChannelSwitchPreviewCard(
+                      direction: ChannelSwitchDirection.next,
+                      visible: true,
+                      entry: entry,
+                      onTap: () {},
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final titleRect = tester.getRect(find.text('あいうえお番組タイトルテスト'));
+          final timeRect = tester.getRect(find.text('10:00–11:00'));
+          final jimakuRect = tester.getRect(find.text('字'));
+          final dualRect = tester.getRect(find.text('二'));
+
+          expect(jimakuRect.top, greaterThanOrEqualTo(titleRect.bottom - 2));
+          expect(jimakuRect.left, greaterThan(timeRect.right));
+          expect(dualRect.left, greaterThan(jimakuRect.right));
+        },
+      );
+
+      testWidgets(
+        'LiveScreen shows loading spinner and resets httpClientProvider on retry after error',
+        (tester) async {
+          const reg = RegisteredNasne(
+            host: '192.0.2.1',
+            udn: 'uuid:live-retry-test',
+            friendlyName: 'nasne-1',
+            macAddr: '00:11:22:33:44:55',
+          );
+          var shouldFail = true;
+          var httpBuilds = 0;
+          Completer<List<LiveBand>>? reloadCompleter;
+
+          await tester.pumpWidget(
+            ProviderScope(
+              retry: (_, _) => null,
+              overrides: [
+                httpClientProvider.overrideWith((ref) {
+                  httpBuilds++;
+                  final c = _DummyHttpClient();
+                  ref.onDispose(c.close);
+                  return c;
+                }),
+                keyValueStoreProvider.overrideWithValue(InMemoryKeyValueStore()),
+                registrationStoreProvider.overrideWithValue(
+                  InMemoryRegistrationStore(const [reg]),
+                ),
+                channelsProvider(reg).overrideWith((ref) async => const []),
+                channelLogosProvider(reg).overrideWith((ref) async => const {}),
+                epgGuideProvider(reg).overrideWith(
+                  (ref) async => const EpgGuide(
+                    broadcastingType: terrestrialBroadcastingType,
+                    services: [],
+                  ),
+                ),
+                schedulesProvider(reg).overrideWith((ref) async => const []),
+                liveChannelsProvider(reg).overrideWith((ref) async {
+                  ref.watch(httpClientProvider);
+                  if (shouldFail) {
+                    throw NasneError.unreachable('test');
+                  }
+                  reloadCompleter = Completer<List<LiveBand>>();
+                  return reloadCompleter!.future;
+                }),
+              ],
+              child: const MaterialApp(home: LiveScreen()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(httpBuilds, 1);
+          expect(find.text('再試行'), findsOneWidget);
+          shouldFail = false;
+          await tester.tap(find.text('再試行'));
+          await tester.pump();
+
+          expect(httpBuilds, 2);
+          expect(find.byType(CircularProgressIndicator), findsOneWidget);
+          expect(find.text('再試行'), findsNothing);
+
+          reloadCompleter?.complete(const []);
+          await tester.pumpAndSettle();
+        },
+      );
+
+      test('PipController exposes method channel controls and mode stream events', () async {
+        const methodChannel = MethodChannel('com.markun.tmhb/pip_test');
+        final calls = <MethodCall>[];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(methodChannel, (call) async {
+              calls.add(call);
+              switch (call.method) {
+                case 'isSupported':
+                  return true;
+                case 'enterPip':
+                  return true;
+                case 'exitPip':
+                  return true;
+                case 'setAutoPipEnabled':
+                  return true;
+              }
+              return null;
+            });
+        addTearDown(
+          () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+              .setMockMethodCallHandler(methodChannel, null),
+        );
+
+        final events = StreamController<bool>.broadcast();
+        addTearDown(events.close);
+
+        final pip = PipController(
+          channel: methodChannel,
+          eventStreamOverride: events.stream,
+        );
+        expect(await pip.isSupported(), isTrue);
+        expect(await pip.enterPip(aspectWidth: 16, aspectHeight: 9), isTrue);
+        await pip.setAutoPipEnabled(true);
+        expect(await pip.exitPip(), isTrue);
+        expect(
+          calls.map((c) => c.method).toList(),
+          ['isSupported', 'enterPip', 'setAutoPipEnabled', 'exitPip'],
+        );
+        expect(
+          pip.onPipModeChanged,
+          emitsInOrder([true, false]),
+        );
+        events.add(true);
+        events.add(false);
+      });
+
+      testWidgets(
         'LiveScreen renders EPG loading indicator until guide completes, then shows 3-digit number, logo plate, and next programme',
         (tester) async {
           tester.view.physicalSize = const Size(960, 540);
@@ -13005,6 +13271,13 @@ class _StubMetadata implements MetadataService {
 class _StubLiveCatalog implements LiveCatalogService {
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _DummyHttpClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    throw UnimplementedError();
+  }
 }
 
 class _FixedTitlesNotifier extends TitlesNotifier {

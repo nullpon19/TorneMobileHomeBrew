@@ -184,6 +184,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../app/desktop_window.dart';
 import '../app/firetv_helper.dart';
 import '../app/mpv_compat.dart';
+import '../app/pip_controller.dart';
 import '../app/ui_control_mode.dart';
 import 'channel_badge.dart';
 import '../app/providers.dart';
@@ -683,6 +684,12 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
         ? resolvedProgram!.broadcastTimeRange
         : data?.broadcastTimeRange;
     final programTitle = resolvedProgram?.programTitle ?? data?.programTitle;
+    final parsedProgramTitle = programTitle != null
+        ? parseBroadcastTitleBadges(programTitle)
+        : null;
+    final attrBadges = parsedProgramTitle == null
+        ? const <String>[]
+        : parsedProgramTitle.attributeBadges.take(5).toList(growable: false);
     return Positioned.fill(
       child: IgnorePointer(
         ignoring: !showCard,
@@ -796,26 +803,38 @@ class LiveChannelSwitchPreviewCard extends StatelessWidget {
                                 ],
                               ),
                               const SizedBox(height: 4),
-                              BroadcastTitleLine(
-                                rawTitle: programTitle ?? data.programTitle,
+                              EpgFormattedTitleText(
+                                parsed: parsedProgramTitle!,
                                 maxLines: 2,
-                                darkSurface: isDark,
-                                badgeScale: 1.0,
-                                maxAttributeBadges: 4,
+                                badgeScale: 1.05,
                                 style: TextStyle(
                                   color: titleColor,
                                   fontSize: 14,
                                   height: 1.3,
                                 ),
                               ),
-                              if (timeRange != null) ...[
+                              if (timeRange != null || attrBadges.isNotEmpty) ...[
                                 const SizedBox(height: 4),
-                                Text(
-                                  timeRange,
-                                  style: TextStyle(
-                                    color: metaColor,
-                                    fontSize: 12,
-                                  ),
+                                Wrap(
+                                  spacing: 4,
+                                  runSpacing: 3,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: [
+                                    if (timeRange != null)
+                                      Text(
+                                        timeRange,
+                                        style: TextStyle(
+                                          color: metaColor,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    for (final tag in attrBadges)
+                                      EpgAttributeMiniBadge(
+                                        label: tag,
+                                        isDark: isDark,
+                                        badgeScale: 1.0,
+                                      ),
+                                  ],
                                 ),
                               ],
                               const SizedBox(height: 8),
@@ -2778,11 +2797,13 @@ class PlayerSessionFullscreenHandoff {
   static bool? touchFullscreenOverride;
   static bool touchLandscapeLocked = false;
   static bool desktopFullscreen = false;
+  static bool desktopPip = false;
 
   static void reset() {
     touchFullscreenOverride = null;
     touchLandscapeLocked = false;
     desktopFullscreen = false;
+    desktopPip = false;
   }
 }
 
@@ -3294,12 +3315,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   late final DiagLog _diag;
   late final FireTvHelper _fireTvHelper;
   late final DesktopWindowController _desktopWindow;
+  late final PipController _pipController;
   late final UiControlMode _initialUiMode;
 
   UiControlMode get _uiMode =>
       mounted ? ref.read(uiControlModeProvider) : _initialUiMode;
 
   bool _desktopFullscreen = false;
+  bool _pipSupported = false;
+  bool _inPipMode = false;
+  bool _desktopPipHover = false;
+  bool _lastAutoPipSent = false;
+  StreamSubscription<bool>? _pipSubscription;
   bool _pointerOverControls = false;
   ChannelSwitchDirection? _hoveredChannelEdge;
   Timer? _desktopEdgeHideTimer;
@@ -3761,6 +3788,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _diag = ref.read(diagLogProvider);
     _fireTvHelper = ref.read(fireTvHelperProvider);
     _desktopWindow = ref.read(desktopWindowControllerProvider);
+    _pipController = ref.read(pipControllerProvider);
     _initialUiMode = ref.read(uiControlModeProvider);
     _androidSdkInt = ref.read(androidSdkIntProvider);
     _useLegacySyncMpvInit = shouldUseLegacySyncMpvInit(
@@ -3807,6 +3835,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _touchFullscreenOverride =
         PlayerSessionFullscreenHandoff.touchFullscreenOverride;
     _desktopFullscreen = PlayerSessionFullscreenHandoff.desktopFullscreen;
+    _inPipMode = PlayerSessionFullscreenHandoff.desktopPip;
+    unawaited(_initPip());
     _recordLiveChannelProgramSnapshot(_activeLiveChannel);
     if (_initialUiMode.isTouch &&
         !PlayerSessionFullscreenHandoff.touchLandscapeLocked) {
@@ -6920,12 +6950,20 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             if (_initialUiMode.isDesktop && _desktopFullscreen) {
               unawaited(_desktopWindow.setFullscreen(false));
             }
+            if (_lastAutoPipSent) {
+              _lastAutoPipSent = false;
+              unawaited(_pipController.setAutoPipEnabled(false));
+            }
+            if (_initialUiMode.isDesktop && _inPipMode) {
+              unawaited(_pipController.exitPip());
+            }
           },
         ),
         (name: 'wakelock', run: () => _wakelockSession.release()),
         (
           name: 'subscriptions',
           run: () {
+            unawaited(_pipSubscription?.cancel());
             for (final subscription in _subscriptions) {
               subscription.cancel();
             }
@@ -7282,6 +7320,79 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     PlayerSessionFullscreenHandoff.desktopFullscreen = next;
     if (!mounted) return;
     setState(() => _desktopFullscreen = next);
+  }
+
+  Future<void> _initPip() async {
+    final supported = await _pipController.isSupported();
+    if (!mounted) return;
+    setState(() => _pipSupported = supported);
+    if (!supported) return;
+    _pipSubscription = _pipController.onPipModeChanged.listen((inPip) {
+      if (!mounted) return;
+      if (_uiMode.isDesktop) {
+        PlayerSessionFullscreenHandoff.desktopPip = inPip;
+      }
+      setState(() {
+        _inPipMode = inPip;
+        if (inPip) {
+          _desktopPipHover = false;
+          _osdOpen = false;
+          _osdFadeController.value = 0.0;
+          _detailOpen = false;
+          _channelPreviewDirection = null;
+          _touchPortraitOverlayOpen = false;
+        }
+      });
+    });
+  }
+
+  void _syncAutoPipState() {
+    final wantAutoPip =
+        _pipSupported &&
+        _playingNow &&
+        !_interrupted &&
+        _error == null &&
+        !_switchingChannel;
+    if (wantAutoPip != _lastAutoPipSent) {
+      _lastAutoPipSent = wantAutoPip;
+      unawaited(_pipController.setAutoPipEnabled(wantAutoPip));
+    }
+  }
+
+  Future<void> _togglePip() async {
+    if (!_pipSupported || !mounted) return;
+    if (_inPipMode) {
+      final exited = await _pipController.exitPip();
+      if (!mounted) return;
+      if (exited && _uiMode.isDesktop) {
+        PlayerSessionFullscreenHandoff.desktopPip = false;
+        setState(() => _inPipMode = false);
+      }
+      return;
+    }
+    _closeOsd();
+    _dismissChannelPreview();
+    _closeDetail();
+    final entered = await _pipController.enterPip(
+      aspectWidth: 16,
+      aspectHeight: 9,
+    );
+    if (!mounted) return;
+    if (!entered) {
+      _showHudMessage(
+        Icons.picture_in_picture_alt,
+        'ピクチャ イン ピクチャを開始できませんでした',
+      );
+      return;
+    }
+    if (_uiMode.isDesktop) {
+      PlayerSessionFullscreenHandoff.desktopPip = true;
+      setState(() {
+        _inPipMode = true;
+        _desktopFullscreen = false;
+        PlayerSessionFullscreenHandoff.desktopFullscreen = false;
+      });
+    }
   }
 
   void _toggleTouchFullscreen(bool currentlyFullscreen) {
@@ -8644,6 +8755,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           unawaited(_toggleDesktopFullscreen());
           return KeyEventResult.handled;
         }
+        if (key == LogicalKeyboardKey.keyP && _pipSupported) {
+          unawaited(_togglePip());
+          return KeyEventResult.handled;
+        }
         if (key == LogicalKeyboardKey.keyM) {
           _togglePlayerMute();
           return KeyEventResult.handled;
@@ -8723,7 +8838,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           return KeyEventResult.handled;
         }
         if (key == LogicalKeyboardKey.escape) {
-          if (_desktopFullscreen) {
+          if (_inPipMode) {
+            unawaited(_togglePip());
+          } else if (_desktopFullscreen) {
             unawaited(_setDesktopFullscreen(false));
           } else if (_channelPreviewDirection != null) {
             _dismissChannelPreview(fromBackKey: true);
@@ -8917,6 +9034,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   @override
   Widget build(BuildContext context) {
     final uiMode = ref.watch(uiControlModeProvider);
+    _syncAutoPipState();
     final mediaSize = MediaQuery.sizeOf(context);
     final mediaPadding = MediaQuery.paddingOf(context);
     final isLandscape = mediaSize.width >= mediaSize.height;
@@ -8979,6 +9097,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
+        if (_inPipMode && uiMode.isDesktop) {
+          unawaited(_togglePip());
+          return;
+        }
         if (uiMode.isDesktop &&
             _desktopFullscreen &&
             !_detailOpen &&
@@ -9103,6 +9225,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                 ),
               )
+            : _inPipMode
+            ? _buildPipLayout(uiMode)
             : isTouchSplit
             ? _buildTouchSplitLayout(
                 loadingLabel: loadingLabel,
@@ -9456,6 +9580,107 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     );
   }
 
+  Widget _buildPipLayout(UiControlMode uiMode) {
+    final stack = Stack(
+      key: const ValueKey('player_pip_surface'),
+      fit: StackFit.expand,
+      children: [
+        Video(
+          controller: _videoController,
+          controls: NoVideoControls,
+          subtitleViewConfiguration: const SubtitleViewConfiguration(
+            visible: false,
+          ),
+        ),
+        if (_jikkyoOn && !_switchingChannel && _error == null)
+          Positioned.fill(
+            child: JikkyoDanmakuOverlay(
+              controller: _jikkyoOverlayController,
+              settings: ref.watch(jikkyoSettingsProvider),
+              isPlaying: _playingNow && !_buffering && !_interrupted,
+              playbackRate: widget.live ? _liveCatchUpRate : _playbackRate,
+              avoidBottomSubtitles:
+                  (_subtitlesOn && _visibleSubtitleCues.isNotEmpty) ||
+                  (ref.watch(superimposeEnabledProvider) &&
+                      _visibleSuperimposeCues.isNotEmpty),
+            ),
+          ),
+        if (_subtitlesOn &&
+            _visibleSubtitleCues.isNotEmpty &&
+            !_switchingChannel &&
+            _error == null)
+          PlayerSubtitleOverlay(
+            settings: ref.watch(subtitleSettingsProvider),
+            cues: _visibleSubtitleCues,
+            bottomSafePadding: 8.0,
+            minFontSize: 9.0,
+          ),
+        if (ref.watch(superimposeEnabledProvider) &&
+            _visibleSuperimposeCues.isNotEmpty &&
+            !_switchingChannel &&
+            _error == null)
+          PlayerSubtitleOverlay(
+            settings: ref.watch(subtitleSettingsProvider),
+            cues: _visibleSuperimposeCues,
+            bottomSafePadding: 8.0,
+            minFontSize: 9.0,
+          ),
+        if (uiMode.isDesktop && _desktopPipHover) ...[
+          Positioned(
+            top: 8,
+            right: 8,
+            child: Material(
+              color: Colors.black.withValues(alpha: 0.72),
+              borderRadius: BorderRadius.circular(20),
+              child: IconButton(
+                key: const ValueKey('player_pip_exit_button'),
+                icon: const Icon(
+                  Icons.open_in_full,
+                  color: Colors.white,
+                  size: 18,
+                ),
+                tooltip: '元に戻す',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => unawaited(_togglePip()),
+              ),
+            ),
+          ),
+          Center(
+            child: Material(
+              color: Colors.black.withValues(alpha: 0.68),
+              shape: const CircleBorder(),
+              child: IconButton(
+                key: const ValueKey('player_pip_play_pause_button'),
+                icon: Icon(
+                  _playingNow ? Icons.pause : Icons.play_arrow,
+                  color: Colors.white,
+                  size: 28,
+                ),
+                tooltip: _playingNow ? '一時停止' : '再生',
+                onPressed: _togglePlayPauseWithHud,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+    if (!uiMode.isDesktop) return stack;
+    return Focus(
+      focusNode: _rootFocusNode,
+      autofocus: true,
+      onKeyEvent: _handleKeyEvent,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _desktopPipHover = true),
+        onExit: (_) => setState(() => _desktopPipHover = false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onDoubleTap: () => unawaited(_togglePip()),
+          child: stack,
+        ),
+      ),
+    );
+  }
+
   Widget _buildTouchSplitLayout({
     required String? loadingLabel,
     required bool canSwipeChannels,
@@ -9762,6 +9987,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   onVolumeChanged: _setPlayerVolume,
                 ),
                 const Spacer(),
+                if (_pipSupported) ...[
+                  OutlinedButton.icon(
+                    key: const ValueKey('player_pip_icon_button'),
+                    style: osdButtonStyle(),
+                    onPressed: () => unawaited(_togglePip()),
+                    icon: const Icon(Icons.picture_in_picture_alt, size: 20),
+                    label: const Text('PinP'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
                 OutlinedButton.icon(
                   key: const ValueKey('player_fullscreen_button'),
                   style: osdButtonStyle(),
@@ -9779,6 +10014,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 tvMode: false,
                 includeCloseButton: false,
                 includeDetailButton: false,
+                includePipButton: false,
               ),
             ),
             if (portraitDetail != null) ...[
@@ -10747,6 +10983,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     required bool includeCloseButton,
     required bool includeDetailButton,
     bool includeTransportButtons = true,
+    bool includePipButton = true,
     bool compact = false,
   }) {
     void onInteraction() {
@@ -10926,6 +11163,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           onPressed: _recordingActionBusy
               ? null
               : () => unawaited(_confirmAndStartLiveRecording()),
+        ),
+      if (includePipButton && _pipSupported)
+        _osdButton(
+          key: const ValueKey('player_pip_button'),
+          icon: Icons.picture_in_picture_alt,
+          label: 'ピクチャ イン ピクチャ',
+          compact: compact,
+          onPressed: () => unawaited(_togglePip()),
         ),
       if (includeDetailButton && _hasProgramDetail)
         _osdButton(
@@ -11118,6 +11363,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       includeCloseButton: false,
       includeDetailButton: true,
       includeTransportButtons: false,
+      includePipButton: false,
       compact: true,
     );
     return Positioned(
@@ -11192,6 +11438,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         ),
                       ),
                       const SizedBox(width: 4),
+                      if (_pipSupported)
+                        IconButton(
+                          key: const ValueKey('player_pip_icon_button'),
+                          icon: const Icon(
+                            Icons.picture_in_picture_alt,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          tooltip: 'ピクチャ イン ピクチャ',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => unawaited(_togglePip()),
+                        ),
                       IconButton(
                         key: const ValueKey('player_fullscreen_button'),
                         icon: const Icon(
@@ -11307,6 +11565,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                           onVolumeChanged: _setPlayerVolume,
                         ),
                         const Spacer(),
+                        if (_pipSupported)
+                          IconButton(
+                            key: const ValueKey('player_pip_icon_button'),
+                            icon: const Icon(
+                              Icons.picture_in_picture_alt,
+                              color: Colors.white,
+                            ),
+                            tooltip: 'ピクチャ イン ピクチャ',
+                            onPressed: () => unawaited(_togglePip()),
+                          ),
                         IconButton(
                           key: const ValueKey('player_fullscreen_button'),
                           icon: Icon(
@@ -11338,6 +11606,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         tvMode: false,
                         includeCloseButton: false,
                         includeDetailButton: true,
+                        includePipButton: false,
                       ),
                     ),
                   ],
@@ -11431,6 +11700,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 
   Widget _osdButton({
+    Key? key,
     FocusNode? focusNode,
     bool autofocus = false,
     required IconData icon,
@@ -11448,6 +11718,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           )
         : osdButtonStyle();
     return OutlinedButton.icon(
+      key: key,
       focusNode: focusNode,
       autofocus: autofocus,
       style: style,

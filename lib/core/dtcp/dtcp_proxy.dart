@@ -75,6 +75,11 @@ class DtcpMediaFetcher {
     HttpClient Function()? clientFactory,
     this.diag = const DiagLog.none(),
     this.responseHeaderTimeout = const Duration(seconds: 12),
+    this.headRetryDelays = const [
+      Duration(milliseconds: 500),
+      Duration(seconds: 1),
+      Duration(seconds: 2),
+    ],
   }) : _clientFactory = clientFactory ?? HttpClient.new;
 
   final HttpClient Function() _clientFactory;
@@ -85,7 +90,18 @@ class DtcpMediaFetcher {
   /// Upper bound waiting for upstream HTTP response headers so dead LTE
   /// sockets fail cleanly instead of stalling forever on `request.close()`.
   final Duration responseHeaderTimeout;
+
+  /// Short backoff delays before retrying transient `HEAD` refusals (such as
+  /// HTTP 511 / 512 / 503 right after VPN setup or while earlier DMS sockets
+  /// settle). Empty disables automatic HEAD retries.
+  final List<Duration> headRetryDelays;
   HttpClient? _client;
+
+  static bool _isRetryableHeadStatus(int status) =>
+      status == HttpStatus.internalServerError ||
+      status == HttpStatus.serviceUnavailable ||
+      status == 511 ||
+      status == 512;
 
   HttpClient get _http =>
       _client ??= _clientFactory()
@@ -112,59 +128,76 @@ class DtcpMediaFetcher {
   /// reference (a non-200 or a non-DTCP media type is an error,
   /// not an endpoint-less response).
   Future<(String host, int port)> akeEndpoint(Uri contentUrl) async {
-    final stopwatch = Stopwatch()..start();
-    try {
-      final request = await _http.headUrl(contentUrl);
-      _applyHeaders(request);
-      final response = await request.close().timeout(responseHeaderTimeout);
-      final rawType =
-          response.headers.value(HttpHeaders.contentTypeHeader) ?? '';
-      final (mediaType, params) = _parseContentType(rawType);
-      final status = response.statusCode;
-      await response.drain<void>();
-      diag(
-        DiagCategory.network,
-        'HEAD ${contentUrl.host}:${contentUrl.port} -> $status in '
-        '${stopwatch.elapsedMilliseconds} ms; media=$mediaType '
-        'params=${params.keys.join(',')}',
-      );
-      if (status != HttpStatus.ok) {
-        throw NasneError.http(status, 'dtcp:http');
-      }
-      if (mediaType != 'application/x-dtcp1') {
-        throw NasneError.parse(
-          'dtcp:http',
-          cause: 'unexpected content media type: $mediaType',
+    for (var attempt = 0; ; attempt++) {
+      final stopwatch = Stopwatch()..start();
+      try {
+        final request = await _http.headUrl(contentUrl);
+        _applyHeaders(request);
+        final response = await request.close().timeout(responseHeaderTimeout);
+        final rawType =
+            response.headers.value(HttpHeaders.contentTypeHeader) ?? '';
+        final (mediaType, params) = _parseContentType(rawType);
+        final status = response.statusCode;
+        final reason = response.reasonPhrase;
+        await response.drain<void>();
+        diag(
+          DiagCategory.network,
+          'HEAD ${contentUrl.host}:${contentUrl.port} -> $status'
+          '${reason.isNotEmpty ? ' ($reason)' : ''} in '
+          '${stopwatch.elapsedMilliseconds} ms; media=$mediaType '
+          'params=${params.keys.join(',')}',
         );
-      }
-      final host = params['dtcp1host'];
-      final port = int.tryParse(params['dtcp1port'] ?? '');
-      if (host == null ||
-          host.isEmpty ||
-          port == null ||
-          port < 1 ||
-          port > 65535) {
-        throw NasneError.parse(
+        if (status != HttpStatus.ok) {
+          if (_isRetryableHeadStatus(status) &&
+              attempt < headRetryDelays.length) {
+            final delay = headRetryDelays[attempt];
+            diag(
+              DiagCategory.network,
+              'HEAD transient HTTP $status; resetting client and retrying '
+              '(${attempt + 1}/${headRetryDelays.length}) in '
+              '${delay.inMilliseconds} ms',
+            );
+            resetClient();
+            await Future<void>.delayed(delay);
+            continue;
+          }
+          throw NasneError.http(status, 'dtcp:http');
+        }
+        if (mediaType != 'application/x-dtcp1') {
+          throw NasneError.parse(
+            'dtcp:http',
+            cause: 'unexpected content media type: $mediaType',
+          );
+        }
+        final host = params['dtcp1host'];
+        final port = int.tryParse(params['dtcp1port'] ?? '');
+        if (host == null ||
+            host.isEmpty ||
+            port == null ||
+            port < 1 ||
+            port > 65535) {
+          throw NasneError.parse(
+            'dtcp:http',
+            cause: 'the content response carries no DTCP endpoint',
+          );
+        }
+        diag(DiagCategory.network, 'dtcp endpoint: $host:$port');
+        return (host, port);
+      } on NasneError {
+        rethrow;
+      } on TimeoutException catch (e) {
+        resetClient();
+        throw NasneError.unreachable(
           'dtcp:http',
-          cause: 'the content response carries no DTCP endpoint',
+          cause:
+              'HEAD response headers timed out after '
+              '${responseHeaderTimeout.inSeconds}s: $e',
         );
+      } catch (e) {
+        // Socket/HTTP failures are reachability failures; classify
+        // them so the UI (and the debug log) can name the stage.
+        throw NasneError.unreachable('dtcp:http', cause: '$e');
       }
-      diag(DiagCategory.network, 'dtcp endpoint: $host:$port');
-      return (host, port);
-    } on NasneError {
-      rethrow;
-    } on TimeoutException catch (e) {
-      resetClient();
-      throw NasneError.unreachable(
-        'dtcp:http',
-        cause:
-            'HEAD response headers timed out after '
-            '${responseHeaderTimeout.inSeconds}s: $e',
-      );
-    } catch (e) {
-      // Socket/HTTP failures are reachability failures; classify
-      // them so the UI (and the debug log) can name the stage.
-      throw NasneError.unreachable('dtcp:http', cause: '$e');
     }
   }
 
@@ -673,7 +706,7 @@ class DtcpProxy {
   /// brief cellular dead zones resume streaming without blocking on AKE.
   static bool shouldReauthenticate(Object? error, int consecutiveErrors) {
     if (error is NasneError && error.category == NasneErrorCategory.http) {
-      if (const {'401', '403', '500', '503', '512'}.contains(error.code)) {
+      if (const {'401', '403', '500', '503', '511', '512'}.contains(error.code)) {
         return true;
       }
     }
@@ -692,6 +725,8 @@ class DtcpProxy {
         '502',
         '503',
         '504',
+        '511',
+        '512',
       }.contains(error.code);
     }
     return false;
@@ -1227,7 +1262,7 @@ class DtcpProxy {
   static bool _isBusyRefusal(Object error) =>
       error is NasneError &&
       error.category == NasneErrorCategory.http &&
-      error.code == '512';
+      (error.code == '512' || error.code == '511');
 
   /// Runs [open] with backoff retries on the transient
   /// refusal (plan 80), rethrowing anything else — and the

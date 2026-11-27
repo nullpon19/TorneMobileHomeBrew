@@ -270,9 +270,11 @@ Widget asyncSection<T>(
   Widget Function(T data) builder, {
   VoidCallback? onRetry,
   bool skipLoadingOnReload = false,
+  bool? skipLoadingOnRefresh,
 }) {
   return value.when(
     skipLoadingOnReload: skipLoadingOnReload,
+    skipLoadingOnRefresh: skipLoadingOnRefresh ?? value.hasValue,
     data: builder,
     loading: () => const Padding(
       padding: EdgeInsets.all(24),

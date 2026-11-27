@@ -657,6 +657,7 @@ void main() {
       expect(DtcpProxy.shouldReauthenticate(NasneError.http(401, 't'), 1), isTrue);
       expect(DtcpProxy.shouldReauthenticate(NasneError.http(403, 't'), 1), isTrue);
       expect(DtcpProxy.shouldReauthenticate(NasneError.http(503, 't'), 1), isTrue);
+      expect(DtcpProxy.shouldReauthenticate(NasneError.http(511, 't'), 1), isTrue);
       expect(DtcpProxy.shouldReauthenticate(NasneError.http(512, 't'), 1), isTrue);
 
       final netErr = NasneError.unreachable('t');

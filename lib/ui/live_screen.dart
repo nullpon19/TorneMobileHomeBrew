@@ -746,8 +746,13 @@ class _LiveListState extends ConsumerState<_LiveList>
             },
           );
         },
-        skipLoadingOnReload: true,
-        onRetry: () => ref.invalidate(liveChannelsProvider(widget.reg)),
+        skipLoadingOnReload: bands.hasValue,
+        onRetry: () {
+          if (bands.hasError) {
+            ref.invalidate(httpClientProvider);
+          }
+          ref.invalidate(liveChannelsProvider(widget.reg));
+        },
       );
     }
 
@@ -769,11 +774,11 @@ class _LiveListState extends ConsumerState<_LiveList>
           reg: r,
           bands: liveBandsWithSubchannelSetting(value, showSubchannels),
         ));
+      } else if (async.isLoading) {
+        anyLoading = true;
       } else if (async.hasError) {
         failedLabels.add(nasneDisplayLabel(r));
         firstError ??= async.error;
-      } else if (async.isLoading) {
-        anyLoading = true;
       }
     }
 
@@ -785,6 +790,7 @@ class _LiveListState extends ConsumerState<_LiveList>
             ? userMessageForError(firstError)
             : '視聴可能なチャンネルを取得できませんでした',
         onRetry: () {
+          ref.invalidate(httpClientProvider);
           for (final r in widget.activeRegs) {
             ref.invalidate(liveChannelsProvider(r));
             ref.invalidate(schedulesProvider(r));

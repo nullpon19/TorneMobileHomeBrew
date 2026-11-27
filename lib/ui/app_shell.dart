@@ -284,6 +284,8 @@ class _AppShellState extends ConsumerState<AppShell> {
   Widget build(BuildContext context) {
     final tab = ref.watch(tabIndexProvider);
     final uiMode = ref.watch(uiControlModeProvider);
+    final showTailscaleButton =
+        ref.watch(tailscaleInstalledProvider).value ?? false;
     ref.listen<AsyncValue<List<RegisteredNasne>>>(
       registrationsProvider,
       (prev, next) => _restoreHomeRailFocusIfNeeded(),
@@ -337,6 +339,21 @@ class _AppShellState extends ConsumerState<AppShell> {
             ],
           );
           if (constraints.maxWidth >= railBreakpoint) {
+            if (uiMode.isTv &&
+                tab == AppTabs.home &&
+                !_userMovedIntoHomePane &&
+                !_railFocusNode.hasFocus) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!mounted) return;
+                if (ref.read(tabIndexProvider) == AppTabs.home &&
+                    !_userMovedIntoHomePane &&
+                    _railFocusNode.context != null &&
+                    !_railFocusNode.hasFocus &&
+                    ModalRoute.of(context)?.isCurrent == true) {
+                  _focusSelectedRailDestination(AppTabs.home);
+                }
+              });
+            }
             final reportedTopInset = MediaQuery.paddingOf(context).top;
             final extraTop = wideLayoutMinTopInset > reportedTopInset
                 ? wideLayoutMinTopInset - reportedTopInset
@@ -383,13 +400,19 @@ class _AppShellState extends ConsumerState<AppShell> {
                                     ),
                                   ),
                               ],
-                              trailing: ref.watch(fireTvHelperProvider).isAndroid
+                              trailing: showTailscaleButton
                                   ? Padding(
                                       padding: const EdgeInsets.only(top: 12),
                                       child: IconButton(
                                         tooltip: 'Tailscale を開く',
                                         icon: const Icon(Icons.vpn_lock),
                                         onPressed: () async {
+                                          ref
+                                              .read(
+                                                tailscaleManualLaunchSignalProvider
+                                                    .notifier,
+                                              )
+                                              .notifyLaunched();
                                           final ok = await ref
                                               .read(fireTvHelperProvider)
                                               .launchTailscale();

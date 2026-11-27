@@ -440,6 +440,19 @@ void invalidateDeviceData(WidgetRef ref, RegisteredNasne reg) {
   ref.invalidate(liveChannelsProvider(reg));
 }
 
+/// Closes pooled pre-VPN/stale HTTP connections and refreshes all registered
+/// nasne units. Invalidating [httpClientProvider] cascades through
+/// [deviceServicesProvider] to every per-device provider automatically.
+void resetNetworkAndInvalidateDevices(
+  WidgetRef ref,
+  Iterable<RegisteredNasne> regs,
+) {
+  ref.invalidate(httpClientProvider);
+  for (final r in regs) {
+    invalidateDeviceData(ref, r);
+  }
+}
+
 /// Persisted list of registered generic DLNA / DTCP-IP MediaServers
 /// (`keyValueStoreProvider` under key `dlna_servers_v1`).
 class DlnaServersNotifier extends Notifier<List<RegisteredDlnaServer>> {

@@ -10,6 +10,7 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:material_ui/material_ui.dart' show ThemeMode;
 
 import '../core/core.dart';
@@ -24,10 +25,18 @@ import 'firetv_helper.dart';
 import 'log_folder.dart';
 import 'log_share.dart';
 import 'multicast_lock.dart';
+import 'pip_controller.dart';
 import 'ui_control_mode.dart';
 import 'wakelock.dart';
 
-final httpClientProvider = Provider<http.Client>((ref) => http.Client());
+final httpClientProvider = Provider<http.Client>((ref) {
+  final io = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 8)
+    ..maxConnectionsPerHost = 6;
+  final client = IOClient(io);
+  ref.onDispose(client.close);
+  return client;
+});
 
 /// Sleep suppression for the player screen (plan 32, reworked in
 /// plan 35): a hand-rolled platform channel flips the OS switch
@@ -1174,6 +1183,35 @@ final androidSdkIntProvider = Provider<int?>((ref) => null);
 
 /// Platform helper for Fire TV (volume max, Tailscale, local file scan).
 final fireTvHelperProvider = Provider<FireTvHelper>((ref) => FireTvHelper());
+
+/// Whether Tailscale is installed on an Android TV device. Always `false` on
+/// non-Android/non-TV platforms or when Tailscale is not installed.
+final tailscaleInstalledProvider = FutureProvider<bool>((ref) async {
+  final helper = ref.watch(fireTvHelperProvider);
+  final uiMode = ref.watch(uiControlModeProvider);
+  if (!helper.isAndroid || !uiMode.isTv) return false;
+  return helper.isTailscaleInstalled();
+});
+
+/// Signal counter incremented when the user manually launches Tailscale from
+/// outside [TailscaleGuard] (e.g. the rail icon button), so returning to the app
+/// waits for nasne reachability and resets stale connections.
+class TailscaleLaunchSignalNotifier extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void notifyLaunched() => state++;
+}
+
+final tailscaleManualLaunchSignalProvider =
+    NotifierProvider<TailscaleLaunchSignalNotifier, int>(
+      TailscaleLaunchSignalNotifier.new,
+    );
+
+/// Cross-platform Picture-in-Picture / floating mini-window controller.
+final pipControllerProvider = Provider<PipController>(
+  (ref) => PipController(),
+);
 
 /// Cross-platform ARIB built-in chime sound player.
 final aribSoundPlayerProvider = Provider<AribSoundPlayer>(

@@ -69,6 +69,11 @@ Future<void> startPlaybackAndShowPlayer({
           canRetry: true,
         );
         if (!retry || !context.mounted) return;
+        if (e.category == NasneErrorCategory.unreachable ||
+            (e.category == NasneErrorCategory.http &&
+                const {'500', '503', '511', '512'}.contains(e.code))) {
+          ref.invalidate(httpClientProvider);
+        }
       }
     } catch (e) {
       if (!context.mounted) return;

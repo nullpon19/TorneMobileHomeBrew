@@ -43,6 +43,62 @@ void main() {
       await server.close(force: true);
     });
 
+    test('akeEndpoint retries transient HTTP 511/512/503 and succeeds on 200', () async {
+      var attempts = 0;
+      final (server, url) = await serve((request) {
+        attempts++;
+        if (attempts == 1) {
+          request.response.statusCode = 511;
+          return;
+        }
+        if (attempts == 2) {
+          request.response.statusCode = 512;
+          return;
+        }
+        request.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'application/x-dtcp1; DTCP1HOST=192.0.2.10; DTCP1PORT=58293',
+        );
+      });
+      final fetcher = DtcpMediaFetcher(
+        headRetryDelays: const [
+          Duration(milliseconds: 5),
+          Duration(milliseconds: 5),
+        ],
+      );
+      final (host, port) = await fetcher.akeEndpoint(url);
+      expect(attempts, 3);
+      expect(host, '192.0.2.10');
+      expect(port, 58293);
+      fetcher.close();
+      await server.close(force: true);
+    });
+
+    test('akeEndpoint throws NasneError.http(511) when retries are exhausted', () async {
+      var attempts = 0;
+      final (server, url) = await serve((request) {
+        attempts++;
+        request.response.statusCode = 511;
+      });
+      final fetcher = DtcpMediaFetcher(
+        headRetryDelays: const [
+          Duration(milliseconds: 5),
+          Duration(milliseconds: 5),
+        ],
+      );
+      await expectLater(
+        fetcher.akeEndpoint(url),
+        throwsA(
+          isA<NasneError>()
+              .having((e) => e.category, 'category', NasneErrorCategory.http)
+              .having((e) => e.code, 'code', '511'),
+        ),
+      );
+      expect(attempts, 3);
+      fetcher.close();
+      await server.close(force: true);
+    });
+
     test('a non-200 HEAD is an http error, not a missing endpoint',
         () async {
       final (server, url) = await serve((request) {
