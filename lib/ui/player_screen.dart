@@ -549,6 +549,9 @@ resolveLiveCatchUpJumpTarget({
   required double cacheStartSeconds,
   required double liveEdgeSeconds,
   required double currentPosSeconds,
+  double? liveEdgeStalenessSeconds,
+  bool cacheEof = false,
+  double maxLiveEdgeStalenessSeconds = 20.0,
   double keyframeSafetyMarginSeconds = 1.5,
   double zeroBufferMarginSeconds = 0.5,
 }) {
@@ -565,8 +568,28 @@ resolveLiveCatchUpJumpTarget({
       deltaSeconds: 0.0,
     );
   }
-  if (liveEdgeSeconds <= cacheStartSeconds + 1.0 ||
-      totalPauseLagSeconds > cacheWindowSeconds) {
+  if (cacheEof || liveEdgeSeconds <= cacheStartSeconds + 1.0) {
+    return (
+      canStayInCache: false,
+      alreadyAtLiveTarget: false,
+      targetSeconds: currentPosSeconds,
+      deltaSeconds: 0.0,
+    );
+  }
+  if (liveEdgeStalenessSeconds != null && liveEdgeStalenessSeconds.isFinite) {
+    if (liveEdgeStalenessSeconds > maxLiveEdgeStalenessSeconds) {
+      return (
+        canStayInCache: false,
+        alreadyAtLiveTarget: false,
+        targetSeconds: currentPosSeconds,
+        deltaSeconds: 0.0,
+      );
+    }
+  } else if (totalPauseLagSeconds >
+      math.max(
+        cacheWindowSeconds.toDouble(),
+        liveEdgeSeconds - cacheStartSeconds,
+      )) {
     return (
       canStayInCache: false,
       alreadyAtLiveTarget: false,
@@ -1020,6 +1043,7 @@ class LiveDemuxerCacheRange {
     this.cacheDurationSeconds,
     this.liveEdgeSeconds,
     this.earliestStartSeconds,
+    this.eof = false,
   });
 
   final double startSeconds;
@@ -1027,6 +1051,7 @@ class LiveDemuxerCacheRange {
   final double? cacheDurationSeconds;
   final double? liveEdgeSeconds;
   final double? earliestStartSeconds;
+  final bool eof;
 
   double get spanSeconds => math.max(0.0, endSeconds - startSeconds);
 }
@@ -1073,6 +1098,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
     final rawCacheDur = _jsonFiniteDouble(decoded['cache-duration']);
     final cacheDur =
         (rawCacheDur != null && rawCacheDur >= 0) ? rawCacheDur : null;
+    final eof = decoded['eof'] == true;
     final rawRanges = decoded['seekable-ranges'];
     if (rawRanges is! List || rawRanges.isEmpty) return null;
     final ranges = <({double start, double end})>[];
@@ -1100,6 +1126,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
             cacheDurationSeconds: cacheDur,
             liveEdgeSeconds: latestEnd,
             earliestStartSeconds: earliestStart,
+            eof: eof,
           );
         }
       }
@@ -1111,6 +1138,7 @@ LiveDemuxerCacheRange? parseDemuxerCacheStateRange(
       cacheDurationSeconds: cacheDur,
       liveEdgeSeconds: latestEnd,
       earliestStartSeconds: earliestStart,
+      eof: eof,
     );
   } catch (_) {
     return null;
@@ -8720,6 +8748,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     _catchingUpLive = true;
     _clearDisplayedSubtitles();
     _closeOsd();
+    _liveSeekDebounceTimer?.cancel();
+    _livePendingSeekBaseSec = null;
+    _livePendingSeekDeltaSec = 0.0;
     _showHudMessage(Icons.skip_next, '現在位置へ移動しています…');
     try {
       if (_liveCatchUpRate != 1.0) {
@@ -8781,15 +8812,31 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               _liveEstimatedLagSeconds + activePause,
               measuredLagBeyondBuffer,
             );
-            final effectiveWindowSeconds = plan.useDiskCache
-                ? math.max(
-                    plan.configuredSeconds,
-                    math.max(plan.readaheadSeconds, livePauseTimeshiftSeconds),
-                  )
-                : math.max(
-                    plan.configuredSeconds,
-                    (liveEdge - cacheStart).floor(),
-                  );
+            final effectiveWindowSeconds = math.max(
+              plan.configuredSeconds,
+              math.max(
+                (liveEdge - cacheStart).floor(),
+                plan.useDiskCache
+                    ? math.max(plan.readaheadSeconds, livePauseTimeshiftSeconds)
+                    : 0,
+              ),
+            );
+            final now = _now();
+            double? liveEdgeStalenessSeconds;
+            final epoch = _liveStreamEpoch;
+            if (epoch != null) {
+              final expectedLiveEdge =
+                  now.difference(epoch).inMilliseconds / 1000.0;
+              if (expectedLiveEdge.isFinite &&
+                  expectedLiveEdge >= -10.0 &&
+                  expectedLiveEdge <= 43200.0) {
+                liveEdgeStalenessSeconds = math.max(
+                  0.0,
+                  expectedLiveEdge - liveEdge,
+                );
+              }
+            }
+            final cacheEof = range?.eof ?? false;
             final jump = resolveLiveCatchUpJumpTarget(
               useCache: plan.useCache,
               configuredBufferSeconds: plan.configuredSeconds,
@@ -8798,6 +8845,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               cacheStartSeconds: cacheStart,
               liveEdgeSeconds: liveEdge,
               currentPosSeconds: currentPos,
+              liveEdgeStalenessSeconds: liveEdgeStalenessSeconds,
+              cacheEof: cacheEof,
+            );
+            _logPlaybackTrace(
+              'live catch-up stayInCache=${jump.canStayInCache} '
+              'already=${jump.alreadyAtLiveTarget} '
+              'pos=${currentPos.toStringAsFixed(1)} '
+              'edge=${liveEdge.toStringAsFixed(1)} '
+              'span=${(liveEdge - cacheStart).toStringAsFixed(1)} '
+              'stale=${liveEdgeStalenessSeconds?.toStringAsFixed(1) ?? '-'} '
+              'eof=$cacheEof '
+              'target=${jump.targetSeconds.toStringAsFixed(1)}',
             );
             if (jump.canStayInCache) {
               if (!jump.alreadyAtLiveTarget) {
@@ -8810,7 +8869,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               _liveCacheStartSec = cacheStart;
               _liveCacheEndSec = liveEdge;
               _liveCacheLiveEdgeSec = liveEdge;
-              _updateLiveStreamEpochFromLiveEdge(liveEdge, _now());
+              _updateLiveStreamEpochFromLiveEdge(liveEdge, now);
               _liveTimePosSec = jump.targetSeconds;
               _bufferedAheadSeconds = math.max(
                 0.0,

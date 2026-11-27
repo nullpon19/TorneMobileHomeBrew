@@ -638,7 +638,7 @@ void main() {
       expect(liveOff.cachePauseInitial, isFalse);
       expect(liveOff.cachePause, isFalse);
       expect(liveOff.cachePauseWaitSeconds, 0);
-      expect(liveOff.readaheadSeconds, livePauseTimeshiftSeconds);
+      expect(liveOff.readaheadSeconds, liveMaxReadaheadSeconds);
       expect(liveOff.demuxerMaxBytes, 105 * 1024 * 1024);
 
       const liveTightAvail = 1400 * 1024 * 1024;
@@ -684,7 +684,7 @@ void main() {
       expect(liveThreeMin.cachePause, isTrue);
       expect(liveThreeMin.cachePauseWaitSeconds, 180);
       expect(liveThreeMin.rebufferWaitSeconds, 15);
-      expect(liveThreeMin.readaheadSeconds, livePauseTimeshiftSeconds);
+      expect(liveThreeMin.readaheadSeconds, liveMaxReadaheadSeconds);
       expect(liveThreeMin.networkTimeoutSeconds, 360);
       expect(liveThreeMin.startTimeoutSeconds, 225);
 
@@ -6331,7 +6331,7 @@ void main() {
         expect(jump0.canStayInCache, isTrue);
         expect(jump0.targetSeconds, closeTo(144.5, 0.01));
 
-        // Exhausted 5-min cache window falls back to upstream live-edge reset.
+        // Exhausted 5-min cache window (unknown staleness) falls back to reset.
         final exhausted = resolveLiveCatchUpJumpTarget(
           useCache: true,
           configuredBufferSeconds: 15,
@@ -6342,6 +6342,65 @@ void main() {
           currentPosSeconds: 60,
         );
         expect(exhausted.canStayInCache, isFalse);
+
+        // Long 45-min rewind stays in cache as long as liveEdge is fresh.
+        final longRewindFresh = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 2680,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 2700,
+          currentPosSeconds: 5,
+          liveEdgeStalenessSeconds: 2.0,
+          cacheEof: false,
+        );
+        expect(longRewindFresh.canStayInCache, isTrue);
+        expect(longRewindFresh.alreadyAtLiveTarget, isFalse);
+        expect(longRewindFresh.targetSeconds, closeTo(2683.5, 0.01));
+
+        // Stalled cache edge (>20s behind wall clock) falls back to upstream reset.
+        final stalledEdge = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 600,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 900,
+          currentPosSeconds: 300,
+          liveEdgeStalenessSeconds: 45.0,
+          cacheEof: false,
+        );
+        expect(stalledEdge.canStayInCache, isFalse);
+
+        // Cache at EOF falls back to upstream reset even if staleness is 0.
+        final cacheAtEof = resolveLiveCatchUpJumpTarget(
+          useCache: true,
+          configuredBufferSeconds: 15,
+          cacheWindowSeconds: 7200,
+          totalPauseLagSeconds: 60,
+          cacheStartSeconds: 0,
+          liveEdgeSeconds: 900,
+          currentPosSeconds: 820,
+          liveEdgeStalenessSeconds: 0.0,
+          cacheEof: true,
+        );
+        expect(cacheAtEof.canStayInCache, isFalse);
+
+        // parseDemuxerCacheStateRange extracts `eof` flag accurately.
+        final parsedEof = parseDemuxerCacheStateRange(
+          '{"eof":true,"cache-duration":12.5,"seekable-ranges":[{"start":10.0,"end":900.0}]}',
+          currentPosSeconds: 500.0,
+        );
+        expect(parsedEof, isNotNull);
+        expect(parsedEof!.eof, isTrue);
+
+        final parsedActive = parseDemuxerCacheStateRange(
+          '{"eof":false,"cache-duration":12.5,"seekable-ranges":[{"start":10.0,"end":900.0}]}',
+          currentPosSeconds: 500.0,
+        );
+        expect(parsedActive, isNotNull);
+        expect(parsedActive!.eof, isFalse);
 
         // Niconico Jikkyo delay mirrors configured live buffer during normal
         // playback without double-subtracting during paused/rewound playback.

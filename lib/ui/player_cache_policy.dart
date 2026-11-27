@@ -310,6 +310,13 @@ String formatBufferDurationLabel(int seconds) {
 /// viewers can resume with variable-speed catch-up without startup delay.
 const int livePauseTimeshiftSeconds = 300;
 
+/// Upper time cap for live `demuxer-readahead-secs` (2 hours).
+/// Actual RAM/disk footprint is already bounded by `demuxerMaxBytes` and the
+/// 1 GiB free-storage guard, so keeping this generously high ensures mpv does
+/// not artificially stop receiving live broadcast while rewound 10-60+ min
+/// inside low-bitrate streams that still fit within the byte budget.
+const int liveMaxReadaheadSeconds = 7200;
+
 /// Returns the playback speed multiplier for catching up from a paused live
 /// offset, applying light hysteresis on downward transitions to prevent speed
 /// chattering.
@@ -470,7 +477,7 @@ MpvBufferPlan computeMpvBufferPlan({
   }
 
   final readaheadSeconds = live
-      ? math.max(normalized + 15, livePauseTimeshiftSeconds)
+      ? math.max(normalized + 15, liveMaxReadaheadSeconds)
       : (normalized > 0 ? normalized + 15 : 20);
   final cachePauseInitial = normalized > 0;
   final cachePause = !live || normalized > 0;
